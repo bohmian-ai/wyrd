@@ -114,9 +114,6 @@ pub struct HumanOwner<'a> {
     pub credential: &'a SignupCredential,
     /// The identity's keyed creator pseudonym, kept on the tenant.
     pub creator_key: &'a [u8; 32],
-    /// Its pseudonyms under retained sealing keys, which the owned-workspace
-    /// cap still counts.
-    pub retained_creator_keys: &'a [[u8; 32]],
 }
 
 /// The tenant administrator a provisioning run establishes.
@@ -326,7 +323,6 @@ impl TenantProvisioning {
             &request.display_name,
             owner.attempt,
             owner.creator_key,
-            owner.retained_creator_keys,
         )
         .await
         .map_err(slug_or_store)?

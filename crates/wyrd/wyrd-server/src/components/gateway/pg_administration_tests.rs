@@ -15,11 +15,9 @@ use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_gateway::{
-    CredentialAssignment, CredentialError, GatewayTenantSnapshot, ManagedSecretBinding,
-};
+use wyrd_gateway::{CredentialAssignment, GatewayTenantSnapshot, ManagedSecretBinding};
 use wyrd_kms::{KmsError, WyrdKms};
-use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;

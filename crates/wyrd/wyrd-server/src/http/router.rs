@@ -29,8 +29,7 @@ use crate::components::health::health_router;
 use crate::components::operators::operator_connections_router;
 use crate::components::platform::{
     platform_auth_router, platform_credentials_router, platform_identity_router,
-    platform_login_router, platform_router, platform_social_router,
-    platform_stored_secrets_router,
+    platform_login_router, platform_router, platform_social_router, platform_stored_secrets_router,
 };
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;

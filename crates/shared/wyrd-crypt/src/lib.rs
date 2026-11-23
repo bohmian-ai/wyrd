@@ -275,34 +275,6 @@ pub enum CryptError {
 
 #[cfg(test)]
 mod tests {
-    /// A pseudonym is stable per key and value, and separated by scope and
-    /// key.
-    #[test]
-    fn pseudonyms_separate_scope_and_key() {
-        let keyring = super::SealingKeyring::new(super::SecretKey::from_bytes([7; 32]));
-        let other = super::SealingKeyring::new(super::SecretKey::from_bytes([8; 32]));
-        let address = keyring.pseudonym("source", b"198.51.100.7");
-        assert_eq!(address, keyring.pseudonym("source", b"198.51.100.7"));
-        assert_ne!(address, keyring.pseudonym("start", b"198.51.100.7"));
-        assert_ne!(address, keyring.pseudonym("sourc", b"e198.51.100.7"));
-        assert_ne!(address, other.pseudonym("source", b"198.51.100.7"));
-    }
-
-    /// Across a rotation both keyrings derive both pseudonyms, each its own
-    /// write key's first, so a value recorded on either side still matches.
-    #[test]
-    fn pseudonyms_match_across_a_rotation() {
-        let old = super::SealingKeyring::new(super::SecretKey::from_bytes([7; 32]))
-            .with_retained(super::SecretKey::from_bytes([8; 32]));
-        let new = super::SealingKeyring::new(super::SecretKey::from_bytes([8; 32]))
-            .with_retained(super::SecretKey::from_bytes([7; 32]));
-        let before = old.pseudonym("creator", b"ada");
-        let after = new.pseudonym("creator", b"ada");
-        assert_ne!(before, after);
-        assert_eq!(old.pseudonyms("creator", b"ada"), [before, after]);
-        assert_eq!(new.pseudonyms("creator", b"ada"), [after, before]);
-    }
-
     use super::{
         SecretBytes, SecretKey, decrypt, derive_key, encrypt, hmac_sha256, verify_hmac_sha256,
     };

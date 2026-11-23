@@ -85,11 +85,8 @@ pub async fn insert_provisioning_tenant(
 }
 
 /// Claim `slug` for the public signup `attempt` by the identity whose keyed
-/// pseudonym under the current sealing write key is `creator`, or resume
-/// that attempt's own interrupted claim of it. `creator` is recorded as the
-/// tenant's creator key, which stays after the attempt is purged; the
-/// identity's pseudonyms under retained keys, `retained`, still match
-/// tenants recorded before a rotation.
+/// pseudonym is `creator`, or resume that attempt's own interrupted claim of
+/// it. The creator key stays on the tenant after the attempt is purged.
 ///
 /// Unlike [`insert_provisioning_tenant`], only a `failed` or stale
 /// `provisioning` row this same attempt created is adopted, so no other
@@ -101,9 +98,7 @@ pub async fn insert_provisioning_tenant(
 /// the deployment's owned-workspace cap of unretired signup tenants; failed
 /// and provisioning claims count, and resuming this attempt's own claim is
 /// not a new one. Claims by one creator are serialized on a transaction
-/// lock per pseudonym, taken in sorted order, so concurrent completions on
-/// any replica cannot exceed the cap, including replicas mid-rotation: they
-/// hold an overlapping set of keys and so share a lock.
+/// lock, so concurrent completions on any replica cannot exceed the cap.
 ///
 /// # Errors
 /// Returns [`SqlError::UniqueViolation`] when the slug belongs to another
@@ -115,29 +110,23 @@ pub async fn claim_signup_tenant(
     display_name: &str,
     attempt: uuid::Uuid,
     creator: &[u8; 32],
-    retained: &[[u8; 32]],
 ) -> Result<Option<TenantClaim>, SqlError> {
-    let mut locks: Vec<&[u8; 32]> = std::iter::once(creator).chain(retained).collect();
-    locks.sort_unstable();
     let mut tx = pool.pool().begin().await.map_err(SqlError::from)?;
-    for key in &locks {
-        sqlx::query(
-            "SELECT pg_advisory_xact_lock(
-                        hashtextextended('wyrd.signup_creator:' || encode($1, 'hex'), 0))",
-        )
-        .bind(key.as_slice())
-        .execute(&mut *tx)
-        .await
-        .map_err(SqlError::from)?;
-    }
-    let keys: Vec<&[u8]> = locks.iter().map(|key| key.as_slice()).collect();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(
+                    hashtextextended('wyrd.signup_creator:' || encode($1, 'hex'), 0))",
+    )
+    .bind(creator.as_slice())
+    .execute(&mut *tx)
+    .await
+    .map_err(SqlError::from)?;
     let admitted: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM platform.tenants WHERE signup_attempt_id = $2)
                 OR (SELECT count(*) FROM platform.tenants
-                     WHERE signup_creator_key = ANY($1) AND status <> 'deleted')
+                     WHERE signup_creator_key = $1 AND status <> 'deleted')
                    < (SELECT signup_workspace_cap FROM platform.login_settings)",
     )
-    .bind(&keys)
+    .bind(creator.as_slice())
     .bind(attempt)
     .fetch_one(&mut *tx)
     .await

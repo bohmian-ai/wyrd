@@ -2,19 +2,19 @@
 //! creation, against a real server and repository Postgres.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use serde_json::{Value, json};
-use wyrd_crypt::{SealingKeyring, SecretKey};
+use wyrd_kms::{KmsBackendKind, KmsConfig};
 use wyrd_testing::WyrdTestServer;
 
 use super::{
-    SOCIAL_HOST, begin_social_at, body_json, complete_signup, enable_google, identity_token_reply,
-    initialize_platform_root, mail_to, mailpit, mount_platform_provider, platform_key_set,
-    platform_session, prove_signup, prove_signup_with, social_call, social_callback,
-    social_request,
+    SOCIAL_HOST, begin_google_login, begin_social_at, body_json, complete_signup, enable_google,
+    finish_google_login, identity_token_reply, identity_token_reply_with, initialize_platform_root,
+    local_records, mail_to, mailpit, mount_platform_provider, platform_key_set, platform_session,
+    prove_signup, prove_signup_with, social_call, social_callback, social_request,
 };
 
 /// The trusted ingress every journey here sits behind.
@@ -23,23 +23,55 @@ const INGRESS: &str = "10.0.0.0/8";
 /// The header that ingress names the visitor in.
 const CLIENT_HEADER: &str = "CF-Connecting-IP";
 
-/// The sealing write key every journey server starts with.
-const OLD_KEY: [u8; 32] = [9; 32];
+/// The wrapping key every journey server starts with.
+const OLD_KEY: &str = "k1";
 
-/// The sealing key a rotation switches to.
-const NEW_KEY: [u8; 32] = [10; 32];
+/// The wrapping key a rotation activates.
+const NEW_KEY: &str = "k2";
 
-/// A keyring writing under `write` that retains `retained`.
-fn keyring(write: [u8; 32], retained: [u8; 32]) -> Arc<SealingKeyring> {
-    Arc::new(
-        SealingKeyring::new(SecretKey::from_bytes(write))
-            .with_retained(SecretKey::from_bytes(retained)),
-    )
+/// A wrapping key no journey server ever held.
+const FOREIGN_KEY: &str = "k3";
+
+/// A directory of owner-only file wrapping keys [`OLD_KEY`], [`NEW_KEY`] and
+/// [`FOREIGN_KEY`], kept for the whole test process so every restart and
+/// replica can read it.
+///
+/// # Panics
+/// Panics when the directory or a key file cannot be written.
+fn wrapping_keys() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().expect("key directory").keep();
+    for (name, byte) in [(OLD_KEY, 0x11_u8), (NEW_KEY, 0x22), (FOREIGN_KEY, 0x33)] {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([byte; 32]),
+        )
+        .expect("key file writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("key file is owner-only");
+    }
+    dir
+}
+
+/// A file `[kms]` over `keys` wrapping under `active` and still opening
+/// envelopes wrapped under `retained`.
+fn kms(keys: &Path, active: &str, retained: &[&str]) -> KmsConfig {
+    KmsConfig {
+        backend: Some(KmsBackendKind::File),
+        active_key: Some(active.to_owned()),
+        retained_keys: retained.iter().map(|key| (*key).to_owned()).collect(),
+        key_dir: Some(keys.to_path_buf()),
+        ..KmsConfig::default()
+    }
 }
 
 /// A server behind [`INGRESS`] with Google enabled for signup, and its
-/// operator session. Its keyring writes under [`OLD_KEY`] and already
-/// retains [`NEW_KEY`], the first step of a documented rotation.
+/// operator session. Its `[kms]` wraps under [`OLD_KEY`] and already
+/// retains [`NEW_KEY`], the first step of a documented rotation, over the
+/// key directory [`WyrdTestServer::kms_config_for_test`] names.
 ///
 /// # Panics
 /// Panics when the server, operator session or provider setup fails.
@@ -65,7 +97,7 @@ async fn signup_server_with(
     let srv = WyrdTestServer::builder()
         .with_social_endpoints_for_test(social)
         .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
-        .with_sealing_keyring(keyring(OLD_KEY, NEW_KEY))
+        .with_kms_for_test(kms(&wrapping_keys(), OLD_KEY, &[NEW_KEY]))
         .start_in_process()
         .await
         .expect("server starts");
@@ -1012,7 +1044,9 @@ async fn email_signup_proves_a_mailbox_in_the_browser_that_asked() {
         .bind(ago)
         .execute(&superuser)
     };
-    expire("1 second").await.expect("the completion window ends");
+    expire("1 second")
+        .await
+        .expect("the completion window ends");
     while social.purge_expired_signups().await.expect("purge runs") > 0 {}
     let (status, replayed, body) = email_step(
         &srv,
@@ -1030,9 +1064,15 @@ async fn email_signup_proves_a_mailbox_in_the_browser_that_asked() {
         1,
         "the spent proof outlives its completion window"
     );
-    expire("11 minutes").await.expect("the email link has expired too");
+    expire("11 minutes")
+        .await
+        .expect("the email link has expired too");
     while social.purge_expired_signups().await.expect("purge runs") > 0 {}
-    assert_eq!(count(&superuser, attempts).await, 0, "then cleanup removes it");
+    assert_eq!(
+        count(&superuser, attempts).await,
+        0,
+        "then cleanup removes it"
+    );
 
     // 6. The address's budget holds across sources, before SMTP.
     let mut admitted = 2;
@@ -1264,7 +1304,10 @@ async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
         complete_with(&srv, &local, "198.51.100.90", &named(credentials.clone())).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({ "tenant": "harbor" }));
-    assert!(again.is_none(), "the creator signs in; a retry opens no session");
+    assert!(
+        again.is_none(),
+        "the creator signs in; a retry opens no session"
+    );
     assert_eq!(statuses(&superuser, "harbor").await, ["active"]);
     let admins: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM wyrd.auth_users u JOIN platform.tenants t
@@ -1485,7 +1528,11 @@ async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
         &json!({ "proof": proof }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "the delivered proof verifies: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the delivered proof verifies: {body}"
+    );
     let completion = completion.expect("completion cookie");
     let (status, signed_in, body) = complete_with(
         &srv,
@@ -1534,9 +1581,14 @@ fn at_cap(status: StatusCode, body: &Value, case: &str) {
 ///   1. the cap is an operator login setting, default 3;
 ///   2. at the cap a new claim is refused with `403`, not `429`, and creates
 ///      nothing;
-///   3. the count survives purging the identity's attempts and rotating
-///      the sealing write key with the old key retained, and a failed claim
-///      still counts;
+///   0. two replicas deriving for the first time together store one
+///      derivation key, and a flow begun on one verifies on the other;
+///   3. the count survives purging the identity's attempts, activating a
+///      new wrapping key with the old one retained, a routine maintenance
+///      pass and retiring the old key: the retired replica still opens the
+///      provider, SMTP and challenge secrets, completes an in-flight signup
+///      proven before retirement, and refuses the same identity at the cap;
+///      a failed claim still counts;
 ///   4. retiring a workspace frees capacity;
 ///   5. two concurrent claims at one slot left, across an old-key and a
 ///      rotated replica, create one;
@@ -1549,12 +1601,82 @@ fn at_cap(status: StatusCode, body: &Value, case: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_owned_workspace_cap_holds_atomically_across_purge() {
     let google = wiremock::MockServer::start().await;
+    let cloudflare = wiremock::MockServer::start().await;
     let (srv, session) = signup_server(&google).await;
     let api = relay_to_mailpit(&srv, &session).await;
     let superuser = srv
         .pg_fixture()
         .superuser_pool()
         .expect("superuser pool opens");
+    let keys = srv
+        .kms_config_for_test()
+        .key_dir
+        .clone()
+        .expect("the journey server uses a file key directory");
+    let derivation_keys = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM platform.derivation_key")
+            .fetch_one(&superuser)
+            .await
+            .expect("derivation keys count")
+    };
+
+    // 0. Two replicas deriving for the first time together keep one
+    // derivation key: a flow begun on one verifies on the other.
+    assert_eq!(derivation_keys().await, 0, "no key before first use");
+    let twin = srv
+        .start_replica(
+            WyrdTestServer::builder()
+                .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+                .with_kms_for_test(kms(&keys, OLD_KEY, &[NEW_KEY])),
+        )
+        .await
+        .expect("a second replica starts");
+    let (here, there) = (
+        format!("here-{}@example.test", uuid::Uuid::new_v4().simple()),
+        format!("there-{}@example.test", uuid::Uuid::new_v4().simple()),
+    );
+    let (body_here, body_there) = (
+        json!({ "method": "email", "email": here }),
+        json!({ "method": "email", "email": there }),
+    );
+    let (begun_here, begun_there) = tokio::join!(
+        email_step(
+            &srv,
+            "/auth/signup",
+            "198.51.100.95",
+            None,
+            "wyrd_signup_email",
+            &body_here,
+        ),
+        email_step(
+            &twin,
+            "/auth/signup",
+            "198.51.100.96",
+            None,
+            "wyrd_signup_email",
+            &body_there,
+        ),
+    );
+    for (status, _, body) in [&begun_here, &begun_there] {
+        assert_eq!(*status, StatusCode::ACCEPTED, "{body}");
+    }
+    assert_eq!(derivation_keys().await, 1, "one derivation key");
+    let flow = begun_there.1.expect("flow cookie");
+    let (proof, _) = mailed_proof(&api, &there).await;
+    let (status, _, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "198.51.100.96",
+        Some(flow.split(';').next().expect("pair")),
+        "wyrd_signup",
+        &json!({ "proof": proof }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the other replica's flow verifies: {body}"
+    );
 
     // 1. The cap is configurable and defaults to three.
     let settings = |body: Option<Value>| {
@@ -1610,13 +1732,14 @@ async fn the_owned_workspace_cap_holds_atomically_across_purge() {
     let (status, body) = create_as(&srv, &google, "google-cap", "cap-c", "198.51.100.102").await;
     at_cap(status, &body, "after purge");
 
-    // 3b. Rotating the write key, the old key retained, keeps the count: a
-    // replica on the new key opens the old replica's proof and still refuses.
+    // 3b. Activating a new wrapping key, the old one retained, keeps the
+    // count: a replica wrapping under the new key opens the old replica's
+    // proof and still refuses.
     let rotated = srv
         .start_replica(
             WyrdTestServer::builder()
                 .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
-                .with_sealing_keyring(keyring(NEW_KEY, OLD_KEY)),
+                .with_kms_for_test(kms(&keys, NEW_KEY, &[OLD_KEY])),
         )
         .await
         .expect("rotated replica starts");
@@ -1630,6 +1753,115 @@ async fn the_owned_workspace_cap_holds_atomically_across_purge() {
     .await;
     at_cap(status, &body, "after rotation");
     assert!(statuses(&superuser, "cap-r").await.is_empty());
+
+    // 3c. A routine pass moves every stored envelope, the platform
+    // derivation key's included, onto the new key; after the old key is
+    // retired the derivation key is unchanged, so the in-flight proof and the
+    // recorded creator key still match.
+    sqlx::query("DELETE FROM platform.signup_admissions")
+        .execute(&superuser)
+        .await
+        .expect("admission windows expire");
+    let (host, port, _) = mailpit();
+    for (uri, body) in [
+        (
+            "/platform/mail",
+            json!({ "host": host, "port": port, "tls": "none", "sender": "signup@wyrd.test",
+                    "username": "relay", "password": "relay-password" }),
+        ),
+        (
+            "/platform/login-settings",
+            json!({ "password_enabled": true, "signup_enabled": true, "signup_workspace_cap": 1,
+                    "signup_challenge": { "site_key": "0x4AAA-site", "secret": "rotated-secret" } }),
+        ),
+    ] {
+        let (status, stored) = social_call(
+            &srv,
+            social_request(Method::PUT, uri, Some(&session), Some(body)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {stored}");
+    }
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains("response=good&"))
+        .and(wiremock::matchers::body_string_contains("secret=rotated-secret"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            json!({ "success": true, "hostname": SOCIAL_HOST, "action": "signup", "error-codes": [] }),
+        ))
+        .mount(&cloudflare)
+        .await;
+    let in_flight = prove_signup(&srv, &google, "google-cap").await;
+    let (status, report) = social_call(
+        &rotated,
+        social_request(
+            Method::POST,
+            "/platform/stored-secrets/maintenance",
+            Some(&session),
+            Some(json!({ "mode": "routine" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["remaining"], 0, "every envelope moved: {report}");
+    let retired = srv
+        .start_replica(
+            WyrdTestServer::builder()
+                .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+                    google_issuer: Some(google.uri()),
+                    turnstile_siteverify_url: Some(cloudflare.uri()),
+                    ..Default::default()
+                })
+                .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+                .with_kms_for_test(kms(&keys, NEW_KEY, &[])),
+        )
+        .await
+        .expect("a replica without the old key starts");
+    let (status, _, body) = complete_with(
+        &retired,
+        &in_flight,
+        "198.51.100.110",
+        &json!({ "slug": "cap-i", "display_name": "cap-i", "challenge_token": "good" }),
+    )
+    .await;
+    at_cap(status, &body, "an in-flight proof after retirement");
+    let proof = prove_signup(&retired, &google, "google-cap").await;
+    let (status, _, body) = complete_with(
+        &retired,
+        &proof,
+        "198.51.100.111",
+        &json!({ "slug": "cap-n", "display_name": "cap-n", "challenge_token": "good" }),
+    )
+    .await;
+    at_cap(status, &body, "a provider sign-in after retirement");
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.derivation_key
+          WHERE length(envelope) > 32
+            AND position(decode(repeat('11', 32), 'hex') in envelope) = 0
+            AND position(decode(repeat('22', 32), 'hex') in envelope) = 0",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("the derivation key reads");
+    assert_eq!(stored, 1, "one derivation key, stored only as an envelope");
+    assert_eq!(
+        cloudflare
+            .received_requests()
+            .await
+            .expect("recorded")
+            .len(),
+        2,
+        "each completion posted the original challenge secret"
+    );
+    let retired_mail = format!("retired-{}@example.test", uuid::Uuid::new_v4().simple());
+    email_proof(&retired, &api, &retired_mail, "198.51.100.112").await;
+    let (status, cleared) = social_call(
+        &srv,
+        settings(Some(
+            json!({ "password_enabled": true, "signup_enabled": true, "signup_workspace_cap": 1 }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
     sqlx::query("UPDATE platform.tenants SET status = 'failed', provisioning_failed_reason = 'interrupted' WHERE slug = 'cap-a'")
         .execute(&superuser)
         .await
@@ -1739,6 +1971,157 @@ async fn siteverify(cloudflare: &wiremock::MockServer, token: &str, status: u16,
         .await;
 }
 
+/// Signup and social sign-in derive their state from the platform
+/// derivation key; a replica that cannot open it refuses them rather than
+/// using plain state, while password sign-in keeps working:
+///   1. on a replica whose `[kms]` holds none of the keys the stored
+///      envelopes name, a social signup start, an email signup start and an
+///      email proof's verification each answer
+///      `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and record no admission window,
+///      and a Google sign-in to an existing workspace refuses alike at its
+///      return, creating no User, identity, session or grant;
+///   2. a workspace administrator still signs in there with a password.
+///
+/// # Panics
+/// Panics when a refusal, a recorded window or the password sign-in differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn signup_refuses_without_its_derivation_key() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server(&google).await;
+    let api = relay_to_mailpit(&srv, &session).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let address = format!("keyless-{}@example.test", uuid::Uuid::new_v4().simple());
+    let (completion, _) = email_proof(&srv, &api, &address, "198.51.100.140").await;
+    let (status, _, body) = complete_with(
+        &srv,
+        &completion,
+        "198.51.100.140",
+        &json!({ "slug": "keyless", "display_name": "Keyless", "local_credentials": {
+            "username": "ada", "password": "quiet harbor lantern" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let late = format!("late-{}@example.test", uuid::Uuid::new_v4().simple());
+    let (status, flow, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "198.51.100.141",
+        None,
+        "wyrd_signup_email",
+        &json!({ "method": "email", "email": late }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let flow = flow.expect("flow cookie");
+    let flow = flow.split(';').next().expect("pair").to_owned();
+    let (proof, _) = mailed_proof(&api, &late).await;
+    let keys = srv
+        .kms_config_for_test()
+        .key_dir
+        .clone()
+        .expect("the journey server uses a file key directory");
+    let keyless = srv
+        .start_replica(
+            WyrdTestServer::builder()
+                .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+                .with_kms_for_test(kms(&keys, FOREIGN_KEY, &[])),
+        )
+        .await
+        .expect("a replica without the wrapping keys starts");
+    let windows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM platform.signup_admissions")
+            .fetch_one(&superuser)
+            .await
+            .expect("windows count")
+    };
+    let before = windows().await;
+
+    // 1. Each signup step refuses and records nothing.
+    for (case, cookie, uri, body) in [
+        (
+            "social start",
+            None,
+            "/auth/signup",
+            json!({ "method": "social", "provider": "google" }),
+        ),
+        (
+            "email start",
+            None,
+            "/auth/signup",
+            json!({ "method": "email", "email": format!("another-{late}") }),
+        ),
+        (
+            "email verification",
+            Some(flow.as_str()),
+            "/auth/signup/verify",
+            json!({ "proof": proof }),
+        ),
+    ] {
+        let (status, set, body) = email_step(
+            &keyless,
+            uri,
+            "198.51.100.142",
+            cookie,
+            "wyrd_signup",
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+        assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE", "{case}");
+        assert!(set.is_none(), "{case} sets no cookie");
+        assert_eq!(windows().await, before, "{case} records no window");
+    }
+
+    // A tenant Google sign-in keeps its pending state server-side; its
+    // return needs the derivation key and refuses as unavailable, signing
+    // nobody in.
+    let begun = begin_google_login(&keyless, "keyless").await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        identity_token_reply_with(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            "google-keyless",
+            "google-keyless@example.test",
+            true,
+        ),
+    )
+    .await;
+    let records = local_records(&superuser).await;
+    let (status, location) =
+        finish_google_login(&keyless, &begun, Some(&begun.cookie), &google.uri()).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "social sign-in refuses"
+    );
+    assert!(location.is_none(), "no session redirect");
+    assert_eq!(
+        local_records(&superuser).await,
+        records,
+        "nothing is created"
+    );
+
+    // 2. Password sign-in does not need the derivation key.
+    let (status, signed_in, body) = email_step(
+        &keyless,
+        "/auth/browser/password/login",
+        "198.51.100.143",
+        None,
+        "wyrd_session_keyless",
+        &json!({ "tenant": "keyless", "username": "ada", "password": "quiet harbor lantern" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(signed_in.is_some());
+}
+
 /// With a Turnstile challenge configured, browser workspace creation needs a
 /// server-validated token, checked after admission and before the claim:
 ///   1. the operator stores the site key and a sealed secret through the
@@ -1747,7 +2130,8 @@ async fn siteverify(cloudflare: &wiremock::MockServer, token: &str, status: u16,
 ///      another hostname or for another action, or reports already used,
 ///      create no tenant and answer `WYRD_AUTH_403_SIGNUP_CHALLENGE`; a
 ///      missing token makes no Siteverify call;
-///   3. an unavailable Siteverify refuses creation;
+///   3. an unavailable Siteverify, or a stored secret that cannot be
+///      opened, refuses creation;
 ///   4. a valid token creates the workspace, posting the stored secret;
 ///   5. a completion refused by admission makes no Siteverify call;
 ///   6. operator creation is never challenged, and clearing the setting
@@ -1881,6 +2265,27 @@ async fn a_configured_challenge_gates_browser_creation() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["details"]["reason"], "challenge_unavailable", "{body}");
     assert!(statuses(&superuser, "chal-down").await.is_empty());
+
+    // 3b. A configured but unreadable challenge secret refuses creation; it
+    // never counts as no challenge.
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT signup_challenge_secret FROM platform.login_settings")
+            .fetch_one(&superuser)
+            .await
+            .expect("the challenge secret reads");
+    sqlx::query("UPDATE platform.login_settings SET signup_challenge_secret = '\\x00'")
+        .execute(&superuser)
+        .await
+        .expect("the challenge secret is corrupted");
+    let (status, _, body) = attempt("chal-unreadable", Some("good"), "198.51.100.127").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE", "{body}");
+    assert!(statuses(&superuser, "chal-unreadable").await.is_empty());
+    sqlx::query("UPDATE platform.login_settings SET signup_challenge_secret = $1")
+        .bind(&stored)
+        .execute(&superuser)
+        .await
+        .expect("the challenge secret is restored");
 
     // 4. A valid token creates the workspace with the stored secret.
     let (status, cookie, body) = attempt("chal-good", Some("good"), "198.51.100.126").await;

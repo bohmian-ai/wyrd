@@ -2185,6 +2185,87 @@ fn env_positive(key: &str) -> Result<Option<u64>, ConfigError> {
     }
 }
 
+/// Shared social sign-in provider endpoints (`[social]`).
+///
+/// Every field is optional and defaults to the real provider. Development and
+/// tests name controlled local providers; production refuses any override, so
+/// a shared social client is only ever redeemed at the real provider.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SocialConfig {
+    /// Google's OpenID Connect issuer; `https://accounts.google.com` when
+    /// unset, and only that in production.
+    #[serde(default)]
+    pub google_issuer: Option<String>,
+    /// GitHub's web root, serving `login/oauth/authorize` and
+    /// `login/oauth/access_token`; `https://github.com` when unset, and only
+    /// that in production.
+    #[serde(default)]
+    pub github_url: Option<String>,
+    /// GitHub's API root, serving `user`; `https://api.github.com` when
+    /// unset, and only that in production.
+    #[serde(default)]
+    pub github_api_url: Option<String>,
+    /// Cloudflare Turnstile's Siteverify endpoint; Cloudflare's own when
+    /// unset, and only that in production.
+    #[serde(default)]
+    pub turnstile_siteverify_url: Option<String>,
+}
+
+impl SocialConfig {
+    /// Resolve the provider endpoints this deployment talks to.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when an override is not an issuer URL
+    /// or URL, or is set in production.
+    pub fn resolve(
+        &self,
+        production: bool,
+    ) -> Result<wyrd_auth::social::SocialEndpoints, ConfigError> {
+        let invalid = |message: &str| ConfigError::Invalid {
+            message: format!("social: {message}"),
+        };
+        let mut endpoints = wyrd_auth::social::SocialEndpoints::default();
+        if let Some(issuer) = &self.google_issuer {
+            if production {
+                return Err(invalid("google_issuer cannot be overridden in production"));
+            }
+            endpoints.google_issuer = wyrd_spec::auth::IssuerUrl::new(issuer)
+                .map_err(|_| invalid("google_issuer is not an issuer URL"))?;
+        }
+        if self.github_url.is_some() || self.github_api_url.is_some() {
+            if production {
+                return Err(invalid(
+                    "GitHub endpoints cannot be overridden in production",
+                ));
+            }
+            let root = |configured: &Option<String>, default: &str, field: &str| {
+                url::Url::parse(configured.as_deref().unwrap_or(default))
+                    .map_err(|_| invalid(&format!("{field} is not a URL")))
+            };
+            endpoints.github = wyrd_auth::social::GithubEndpoints::at(
+                &root(&self.github_url, "https://github.com/", "github_url")?,
+                &root(
+                    &self.github_api_url,
+                    "https://api.github.com/",
+                    "github_api_url",
+                )?,
+            )
+            .map_err(|_| invalid("GitHub endpoints do not form URLs"))?;
+        }
+        if let Some(siteverify) = &self.turnstile_siteverify_url {
+            if production {
+                return Err(invalid(
+                    "turnstile_siteverify_url cannot be overridden in production",
+                ));
+            }
+            endpoints.turnstile_siteverify = url::Url::parse(siteverify)
+                .map_err(|_| invalid("turnstile_siteverify_url is not a URL"))?;
+        }
+        Ok(endpoints)
+    }
+}
+
 /// The deployment's GitHub App (`[github]`, `WYRD_GITHUB_*`).
 ///
 /// Optional: when every field is unset the GitHub integration is unavailable

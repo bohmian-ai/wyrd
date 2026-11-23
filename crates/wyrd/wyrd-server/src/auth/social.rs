@@ -493,7 +493,13 @@ pub async fn signup_complete(
         SignupAdmission::Created(tenant) => {
             return Ok(with_cookies(
                 StatusCode::OK,
-                vec![cookie_header(&origin, SIGNUP_COOKIE, "", SIGNUP_COOKIE_PATH, 0)],
+                vec![cookie_header(
+                    &origin,
+                    SIGNUP_COOKIE,
+                    "",
+                    SIGNUP_COOKIE_PATH,
+                    0,
+                )],
                 Json(SignupCompleteResponse { tenant }),
             ));
         }
@@ -524,7 +530,6 @@ pub async fn signup_complete(
         attempt: creation.attempt,
         credential: &creation.credential,
         creator_key: &creation.creator_key,
-        retained_creator_keys: &creation.retained_creator_keys,
     };
     let tenant_request = CreateTenantRequest {
         slug: request.slug.clone(),

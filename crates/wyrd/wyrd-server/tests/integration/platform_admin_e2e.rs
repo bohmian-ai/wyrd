@@ -7991,7 +7991,10 @@ async fn a_visitor_creates_a_workspace_with_google() {
         .expect("request builds");
     let (status, refused) = social_call(&srv, request).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
-    assert_eq!(refused["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{refused}");
+    assert_eq!(
+        refused["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+        "{refused}"
+    );
     let (status, changed) = social_call(&srv, settings(true)).await;
     assert_eq!(status, StatusCode::OK, "signup enables: {changed}");
 
@@ -8134,7 +8137,10 @@ async fn a_visitor_creates_a_workspace_with_google() {
         );
     }
     assert_eq!(
-        [&first.2, &second.2].iter().filter(|cookie| cookie.is_some()).count(),
+        [&first.2, &second.2]
+            .iter()
+            .filter(|cookie| cookie.is_some())
+            .count(),
         1,
         "only the creating completion opens a session: {first:?} {second:?}"
     );

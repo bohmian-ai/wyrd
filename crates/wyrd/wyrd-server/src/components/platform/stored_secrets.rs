@@ -11,7 +11,9 @@
 //!   nonce wrapped by the active key.
 //!
 //! The pass walks human connections, workload trusted issuers, the platform
-//! connection, Gateway managed credentials, and Operator connections. Each
+//! connection, Gateway managed credentials, Operator connections, the shared social
+//! providers, the mail relay password, the signup challenge, and the platform
+//! derivation key. Each
 //! envelope's context is rebuilt from its row's trusted owner metadata, so an
 //! envelope copied to another owner fails to open and stays `remaining`.
 //! Key-service calls run with no transaction or row lock held, and each value
@@ -317,11 +319,15 @@ fn context<'a>(
         StoredSecretTable::PlatformOidc => SecretPurpose::PlatformOidc,
         StoredSecretTable::GatewayProviderCredentials => SecretPurpose::GatewayProviderCredential,
         StoredSecretTable::OperatorConnections => SecretPurpose::OperatorConnection,
+        StoredSecretTable::SocialProviders => SecretPurpose::SocialProvider,
+        StoredSecretTable::ApplicationMail => SecretPurpose::ApplicationMail,
+        StoredSecretTable::SignupChallenge => SecretPurpose::SignupChallenge,
+        StoredSecretTable::DerivationKey => SecretPurpose::PlatformDerivationKey,
     };
-    let scope = match (table, row.data_tenant_id) {
-        (StoredSecretTable::PlatformOidc, None) => SecretScope::Platform,
-        (StoredSecretTable::PlatformOidc, Some(_)) | (_, None) => return None,
-        (_, Some(tenant)) => SecretScope::Tenant(DataTenantId::try_from(tenant).ok()?),
+    let scope = match (table.is_platform(), row.data_tenant_id) {
+        (true, None) => SecretScope::Platform,
+        (true, Some(_)) | (false, None) => return None,
+        (false, Some(tenant)) => SecretScope::Tenant(DataTenantId::try_from(tenant).ok()?),
     };
     Some(SecretContext {
         scope,
@@ -340,6 +346,10 @@ const fn store(table: StoredSecretTable) -> StoredSecretStore {
         StoredSecretTable::PlatformOidc => StoredSecretStore::PlatformOidc,
         StoredSecretTable::GatewayProviderCredentials => StoredSecretStore::GatewayCredential,
         StoredSecretTable::OperatorConnections => StoredSecretStore::OperatorConnection,
+        StoredSecretTable::SocialProviders => StoredSecretStore::SocialProvider,
+        StoredSecretTable::ApplicationMail => StoredSecretStore::ApplicationMail,
+        StoredSecretTable::SignupChallenge => StoredSecretStore::SignupChallenge,
+        StoredSecretTable::DerivationKey => StoredSecretStore::DerivationKey,
     }
 }
 

@@ -402,3 +402,39 @@ pub async fn put_mail_relay(
     .map(|_| ())
     .map_err(SqlError::from)
 }
+
+/// Read the platform derivation key's envelope, if one was ever stored.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn derivation_key(pool: &OperatorPool) -> Result<Option<Vec<u8>>, SqlError> {
+    sqlx::query_scalar::<_, Vec<u8>>("SELECT envelope FROM platform.derivation_key")
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(SqlError::from)
+}
+
+/// Store `envelope` as the platform derivation key unless one is already
+/// stored, then return the stored envelope.
+///
+/// Concurrent first starts each offer their own envelope; exactly one wins
+/// and every caller gets the winner, so all replicas derive from one key.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the write or read fails.
+pub async fn offer_derivation_key(
+    pool: &OperatorPool,
+    envelope: &[u8],
+) -> Result<Vec<u8>, SqlError> {
+    sqlx::query(
+        "INSERT INTO platform.derivation_key (envelope) VALUES ($1) ON CONFLICT DO NOTHING",
+    )
+    .bind(envelope)
+    .execute(pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    sqlx::query_scalar::<_, Vec<u8>>("SELECT envelope FROM platform.derivation_key")
+        .fetch_one(pool.pool())
+        .await
+        .map_err(SqlError::from)
+}

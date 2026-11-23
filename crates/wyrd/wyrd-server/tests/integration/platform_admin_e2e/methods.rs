@@ -249,7 +249,10 @@ async fn browser(
 /// Panics when the path acted.
 fn assert_unavailable(case: &str, refused: &(StatusCode, Option<String>, Value)) {
     assert_eq!(refused.0, StatusCode::FORBIDDEN, "{case}: {}", refused.2);
-    assert_eq!(refused.2["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{case}");
+    assert_eq!(
+        refused.2["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+        "{case}"
+    );
     assert_eq!(
         refused.2["details"]["reason"], "method_unavailable",
         "{case}"

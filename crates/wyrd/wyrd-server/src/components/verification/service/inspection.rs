@@ -59,7 +59,7 @@ use crate::state::registry_db_error;
 use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
-use crate::verification::inputs::{DirectResult, InputOrigin, InputResolver};
+use crate::verification::inputs::{DirectResult, InputResolver};
 use crate::verification::state::{RunState, StateError};
 
 /// Audit operation of an invocation page read.

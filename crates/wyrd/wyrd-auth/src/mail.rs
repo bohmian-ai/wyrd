@@ -2,7 +2,7 @@
 //! relay.
 //!
 //! A platform administrator stores the relay on the platform login settings
-//! record, its password sealed by the deployment keyring, and can send a test
+//! record, its password sealed through `[kms]`, and can send a test
 //! message. Tenant invitations then use it: the invitation handlers commit
 //! first and call [`ApplicationMail::send_invitations`] afterwards, so no
 //! tenant transaction waits on SMTP. Each message is sent separately and
@@ -19,7 +19,7 @@ use lettre::message::{Mailbox, Message};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use serde_json::json;
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::{SecretContext, SecretPurpose, SecretScope, WyrdKms};
 use wyrd_spec::auth::{
     ConfigureMailRelayRequest, InvitationDelivery, MailRelayView, MailSettings, MailTestResponse,
     SmtpTls,
@@ -29,6 +29,18 @@ use wyrd_sql::queries::platform::social::{MailRelayRow, mail_relay, put_mail_rel
 use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::error::store_error;
+
+/// The envelope context of the relay password bound to its `username`, as
+/// stored-secret maintenance rebuilds it.
+const fn relay_context<'a>(username: &'a [&'a str]) -> SecretContext<'a> {
+    SecretContext {
+        scope: SecretScope::Platform,
+        purpose: SecretPurpose::ApplicationMail,
+        owner: "smtp_relay",
+        authority: username,
+        version: None,
+    }
+}
 
 /// How long one SMTP read or write may wait before the send fails.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,8 +62,8 @@ pub struct InvitationMail<'a> {
 pub struct ApplicationMail {
     /// Operator pool; `platform.*` admits only operator sessions.
     operator: OperatorPool,
-    /// Sealing keyring for the relay password; `None` refuses a password.
-    keyring: Option<Arc<SealingKeyring>>,
+    /// Stored-secret facade for the relay password; `None` refuses one.
+    kms: Option<Arc<WyrdKms>>,
 }
 
 impl std::fmt::Debug for ApplicationMail {
@@ -69,10 +81,10 @@ struct Relay {
 }
 
 impl ApplicationMail {
-    /// Build the owner over the operator pool and keyring.
+    /// Build the owner over the operator pool and stored-secret facade.
     #[must_use]
-    pub fn new(operator: OperatorPool, keyring: Option<Arc<SealingKeyring>>) -> Self {
-        Self { operator, keyring }
+    pub fn new(operator: OperatorPool, kms: Option<Arc<WyrdKms>>) -> Self {
+        Self { operator, kms }
     }
 
     /// The configured relay as management reads it, without its password.
@@ -92,7 +104,7 @@ impl ApplicationMail {
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an empty host, a zero port, an
     /// unparsable sender, a password without a username or a password on a
-    /// deployment without a sealing keyring, and
+    /// deployment without `[kms]`, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the write fails.
     pub async fn configure(
         &self,
@@ -123,17 +135,20 @@ impl ApplicationMail {
             (Some(_), None) => {
                 return Err(validation("a password needs a username", "username"));
             }
-            (Some(password), Some(_)) => {
-                let keyring = self.keyring.as_ref().ok_or_else(|| {
+            (Some(password), Some(username)) => {
+                let kms = self.kms.as_deref().ok_or_else(|| {
                     validation(
-                        "this deployment has no sealing key, so a relay password cannot be stored",
+                        "this deployment has no [kms], so a relay password cannot be stored",
                         "password",
                     )
                 })?;
                 Some(
-                    keyring
-                        .seal(password.expose().as_bytes())
-                        .map_err(|_| validation("the password could not be sealed", "password"))?,
+                    kms.seal(&relay_context(&[username]), password.expose().as_bytes())
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(%error, "relay password could not be sealed");
+                            validation("the password could not be sealed", "password")
+                        })?,
                 )
             }
         };
@@ -300,12 +315,17 @@ impl ApplicationMail {
         let mut builder = builder.port(port).timeout(Some(SMTP_TIMEOUT));
         if let Some(username) = row.username {
             let password = match row.password_enc {
-                Some(sealed) => self
-                    .keyring
-                    .as_ref()
-                    .and_then(|keyring| keyring.open(&sealed).ok())
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .ok_or_else(|| unusable("password"))?,
+                Some(sealed) => {
+                    let kms = self.kms.as_deref().ok_or_else(|| unusable("password"))?;
+                    let opened = kms
+                        .open(&relay_context(&[username.as_str()]), &sealed)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(%error, "relay password could not be opened");
+                            unusable("password")
+                        })?;
+                    String::from_utf8(opened.to_vec()).map_err(|_| unusable("password"))?
+                }
                 None => String::new(),
             };
             builder = builder.credentials(Credentials::new(username, password));

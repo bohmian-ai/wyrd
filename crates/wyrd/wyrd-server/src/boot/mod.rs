@@ -1662,11 +1662,11 @@ fn attach_human_logins(
     ));
     auth.application_mail = postgres
         .operator_pool()
-        .map(|pool| ApplicationMail::new(pool, sealing_key.clone()));
+        .map(|pool| ApplicationMail::new(pool, kms.clone()));
     auth.social_sign_in = postgres.operator_pool().map(|pool| {
         SocialSignIn::new(
             pool,
-            sealing_key.clone(),
+            kms.clone(),
             config.deployment_profile.screened_http(),
             config
                 .social

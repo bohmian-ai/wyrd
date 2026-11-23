@@ -50,10 +50,9 @@ use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     HumanConnectionWrite, LoginState, deactivate_active_human_connection,
     human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
-    insert_login_state, list_service_account_roles, list_user_roles, live_human_connections,
-    lock_human_connection_slot, promote_tested_human_candidate, remove_human_connection,
-    renew_human_connection_secret, replace_human_candidate, service_account_by_id,
-    stamp_human_candidate_tested, user_by_id,
+    insert_login_state, live_human_connections, lock_human_connection_slot,
+    promote_tested_human_candidate, remove_human_connection, renew_human_connection_secret,
+    replace_human_candidate, stamp_human_candidate_tested,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};

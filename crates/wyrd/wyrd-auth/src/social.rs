@@ -30,7 +30,7 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, CodeRedemption, GITHUB_NAMESPACE, GithubOAuth,
     MappedClaims, RelyingParty, ScreenedHttp,
 };
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::{SecretContext, SecretPurpose, SecretScope, WyrdKms};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
@@ -64,6 +64,7 @@ use crate::browser_sessions::{
 use crate::callback::{
     LoginCompletion, audit_authorization_code_failure, provider_refusal, verify_response_issuer,
 };
+use crate::derivation::PlatformKey;
 use crate::error::{relying_party_error, store_error};
 use crate::issuance::TenantGrant;
 use crate::login::{LOGIN_STATE_TTL, login_unavailable};
@@ -105,8 +106,12 @@ impl Default for SocialEndpoints {
 pub struct SocialSignIn {
     /// Operator pool; `platform.*` admits only operator sessions.
     operator: OperatorPool,
-    /// Sealing keyring for client secrets; `None` refuses configuration.
-    keyring: Option<Arc<SealingKeyring>>,
+    /// Stored-secret facade for provider and challenge secrets; `None`
+    /// refuses storing or opening them.
+    kms: Option<Arc<WyrdKms>>,
+    /// Platform derivation key for flow cookies, email proofs and
+    /// pseudonyms; shared by clones.
+    platform_key: Arc<PlatformKey>,
     /// Screened relying party for OIDC providers.
     relying_party: RelyingParty,
     /// Screened GitHub.com OAuth client.
@@ -139,19 +144,30 @@ pub struct EnabledProvider {
     pub client_secret: SecretString,
 }
 
+/// The creator's sign-in, its password not yet derived.
+enum Pending {
+    Ready(SignupCredential),
+    Password {
+        username: String,
+        password: SecretString,
+        email: String,
+    },
+}
+
 impl SocialSignIn {
-    /// Build the owner over the operator pool, keyring, screened HTTP and
-    /// provider endpoints.
+    /// Build the owner over the operator pool, stored-secret facade,
+    /// screened HTTP and provider endpoints.
     #[must_use]
     pub fn new(
         operator: OperatorPool,
-        keyring: Option<Arc<SealingKeyring>>,
+        kms: Option<Arc<WyrdKms>>,
         http: ScreenedHttp,
         endpoints: SocialEndpoints,
     ) -> Self {
         Self {
+            platform_key: Arc::new(PlatformKey::new(operator.clone(), kms.clone())),
             operator,
-            keyring,
+            kms,
             relying_party: RelyingParty::new(http),
             github: GithubOAuth::new(http, endpoints.github.clone()),
             http,
@@ -184,7 +200,7 @@ impl SocialSignIn {
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an empty client id or secret or a
-    /// deployment without a sealing keyring, and
+    /// deployment without `[kms]`, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the write fails.
     pub async fn configure(
         &self,
@@ -200,15 +216,22 @@ impl SocialSignIn {
                 "client_id",
             ));
         }
-        let keyring = self.keyring.as_ref().ok_or_else(|| {
+        let kms = self.kms.as_deref().ok_or_else(|| {
             validation(
-                "this deployment has no sealing key, so provider secrets cannot be stored",
+                "this deployment has no [kms], so provider secrets cannot be stored",
                 "client_secret",
             )
         })?;
-        let sealed = keyring
-            .seal(request.client_secret.expose().as_bytes())
-            .map_err(|_| validation("the client secret could not be sealed", "client_secret"))?;
+        let sealed = kms
+            .seal(
+                &provider_context(provider.as_str(), &[client_id]),
+                request.client_secret.expose().as_bytes(),
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "provider client secret could not be sealed");
+                validation("the client secret could not be sealed", "client_secret")
+            })?;
         let row = put_social_provider(conn, provider.as_str(), client_id, &sealed)
             .await
             .map_err(store_error)?;
@@ -377,7 +400,7 @@ impl SocialSignIn {
             .map_err(store_error)?
             .filter(|row| row.revision == state.provider_revision && row.enabled)
             .ok_or_else(revision_changed)?;
-        let enabled = self.open(provider, row)?;
+        let enabled = self.open(provider, row).await?;
         self.verify_code(
             &enabled,
             ProviderReturn {
@@ -542,27 +565,36 @@ impl SocialSignIn {
             .map_err(store_error)?
             .filter(|row| row.revision == revision)
             .ok_or_else(revision_changed)?;
-        self.open(provider, row)
+        self.open(provider, row).await
     }
 
-    /// Open `row`'s sealed secret.
+    /// Open `row`'s stored secret.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Internal`] when no held key opens it.
-    fn open(
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] without `[kms]` or when
+    /// the envelope cannot be opened; a configured provider whose secret is
+    /// unreadable is refused, never treated as unconfigured.
+    async fn open(
         &self,
         provider: SocialProvider,
         row: SocialProviderRow,
     ) -> Result<EnabledProvider, WyrdError> {
-        let secret = self
-            .keyring
-            .as_ref()
-            .and_then(|keyring| keyring.open(&row.client_secret_enc).ok())
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .ok_or_else(|| WyrdError::Internal {
-                message: "the provider client secret could not be opened".to_owned(),
-                details: json!({ "provider": provider.as_str() }),
+        let unavailable = || WyrdError::AuthVerifyUnavailable {
+            message: "the provider client secret could not be opened".to_owned(),
+            details: json!({ "provider": provider.as_str(), "reason": "provider_secret_unavailable" }),
+        };
+        let kms = self.kms.as_deref().ok_or_else(unavailable)?;
+        let opened = kms
+            .open(
+                &provider_context(provider.as_str(), &[row.client_id.as_str()]),
+                &row.client_secret_enc,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, provider = provider.as_str(), "provider client secret could not be opened");
+                unavailable()
             })?;
+        let secret = String::from_utf8(opened.to_vec()).map_err(|_| unavailable())?;
         Ok(EnabledProvider {
             provider,
             revision: row.revision,
@@ -598,13 +630,13 @@ impl SocialSignIn {
 
     /// Replace the deployment login settings on the audited operator `conn`.
     ///
-    /// A signup challenge's secret is sealed under the deployment keyring;
+    /// A signup challenge's secret is sealed through `[kms]`;
     /// a challenge sent without one keeps the stored secret.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for a challenge with no secret
     /// stored or sent, an empty site key or secret, or a deployment without
-    /// a sealing key, and [`WyrdError::AuthVerifyUnavailable`] when the write
+    /// `[kms]`, and [`WyrdError::AuthVerifyUnavailable`] when the write
     /// fails.
     pub async fn put_settings(
         &self,
@@ -626,16 +658,18 @@ impl SocialSignIn {
         }
         let sealed = match challenge.and_then(|challenge| challenge.secret.as_ref()) {
             Some(secret) => Some(
-                self.keyring
-                    .as_ref()
+                self.kms
+                    .as_deref()
                     .ok_or_else(|| {
                         validation(
-                            "this deployment has no sealing key, so a challenge secret cannot be stored",
+                            "this deployment has no [kms], so a challenge secret cannot be stored",
                             "signup_challenge.secret",
                         )
                     })?
-                    .seal(secret.expose().as_bytes())
-                    .map_err(|_| {
+                    .seal(&CHALLENGE_CONTEXT, secret.expose().as_bytes())
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error, "signup challenge secret could not be sealed");
                         validation(
                             "the challenge secret could not be sealed",
                             "signup_challenge.secret",
@@ -674,7 +708,7 @@ impl SocialSignIn {
     /// Siteverify refuses, reports already used, or reports solved on
     /// another hostname or for another action, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the challenge settings,
-    /// keyring or Siteverify are unavailable.
+    /// stored secret or Siteverify are unavailable.
     pub async fn require_challenge(
         &self,
         token: Option<&str>,
@@ -698,13 +732,17 @@ impl SocialSignIn {
             message: "the signup challenge cannot be checked right now; try again".to_owned(),
             details: json!({ "reason": "challenge_unavailable" }),
         };
-        let secret = self
-            .keyring
-            .as_ref()
-            .and_then(|keyring| keyring.open(&sealed).ok())
-            .and_then(|plain| String::from_utf8(plain).ok())
+        let kms = self.kms.as_deref().ok_or_else(unavailable)?;
+        let opened = kms
+            .open(&CHALLENGE_CONTEXT, &sealed)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "signup challenge secret could not be opened");
+                unavailable()
+            })?;
+        let secret = String::from_utf8(opened.to_vec())
             .map(SecretString::from)
-            .ok_or_else(unavailable)?;
+            .map_err(|_| unavailable())?;
         let answer = Turnstile::new(self.http, self.endpoints.turnstile_siteverify.clone())
             .verify(&secret, token, source)
             .await
@@ -1235,14 +1273,30 @@ pub const SIGNUP_EMAIL_TTL: std::time::Duration = std::time::Duration::from_mins
 /// source.
 const SIGNUP_ADDRESS_ATTEMPTS: i32 = 5;
 
-/// Signup without the deployment sealing keyring, which refuses rather than
-/// store or send plain state.
-fn sealing_key_missing() -> WyrdError {
-    WyrdError::AuthVerifyUnavailable {
-        message: "signup needs the deployment sealing keyring".to_owned(),
-        details: json!({ "reason": "sealing_key_missing" }),
+/// The envelope context of the one signup challenge secret, which
+/// stored-secret maintenance rebuilds from the same fixed owner.
+const CHALLENGE_CONTEXT: SecretContext<'static> = SecretContext {
+    scope: SecretScope::Platform,
+    purpose: SecretPurpose::SignupChallenge,
+    owner: "signup_challenge",
+    authority: &[],
+    version: None,
+};
+
+/// The envelope context of `provider`'s client secret bound to its
+/// `client_id` authority, as stored-secret maintenance rebuilds it.
+const fn provider_context<'a>(provider: &'a str, client_id: &'a [&'a str]) -> SecretContext<'a> {
+    SecretContext {
+        scope: SecretScope::Platform,
+        purpose: SecretPurpose::SocialProvider,
+        owner: provider,
+        authority: client_id,
+        version: None,
     }
 }
+
+/// Label of the derivation subkey that seals signup flow cookies.
+const ENVELOPE_LABEL: &str = "signup-envelope";
 
 /// One provider return to redeem: its code and the round-trip values the
 /// redemption must match.
@@ -1278,9 +1332,6 @@ pub struct SignupCreation {
     pub credential: SignupCredential,
     /// The identity's keyed creator pseudonym, recorded on the tenant.
     pub creator_key: [u8; 32],
-    /// The identity's creator pseudonyms under retained sealing keys, which
-    /// still match tenants it created before the write key rotated.
-    pub retained_creator_keys: Vec<[u8; 32]>,
     /// The tenant an earlier, failed completion of this attempt claimed, and
     /// its slug.
     pub claimed: Option<(DataTenantId, String)>,
@@ -1349,7 +1400,9 @@ impl SocialSignIn {
         source: Option<std::net::IpAddr>,
     ) -> Result<BegunBrowserLogin, WyrdError> {
         let source = source.ok_or_else(source_unknown)?;
-        let start = self.pseudonym("start", crate::admission::source_key(source).as_bytes())?;
+        let start = self
+            .pseudonym("start", crate::admission::source_key(source).as_bytes())
+            .await?;
         self.admit(&[(SignupAdmissionScope::Start, start, SIGNUP_START_ATTEMPTS)])
             .await?;
         self.require_signup_provider(provider).await?;
@@ -1361,16 +1414,18 @@ impl SocialSignIn {
         let authorization = self
             .authorize(provider, &row.client_id, origin, true)
             .await?;
-        let binding = self.seal_envelope(&SignupEnvelope::SignupSocial {
-            state: authorization.state,
-            provider,
-            revision: row.revision,
-            redirect_uri: authorization.redirect_uri.to_string(),
-            code_verifier: authorization.code_verifier.expose_secret().to_owned(),
-            nonce: authorization.nonce,
-            binding: random_secret(),
-            expires_at: self.envelope_deadline(LOGIN_STATE_TTL).await?,
-        })?;
+        let binding = self
+            .seal_envelope(&SignupEnvelope::SignupSocial {
+                state: authorization.state,
+                provider,
+                revision: row.revision,
+                redirect_uri: authorization.redirect_uri.to_string(),
+                code_verifier: authorization.code_verifier.expose_secret().to_owned(),
+                nonce: authorization.nonce,
+                binding: random_secret(),
+                expires_at: self.envelope_deadline(LOGIN_STATE_TTL).await?,
+            })
+            .await?;
         Ok(BegunBrowserLogin {
             authorization_url: authorization.url,
             binding,
@@ -1408,8 +1463,12 @@ impl SocialSignIn {
     ) -> Result<SecretString, WyrdError> {
         let source = source.ok_or_else(source_unknown)?;
         let address = crate::mail::EmailAddress::parse(typed, "email")?;
-        let start = self.pseudonym("start", crate::admission::source_key(source).as_bytes())?;
-        let mailbox = self.pseudonym("address", address.canonical.as_bytes())?;
+        let start = self
+            .pseudonym("start", crate::admission::source_key(source).as_bytes())
+            .await?;
+        let mailbox = self
+            .pseudonym("address", address.canonical.as_bytes())
+            .await?;
         self.admit(&[
             (SignupAdmissionScope::Start, start, SIGNUP_START_ATTEMPTS),
             (
@@ -1445,13 +1504,15 @@ impl SocialSignIn {
             return Err(signup_unavailable());
         }
         let proof = random_secret();
-        let cookie = self.seal_envelope(&SignupEnvelope::SignupEmail {
-            proof_hash: Sha256Hex::digest(proof.as_bytes()),
-            address: address.canonical.clone(),
-            binding: random_secret(),
-            expires_at: self.envelope_deadline(SIGNUP_EMAIL_TTL).await?,
-            attempt,
-        })?;
+        let cookie = self
+            .seal_envelope(&SignupEnvelope::SignupEmail {
+                proof_hash: Sha256Hex::digest(proof.as_bytes()),
+                address: address.canonical.clone(),
+                binding: random_secret(),
+                expires_at: self.envelope_deadline(SIGNUP_EMAIL_TTL).await?,
+                attempt,
+            })
+            .await?;
         let mut link = origin
             .join("/signup/verify")
             .map_err(|_| invalid_state("the deployment origin is invalid"))?;
@@ -1488,13 +1549,17 @@ impl SocialSignIn {
             message: "this email link is not valid in this browser; start again".to_owned(),
             details: json!({}),
         };
+        let opened = match cookie {
+            Some(cookie) => self.open_envelope(cookie).await?,
+            None => None,
+        };
         let Some(SignupEnvelope::SignupEmail {
             proof_hash,
             address,
             binding,
             expires_at,
             attempt,
-        }) = cookie.and_then(|cookie| self.open_envelope(cookie))
+        }) = opened
         else {
             return Err(refused());
         };
@@ -1578,6 +1643,10 @@ impl SocialSignIn {
         query: &CallbackQuery,
         browser_binding: Option<&str>,
     ) -> Result<Option<SecretString>, WyrdError> {
+        let opened = match browser_binding {
+            Some(cookie) => self.open_envelope(cookie).await?,
+            None => None,
+        };
         let Some(SignupEnvelope::SignupSocial {
             state,
             provider: began,
@@ -1587,7 +1656,7 @@ impl SocialSignIn {
             nonce,
             binding,
             expires_at,
-        }) = browser_binding.and_then(|cookie| self.open_envelope(cookie))
+        }) = opened
         else {
             return Ok(None);
         };
@@ -1695,15 +1764,6 @@ impl SocialSignIn {
                 .map(SignupAdmission::Created)
                 .ok_or_else(|| invalid_state("this signup's workspace is gone; start again"));
         }
-        /// The creator's sign-in, its password not yet derived.
-        enum Pending {
-            Ready(SignupCredential),
-            Password {
-                username: String,
-                password: SecretString,
-                email: String,
-            },
-        }
         let (pending, identity) = match (proven.proof_kind.as_str(), local) {
             ("email", Some(local)) => {
                 let address = proven
@@ -1763,23 +1823,17 @@ impl SocialSignIn {
                 )
             }
         };
-        let mut creator_keys = self
-            .keyring
-            .as_ref()
-            .ok_or_else(sealing_key_missing)?
-            .pseudonyms("creator", &identity)
-            .into_iter();
-        let creator_key = creator_keys.next().ok_or_else(sealing_key_missing)?;
-        let retained_creator_keys = creator_keys.collect();
+        let creator_key = self.pseudonym("creator", &identity).await?;
         self.admit(&[
             (
                 SignupAdmissionScope::Identity,
-                self.pseudonym("identity", &identity)?,
+                self.pseudonym("identity", &identity).await?,
                 SIGNUP_IDENTITY_ATTEMPTS,
             ),
             (
                 SignupAdmissionScope::Source,
-                self.pseudonym("source", crate::admission::source_key(source).as_bytes())?,
+                self.pseudonym("source", crate::admission::source_key(source).as_bytes())
+                    .await?,
                 SIGNUP_SOURCE_ATTEMPTS,
             ),
         ])
@@ -1814,7 +1868,6 @@ impl SocialSignIn {
             attempt: proven.id,
             credential,
             creator_key,
-            retained_creator_keys,
             claimed,
         }))
     }
@@ -1835,39 +1888,44 @@ impl SocialSignIn {
             SIGNUP_SPENT_RETENTION,
             SIGNUP_PURGE_BATCH,
         )
-            .await
-            .map_err(store_error)
+        .await
+        .map_err(store_error)
     }
 
-    /// `envelope` sealed under the deployment keyring, as a cookie value.
+    /// `envelope` sealed under the platform derivation key, as a cookie
+    /// value.
     ///
     /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] without a keyring and
-    /// [`WyrdError::Internal`] when sealing fails.
-    fn seal_envelope(&self, envelope: &SignupEnvelope) -> Result<SecretString, WyrdError> {
-        let keyring = self.keyring.as_ref().ok_or_else(sealing_key_missing)?;
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the derivation key
+    /// is unavailable and [`WyrdError::Internal`] when sealing fails.
+    async fn seal_envelope(&self, envelope: &SignupEnvelope) -> Result<SecretString, WyrdError> {
         let plain = serde_json::to_vec(envelope).map_err(|error| WyrdError::Internal {
             message: format!("signup envelope encoding failed: {error}"),
             details: json!({}),
         })?;
-        let sealed = keyring.seal(&plain).map_err(|error| WyrdError::Internal {
-            message: format!("signup envelope sealing failed: {error}"),
-            details: json!({}),
-        })?;
+        let sealed = self.platform_key.seal(ENVELOPE_LABEL, &plain).await?;
         Ok(SecretString::from(
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sealed),
         ))
     }
 
-    /// The envelope sealed in `cookie`; `None` for any value this keyring did
-    /// not seal as an envelope, so a tampered or foreign cookie proves
+    /// The envelope sealed in `cookie`; `None` for any value this deployment
+    /// did not seal as an envelope, so a tampered or foreign cookie proves
     /// nothing.
-    fn open_envelope(&self, cookie: &str) -> Option<SignupEnvelope> {
-        let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(cookie)
-            .ok()?;
-        let plain = self.keyring.as_ref()?.open(&sealed).ok()?;
-        serde_json::from_slice(&plain).ok()
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the derivation key
+    /// is unavailable, which refuses rather than treating the cookie as
+    /// foreign.
+    async fn open_envelope(&self, cookie: &str) -> Result<Option<SignupEnvelope>, WyrdError> {
+        let Ok(sealed) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cookie) else {
+            return Ok(None);
+        };
+        Ok(self
+            .platform_key
+            .open(ENVELOPE_LABEL, &sealed)
+            .await?
+            .and_then(|plain| serde_json::from_slice(&plain).ok()))
     }
 
     /// The database-clock deadline, in Unix seconds, `ttl` from now.
@@ -1893,17 +1951,14 @@ impl SocialSignIn {
         }
     }
 
-    /// The keyring pseudonym of `value` in `scope`, which signup admission
-    /// and creator accounting store instead of the value.
+    /// The derivation-key pseudonym of `value` in `scope`, which signup
+    /// admission and creator accounting store instead of the value.
     ///
     /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the deployment has no
-    /// sealing keyring, which refuses signup rather than storing plain keys.
-    fn pseudonym(&self, scope: &str, value: &[u8]) -> Result<[u8; 32], WyrdError> {
-        self.keyring
-            .as_ref()
-            .map(|keyring| keyring.pseudonym(scope, value))
-            .ok_or_else(sealing_key_missing)
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the derivation key
+    /// is unavailable, which refuses signup rather than storing plain keys.
+    async fn pseudonym(&self, scope: &str, value: &[u8]) -> Result<[u8; 32], WyrdError> {
+        self.platform_key.pseudonym(scope, value).await
     }
 
     /// Count one attempt in every `(scope, key, limit)` window and refuse with

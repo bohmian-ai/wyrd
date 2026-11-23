@@ -175,10 +175,12 @@ const CLIENT_ADDRESS_HEADER: &str = "x-wyrd-client";
 /// # Panics
 /// Panics when the replica or BFF fails to start or a stored window differs.
 async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
-    let replica = Box::pin(srv.start_bound_replica(
-        WyrdTestServerBuilder::default()
-            .with_trusted_ingress_for_test(&["127.0.0.1/32", "::1/128"], CLIENT_ADDRESS_HEADER),
-    ))
+    let replica = Box::pin(
+        srv.start_bound_replica(
+            WyrdTestServerBuilder::default()
+                .with_trusted_ingress_for_test(&["127.0.0.1/32", "::1/128"], CLIENT_ADDRESS_HEADER),
+        ),
+    )
     .await
     .expect("trusted-ingress replica starts");
     let bff = start_bff(
@@ -238,7 +240,10 @@ async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
         "each visitor fails into its own window"
     );
     drop(bff);
-    replica.shutdown().await.expect("trusted-ingress replica shuts down");
+    replica
+        .shutdown()
+        .await
+        .expect("trusted-ingress replica shuts down");
 }
 
 /// Node TLS terminator: accepts TLS with `TLS_KEY`/`TLS_CERT` on `TLS_PORT`

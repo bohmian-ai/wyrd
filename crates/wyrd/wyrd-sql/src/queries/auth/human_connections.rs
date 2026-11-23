@@ -445,17 +445,43 @@ pub enum StoredSecretTable {
     GatewayProviderCredentials,
     /// `wyrd.operator_connections.secret_ciphertext`, keyed by connection id.
     OperatorConnections,
+    /// `platform.social_providers.client_secret_enc`, keyed by provider.
+    SocialProviders,
+    /// `platform.login_settings.smtp_password_enc`, the one relay password.
+    ApplicationMail,
+    /// `platform.login_settings.signup_challenge_secret`, the one challenge
+    /// secret.
+    SignupChallenge,
+    /// `platform.derivation_key.envelope`, the one platform derivation key.
+    DerivationKey,
 }
 
 impl StoredSecretTable {
     /// Every column maintenance walks, in a stable order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 9] = [
         Self::HumanConnections,
         Self::TrustedIssuers,
         Self::PlatformOidc,
         Self::GatewayProviderCredentials,
         Self::OperatorConnections,
+        Self::SocialProviders,
+        Self::ApplicationMail,
+        Self::SignupChallenge,
+        Self::DerivationKey,
     ];
+
+    /// Whether this column holds deployment secrets no tenant owns.
+    #[must_use]
+    pub const fn is_platform(self) -> bool {
+        matches!(
+            self,
+            Self::PlatformOidc
+                | Self::SocialProviders
+                | Self::ApplicationMail
+                | Self::SignupChallenge
+                | Self::DerivationKey
+        )
+    }
 
     /// The operator statement listing every stored (non-null) envelope in
     /// this column with no lifecycle or expiry filter, so a pass and the
@@ -497,6 +523,30 @@ impl StoredSecretTable {
                    FROM wyrd.operator_connections
                   ORDER BY data_tenant_id, connection_id"
             }
+            Self::SocialProviders => {
+                "SELECT NULL::uuid AS data_tenant_id, provider AS row_key, provider AS owner,
+                        ARRAY[client_id] AS authority,
+                        NULL::bigint AS version, client_secret_enc AS envelope
+                   FROM platform.social_providers ORDER BY provider"
+            }
+            Self::ApplicationMail => {
+                "SELECT NULL::uuid AS data_tenant_id, 'smtp_relay' AS row_key,
+                        'smtp_relay' AS owner, ARRAY[smtp_username] AS authority,
+                        NULL::bigint AS version, smtp_password_enc AS envelope
+                   FROM platform.login_settings WHERE smtp_password_enc IS NOT NULL"
+            }
+            Self::SignupChallenge => {
+                "SELECT NULL::uuid AS data_tenant_id, 'signup_challenge' AS row_key,
+                        'signup_challenge' AS owner, ARRAY[]::text[] AS authority,
+                        NULL::bigint AS version, signup_challenge_secret AS envelope
+                   FROM platform.login_settings WHERE signup_challenge_secret IS NOT NULL"
+            }
+            Self::DerivationKey => {
+                "SELECT NULL::uuid AS data_tenant_id, 'platform_derivation_key' AS row_key,
+                        'platform_derivation_key' AS owner, ARRAY[]::text[] AS authority,
+                        NULL::bigint AS version, envelope
+                   FROM platform.derivation_key"
+            }
         }
     }
 
@@ -525,6 +575,23 @@ impl StoredSecretTable {
                 "UPDATE wyrd.operator_connections SET secret_ciphertext = $4
                   WHERE data_tenant_id = $1 AND connection_id::text = $2
                     AND secret_ciphertext = $3"
+            }
+            Self::SocialProviders => {
+                "UPDATE platform.social_providers SET client_secret_enc = $4
+                  WHERE $1::uuid IS NULL AND provider = $2 AND client_secret_enc = $3"
+            }
+            Self::ApplicationMail => {
+                "UPDATE platform.login_settings SET smtp_password_enc = $4
+                  WHERE $1::uuid IS NULL AND $2 = 'smtp_relay' AND smtp_password_enc = $3"
+            }
+            Self::SignupChallenge => {
+                "UPDATE platform.login_settings SET signup_challenge_secret = $4
+                  WHERE $1::uuid IS NULL AND $2 = 'signup_challenge'
+                    AND signup_challenge_secret = $3"
+            }
+            Self::DerivationKey => {
+                "UPDATE platform.derivation_key SET envelope = $4
+                  WHERE $1::uuid IS NULL AND $2 = 'platform_derivation_key' AND envelope = $3"
             }
         }
     }

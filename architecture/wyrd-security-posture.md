@@ -393,8 +393,8 @@ credential.
 - Recoverable auth-provider and workload-issuer client secrets, shared
   social-provider client secrets, application SMTP credentials and the signup
   challenge secret follow [stored secrets](#stored-secrets). Signup and sign-in
-  flow cookies, email proofs and keyed pseudonyms (admission keys, creator keys
-  and the workspace discovery directory) derive per-use keys from one random
+  flow cookies, email proofs and keyed pseudonyms (admission and creator keys)
+  derive per-use keys from one random
   platform derivation key, stored only as a `WyrdKms` envelope; wrapping-key
   rotation re-wraps it and never changes it. Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.

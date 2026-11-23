@@ -206,6 +206,11 @@ pub const FIXTURE_ROOTS: [(&str, bool, &[&str]); 1] = [(FIXTURE_ROOT, false, &["
 /// Why an assertion step has no local provider observations.
 const NO_PROVIDER: &str = "an assertion check calls no provider";
 
+/// Why a judge step has no capture-slot wait: the server reserves a bound
+/// call's capture slot without waiting, so it never records one.
+const NO_CAPTURE_WAIT: &str =
+    "a verification lane's bound model call never waits for a capture slot";
+
 /// Why a step other than the canonical one has no per-request ledger.
 const NOT_CANONICAL: &str = "only the canonical workload's Agents run code";
 
@@ -2270,7 +2275,8 @@ fn set_phases(repetition: &mut Repetition, population: &Population) {
 /// a judge's in-process model call records, each over its own histogram
 /// population, nested in the Verifier block and never summed. An assertion
 /// step calls no provider, so each is inapplicable; on a judge step without
-/// errors each is required.
+/// errors each is required except the capture-slot wait, which a bound
+/// call never makes.
 fn set_gateway(repetition: &mut Repetition, population: &Population, op: Op, clean: bool) {
     let observations = GATEWAY_PHASES
         .iter()
@@ -2291,6 +2297,8 @@ fn set_gateway(repetition: &mut Repetition, population: &Population, op: Op, cle
     for (observation, family, label) in observations {
         if op == Op::Verify {
             repetition.inapplicable(&observation, NO_PROVIDER);
+        } else if label == ("wait", "capture_slot") {
+            repetition.inapplicable(&observation, NO_CAPTURE_WAIT);
         } else {
             repetition.diagnose(&observation, population.histogram(family, &[label]), clean);
         }
@@ -3210,7 +3218,8 @@ mod tests {
 
     /// A judge step reports each recorded Gateway phase and wait under its
     /// own `gateway.phase.*` or `gateway.wait.*` label with its actual
-    /// observation count, from the server's histograms alone; an assertion
+    /// observation count, from the server's histograms alone, except the
+    /// capture-slot wait its bound calls never make; an assertion
     /// step marks every one inapplicable; and a judge window without a
     /// recorded phase is invalid rather than zero.
     ///
@@ -3241,7 +3250,14 @@ mod tests {
             let count = judge.reading(&format!("{DIAGNOSTIC}gateway.phase.{phase}.count"));
             assert_eq!(count.value, Some(calls as f64), "{phase}");
         }
-        for wait in super::WAITS {
+        let slot = judge.reading(&format!("{DIAGNOSTIC}gateway.wait.capture_slot.mean_us"));
+        assert_eq!(
+            slot.reason.as_deref(),
+            Some(
+                "inapplicable: a verification lane's bound model call never waits for a capture slot"
+            )
+        );
+        for wait in super::WAITS.iter().filter(|wait| **wait != "capture_slot") {
             let mean = judge.reading(&format!("{DIAGNOSTIC}gateway.wait.{wait}.mean_us"));
             assert!(
                 mean.value.is_some_and(|high| 20.0 <= high),
@@ -3263,7 +3279,8 @@ mod tests {
         super::set_gateway(&mut empty, &none, Op::Judge, true);
         assert_eq!(
             empty.invalid.len(),
-            super::GATEWAY_PHASES.len() + super::WAITS.len()
+            super::GATEWAY_PHASES.len() + super::WAITS.len() - 1,
+            "every phase and wait but the capture slot is required"
         );
     }
 

@@ -710,9 +710,13 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
 /// stops every later launch while keeping their rows. A Gateway smoke
 /// offered far more than it can serve counts every missed arrival as an
 /// error, so integrity judgment makes both of its cases INVALID in the saved
-/// sweep while each case's cleanup is confirmed and the next case runs.
+/// sweep while each case's cleanup is confirmed and the next case runs. A
+/// Verification smoke runs a Rust and a Python direct-verify case to VALID
+/// with confirmed cleanup, and an unflooded Gateway case runs to VALID, so
+/// every category's sweep path is proven VALID.
 ///
-/// `mise run test:benchmark:l1` after `mise run bench:build`, with Docker.
+/// `mise run test:benchmark:l1` after `mise run bench:build` and
+/// `mise run bench:build:sdks`, with Docker.
 ///
 /// # Panics
 ///
@@ -889,6 +893,56 @@ async fn l1_sweeps_isolate_and_record_cases() {
         table,
         "regenerated without artifacts"
     );
+
+    let verified = sweep_in(
+        Category::Verification,
+        &[
+            "--cases",
+            "direct-verify-c1,direct-verify-python-r3000",
+            "--allow-dirty",
+        ],
+    );
+    let record = verified
+        .supervise(&interrupt, |case, n| {
+            let sweep = &verified;
+            let interrupt = &interrupt;
+            async move { sweep.attempt(case, n, interrupt).await }
+        })
+        .await;
+    for (entry, case) in record.cases.iter().zip(cases(&verified)) {
+        let case = case.expect("a kept case record");
+        assert_eq!(
+            entry.status,
+            CaseStatus::Valid,
+            "{}: {:?}",
+            entry.selector,
+            case.reasons
+        );
+        assert!(case.cleanup.confirmed, "{:?}", case.cleanup);
+    }
+    let table = summary::report(&verified.directory.join(summary::SWEEP_FILE))
+        .expect("reads")
+        .expect("a sweep");
+    assert!(
+        table.contains("| direct-verify-c1 | VALID |")
+            && table.contains("| direct-verify-python-r3000 | VALID |"),
+        "{table}"
+    );
+
+    let served = sweep_in(
+        Category::Gateway,
+        &["--cases", "buffered-1kib-capture-metadata.c1", "--allow-dirty"],
+    );
+    let record = served
+        .supervise(&interrupt, |case, n| {
+            let sweep = &served;
+            let interrupt = &interrupt;
+            async move { sweep.attempt(case, n, interrupt).await }
+        })
+        .await;
+    let case = cases(&served).remove(0).expect("a kept case record");
+    assert_eq!(record.cases[0].status, CaseStatus::Valid, "{:?}", case.reasons);
+    assert!(case.cleanup.confirmed, "{:?}", case.cleanup);
 
     let flooded = sweep_in(
         Category::Gateway,

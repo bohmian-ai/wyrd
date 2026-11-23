@@ -583,8 +583,8 @@ description = "L1 Bifrost sweep: by default the 18 routine cases in order: the e
 run = "scripts/benchmarks/l1.sh bifrost"
 
 [tasks."test:benchmark:l1"]
-description = "Harness lane for the L1 sweep path: two-case smoke sweeps (Bifrost writes, then a Bifrost read) through the same supervisor, case process, PostgreSQL wrapper and records the benchmark:l1 sweeps use, with smoke-scale fixtures and 2 s windows, checking fresh case-owned server, database and storage state, drain, teardown and cleanup evidence, case and sweep records, and the regenerated summary. Judges workflow and evidence integrity only, never performance. Needs Docker; part of no gate or CI lane."
-depends = ["bench:build"]
+description = "Harness lane for the L1 sweep path: two-case smoke sweeps for every category (Bifrost writes then a read, a served and two flooded Gateway cases, and Rust then Python Verification) through the same supervisor, case process, PostgreSQL wrapper and records the benchmark:l1 sweeps use, with smoke-scale fixtures and 2 s windows, checking fresh case-owned server, database and storage state, drain, teardown and cleanup evidence, case and sweep records, and the regenerated summary. Judges workflow and evidence integrity only, never performance. Needs Docker; part of no gate or CI lane."
+depends = ["bench:build", "bench:build:sdks"]
 env = { CARGO_PROFILE_RELEASE_DEBUG = "line-tables-only", RUSTFLAGS = "-C force-frame-pointers=yes" }
 run = "cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only -E 'test(=tests::pg_tests::l1_sweeps_isolate_and_record_cases)'"
 

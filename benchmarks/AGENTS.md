@@ -114,7 +114,11 @@ whether an existing reading already answers the question.
 
 ## Records
 
-Only a clean, unprofiled, full L2 run enters `benchmarks/history/`, which is
-the `benchmark-records` branch. Every L1 sweep keeps its sweep and case
-records under `target/benchmarks/l1/<category>/<sweep>/`, and every other run
-stays under `target/benchmarks/`. Never commit records on a code branch.
+`benchmarks/history/` is the `benchmark-records` branch. A clean,
+unprofiled, full L2 run enters it. Every L1 sweep writes its sweep and case
+records under `target/benchmarks/l1/<category>/<sweep>/`; a clean, unprofiled
+routine sweep (no `--cases`) enters history as
+`l1/<category>/<sweep>-<sha9>/`, holding `sweep.json` and its case records
+without their artifact directories. L1 records never feed L2 calibration or
+`bench:results`. Every other run stays under `target/benchmarks/`. Never
+commit records on a code branch.

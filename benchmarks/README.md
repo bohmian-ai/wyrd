@@ -566,7 +566,9 @@ history and `bench:results` and the Bifrost L2 calibration read it only
 there; neither reads any other location.
 
 To keep a run's record, commit it inside `benchmarks/history/` (on the
-`benchmark-records` branch) and push that branch. Never commit records on a
+`benchmark-records` branch) and push that branch. A clean, unprofiled routine
+L1 sweep is kept as `l1/<category>/<sweep>-<sha9>/` with its `sweep.json` and
+case records; `capacity report` renders it from there. Never commit records on a
 code branch.
 
 `mise run bench:results` writes every record in history into one self-contained

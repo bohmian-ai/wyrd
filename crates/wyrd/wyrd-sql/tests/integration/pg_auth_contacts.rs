@@ -8,8 +8,8 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::Sha256Hex;
     use wyrd_sql::queries::auth::{
-        consume_password_reset, insert_local_user, insert_password_reset,
-        replace_verified_contact, verified_contact_for_update,
+        consume_password_reset, insert_local_user, insert_password_reset, replace_verified_contact,
+        verified_contact_for_update,
     };
 
     /// Two verifications begun against no contact race: exactly one inserts
@@ -111,9 +111,17 @@ mod pg_tests {
         .await
         .expect("user inserts");
         for (n, contact_revision) in [(1, None), (2, Some(1)), (3, Some(1))] {
-            insert_password_reset(&mut conn, Uuid::now_v7(), &code(n), user, 0, user, contact_revision)
-                .await
-                .expect("reset inserts");
+            insert_password_reset(
+                &mut conn,
+                Uuid::now_v7(),
+                &code(n),
+                user,
+                0,
+                user,
+                contact_revision,
+            )
+            .await
+            .expect("reset inserts");
         }
         conn.commit().await.expect("resets commit");
 

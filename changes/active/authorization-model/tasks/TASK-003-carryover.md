@@ -905,6 +905,21 @@ directory-update owner once here; recovery below consumes its output.
   the query change.
   - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner &&
     cargo nextest run --locked -p wyrd-sql --test integration -E "test(/^pg_auth_contacts::/)"'`.
+- Commands (all clean):
+  - the Postgres journey command with each scenario's exact selector, and with
+    `test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/)` (90/90, the existing operator
+    reset and browser-session regressions included);
+  - `cargo nextest run --locked -p wyrd-auth -p wyrd-sql --lib -E 'not test(/pg_tests::/)'` (125/125);
+  - `mise run fmt`; `cargo clippy --locked -p wyrd-spec -p wyrd-sql -p wyrd-auth -p wyrd-server
+    --features wyrd-server/test-support --all-targets -- -D warnings`; `mise run codegen:check`;
+    `mise run check:tenant-isolation`; `git diff --check`.
+- Left open:
+  - The timing comparison is a coarse median check (within the other classes' median, or 25 ms).
+    The public path is the same code for every account, because all account work runs after the answer.
+  - Social-only Users have no username, so a reset request cannot name them. The journey proves the
+    operator path refuses them (`404`); the mailed path finds no local credential by construction.
+  - No relay-removal or tenant-policy write surface was needed here; the tests set both in SQL.
+  - MCP and `wyrd-client` projections of the reset request are not added (as for signup).
 
 ### 13. Verified contacts support private self-service reset
 
@@ -932,7 +947,7 @@ reset still works; removing SMTP does not invalidate issued codes.
 and key use, plus tenant SQL one-use/contact-revision integration. RED is missing
 reset-request/send isolation; existing contact and reset redemption are reused and regressed.
 
-**Cycle 13 evidence (in progress).**
+**Cycle 13 evidence.**
 
 - Scenario 1, a verified contact resets a forgotten password:
   `platform_admin_e2e::contacts::a_verified_contact_resets_a_forgotten_password`

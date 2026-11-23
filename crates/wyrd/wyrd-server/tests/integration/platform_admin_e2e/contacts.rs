@@ -859,12 +859,18 @@ async fn a_reset_code_refuses_every_stale_or_foreign_use() {
     verify_contact(&srv, &api, "pier", &dee_session, dee).await;
     let refused = |status: StatusCode, body: &Value, case: &str| {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}: {body}");
-        assert_eq!(body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID", "{case}: {body}");
+        assert_eq!(
+            body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+            "{case}: {body}"
+        );
     };
 
     // 1. A newer request replaces a code; a code expires.
     for _ in 0..2 {
-        assert_eq!(request_reset(&srv, "pier", "admin", VISITOR).await.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            request_reset(&srv, "pier", "admin", VISITOR).await.0,
+            StatusCode::ACCEPTED
+        );
     }
     let texts = await_mail(&api, old, RESET_SUBJECT, 2).await;
     let (newer, older) = (reset_code(&texts[0]), reset_code(&texts[1]));
@@ -883,7 +889,10 @@ async fn a_reset_code_refuses_every_stale_or_foreign_use() {
     refused(status, &body, "expired");
 
     // 2. A contact proof is no reset code; replacing the contact voids its codes.
-    assert_eq!(request_reset(&srv, "pier", "admin", VISITOR).await.0, StatusCode::ACCEPTED);
+    assert_eq!(
+        request_reset(&srv, "pier", "admin", VISITOR).await.0,
+        StatusCode::ACCEPTED
+    );
     let bound = reset_code(&await_mail(&api, old, RESET_SUBJECT, 3).await[0]);
     let (status, flow, body) = browser(
         &srv,
@@ -913,7 +922,10 @@ async fn a_reset_code_refuses_every_stale_or_foreign_use() {
         .expect("no refused code changed the password");
 
     // 3. Required company SSO leaves no reset path; social-only Users get no code.
-    assert_eq!(request_reset(&srv, "pier", "dee", VISITOR).await.0, StatusCode::ACCEPTED);
+    assert_eq!(
+        request_reset(&srv, "pier", "dee", VISITOR).await.0,
+        StatusCode::ACCEPTED
+    );
     let mailed = reset_code(&await_mail(&api, dee, RESET_SUBJECT, 1).await[0]);
     let require_sso = |required: bool| {
         sqlx::query(
@@ -976,7 +988,11 @@ async fn a_reset_code_refuses_every_stale_or_foreign_use() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{body}");
     let (status, _, body) = redeem(&srv, "pier", &mailed, fresh).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "the mailed code survives: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the mailed code survives: {body}"
+    );
     let (status, _, body) = redeem(
         &srv,
         "pier",
@@ -984,7 +1000,11 @@ async fn a_reset_code_refuses_every_stale_or_foreign_use() {
         fresh,
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "the operator code works offline: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the operator code works offline: {body}"
+    );
     for name in ["dee", "bea"] {
         sign_in_as(&srv, "pier", name, fresh)
             .await
@@ -1055,7 +1075,11 @@ async fn reset_requests_are_throttled_without_locking_or_disclosing_delivery() {
     }
     assert_eq!(counted().await, vec![5], "every request was counted");
     await_mail(&api, ada, RESET_SUBJECT, 3).await;
-    assert_eq!(mail_count(&api, ada, RESET_SUBJECT).await, 3, "three were mailed");
+    assert_eq!(
+        mail_count(&api, ada, RESET_SUBJECT).await,
+        3,
+        "three were mailed"
+    );
     sign_in_as(&srv, "dock", "admin", PASSWORD)
         .await
         .expect("requests never lock the account");
@@ -1069,7 +1093,10 @@ async fn reset_requests_are_throttled_without_locking_or_disclosing_delivery() {
     let (status, body, _) = request_reset(&srv, "dock", "nobody", source).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["code"], "WYRD_AUTH_429_PASSWORD_ATTEMPTS", "{body}");
-    assert!(body["details"]["retry_after_seconds"].as_u64() > Some(0), "{body}");
+    assert!(
+        body["details"]["retry_after_seconds"].as_u64() > Some(0),
+        "{body}"
+    );
     let (status, _, _) = request_reset(&srv, "dock", "nobody", VISITOR).await;
     assert_eq!(status, StatusCode::ACCEPTED, "other sources are unaffected");
 
@@ -1105,10 +1132,22 @@ async fn reset_requests_are_throttled_without_locking_or_disclosing_delivery() {
         .expect("the send reached the refusing relay")
         .expect("the relay reports");
     relay_to_mailpit(&srv, &operator).await;
-    assert_eq!(request_reset(&srv, "dock", "bea", VISITOR).await.0, StatusCode::ACCEPTED);
+    assert_eq!(
+        request_reset(&srv, "dock", "bea", VISITOR).await.0,
+        StatusCode::ACCEPTED
+    );
     let texts = await_mail(&api, bea, RESET_SUBJECT, 1).await;
     assert_eq!(texts.len(), 1, "the lost code was never resent");
-    let (status, _, body) = redeem(&srv, "dock", &reset_code(&texts[0]), "quiet harbor lanterns").await;
+    let (status, _, body) = redeem(
+        &srv,
+        "dock",
+        &reset_code(&texts[0]),
+        "quiet harbor lanterns",
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    assert!(attempts.try_recv().is_err(), "nothing retried the refused send");
+    assert!(
+        attempts.try_recv().is_err(),
+        "nothing retried the refused send"
+    );
 }

@@ -1,10 +1,11 @@
 //! Operator connection management shared by HTTP and MCP.
 //!
 //! [`OperatorConnectionControl`] is the one owner of create, list, get,
-//! update, and disable. Every read authorizes `operators:read`, every write
+//! update, disable, and encryption renewal. Every read authorizes `operators:read`, every write
 //! `operators:write`, and each decision is staged on the process audit outbox
-//! before the operation runs. Secrets are sealed by [`OperatorKeys`] before
-//! they reach SQL, and no operation returns or logs one.
+//! before the operation runs. Secrets are sealed by [`OperatorSecrets`] before
+//! any transaction opens, writes are fenced on the exact row they were
+//! prepared from, and no operation returns or logs a secret.
 
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
@@ -19,7 +20,7 @@ use wyrd_sql::queries::operator_connections::{
 };
 use zeroize::Zeroizing;
 
-use super::keys::{OperatorKeys, SecretIdentity};
+use super::secrets::{OperatorSecrets, SecretIdentity};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::{AppState, registry_db_error};
@@ -34,6 +35,8 @@ const GET: &str = "operator_connection.read";
 const UPDATE: &str = "operator_connection.update";
 /// Audit operation of a connection disable.
 const DISABLE: &str = "operator_connection.disable";
+/// Audit operation of a connection encryption renewal.
+const RENEW_ENCRYPTION: &str = "operator_connection.renew_encryption";
 
 /// The not-found refusal for `connection_id`.
 fn not_found(connection_id: OperatorConnectionId) -> WyrdError {
@@ -56,12 +59,16 @@ fn plaintext(secret: &ConnectionSecret) -> Result<Zeroizing<Vec<u8>>, WyrdError>
     })
 }
 
-/// A change to an existing connection: a typed update or a disable.
+/// A change to an existing connection: a typed update, a disable, or an
+/// encryption renewal.
 enum Change {
     /// PATCH semantics.
     Update(UpdateOperatorConnectionRequest),
     /// DELETE semantics: disable, keep the row.
     Disable,
+    /// Reseal the unchanged secret under a fresh DEK; authority, status, and
+    /// secret version are kept.
+    RenewEncryption,
 }
 
 /// Owner of Operator connection management for one request.
@@ -76,17 +83,17 @@ impl<'a> OperatorConnectionControl<'a> {
         Self { state }
     }
 
-    /// The key owner.
-    fn keys(&self) -> &OperatorKeys {
-        self.state.verification.operator_keys()
+    /// The credential owner.
+    fn secrets(&self) -> &OperatorSecrets {
+        self.state.verification.operator_secrets()
     }
 
-    /// Create a connection, sealing its secret under the active key version.
+    /// Create a connection, sealing its secret before the insert opens.
     ///
     /// # Errors
     /// Returns [`WyrdError::OperatorConnectionInvalid`] for an invalid body,
     /// [`WyrdError::PermissionDeniedRbac`] without `operators:write`,
-    /// [`WyrdError::OperatorKeyUnavailable`] when no active key is readable,
+    /// [`WyrdError::OperatorKeyUnavailable`] when the secret cannot be sealed,
     /// [`WyrdError::OperatorConnectionConflict`] when the provider/name exists,
     /// or a registry error.
     pub(crate) async fn create(
@@ -98,15 +105,15 @@ impl<'a> OperatorConnectionControl<'a> {
         let resource = format!("operator_connection:{}/{name}", config.provider());
         self.authorize_write(caller, CREATE, &resource)?;
         let connection_id = OperatorConnectionId::new_v7();
-        let identity = SecretIdentity {
-            tenant: caller.data_tenant_id,
+        let identity = SecretIdentity::new(
+            caller.data_tenant_id,
             connection_id,
-            provider: config.provider(),
-            name: &name,
-            secret_version: 1,
-        };
+            config.provider(),
+            &name,
+            1,
+        );
         let committed = async {
-            let sealed = self.keys().seal(identity, &plaintext(&secret)?).await?;
+            let sealed = self.secrets().seal(&identity, &plaintext(&secret)?).await?;
             let mut conn = self
                 .state
                 .registry_tenant_conn(caller.data_tenant_id)
@@ -189,7 +196,7 @@ impl<'a> OperatorConnectionControl<'a> {
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
-        let row = get_connection(&mut conn, connection_id, false)
+        let row = get_connection(&mut conn, connection_id)
             .await
             .map_err(registry_db_error)?;
         conn.commit().await.map_err(registry_db_error)?;
@@ -204,8 +211,10 @@ impl<'a> OperatorConnectionControl<'a> {
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `operators:write`,
     /// [`WyrdError::OperatorConnectionNotFound`],
     /// [`WyrdError::OperatorConnectionInvalid`] for a wrong provider or
-    /// invalid value, [`WyrdError::OperatorKeyUnavailable`] when a secret is
-    /// supplied and no active key is readable, or a registry error.
+    /// invalid value, [`WyrdError::OperatorKeyUnavailable`] when a supplied
+    /// secret cannot be sealed, [`WyrdError::OperatorConnectionConflict`]
+    /// when a concurrent write changed the connection first, or a registry
+    /// error.
     pub(crate) async fn update(
         &self,
         caller: &Caller,
@@ -231,13 +240,45 @@ impl<'a> OperatorConnectionControl<'a> {
             .await
     }
 
-    /// Lock, change, and store one connection after staging its decision.
+    /// Renew a connection's encryption: reseal its unchanged secret under a
+    /// fresh DEK and nonce, keeping its identity, authority, status, and
+    /// secret version. A disabled connection stays disabled.
     ///
-    /// A refusal found under the lock (not found, invalid) commits the read
-    /// transaction and is returned as the operation's error.
+    /// This does not change or revoke the credential at its provider; a
+    /// leaked or expired credential needs a replacement through
+    /// [`Self::update`].
     ///
     /// # Errors
-    /// Returns the refusals named on [`Self::update`].
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without `operators:write`,
+    /// [`WyrdError::OperatorConnectionNotFound`],
+    /// [`WyrdError::OperatorKeyUnavailable`] when the stored secret cannot be
+    /// opened or resealed, [`WyrdError::OperatorConnectionConflict`] when a
+    /// concurrent write changed the connection first, or a registry error.
+    pub(crate) async fn renew_encryption(
+        &self,
+        caller: &Caller,
+        connection_id: OperatorConnectionId,
+    ) -> Result<OperatorConnectionView, WyrdError> {
+        self.change(
+            caller,
+            connection_id,
+            RENEW_ENCRYPTION,
+            Change::RenewEncryption,
+        )
+        .await
+    }
+
+    /// Read, prepare, and store one connection after staging its decision.
+    ///
+    /// The row is read in its own transaction, a replacement secret is sealed
+    /// with no transaction open, and the write is fenced on the authority,
+    /// status, secret version, and envelope read, so a key-service wait holds
+    /// no row lock. A concurrent change that commits first wins the fence, and
+    /// this change is refused rather than applied over the winner.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OperatorConnectionConflict`] when a concurrent
+    /// change committed first, and the refusals named on [`Self::update`].
     async fn change(
         &self,
         caller: &Caller,
@@ -250,67 +291,65 @@ impl<'a> OperatorConnectionControl<'a> {
             operation,
             &format!("operator_connection:{connection_id}"),
         )?;
-        let committed = async {
-            let mut conn = self
-                .state
-                .registry_tenant_conn(caller.data_tenant_id)
-                .await?;
-            let Some(current) = get_connection(&mut conn, connection_id, true)
-                .await
-                .map_err(registry_db_error)?
-            else {
-                conn.commit().await.map_err(registry_db_error)?;
-                return Ok(Err(not_found(connection_id)));
-            };
-            let update = match change {
-                Change::Disable => wyrd_spec::operator_connection::ConnectionUpdate {
-                    config: current.view.config.clone(),
-                    secret: None,
-                    status: Some(OperatorConnectionStatus::Disabled),
-                },
-                Change::Update(request) => match request.apply(current.view.config.clone()) {
-                    Ok(update) => update,
-                    Err(refusal) => {
-                        conn.commit().await.map_err(registry_db_error)?;
-                        return Ok(Err(refusal));
-                    }
-                },
-            };
-            let secret_version = current.secret_version + 1;
-            let sealed = match &update.secret {
-                Some(secret) => Some(
-                    self.keys()
-                        .seal(
-                            SecretIdentity {
-                                tenant: caller.data_tenant_id,
-                                connection_id,
-                                provider: current.view.config.provider(),
-                                name: &current.view.name,
-                                secret_version,
-                            },
-                            &plaintext(secret)?,
-                        )
-                        .await?,
-                ),
-                None => None,
-            };
-            let stored = update_connection(
-                &mut conn,
-                connection_id,
-                &ConnectionChange {
-                    config: &update.config,
-                    status: update.status.unwrap_or(current.view.status),
-                    secret: sealed.as_ref().map(|sealed| (sealed, secret_version)),
-                    principal: caller.principal.id,
-                },
-            )
+        let tenant = caller.data_tenant_id;
+        let mut conn = self.state.registry_tenant_conn(tenant).await?;
+        let current = get_connection(&mut conn, connection_id)
             .await
             .map_err(registry_db_error)?;
-            conn.commit().await.map_err(registry_db_error)?;
-            Ok::<_, WyrdError>(Ok(stored.view))
-        }
-        .await;
-        committed?
+        conn.commit().await.map_err(registry_db_error)?;
+        let current = current.ok_or_else(|| not_found(connection_id))?;
+        let update = match &change {
+            Change::Disable => wyrd_spec::operator_connection::ConnectionUpdate {
+                config: current.view.config.clone(),
+                secret: None,
+                status: Some(OperatorConnectionStatus::Disabled),
+            },
+            Change::RenewEncryption => wyrd_spec::operator_connection::ConnectionUpdate {
+                config: current.view.config.clone(),
+                secret: None,
+                status: None,
+            },
+            Change::Update(request) => request.clone().apply(current.view.config.clone())?,
+        };
+        let (sealed, secret_version) = match (&change, &update.secret) {
+            (Change::RenewEncryption, _) => (
+                Some(self.secrets().renew(tenant, &current).await?),
+                current.secret_version,
+            ),
+            (_, Some(secret)) => {
+                let next = current.secret_version + 1;
+                let sealed = self
+                    .secrets()
+                    .seal(
+                        &SecretIdentity::of(tenant, &current.view, next),
+                        &plaintext(secret)?,
+                    )
+                    .await?;
+                (Some(sealed), next)
+            }
+            (_, None) => (None, current.secret_version),
+        };
+        let mut conn = self.state.registry_tenant_conn(tenant).await?;
+        let stored = update_connection(
+            &mut conn,
+            &current,
+            &ConnectionChange {
+                config: &update.config,
+                status: update.status.unwrap_or(current.view.status),
+                secret: sealed.as_ref().map(|sealed| (sealed, secret_version)),
+                principal: caller.principal.id,
+            },
+        )
+        .await
+        .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        stored
+            .map(|stored| stored.view)
+            .ok_or_else(|| WyrdError::OperatorConnectionConflict {
+                message: "the Operator connection changed concurrently; read it again and retry"
+                    .to_owned(),
+                details: serde_json::json!({ "connection_id": connection_id }),
+            })
     }
 
     /// Evaluate `operators:write` and stage the decision on the process audit

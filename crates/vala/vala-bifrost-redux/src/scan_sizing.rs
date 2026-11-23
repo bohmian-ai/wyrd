@@ -599,12 +599,23 @@ impl BatchPruning {
         if statistics.len() != batches {
             return vec![true; batches];
         }
+        self.keep_with(&datafusion::common::pruning::PrunableStatistics::new(
+            statistics.to_vec(),
+            Arc::clone(self.0.schema()),
+        ))
+    }
+
+    /// Returns, per container of `statistics`, whether its bounds leave it
+    /// possibly matching; bounds that cannot be evaluated keep every
+    /// container.
+    #[must_use]
+    pub(crate) fn keep_with(
+        &self,
+        statistics: &impl datafusion::common::pruning::PruningStatistics,
+    ) -> Vec<bool> {
         self.0
-            .prune(&datafusion::common::pruning::PrunableStatistics::new(
-                statistics.to_vec(),
-                Arc::clone(self.0.schema()),
-            ))
-            .unwrap_or_else(|_| vec![true; batches])
+            .prune(statistics)
+            .unwrap_or_else(|_| vec![true; statistics.num_containers()])
     }
 }
 

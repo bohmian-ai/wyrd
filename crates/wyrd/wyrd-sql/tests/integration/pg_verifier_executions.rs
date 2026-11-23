@@ -2176,6 +2176,50 @@ async fn release_requeues_without_consuming_an_attempt() {
     assert_eq!(again.input, first.input);
 }
 
+/// Only an execution no claim ever leased reads as unclaimed.
+///
+/// A release refunds the attempt and returns the row to `pending`, so its
+/// status and attempt number look like a fresh execution's; whether it was
+/// claimed must still read `true` in both its status and its next claim,
+/// because the released attempt may have saved state.
+///
+/// # Panics
+/// Panics when a claim or status read fails, or either reports the wrong
+/// claim history.
+#[tokio::test]
+async fn a_released_execution_still_reads_as_claimed() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    assert!(!status(&queue, &mut conn, execution).await.claimed);
+
+    let first = claim(&queue, &mut conn).await;
+    assert!(
+        !first.claimed_before,
+        "the first claim finds no earlier lease"
+    );
+    assert!(status(&queue, &mut conn, execution).await.claimed);
+    queue
+        .release(&mut conn, first.lease, Duration::zero())
+        .await
+        .expect("release answers");
+
+    let released = status(&queue, &mut conn, execution).await;
+    assert_eq!(released.state.status, VerificationExecutionStatus::Pending);
+    assert!(released.claimed, "a released execution was still claimed");
+    let again = claim(&queue, &mut conn).await;
+    assert_eq!(again.attempt, 1);
+    assert!(again.claimed_before, "the reclaim sees the released lease");
+}
+
 /// A claim reports how long its execution waited past its due time and how long
 /// ago its trigger created it, both measured by the claim statement's
 /// PostgreSQL instant, and a reclaim measures its wait from the lease expiry.

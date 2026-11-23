@@ -249,10 +249,27 @@ server-owned fields. A retry preserves
 the batch ID. Within the idempotency-retention window,
 reusing an accepted ID requires the same source schema, row count, row
 order, and payload digest; any mismatch is a stable batch-identity conflict.
+Every Bifrost content digest, the logical batch identity and the WAL payload
+digest alike, is XXH3-128: these detect accidental mismatch within one tenant's
+own table, never adversarial collision, and CRC32C still frames each WAL
+record. An OTLP request carries no batch ID, so Gate derives it from the
+XXH3-128 logical identity of the accepted user columns and authenticated
+context and marks it UUIDv8, which no client may supply (client batch IDs are
+UUIDv7); for these derived IDs the ID is the content, so a retry is recognised
+by ID alone and Scribe computes no separate slice identity for it.
 Resolve accepted retries under the fence's original `table_version`, even
 when current partitioning or schema would prepare different slices or reject
 the old request. Stale versions on new batches are typed table-version
 conflicts; an accepted ID never bypasses strict content or permission checks.
+
+Recent transport retry history defaults to one hour from acceptance and the
+newest 10,000 accepted batch identities per tenant-qualified logical table,
+across clients and pods. Either limit can make a receipt eligible for removal,
+but a receipt still required for accepted-WAL recovery remains protected until
+the whole-batch durable handoff described below. PostgreSQL owns coordination
+time. Once the receipt is actually removed, an old transport identity may be
+accepted again; the committed-batch mirror must not outlive that authority.
+These limits do not expire stored rows or permanent application decisions.
 
 One authenticated tenant and logical `TableRef` bind exactly one physical
 Iceberg table, namespace, and object-store prefix. Callers never choose another
@@ -362,7 +379,9 @@ typed columns:
   `gen_ai_*`, `http_request_method`, `http_route`,
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
-  attributes and `body_text` (the body when it is a string) on logs.
+  attributes on logs. A log body that is a string is stored once, in
+  `body_text`, with `body` null; `body` holds only a non-string body, so no
+  row carries its body twice.
 - `bifrost.metrics.points` carries `series_id`, a nullable
   `FixedSizeBinary(16)` column with a Bloom filter, derived at admission from
   the point's series identity and never taken from a writer: Scribe replaces
@@ -524,8 +543,10 @@ typed columns:
     deduplication alone does not implement this contract. These are required
     owner extensions, not claims that the current implementation already does so.
     Each revision's batch identity derives from its execution and revision, so
-    its Scribe batch fence accepts exactly one write of it; recovery reads the
-    fenced prefix. No PostgreSQL execution-head table exists. A revision the old
+    its Scribe batch fence arbitrates acceptance; recovery reads the contiguous
+    accepted revisions from their Bifrost records, using recent fences to bridge
+    accepted-but-not-yet-visible rows. Expired fences do not truncate that history.
+    No PostgreSQL execution-head table exists. A revision the old
     owner froze just before takeover may still be accepted first and is then
     inherited; that rare interval is accepted.
   - External File completion, exact path/digest/length validation, inventory
@@ -725,12 +746,17 @@ producers whose caller waits. A publication's positive receipt is returned
 only after Scribe acknowledges every subscriber's acceptance, within half the request timeout; without that
 acknowledgement the publish answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
 and a republish of the same content replays. `bifrost.verification.evidence` is
-fenced-only: the committed batch fence is the acceptance, so an unfenced batch
-is absent and a fenced acceptance whose row no query can see yet is
-unavailable, never absent, both for publish deduplication and for a consumer's
-recovery read. An approval decision follows the same contract: its receipt is
+accepted-only: the committed batch fence arbitrates initial acceptance. Permanent
+evidence, approval, execution-revision and GitHub-delivery history and domain
+retry/conflict decisions come from their Bifrost records after receipt expiry.
+Consumers read only their Bifrost records, never retry receipts. An accepted
+record that is not yet readable can appear absent. Its fixed batch identity makes
+a second write a matching retry or a refused conflict, never an overwrite.
+Consumers re-read on retry; a failed query is unavailable. Receipt expiry does
+not remove retained domain history or its conflict rules.
+An approval decision follows the same contract: its receipt is
 returned only after Scribe acknowledges the decision within half the request
-timeout, `bifrost.verification.approvals` is fenced-only, and without the
+timeout, `bifrost.verification.approvals` is accepted-only, and without the
 acknowledgement the decide answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
 so the caller decides again. A parked execution's revision is acknowledged
 before its queue row is released, so a crash before then repeats unpersisted work, never loses
@@ -927,6 +953,8 @@ table version and acceptance facts before current-definition preparation.
 Compare content under that retained definition, not current schema/partition
 rules; preserve exact source schema, row order/count, payload and origin/time.
 A matching mirror hit acknowledges the original acceptance without rewriting.
+The mirror expires with its authoritative receipt; it cannot extend transport
+retry recognition after that receipt has been deleted.
 
 On a cold miss, do not add a preliminary accepted-ID query. Preparation and
 WAL attempts remain provisional. The existing fence conflict read returns the
@@ -1054,15 +1082,23 @@ operation IDs against `file_list` before opening admission. Unknown codec/table
 versions, unmappable legacy evidence, checksum mismatch,
 contradictory lineage or ambiguous authority fail closed. WAL SLICE and COMMIT
 bind the same table version and retain per-attempt CRC, ordinal/count, terminal
-and payload/WAL integrity checks; no recipe JSON travels in either record.
+and payload/WAL integrity checks; COMMIT binds each slice's ordinal, length and
+XXH3-128 payload digest. No recipe JSON travels in either record.
 A cold retry may leave a complete provisional attempt with different geometry.
 The durable fence's canonical coordinates select the accepted attempt;
 noncanonical attempts for that spent ID restore no rows. Do not reject those
 attempts solely for differing cross-attempt geometry before consulting the
-fence. Contradictions at canonical coordinates still fail closed, and missing
-fence authority never permits speculative suppression. Preserve genuinely
-unfenced complete-commit recovery under its recorded version. No abort record,
-truncation workaround or second replay ledger is introduced.
+fence. Contradictions at canonical coordinates still fail closed. WAL-dependent
+recovery requires committed acceptance authority: a confirmed never-accepted
+attempt restores no rows, including a complete provisional attempt or another
+pod's losing retry. This deliberately gives up opportunistic unfenced salvage;
+the producer must retry, and can lose never-accepted data if it cannot. Accepted
+writes remain recoverable even when their response was lost. Unavailable or
+contradictory authority fails closed rather than being treated as missing.
+Independently staged/published data restores from its own durable records after
+receipt expiry. Load the safe frontier below before interpreting missing receipts,
+so expired winning fences cannot resurrect old losing attempts. No abort record,
+truncation workaround or second per-batch replay ledger is introduced.
 
 A shard keeps up to two retired WAL files and overwrites them as its next
 segments, so appends reuse allocated blocks rather than growing a file. Every
@@ -1079,9 +1115,60 @@ spans shards: every shard draws LSNs from the stream's one counter and
 Because SLICE and COMMIT records share one sync, a crash may leave a complete
 but invalid record in a shard's unsynced tail. Replay ends that shard's chain
 at the first such record in its last segment, as it does a torn tail, only
-when the shard stream's newest durable batch fence lies before it; a bad
-record preceding an acknowledged COMMIT, in an earlier segment, or with no
-fence authority available fails closed.
+when durable fence/checkpoint authority establishes that no acknowledged COMMIT
+depends on that tail. Receipt expiry must preserve this check through the safe
+frontier below. A bad record preceding an acknowledged COMMIT, in an earlier
+segment, or without sufficient recovery authority fails closed.
+
+### Receipt handoff and cleanup
+
+The existing local shard manifest additionally holds a monotonic recovery-safe
+frontier qualified by node, writer epoch and shard. It covers a contiguous prefix
+of closed segments only after every accepted batch touching that prefix has all
+its slices in fsynced, validated, recoverable staged/published custody. Crossing
+batches, earlier gaps and unresolved ownership block advancement. Persist this
+frontier through the existing atomic manifest mechanism before receipt deletion
+or disposal of its supporting evidence. Per-seal-key maxima, file absence and
+successful retirement calls are not proof of a safe whole-shard prefix. Replay,
+stage-record retirement and torn-tail checks retain the evidence needed to
+protect acknowledged data after individual receipts disappear. Offline streams
+never acquire a frontier by timeout.
+
+One bounded background Scribe cleaner per process, on the existing runtime,
+receives coalesced custody/count wakes and periodic age wakes. Missed notifications
+are recovered from durable state; full channels cannot block ingestion. Tenant SQL
+deletes in bounded batches only when a receipt is outside recent age/count history
+and its current canonical stream/shard terminal COMMIT segment is at or below that
+stream's persisted safe frontier. Recheck canonical coordinates so a stale candidate
+cannot delete a replacement acceptance. The serial shard loop and ACK never await
+cleanup or run its SQL; Forge does not own receipt cleanup.
+
+The existing admission owner checks local cleanup health, alongside existing
+workload, memory, in-flight and unstaged pressure. Startup is cleanup-unverified:
+reconstruct durable ownership including the stable node's retained epochs and finish
+an initial due-work sweep before fresh write admission. Each sweep captures finite
+scope and a PostgreSQL-time policy cutoff, then reconciles every safely eligible
+receipt at that boundary. Only confirmed completion of the entire captured scope
+publishes coverage; ambiguous SQL requires reconciliation. Empty eligible scope is
+success, and recovery-pinned receipts alone are not cleanup failure.
+
+SQL failure/ambiguity or stale completed coverage makes new admission retryable-busy.
+The bounded progress deadline follows the private periodic cadence; freshness is
+anchored to the sweep boundary, not the completion time of an arbitrarily old sweep.
+Heartbeats and partial DELETE progress cannot renew health; hung/exited workers must
+also become stale. Already admitted writes may finish under existing in-flight bounds.
+Reads, visibility, unrelated workloads, staging, recovery and cleanup stay usable;
+do not poison memory accounting or process readiness. A current sweep completed within
+its deadline restores admission subject to normal pressure. The request adds only a
+local check, never a cleanup query, durable write or sweep wait.
+
+This prevents indefinitely continuing acceptance while cleanup fails or falls behind.
+There is no independent receipt quota or credit ledger, and no instantaneous row-count
+or physical PostgreSQL-byte ceiling: recovery pins and pending sweeps may exceed the
+recent-history limit, and physical reuse depends on vacuum. Cleanup failure can pause
+fresh writes while INSERT still works. A permanently abandoned node's local-only
+accepted custody requires recovery or an explicit decommission/data-loss decision,
+never expiry by timeout.
 
 Shutdown closes admission and mailboxes, rotates nonempty generations, stages
 immutable ownership, and drains admitted work within the server deadline. It

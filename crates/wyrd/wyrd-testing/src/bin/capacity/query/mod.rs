@@ -1,4 +1,4 @@
-//! The Bifrost engine's experiments, run through `mise run bench:l1:bifrost`
+//! The Bifrost engine's experiments, run through `mise run benchmark:l1:bifrost`
 //! and `mise run bench:l2:bifrost`.
 //!
 //! Both read as the production journey they measure. One release
@@ -26,6 +26,7 @@ mod isolated;
 mod logs;
 mod run;
 mod telemetry;
+pub mod ui;
 mod workload;
 
 use std::path::Path;
@@ -36,9 +37,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, Platform, WyrdClient};
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
     Criterion, Declaration, Derive, Direction, Engine, HISTORY_DIRECTORY, Level, Metric, Mode, Op,
-    Reason, Record, Status, Step, Verdict, WINDOW_SECONDS,
+    Reason, Record, Role, Status, Step, Verdict, WINDOW_SECONDS,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -108,7 +110,7 @@ pub const POINT_P99_MS: f64 = 5.0;
 /// Native write peak sanity floor, rows per second.
 pub const NATIVE_PEAK_FLOOR: f64 = 200_000.0;
 
-/// OTLP write peak sanity floor, encoded wire MiB per server CPU-second.
+/// OTLP write peak sanity floor, uncompressed OTLP input MiB per server CPU-second.
 pub const OTLP_PEAK_FLOOR: f64 = 30.0;
 
 /// The `writes-parquet` budget, seconds: its measured windows, the
@@ -144,7 +146,7 @@ const PARQUET_ENV: [(&str, &str); 1] = [("WYRD_MAX_FILE_RETENTION_TIME", "30")];
 /// so rows stage and publish only when the benchmark control asks. Only the
 /// `hot` reads use them, over a fixture loaded once before any window; a
 /// write workload under them would hold every row it writes in memory.
-const HOT_ENV: [(&str, &str); 3] = [
+pub const HOT_ENV: [(&str, &str); 3] = [
     ("WYRD_MAX_FILE_SIZE_IN_MEMORY", "16384"),
     ("WYRD_MAX_FILE_SIZE_ON_DISK", "16384"),
     ("WYRD_MAX_FILE_RETENTION_TIME", "86400"),
@@ -164,11 +166,24 @@ pub enum Experiment {
     Hot,
     /// Reads after every row is published as Parquet.
     Parquet,
+    /// The original UI SQL over the deterministic journey in each
+    /// residence.
+    UiSql,
+    /// [`Self::UiSql`] over ten times the journey's requests.
+    UiSql10x,
+    /// [`Self::UiSql`] after a published span sample taught the server a
+    /// span Variant layout.
+    UiSqlLearned,
 }
 
 impl Experiment {
-    /// Every experiment, in the order `l1 bifrost` runs them.
-    pub const ALL: [Self; 3] = [Self::WritesParquet, Self::Hot, Self::Parquet];
+    /// The experiments the routine Bifrost sweep's cases belong to, in the
+    /// order it runs them.
+    pub const ALL: [Self; 4] = [Self::WritesParquet, Self::Hot, Self::Parquet, Self::UiSql];
+
+    /// The extended experiments, whose cases are all targeted: never part of
+    /// the routine Bifrost sweep.
+    pub const EXTENDED: [Self; 2] = [Self::UiSql10x, Self::UiSqlLearned];
 
     /// The experiment id: its command word and record directory.
     #[must_use]
@@ -177,6 +192,9 @@ impl Experiment {
             Self::WritesParquet => "writes-parquet",
             Self::Hot => "hot",
             Self::Parquet => "parquet",
+            Self::UiSql => "ui-sql",
+            Self::UiSql10x => "ui-sql-10x",
+            Self::UiSqlLearned => "ui-sql-learned",
         }
     }
 
@@ -185,7 +203,20 @@ impl Experiment {
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
+            .chain(Self::EXTENDED)
             .find(|experiment| experiment.name() == name)
+    }
+
+    /// The ui-sql arm the experiment runs, or `None` for the other
+    /// experiments.
+    #[must_use]
+    pub const fn ui_arm(self) -> Option<ui::Arm> {
+        match self {
+            Self::UiSql => Some(ui::Arm::DEFAULT),
+            Self::UiSql10x => Some(ui::Arm::TEN_X),
+            Self::UiSqlLearned => Some(ui::Arm::LEARNED),
+            Self::WritesParquet | Self::Hot | Self::Parquet => None,
+        }
     }
 
     /// Whether the experiment measures writes rather than reads.
@@ -198,14 +229,14 @@ impl Experiment {
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::WritesParquet | Self::Parquet => &PARQUET_ENV,
-            Self::Hot => &HOT_ENV,
+            Self::Hot | Self::UiSql | Self::UiSql10x | Self::UiSqlLearned => &HOT_ENV,
         }
     }
 
     /// The read steps: each op, what it asks, and its client counts.
     const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
         match self {
-            Self::WritesParquet => &[],
+            Self::WritesParquet | Self::UiSql | Self::UiSql10x | Self::UiSqlLearned => &[],
             Self::Hot => &HOT_READS,
             Self::Parquet => &PARQUET_READS,
         }
@@ -445,8 +476,9 @@ pub fn experiment(arguments: &[String]) -> std::result::Result<Experiment, Strin
         .and_then(|name| Experiment::parse(name))
         .ok_or_else(|| {
             format!(
-                "l1 bifrost takes one experiment of {:?} before its flags",
-                Experiment::ALL.map(Experiment::name)
+                "l1 bifrost takes one experiment of {:?} or {:?} before its flags",
+                Experiment::ALL.map(Experiment::name),
+                Experiment::EXTENDED.map(Experiment::name)
             )
         })
 }
@@ -491,10 +523,12 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     {
         fixture.insert("smoke_rows".to_owned(), json!(scale));
     }
-    let workload: Box<dyn wyrd_testing::experiment::Workload> = match experiment {
-        Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
-        None => Box::new(competing::Competing::new(logs, scale)),
-    };
+    let workload: Box<dyn wyrd_testing::experiment::Workload> =
+        match (experiment, experiment.and_then(Experiment::ui_arm)) {
+            (_, Some(arm)) => Box::new(ui::workload::Ui::new(logs, arm)),
+            (Some(experiment), None) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
+            (None, None) => Box::new(competing::Competing::new(logs, scale)),
+        };
     Ok(Plan {
         declaration,
         workload,
@@ -785,6 +819,20 @@ fn isolated_metrics() -> Vec<Metric> {
             cpu_per(work("queries", 1e3)),
         ),
         derived(
+            "input_mib_per_s_per_vcpu",
+            "MiB/s/vCPU",
+            "(W/T)/P: the headline ingest rate: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per wall second per provisioned vCPU; OTLP steps only",
+            Direction::Higher,
+            per_vcpu(work("wire_bytes", 1.0 / 1_048_576.0)),
+        ),
+        derived(
+            "input_mib_per_cpu_s",
+            "MiB/cpu-s",
+            "W/C: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per server CPU-second used; OTLP steps only",
+            Direction::Higher,
+            per_cpu(work("wire_bytes", 1.0 / 1_048_576.0)),
+        ),
+        derived(
             "rows_per_s",
             "rows/s",
             "durably acknowledged rows per wall second",
@@ -822,32 +870,18 @@ fn isolated_metrics() -> Vec<Metric> {
             },
         ),
         derived(
-            "mib_per_s_per_vcpu",
+            "stored_mib_per_s_per_vcpu",
             "MiB/s/vCPU",
-            "(W/T)/P: uncompressed retained Arrow MiB per wall second per provisioned vCPU",
+            "(W/T)/P: uncompressed Arrow MiB the server stored per wall second per provisioned vCPU; it falls when the schema stores less per row, so it is not an ingest rate",
             Direction::Higher,
             per_vcpu(work("retained_mib", 1.0)),
         ),
         derived(
-            "mib_per_cpu_s",
+            "stored_mib_per_cpu_s",
             "MiB/cpu-s",
-            "W/C: uncompressed retained Arrow MiB per server CPU-second used",
+            "W/C: uncompressed Arrow MiB the server stored per server CPU-second used; not an ingest rate",
             Direction::Higher,
             per_cpu(work("retained_mib", 1.0)),
-        ),
-        derived(
-            "wire_mib_per_s_per_vcpu",
-            "MiB/s/vCPU",
-            "(W/T)/P: encoded OTLP wire MiB per wall second per provisioned vCPU",
-            Direction::Higher,
-            per_vcpu(work("wire_bytes", 1.0 / 1_048_576.0)),
-        ),
-        derived(
-            "wire_mib_per_cpu_s",
-            "MiB/cpu-s",
-            "W/C: encoded OTLP wire MiB per server CPU-second used",
-            Direction::Higher,
-            per_cpu(work("wire_bytes", 1.0 / 1_048_576.0)),
         ),
     ];
     let phases = WRITE_PHASES
@@ -868,6 +902,10 @@ fn isolated_metrics() -> Vec<Metric> {
             ));
         }
     }
+    metrics.extend(Population::root_metrics(
+        Role::Driver,
+        &[run::OTLP_DRIVER_ROOT],
+    ));
     metrics
 }
 
@@ -883,8 +921,10 @@ const SERVER_FAILURES: &str = "server timings at the step's boundary whose outco
 
 /// The settled-state facts the `parquet` experiment reads once after its
 /// settlement, outside every window, and reports on the step each
-/// describes: `(step, metric, unit, description)`.
-pub const SETTLED: [(&str, &str, &str, &str); 5] = [
+/// describes: `(step, metric, unit, description)`. Each OTLP path's
+/// `compression` is the headline storage figure; `storage_ratio` stays as
+/// the Arrow-relative diagnostic every path, native included, reports.
+pub const SETTLED: [(&str, &str, &str, &str); 7] = [
     (
         "span-shredded-c1",
         "span_shredding_faults",
@@ -915,7 +955,22 @@ pub const SETTLED: [(&str, &str, &str, &str); 5] = [
         "ratio",
         STORAGE_RATIO,
     ),
+    (
+        "full-scan-c1",
+        "compression.otlp-spans",
+        "ratio",
+        COMPRESSION,
+    ),
+    (
+        "full-scan-c1",
+        "compression.otlp-logs",
+        "ratio",
+        COMPRESSION,
+    ),
 ];
+
+/// What each `compression.<path>` reading is.
+const COMPRESSION: &str = "uncompressed OTLP protobuf bytes the clients sent and the server acknowledged while the path's sample loaded alone, per byte of its table's growth in published Parquet: input over stored, higher is smaller; WAL, staging, and catalog bytes are excluded";
 
 /// What each `storage_ratio.<path>` reading is.
 const STORAGE_RATIO: &str = "the path's table growth in published Parquet bytes per retained Arrow byte inserted while its sample loaded alone: 200,000 rows for native and logs, the 1M-row span fixture for spans, all settled together; the inserted bytes include server-internal rows written meanwhile, and WAL, staging, and catalog bytes are excluded";
@@ -930,38 +985,33 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
     if experiment.writes() {
         base.timing.budget_seconds = WRITES_BUDGET_SECONDS;
     }
-    base.question = String::from(match experiment {
-        Experiment::WritesParquet => {
-            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"
+    let limits = limits(experiment.env(), shard_override().as_deref());
+    let (question, fixture, workload) = match experiment {
+        Experiment::WritesParquet => (
+            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?",
+            write_fixture(),
+            "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
+        ),
+        Experiment::Hot => (
+            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?",
+            hot_fixture(),
+            "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
+        ),
+        Experiment::Parquet => (
+            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?",
+            read_fixture("parquet"),
+            "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
+        ),
+        Experiment::UiSql | Experiment::UiSql10x | Experiment::UiSqlLearned => {
+            let arm = experiment.ui_arm().unwrap_or(ui::Arm::DEFAULT);
+            return ui::declare(base, isolated_metrics(), limits, arm);
         }
-        Experiment::Hot => {
-            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?"
-        }
-        Experiment::Parquet => {
-            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?"
-        }
-    });
+    };
+    question.clone_into(&mut base.question);
     base.variables.insert("clients".to_owned(), json!(PAIR));
-    base.controls.insert(
-        "fixture".to_owned(),
-        match experiment {
-            Experiment::WritesParquet => write_fixture(),
-            Experiment::Hot => hot_fixture(),
-            Experiment::Parquet => read_fixture("parquet"),
-        },
-    );
-    base.controls.insert(
-        "limits".to_owned(),
-        limits(experiment.env(), shard_override().as_deref()),
-    );
-    base.controls.insert(
-        "workload".to_owned(),
-        json!(match experiment {
-            Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
-            Experiment::Hot => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
-            Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
-        }),
-    );
+    base.controls.insert("fixture".to_owned(), fixture);
+    base.controls.insert("limits".to_owned(), limits);
+    base.controls.insert("workload".to_owned(), json!(workload));
     base.metrics = isolated_metrics();
     if experiment == Experiment::Parquet {
         base.metrics.extend(
@@ -1033,13 +1083,13 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
             ),
             (
                 "otlp-spans-peak-floor",
-                "wire_mib_per_cpu_s",
+                "input_mib_per_cpu_s",
                 "otlp-spans-peak",
                 OTLP_PEAK_FLOOR,
             ),
             (
                 "otlp-logs-peak-floor",
-                "wire_mib_per_cpu_s",
+                "input_mib_per_cpu_s",
                 "otlp-logs-peak",
                 OTLP_PEAK_FLOOR,
             ),
@@ -1113,7 +1163,9 @@ fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
                 "native-write-c1" | "otlp-spans-c1" | "otlp-spans-1k-c1" | "native-write-c64"
             )
         }
-        Experiment::Hot => false,
+        Experiment::Hot | Experiment::UiSql | Experiment::UiSql10x | Experiment::UiSqlLearned => {
+            false
+        }
     };
     if long {
         params[WINDOW_SECONDS] = json!(10);
@@ -1185,6 +1237,7 @@ pub fn calibrate(
                     == Some(&limits(&PARQUET_ENV, shard_override().as_deref()))
                 && record.validity.reasons.is_empty()
                 && record.mode == Mode::Full
+                && record.lifecycle.is_none()
         })
         .collect();
     compatible.sort_by_key(|record| std::cmp::Reverse(record.started_at));
@@ -1219,7 +1272,7 @@ pub fn calibrate(
         })
         .ok_or_else(|| {
             format!(
-                "no compatible valid L1 `writes-parquet` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost:writes:parquet` (or `bench:l1:bifrost:writes`) on this host and build first",
+                "no compatible valid historical schema-3 L1 `writes-parquet` record measures every write path: {} records read, {} compatible; L1 case-protocol records never calibrate L2",
                 records.len(),
                 compatible.len()
             )
@@ -1447,10 +1500,10 @@ fn competing_declaration(
         Metric::derived("table_aggregates_per_cpu_s", "queries/cpu-s", "whole-table aggregates per server CPU-second; the denominator also pays for everything else", Direction::Higher, Derive::PerCpu { work: "table_aggregates".to_owned(), scale: 1.0 }),
         Metric::derived("ingest_rows_per_cpu_s", "rows/cpu-s", "ingest rows per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
         Metric::derived("queries_per_s_per_vcpu", "queries/s/vCPU", "mixed queries per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "queries".to_owned(), scale: 1.0 }),
-        Metric::derived("mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: retained Arrow MiB per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "retained_mib".to_owned(), scale: 1.0 }),
-        Metric::derived("mib_per_cpu_s", "MiB/cpu-s", "W/C: retained Arrow MiB per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "retained_mib".to_owned(), scale: 1.0 }),
-        Metric::derived("wire_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: encoded OTLP wire MiB per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
-        Metric::derived("wire_mib_per_cpu_s", "MiB/cpu-s", "W/C: encoded OTLP wire MiB per server CPU-second; the denominator also pays for native ingest and queries", Direction::Higher, Derive::PerCpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("stored_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: retained Arrow MiB the server stored per wall second per provisioned logical CPU; not an ingest rate", Direction::Higher, Derive::PerVcpu { work: "retained_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("stored_mib_per_cpu_s", "MiB/cpu-s", "W/C: retained Arrow MiB the server stored per server CPU-second; not an ingest rate; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "retained_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("input_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: the headline ingest rate: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("input_mib_per_cpu_s", "MiB/cpu-s", "W/C: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per server CPU-second; the denominator also pays for native ingest and queries", Direction::Higher, Derive::PerCpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
         Metric::derived("cpu_ms_per_query", "cpu-ms/query", "server CPU per mixed query, C/W; the numerator also pays for ingest", Direction::Lower, Derive::CpuPer { work: "queries".to_owned(), scale: 1e3 }),
         Metric::derived("ingest_rows_per_s_per_vcpu", "rows/s/vCPU", "ingest rows per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
         Metric::derived("cpu_us_per_ingest_row", "cpu-µs/row", "server CPU per ingest row, C/W; the numerator also pays for queries", Direction::Lower, Derive::CpuPer { work: "ingest_rows".to_owned(), scale: 1e6 }),
@@ -1521,6 +1574,32 @@ fn client(server: &LocalServer) -> Result<WyrdClient> {
         credential: Some(server.api_key().clone()),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)
     })?)
+}
+
+/// Scribe's gauge of cached learned Variant layouts, by namespace.
+const LAYOUTS_LEARNED: &str = "bifrost_scribe_variant_layouts_learned";
+
+/// Publishes everything `server`'s Scribe holds through the benchmark
+/// control and requires the publish to have taught it a `bifrost.traces`
+/// Variant layout, so later span rows are written in that learned layout.
+///
+/// # Errors
+///
+/// Returns a failed platform sign-in or publish, an empty publish, or no
+/// learned layout.
+pub async fn learn_span_layout(server: &LocalServer) -> Result<()> {
+    let claims = platform(server).await?.publish_scribe().await?;
+    let learned = server
+        .metrics()
+        .await?
+        .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
+    if claims == 0 || learned < 1.0 {
+        return Err(format!(
+            "publishing the span sample published {claims} claims and taught {learned} bifrost.traces Variant layouts"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The platform session on `server` of the platform root credential its

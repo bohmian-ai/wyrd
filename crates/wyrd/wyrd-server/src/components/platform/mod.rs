@@ -16,6 +16,9 @@
 //! `benchmark`, built only with the `bench` feature, lets a benchmark stage
 //! and publish this replica's Scribe on request.
 //!
+//! `stored_secrets` runs the explicit wrapping-key maintenance pass over
+//! every recoverable stored secret.
+//!
 //! `builtins` gives every tenant the canonical Bifrost built-in tables at
 //! provisioning and reconciles them for active tenants at startup.
 
@@ -28,8 +31,10 @@ pub mod provisioning;
 pub mod recovery;
 pub mod routes;
 pub mod social;
+pub mod stored_secrets;
 
 pub use credentials::platform_credentials_router;
 pub use identity::{platform_identity_router, platform_login_router};
 pub use routes::{platform_auth_router, platform_router};
 pub use social::platform_social_router;
+pub use stored_secrets::platform_stored_secrets_router;

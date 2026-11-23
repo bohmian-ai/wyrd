@@ -94,15 +94,17 @@ class Observe:
     ) -> VerificationResult:
         """Execute the bound Verifier ``verifier`` on this view's subject now.
 
-        Pass one positional value for a single-slot Verifier, or one keyword
-        per input slot. The slot's type decides each value's form: JSON
+        Pass one positional value: the slot value of a single-slot Verifier,
+        or else a model or mapping whose fields are the input slots. Or pass
+        one keyword per input slot. The slot's type decides each value's form: JSON
         values fill ``json`` slots, a 32-hex trace ID fills a ``trace`` slot,
         and a ``wyrd.verify.File`` or ``ArtifactRef`` fills a ``media`` slot. Files are
         hashed and uploaded during this call. Blocks for the execution.
 
         Args:
             verifier: the name of a Verifier bound to this view's subject.
-            *value: the one value of a single-slot Verifier.
+            *value: the one value of a single-slot Verifier, or a model or
+                mapping whose fields are the input slots.
             group_id: the caller's group, such as a conversation or order ID,
                 that grouped Verifiers judge together; never an input slot.
             **inputs: values keyed by input slot name.
@@ -145,7 +147,8 @@ class Observe:
             verifier: the name of a Verifier bound to this view's subject.
             data_type: a model exposing ``model_validate``, such as a
                 Pydantic model class or a ``RootModel`` union.
-            *value: the one value of a single-slot Verifier.
+            *value: the one value of a single-slot Verifier, or a model or
+                mapping whose fields are the input slots.
             group_id: the caller's group, as for ``verify``.
             **inputs: values keyed by input slot name.
 
@@ -173,7 +176,8 @@ class Observe:
 
         Args:
             verifier: the name of a Verifier bound to this view's subject.
-            *value: the one value of a single-slot Verifier.
+            *value: the one value of a single-slot Verifier, or a model or
+                mapping whose fields are the input slots.
             group_id: the caller's group, as for ``verify``.
             **inputs: values keyed by input slot name.
 
@@ -182,8 +186,8 @@ class Observe:
 
         Raises:
             WyrdError: As ``verify`` for Run evidence; for window samples,
-                ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
-                ``WYRD_SDK_409_BIFROST_CLOSED``, or
+                the error of starting the state's Bifrost writer when this is
+                the first write, ``WYRD_SDK_409_BIFROST_CLOSED``, or
                 ``WYRD_CLIENT_429_QUEUE_FULL``.
         """
         ...
@@ -236,7 +240,8 @@ class RunBifrost:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a row of another
                 shape, a non-``str`` key, or a non-finite float;
                 ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
-                ``bifrost.datasets``; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``bifrost.datasets``; the error of starting the state's
+                Bifrost writer when this is the first write;
                 ``WYRD_SDK_409_BIFROST_CLOSED``, or
                 ``WYRD_CLIENT_429_QUEUE_FULL``; and the server's error for a
                 table that is unknown, unauthorized, or unavailable.

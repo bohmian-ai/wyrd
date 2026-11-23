@@ -1,9 +1,13 @@
 //! Canonical log-signal table definition and its table-owned projection.
 
+pub mod input;
 pub mod projection;
 pub mod records;
 
-pub use projection::{canonical_log_schema, log_row_output_bytes, project_resource_logs};
+pub use input::LogInput;
+pub use projection::{
+    canonical_log_schema, log_row_output_bytes, project_log_input, project_resource_logs,
+};
 pub use records::RecordsTable;
 
 #[cfg(test)]
@@ -211,6 +215,106 @@ mod tests {
         );
     }
 
+    /// A record refused after its body and attributes are encoded, here by a
+    /// malformed `wyrd.card_uid`, leaves no Variant row behind: the next
+    /// accepted record keeps its own body and attributes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused record is accepted or a later row reads its
+    /// body or attributes.
+    #[test]
+    fn a_record_refused_after_encoding_leaves_no_variant_row() {
+        let record = |body: i64| LogRecord {
+            body: Some(AnyValue {
+                value: Some(Value::IntValue(body)),
+            }),
+            attributes: vec![attribute("index", Value::IntValue(body))],
+            ..LogRecord::default()
+        };
+        let mut refused = record(2);
+        refused.attributes.push(attribute(
+            "wyrd.card_uid",
+            Value::StringValue("not-a-card-uid".to_owned()),
+        ));
+        let request = vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record(1), refused, record(3)],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }];
+        let (batch, outcome) =
+            project_resource_logs(&request, None, usize::MAX).expect("logs project");
+        assert_eq!((outcome.accepted_records, outcome.rejected_records), (2, 1));
+        let body = |row| variant_cell_to_json(column(&batch, "body"), row).expect("body reads");
+        let index = |row| {
+            variant_cell_to_json(column(&batch, "attributes"), row).expect("attributes read")
+                ["index"]
+                .clone()
+        };
+        assert_eq!((body(0), index(0)), (json!(1), json!(1)));
+        assert_eq!((body(1), index(1)), (json!(3), json!(3)));
+    }
+
+    /// A string body is refused exactly where and why its Variant would be:
+    /// the largest text whose Variant fits the body limit lands, one byte
+    /// more is refused by size, and a text past the Variant limit is refused
+    /// with the catalogued Variant code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a boundary body lands on the wrong side or a refusal
+    /// gives a different reason.
+    #[test]
+    fn string_log_body_limits_match_its_variant() {
+        let limit = wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES;
+        let text = |len: usize| AnyValue {
+            value: Some(Value::StringValue("x".repeat(len))),
+        };
+        let overhead = any_value_variant("body", &text(limit))
+            .expect("encodes")
+            .encoded_bytes()
+            - limit;
+        let variant_limit =
+            usize::try_from(wyrd_spec::vala::api::VARIANT_MAX_ENCODED_BYTES).expect("fits");
+        let project = |len: usize| {
+            let request = vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        body: Some(text(len)),
+                        ..LogRecord::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }];
+            project_resource_logs(&request, None, usize::MAX)
+                .expect("logs project")
+                .1
+                .rejection_message
+        };
+
+        assert_eq!(
+            project(limit - overhead),
+            None,
+            "the largest fitting body lands"
+        );
+        assert_eq!(
+            project(limit - overhead + 1).as_deref(),
+            Some("log body exceeds the accepted payload size")
+        );
+        let reason = project(variant_limit).expect("a body past the Variant limit is refused");
+        assert!(
+            reason.starts_with("WYRD_VALA_413_VARIANT_TOO_LARGE"),
+            "{reason}"
+        );
+    }
+
     /// Downcast one named column, panicking when its Arrow type differs.
     fn typed<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
         column(batch, name)
@@ -249,7 +353,13 @@ mod tests {
             "the ledger columns plus the two appended correlation columns"
         );
 
-        for (row, value) in forms.into_iter().enumerate() {
+        let body_text = typed::<StringArray>(&batch, "body_text");
+        assert_eq!(body_text.value(0), "body text");
+        assert!(
+            column(&batch, "body").is_null(0),
+            "a string body is stored once, in body_text"
+        );
+        for (row, value) in forms.into_iter().enumerate().skip(1) {
             let expected = any_value_variant("body", &AnyValue { value: Some(value) })
                 .expect("every body form projects");
             assert_eq!(
@@ -257,14 +367,12 @@ mod tests {
                 (expected.metadata(), expected.value()),
                 "body row {row}"
             );
+            assert!(body_text.is_null(row), "a non-string body has no text");
         }
         assert!(
             column(&batch, "body").is_null(correlated),
             "an absent body projects to null"
         );
-        let body_text = typed::<StringArray>(&batch, "body_text");
-        assert_eq!(body_text.value(0), "body text");
-        assert!(body_text.is_null(1), "a non-string body promotes no text");
         assert!(body_text.is_null(correlated));
 
         let names = typed::<StringArray>(&batch, "event_name");
@@ -671,5 +779,33 @@ mod tests {
         assert!(run_ids.is_null(2));
 
         correlation_fixture::assert_attribute_rows(&batch, &[&missing, &valid, &duplicate]);
+    }
+
+    /// The projector reserves each fixed-width column once from the export's
+    /// checked record count, so a column's backing allocation holds exactly
+    /// its rows instead of a grown power-of-two capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any record is refused or a fixed-width column retains more
+    /// capacity than its accepted rows.
+    #[test]
+    fn log_projection_reserves_columns_from_the_record_count() {
+        const RECORDS: usize = 100;
+        let request = logs_with_attribute_sets(vec![Vec::new(); RECORDS]);
+
+        let (batch, outcome) = project_resource_logs(&request, None, usize::MAX).expect("projects");
+
+        assert_eq!(outcome.accepted_records, 100);
+        assert_eq!(outcome.rejected_records, 0);
+        for name in [
+            "time_unix_nano",
+            "observed_time_unix_nano",
+            "severity_number",
+        ] {
+            let data = column(&batch, name).to_data();
+            let width = data.data_type().primitive_width().expect("fixed width");
+            assert_eq!(data.buffers()[0].capacity(), RECORDS * width, "{name}");
+        }
     }
 }

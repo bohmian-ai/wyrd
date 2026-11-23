@@ -1,6 +1,6 @@
 //! HTTP projection of Operator connection management.
 //!
-//! Five operations on `/v1/operator-connections`. Each handler parses its
+//! Six operations on `/v1/operator-connections`. Each handler parses its
 //! typed path and body, then delegates to [`OperatorConnectionControl`], which
 //! owns authorization, audit, sealing, and tenancy. A malformed body is
 //! refused by position only, so a rejected secret value is never echoed.
@@ -33,6 +33,7 @@ pub fn operator_connections_router() -> OpenApiRouter<AppState> {
             update_connection,
             disable_connection
         ))
+        .routes(routes!(renew_connection_encryption))
 }
 
 /// Decode a JSON body without echoing any of its values.
@@ -248,6 +249,58 @@ async fn disable_connection(
     Ok(Json(
         OperatorConnectionControl::new(&state)
             .disable(&caller, connection_id)
+            .await?,
+    ))
+}
+
+/// Renew one connection's encryption: reseal its unchanged secret under a
+/// fresh data key on the same identity, status, and secret version.
+///
+/// Renewal protects the stored copy only. It does not replace or revoke the
+/// credential at its provider; replace a leaked or expired credential with
+/// PATCH and revoke the old value at its issuer.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path is malformed, the caller lacks
+/// `operators:write`, the connection is not in the caller's tenant, the
+/// stored secret cannot be opened or resealed, a concurrent write changed the
+/// connection first, or the write fails.
+#[utoipa::path(
+    post,
+    path = "/operator-connections/{connection_id}/renew-encryption",
+    params(("connection_id" = OperatorConnectionId, Path, description = "Connection ID")),
+    responses(
+        (status = 200, description = "Connection whose secret was resealed", body = OperatorConnectionView),
+        (status = 400, description = "The connection ID is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks operators:write \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such connection in the caller's tenant \
+          (WYRD_OPERATOR_404_CONNECTION_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "A concurrent write changed the connection first \
+          (WYRD_OPERATOR_409_CONNECTION_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "The stored secret cannot be opened or resealed, or the \
+          registry is unavailable (WYRD_OPERATOR_503_KEY_UNAVAILABLE, \
+          WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Operator connections"
+)]
+#[tracing::instrument(
+    skip(state, caller),
+    fields(operation = "operator_connection.renew_encryption")
+)]
+async fn renew_connection_encryption(
+    State(state): State<AppState>,
+    caller: Caller,
+    connection_id: Result<Path<OperatorConnectionId>, PathRejection>,
+) -> Result<Json<OperatorConnectionView>, WyrdErrorResponse> {
+    let Path(connection_id) = connection_id.map_err(|rejection| path_rejection(&rejection))?;
+    Ok(Json(
+        OperatorConnectionControl::new(&state)
+            .renew_encryption(&caller, connection_id)
             .await?,
     ))
 }

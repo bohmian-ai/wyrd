@@ -7,9 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::{self, Debug, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -20,8 +18,8 @@ use url::Url;
 use vala_bifrost_redux::resources::ScribeWorkerOverrides;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
-use wyrd_crypt::SealingKeyring;
 use wyrd_gateway::{CredentialAssignment, CredentialResolver, VaultBackend};
+use wyrd_kms::{KmsConfig, KmsError};
 use wyrd_spec::TenantSlug;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
@@ -71,17 +69,10 @@ pub enum ConfigError {
         /// The loader's static refusal; it names no key material.
         reason: &'static str,
     },
-    /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` or
-    /// `WYRD_SEALING_RETAINED_KEYS_FILE` was refused by
-    /// [`read_secret_file`]: unreadable, not a regular owner-only file, or
-    /// larger than one secret.
-    #[error("sealing-key file at {path} {reason}")]
-    ReadSealingKey {
-        /// Path that was refused.
-        path: PathBuf,
-        /// The loader's static refusal; it names no key material.
-        reason: &'static str,
-    },
+    /// A `WYRD_KMS_*` projection is empty, not UTF-8, or names an unknown
+    /// backend; the error names the setting, never its value.
+    #[error(transparent)]
+    Kms(#[from] KmsError),
     /// An environment variable is set but contains no value.
     #[error("environment variable {key} is set but empty")]
     EmptyEnvVar {
@@ -1839,10 +1830,6 @@ pub struct VerificationConfig {
     /// durable queue, so every replica may run them.
     #[serde(default = "default_verification_enabled")]
     pub enabled: bool,
-    /// Where the key-encryption keys that protect Operator connection
-    /// credentials come from.
-    #[serde(default)]
-    pub operator_keys: OperatorKeysConfig,
     /// `verify` calls one process runs at once; unset keeps the default.
     /// `WYRD_VERIFICATION_DIRECT_EXECUTIONS` overrides it.
     #[serde(default)]
@@ -1877,11 +1864,10 @@ fn default_verification_enabled() -> bool {
 }
 
 impl Default for VerificationConfig {
-    /// The runtime is enabled with the default Operator key source.
+    /// The runtime is enabled with default limits.
     fn default() -> Self {
         Self {
             enabled: default_verification_enabled(),
-            operator_keys: OperatorKeysConfig::default(),
             direct_executions: None,
             queued_executions: None,
             execution_timeout_ms: None,
@@ -2196,338 +2182,6 @@ fn env_positive(key: &str) -> Result<Option<u64>, ConfigError> {
             key: key.to_owned(),
             message: format!("expected a positive integer, got {value:?}"),
         }),
-    }
-}
-
-/// Source of the 32-byte key-encryption keys (KEKs) that wrap each Operator
-/// connection's data key.
-///
-/// Wyrd stores every Slack, PagerDuty, and HTTP credential itself, encrypted;
-/// this names only where the key that unlocks them lives. Keys are read at
-/// use, never cached, so a rotated file or Vault secret applies on the next
-/// read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorKeySource {
-    /// One deployment key per version from `WYRD_OPERATOR_KEK_V<version>`
-    /// (base64). The zero-dependency first-run and self-hosted source.
-    #[default]
-    Env,
-    /// One deployment key per version from the owner-only file
-    /// `<dir>/v<version>` (base64).
-    File,
-    /// One key per tenant and version from HashiCorp Vault KV v2 at
-    /// `<mount>/data/<prefix>/<data_tenant_id>/<version>`, field `key`
-    /// (base64). Required for multi-tenant production.
-    Vault,
-}
-
-/// HashiCorp Vault KV v2 location of per-tenant Operator KEKs.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VaultKeysConfig {
-    /// Vault base URL, such as `https://vault.internal:8200`.
-    pub addr: String,
-    /// KV v2 mount name.
-    #[serde(default = "default_vault_mount")]
-    pub mount: String,
-    /// Path prefix under the mount; the tenant and version are appended.
-    #[serde(default = "default_vault_prefix")]
-    pub prefix: String,
-    /// File holding the Vault token, re-read on every key read so an agent
-    /// may renew it in place. Mutually exclusive with
-    /// `WYRD_OPERATOR_KEK_VAULT_TOKEN`.
-    #[serde(default)]
-    pub token_file: Option<PathBuf>,
-    /// Inline Vault token from `WYRD_OPERATOR_KEK_VAULT_TOKEN`; never read
-    /// from TOML.
-    #[serde(skip)]
-    pub token: Option<SecretString>,
-}
-
-impl Debug for VaultKeysConfig {
-    /// Redacting debug: the address, mount, prefix, and token file locate
-    /// secret material, so only the type name is printed.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VaultKeysConfig").finish_non_exhaustive()
-    }
-}
-
-/// Serde default for [`VaultKeysConfig::mount`].
-fn default_vault_mount() -> String {
-    "secret".to_owned()
-}
-
-/// Serde default for [`VaultKeysConfig::prefix`].
-fn default_vault_prefix() -> String {
-    "wyrd/operator-keys".to_owned()
-}
-
-/// Operator connection key configuration (`[verification.operator_keys]`).
-///
-/// Multi-tenant production (no `auth.tenant_slug`) must use
-/// [`OperatorKeySource::Vault`] over `https` and fails startup unless every
-/// active tenant's active key is readable. Elsewhere Wyrd runs without a
-/// readable active key; only creating or changing a connection credential
-/// refuses with `WYRD_OPERATOR_503_KEY_UNAVAILABLE`.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperatorKeysConfig {
-    /// Where keys are read from.
-    #[serde(default)]
-    pub source: OperatorKeySource,
-    /// Key version new and rotated credentials are wrapped under. Publish a
-    /// version's key before activating it; keep older versions readable
-    /// until rewrap leaves no row on them.
-    #[serde(default = "default_active_key_version")]
-    pub active_version: NonZeroU32,
-    /// Directory of `v<version>` key files for [`OperatorKeySource::File`].
-    #[serde(default)]
-    pub dir: Option<PathBuf>,
-    /// Vault location for [`OperatorKeySource::Vault`].
-    #[serde(default)]
-    pub vault: Option<VaultKeysConfig>,
-}
-
-impl Debug for OperatorKeysConfig {
-    /// Redacting debug: prints the source kind, active version, and whether a
-    /// Vault section is present, never a directory or Vault selector.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OperatorKeysConfig")
-            .field("source", &self.source)
-            .field("active_version", &self.active_version)
-            .field("vault", &self.vault.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Serde default for [`OperatorKeysConfig::active_version`].
-const fn default_active_key_version() -> NonZeroU32 {
-    NonZeroU32::MIN
-}
-
-impl Default for OperatorKeysConfig {
-    /// Environment-sourced key version 1.
-    fn default() -> Self {
-        Self {
-            source: OperatorKeySource::default(),
-            active_version: default_active_key_version(),
-            dir: None,
-            vault: None,
-        }
-    }
-}
-
-impl OperatorKeysConfig {
-    /// Check that the chosen source is fully configured and allowed here.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::Invalid`] when `active_version` exceeds the
-    /// persisted `i32` key-version range, `file` has no `dir`, `vault` has no
-    /// usable address or token, both token forms are set, a production
-    /// deployment names a plaintext `http` Vault address, a multi-tenant
-    /// production deployment uses anything but Vault, or any production
-    /// deployment uses the development-only environment source.
-    fn validate(&self, production: bool, multi_tenant: bool) -> Result<(), ConfigError> {
-        let multi_tenant_production = production && multi_tenant;
-        let invalid = |message: &str| {
-            Err(ConfigError::Invalid {
-                message: format!("verification.operator_keys: {message}"),
-            })
-        };
-        if i32::try_from(self.active_version.get()).is_err() {
-            return invalid("active_version must not exceed 2147483647 (i32::MAX)");
-        }
-        if multi_tenant_production && self.source != OperatorKeySource::Vault {
-            return invalid(
-                "multi-tenant production requires source = \"vault\" \
-                 (WYRD_OPERATOR_KEK_SOURCE=vault) so each tenant has its own key",
-            );
-        }
-        if production && self.source == OperatorKeySource::Env {
-            return invalid(
-                "source = \"env\" is development-only; single-tenant production requires \
-                 source = \"file\" or \"vault\" (WYRD_OPERATOR_KEK_SOURCE)",
-            );
-        }
-        match self.source {
-            OperatorKeySource::File if self.dir.is_none() => {
-                invalid("source = \"file\" requires dir (WYRD_OPERATOR_KEK_DIR)")
-            }
-            OperatorKeySource::Env | OperatorKeySource::File => Ok(()),
-            OperatorKeySource::Vault => {
-                let Some(vault) = &self.vault else {
-                    return invalid(
-                        "source = \"vault\" requires vault.addr (WYRD_OPERATOR_KEK_VAULT_ADDR)",
-                    );
-                };
-                match url::Url::parse(&vault.addr) {
-                    Ok(url) if url.scheme() == "https" => {}
-                    Ok(url) if url.scheme() == "http" && !production => {}
-                    Ok(url) if url.scheme() == "http" => {
-                        return invalid(
-                            "production requires an https vault.addr; plaintext http is \
-                             limited to non-production local fixtures",
-                        );
-                    }
-                    _ => return invalid("vault.addr must be an http(s) URL"),
-                }
-                match (&vault.token_file, &vault.token) {
-                    (Some(_), Some(_)) => invalid(
-                        "set only one of vault.token_file (WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE) \
-                         and WYRD_OPERATOR_KEK_VAULT_TOKEN",
-                    ),
-                    (None, None) => invalid(
-                        "source = \"vault\" requires a token (WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE \
-                         or WYRD_OPERATOR_KEK_VAULT_TOKEN)",
-                    ),
-                    _ => Ok(()),
-                }
-            }
-        }
-    }
-
-    /// Apply `WYRD_OPERATOR_KEK_*` environment overrides.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::BadEnvVar`] or [`ConfigError::EmptyEnvVar`] for
-    /// a malformed override.
-    fn apply_env(&mut self) -> Result<(), ConfigError> {
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_SOURCE")? {
-            self.source = match val.as_str() {
-                "env" => OperatorKeySource::Env,
-                "file" => OperatorKeySource::File,
-                "vault" => OperatorKeySource::Vault,
-                _ => {
-                    return Err(ConfigError::BadEnvVar {
-                        key: "WYRD_OPERATOR_KEK_SOURCE".to_owned(),
-                        message: format!("expected 'env', 'file', or 'vault', got {val:?}"),
-                    });
-                }
-            };
-        }
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_ACTIVE_VERSION")? {
-            self.active_version =
-                val.parse()
-                    .map_err(|e: std::num::ParseIntError| ConfigError::BadEnvVar {
-                        key: "WYRD_OPERATOR_KEK_ACTIVE_VERSION".to_owned(),
-                        message: e.to_string(),
-                    })?;
-        }
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_DIR")? {
-            self.dir = Some(PathBuf::from(val));
-        }
-        if let Some(addr) = env_opt("WYRD_OPERATOR_KEK_VAULT_ADDR")? {
-            match &mut self.vault {
-                Some(vault) => vault.addr = addr,
-                None => {
-                    self.vault = Some(VaultKeysConfig {
-                        addr,
-                        mount: default_vault_mount(),
-                        prefix: default_vault_prefix(),
-                        token_file: None,
-                        token: None,
-                    });
-                }
-            }
-        }
-        let Some(vault) = &mut self.vault else {
-            return Ok(());
-        };
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_MOUNT")? {
-            vault.mount = val;
-        }
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_PREFIX")? {
-            vault.prefix = val;
-        }
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE")? {
-            vault.token_file = Some(PathBuf::from(val));
-        }
-        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_TOKEN")? {
-            vault.token = Some(SecretString::from(val));
-        }
-        Ok(())
-    }
-}
-
-/// Shared social sign-in provider endpoints (`[social]`).
-///
-/// Every field is optional and defaults to the real provider. Development and
-/// tests name controlled local providers; production refuses any override, so
-/// a shared social client is only ever redeemed at the real provider.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SocialConfig {
-    /// Google's OpenID Connect issuer; `https://accounts.google.com` when
-    /// unset, and only that in production.
-    #[serde(default)]
-    pub google_issuer: Option<String>,
-    /// GitHub's web root, serving `login/oauth/authorize` and
-    /// `login/oauth/access_token`; `https://github.com` when unset, and only
-    /// that in production.
-    #[serde(default)]
-    pub github_url: Option<String>,
-    /// GitHub's API root, serving `user`; `https://api.github.com` when
-    /// unset, and only that in production.
-    #[serde(default)]
-    pub github_api_url: Option<String>,
-    /// Cloudflare Turnstile's Siteverify endpoint; Cloudflare's own when
-    /// unset, and only that in production.
-    #[serde(default)]
-    pub turnstile_siteverify_url: Option<String>,
-}
-
-impl SocialConfig {
-    /// Resolve the provider endpoints this deployment talks to.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::Invalid`] when an override is not an issuer URL
-    /// or URL, or is set in production.
-    pub fn resolve(
-        &self,
-        production: bool,
-    ) -> Result<wyrd_auth::social::SocialEndpoints, ConfigError> {
-        let invalid = |message: &str| ConfigError::Invalid {
-            message: format!("social: {message}"),
-        };
-        let mut endpoints = wyrd_auth::social::SocialEndpoints::default();
-        if let Some(issuer) = &self.google_issuer {
-            if production {
-                return Err(invalid("google_issuer cannot be overridden in production"));
-            }
-            endpoints.google_issuer = wyrd_spec::auth::IssuerUrl::new(issuer)
-                .map_err(|_| invalid("google_issuer is not an issuer URL"))?;
-        }
-        if self.github_url.is_some() || self.github_api_url.is_some() {
-            if production {
-                return Err(invalid(
-                    "GitHub endpoints cannot be overridden in production",
-                ));
-            }
-            let root = |configured: &Option<String>, default: &str, field: &str| {
-                url::Url::parse(configured.as_deref().unwrap_or(default))
-                    .map_err(|_| invalid(&format!("{field} is not a URL")))
-            };
-            endpoints.github = wyrd_auth::social::GithubEndpoints::at(
-                &root(&self.github_url, "https://github.com/", "github_url")?,
-                &root(
-                    &self.github_api_url,
-                    "https://api.github.com/",
-                    "github_api_url",
-                )?,
-            )
-            .map_err(|_| invalid("GitHub endpoints do not form URLs"))?;
-        }
-        if let Some(siteverify) = &self.turnstile_siteverify_url {
-            if production {
-                return Err(invalid(
-                    "turnstile_siteverify_url cannot be overridden in production",
-                ));
-            }
-            endpoints.turnstile_siteverify = url::Url::parse(siteverify)
-                .map_err(|_| invalid("turnstile_siteverify_url is not a URL"))?;
-        }
-        Ok(endpoints)
     }
 }
 
@@ -2972,6 +2626,10 @@ pub struct WyrdServerConfig {
     /// Shared social sign-in provider endpoints.
     #[serde(default)]
     pub social: SocialConfig,
+    /// The stored-secret wrapping backend (`[kms]`, `WYRD_KMS_*`); unset
+    /// leaves the deployment without recoverable stored secrets.
+    #[serde(default)]
+    pub kms: KmsConfig,
 }
 
 impl WyrdServerConfig {
@@ -3172,36 +2830,6 @@ pub struct AuthConfig {
     /// separately. `None` when unset; production boot fails closed without it.
     #[serde(skip)]
     pub signing_key: Option<SecretString>,
-    /// Base64-encoded 32-byte AES-256-GCM write key for stored provider secrets.
-    ///
-    /// Env-injected only — never read from the TOML file. Loaded at config time
-    /// from `WYRD_SEALING_KEY_FILE` (path to a mounted secret; primary) or
-    /// `WYRD_SEALING_KEY_BASE64` (inline base64; fallback). Boot decodes this to
-    /// a 32-byte key and makes it the write key of the deployment
-    /// `SealingKeyring`: every new provider secret (tenant human connections,
-    /// workload issuers, the platform connection) is sealed under it with a
-    /// versioned `key_id` envelope. `None` when unset; storing a secret without
-    /// a configured key fails closed.
-    ///
-    /// **Rotation:** add the new key to every replica as a retained key, switch
-    /// this write key while listing the old one in
-    /// [`Self::sealing_retained_keys`], and restart. Boot rewraps every stored
-    /// secret under the write key and logs any value it could not open. Remove
-    /// the old retained key only after boot reports zero values needing rewrap.
-    /// Signup creator accounting is a one-way pseudonym that cannot be
-    /// rewrapped: while the old key is retained the owned-workspace cap still
-    /// counts workspaces created under it, and removing it forgets them.
-    #[serde(skip)]
-    pub sealing_key: Option<SecretString>,
-    /// Base64-encoded 32-byte keys retained only to open secrets sealed before
-    /// the latest rotation.
-    ///
-    /// Env-injected only. Loaded from `WYRD_SEALING_RETAINED_KEYS_FILE` (a file
-    /// holding one base64 key per line; primary) or
-    /// `WYRD_SEALING_RETAINED_KEYS_BASE64` (comma-separated base64; fallback).
-    /// Empty when unset.
-    #[serde(skip)]
-    pub sealing_retained_keys: Vec<SecretString>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3462,20 +3090,14 @@ impl GatewayConfig {
         }
     }
 
-    /// Builds the runtime credential resolver over every declared backend and
-    /// the deployment sealing keyring.
+    /// Builds the runtime credential resolver over every declared backend.
     ///
     /// Reads each backend's CA bundle once; tokens are read per resolution.
-    /// `keyring` is the deployment keyring gateway administration seals
-    /// managed secrets with, so sealing and opening use one key set.
     ///
     /// # Errors
     /// Returns [`ConfigError::Invalid`] when a CA bundle is unreadable or does
     /// not parse, or a backend client cannot be built.
-    pub fn credential_resolver(
-        &self,
-        keyring: Option<Arc<SealingKeyring>>,
-    ) -> Result<CredentialResolver, ConfigError> {
+    pub fn credential_resolver(&self) -> Result<CredentialResolver, ConfigError> {
         self.secret_backends
             .iter()
             .map(|(name, backend)| {
@@ -3505,7 +3127,7 @@ impl GatewayConfig {
                 Ok((name.clone(), vault))
             })
             .collect::<Result<_, _>>()
-            .map(|backends| CredentialResolver::new(backends, keyring))
+            .map(CredentialResolver::new)
     }
 }
 
@@ -4015,8 +3637,6 @@ impl WyrdServerConfig {
             self.verification.enabled = parse_flag(&val, "WYRD_VERIFICATION_ENABLED")?;
         }
 
-        // verification.operator_keys (WYRD_OPERATOR_KEK_*)
-        self.verification.operator_keys.apply_env()?;
         self.verification.resolve_limits()?;
 
         // github (WYRD_GITHUB_*)
@@ -4053,14 +3673,8 @@ impl WyrdServerConfig {
             self.auth.signing_key = Some(key);
         }
 
-        // auth.sealing_key (WYRD_SEALING_KEY_FILE primary, WYRD_SEALING_KEY_BASE64 fallback)
-        if let Some(key) = load_sealing_key()? {
-            self.auth.sealing_key = Some(key);
-        }
-        let retained = load_sealing_retained_keys()?;
-        if !retained.is_empty() {
-            self.auth.sealing_retained_keys = retained;
-        }
+        // kms (WYRD_KMS_*)
+        self.kms.apply_env()?;
 
         Ok(())
     }
@@ -4078,12 +3692,6 @@ impl WyrdServerConfig {
             .resolve(self.deployment_profile.is_production())?;
         self.http.trusted_ingress()?;
         let serves_api = self.role.serves_api();
-        if serves_api {
-            self.verification.operator_keys.validate(
-                self.deployment_profile.is_production(),
-                self.auth.tenant_slug.is_none(),
-            )?;
-        }
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
                 message: "forge.per_tenant_active_cap must be positive".to_owned(),
@@ -4523,8 +4131,7 @@ where
 /// `WYRD_SIGNING_KEY_PEM` (inline PEM) is the fallback. The file form is
 /// preferred because a k8s Secret volume keeps the PEM out of the process
 /// environment and `env` dumps. Setting both is a configuration error. The
-/// file is read through [`read_secret_file`], the same loader the sealing keys
-/// use, so it must be a regular, owner-only file no larger than one secret.
+/// file is read through [`read_secret_file`], so it must be a regular, owner-only file no larger than one secret.
 ///
 /// # Errors
 /// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
@@ -4548,80 +4155,6 @@ fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
         (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
         (None, None) => Ok(None),
     }
-}
-
-/// Load the base64-encoded issuer sealing key from the environment.
-///
-/// `WYRD_SEALING_KEY_FILE` (a path to a mounted secret) is the primary source;
-/// `WYRD_SEALING_KEY_BASE64` (inline base64) is the fallback. The file form is
-/// preferred for the same reason as the signing key. Setting both is a
-/// configuration error. The file is read through [`read_secret_file`], so it
-/// must be a regular, owner-only file no larger than one secret. Surrounding
-/// whitespace (e.g. a trailing newline in a mounted secret file) is trimmed;
-/// boot decodes the base64 to a 32-byte key.
-///
-/// # Errors
-/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
-/// [`ConfigError::ReadSealingKey`] when the file is refused.
-fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
-    let file = env_opt("WYRD_SEALING_KEY_FILE")?;
-    let inline = env_opt("WYRD_SEALING_KEY_BASE64")?;
-    match (file, inline) {
-        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
-            keys: vec![
-                "WYRD_SEALING_KEY_FILE".to_string(),
-                "WYRD_SEALING_KEY_BASE64".to_string(),
-            ],
-        }),
-        (Some(path), None) => {
-            let path = PathBuf::from(path);
-            let encoded = read_secret_file(&path)
-                .map_err(|reason| ConfigError::ReadSealingKey { path, reason })?;
-            Ok(Some(SecretString::from(encoded.trim().to_owned())))
-        }
-        (None, Some(encoded)) => Ok(Some(SecretString::from(encoded.trim().to_owned()))),
-        (None, None) => Ok(None),
-    }
-}
-
-/// Load the base64-encoded retained sealing keys from the environment.
-///
-/// `WYRD_SEALING_RETAINED_KEYS_FILE` names a mounted file with one base64 key
-/// per line (blank lines ignored); `WYRD_SEALING_RETAINED_KEYS_BASE64` holds a
-/// comma-separated list. Setting both is a configuration error. The file is
-/// read through [`read_secret_file`] under the same rules as the active key.
-/// Boot decodes and validates each key.
-///
-/// # Errors
-/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
-/// [`ConfigError::ReadSealingKey`] when the file is refused.
-fn load_sealing_retained_keys() -> Result<Vec<SecretString>, ConfigError> {
-    let file = env_opt("WYRD_SEALING_RETAINED_KEYS_FILE")?;
-    let inline = env_opt("WYRD_SEALING_RETAINED_KEYS_BASE64")?;
-    let (text, separator) = match (file, inline) {
-        (Some(_), Some(_)) => {
-            return Err(ConfigError::ConflictingEnvVars {
-                keys: vec![
-                    "WYRD_SEALING_RETAINED_KEYS_FILE".to_string(),
-                    "WYRD_SEALING_RETAINED_KEYS_BASE64".to_string(),
-                ],
-            });
-        }
-        (Some(path), None) => {
-            let path = PathBuf::from(path);
-            let text = read_secret_file(&path)
-                .map_err(|reason| ConfigError::ReadSealingKey { path, reason })?;
-            (text, '\n')
-        }
-        (None, Some(text)) => (text, ','),
-        (None, None) => return Ok(Vec::new()),
-    };
-    Ok(text
-        .split(separator)
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(|key| SecretString::from(key.to_owned()))
-        .collect())
 }
 
 /// Parse a boolean flag from a `0`/`1` string.
@@ -4850,14 +4383,12 @@ mod tests {
     /// plaintext gRPC to the server, and peer mTLS uses `WYRD_PEER_TLS_DIR`.
     #[test]
     fn production_peer_target_needs_no_public_grpc_certificate() {
-        let directory = tempfile::tempdir().expect("key temp directory");
         for role in [ServerTarget::Combined, ServerTarget::BifrostQuery] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
                 ..WyrdServerConfig::default()
             };
-            config.verification.operator_keys = production_operator_keys(directory.path());
             config.bifrost.peer.address = Some("wyrd-core-0.wyrd-core:50052".to_owned());
             config.bifrost.peer.tls_dir = Some(PathBuf::from("/etc/wyrd/peer"));
 
@@ -5677,179 +5208,6 @@ minimum_slots = 2
         profile
     }
 
-    /// The Vault-sourced Operator keys multi-tenant production requires,
-    /// reading its token from a file under `directory`.
-    fn production_operator_keys(directory: &Path) -> OperatorKeysConfig {
-        OperatorKeysConfig {
-            source: OperatorKeySource::Vault,
-            vault: Some(VaultKeysConfig {
-                addr: "https://vault.internal:8200".to_owned(),
-                mount: default_vault_mount(),
-                prefix: default_vault_prefix(),
-                token_file: Some(directory.join("vault-token")),
-                token: None,
-            }),
-            ..OperatorKeysConfig::default()
-        }
-    }
-
-    /// The environment KEK is development-only: production refuses it even
-    /// when single-tenant, where the owner-only file and Vault stay accepted,
-    /// and multi-tenant production remains Vault-only. Validation reads no key.
-    #[test]
-    fn operator_key_source_follows_deployment() {
-        let directory = tempfile::tempdir().expect("key temp directory");
-        OperatorKeysConfig::default()
-            .validate(false, true)
-            .expect("development accepts the environment source");
-        let refused = OperatorKeysConfig::default()
-            .validate(true, false)
-            .expect_err("single-tenant production refuses the environment source")
-            .to_string();
-        assert!(refused.contains("development-only"), "{refused}");
-        let file = OperatorKeysConfig {
-            source: OperatorKeySource::File,
-            dir: Some(directory.path().join("absent-keys")),
-            ..OperatorKeysConfig::default()
-        };
-        file.validate(true, false)
-            .expect("single-tenant production accepts the file source");
-        let vault = production_operator_keys(directory.path());
-        vault
-            .validate(true, false)
-            .expect("single-tenant production accepts Vault");
-        vault
-            .validate(true, true)
-            .expect("multi-tenant production accepts https Vault");
-        let refused = file
-            .validate(true, true)
-            .expect_err("multi-tenant production refuses the file source")
-            .to_string();
-        assert!(refused.contains("vault"), "{refused}");
-    }
-
-    /// Production refuses a plaintext Vault address before any token or key
-    /// crosses it and accepts HTTPS; plaintext stays available only to a
-    /// non-production local fixture.
-    #[test]
-    fn production_vault_requires_https() {
-        let directory = tempfile::tempdir().expect("key temp directory");
-        let mut keys = production_operator_keys(directory.path());
-        keys.validate(true, true).expect("https Vault validates");
-        if let Some(vault) = &mut keys.vault {
-            vault.addr = "http://vault.internal:8200".to_owned();
-        }
-        for multi_tenant in [true, false] {
-            let refused = keys
-                .validate(true, multi_tenant)
-                .expect_err("production refuses plaintext Vault")
-                .to_string();
-            assert!(refused.contains("https"), "{refused}");
-        }
-        keys.validate(false, true)
-            .expect("a development fixture may use plaintext Vault");
-    }
-
-    /// The largest persisted key version is accepted exactly, and one past it
-    /// is refused at validation from both TOML and the environment, before
-    /// boot or any key provider is reached.
-    #[test]
-    fn operator_key_version_must_fit_i32() {
-        let at_max: OperatorKeysConfig =
-            toml::from_str("active_version = 2147483647").expect("i32::MAX parses");
-        at_max.validate(false, false).expect("i32::MAX validates");
-        assert_eq!(at_max.active_version.get(), 2_147_483_647);
-        let past_max: OperatorKeysConfig =
-            toml::from_str("active_version = 2147483648").expect("u32 parses");
-        let refused = past_max
-            .validate(false, false)
-            .expect_err("i32::MAX + 1 is refused")
-            .to_string();
-        assert!(refused.contains("active_version"), "{refused}");
-
-        let _guard = ENV_LOCK.lock().expect("environment test lock");
-        temp_env::with_vars(
-            [("WYRD_OPERATOR_KEK_ACTIVE_VERSION", Some("2147483648"))],
-            || {
-                let mut config = WyrdServerConfig::default();
-                config.bifrost.oracle.allow_unapproved_profile = true;
-                config.apply_env_overrides().expect("the override parses");
-                assert!(matches!(
-                    config.validate(),
-                    Err(ConfigError::Invalid { ref message }) if message.contains("active_version")
-                ));
-            },
-        );
-    }
-
-    /// An oversized Operator key version is ignored by the Forge maintenance
-    /// target, which owns no Operator keys, and refused before boot for an
-    /// API-bearing target.
-    #[test]
-    fn oversized_operator_key_version_follows_role_ownership() {
-        for (role, accepted) in [
-            (ServerTarget::BifrostMaintenance, true),
-            (ServerTarget::Direct, false),
-        ] {
-            let mut config = WyrdServerConfig {
-                role,
-                ..WyrdServerConfig::default()
-            };
-            config.bifrost.oracle.allow_unapproved_profile = true;
-            config.bifrost.peer = BifrostPeerConfig {
-                address: Some("pod-0.peers.svc:50052".to_owned()),
-                tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
-                ..BifrostPeerConfig::default()
-            };
-            config.verification.operator_keys.active_version =
-                NonZeroU32::new(2_147_483_648).expect("positive");
-            match config.validate() {
-                Ok(()) => assert!(accepted, "{role:?} accepted an oversized version"),
-                Err(ConfigError::Invalid { message }) => {
-                    assert!(!accepted, "{role:?} refused: {message}");
-                    assert!(message.contains("active_version"), "{message}");
-                }
-                Err(other) => panic!("{role:?} failed unexpectedly: {other}"),
-            }
-        }
-    }
-
-    /// Debug formatting of the key configuration, directly and through the
-    /// server configuration, prints only the source kind, active version, and
-    /// Vault presence, never a selector or token.
-    #[test]
-    fn operator_keys_debug_redacts_selectors() {
-        let keys = OperatorKeysConfig {
-            source: OperatorKeySource::Vault,
-            active_version: NonZeroU32::new(907_311).expect("positive"),
-            dir: Some(PathBuf::from("/sentinel-kek-dir")),
-            vault: Some(VaultKeysConfig {
-                addr: "https://sentinel-vault-addr:8200".to_owned(),
-                mount: "sentinel-mount".to_owned(),
-                prefix: "sentinel-prefix".to_owned(),
-                token_file: Some(PathBuf::from("/sentinel-token-file")),
-                token: Some(SecretString::from("sentinel-inline-token")),
-            }),
-        };
-        let mut config = WyrdServerConfig::default();
-        config.verification.operator_keys = keys.clone();
-        for debug in [format!("{keys:?}"), format!("{config:?}")] {
-            for sentinel in [
-                "sentinel-kek-dir",
-                "sentinel-vault-addr",
-                "sentinel-mount",
-                "sentinel-prefix",
-                "sentinel-token-file",
-                "sentinel-inline-token",
-            ] {
-                assert!(!debug.contains(sentinel), "{sentinel} leaked: {debug}");
-            }
-            assert!(debug.contains("source: Vault"), "{debug}");
-            assert!(debug.contains("active_version: 907311"), "{debug}");
-            assert!(debug.contains("vault: true"), "{debug}");
-        }
-    }
-
     /// Proves production accepts only a complete maintainer-approved profile.
     #[test]
     fn oracle_production_calibration_requires_approved_profile() {
@@ -5861,7 +5219,6 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
-        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path.clone();
         assert!(config.validate().is_err());
 
@@ -5994,7 +5351,6 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
-        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -6013,7 +5369,6 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
-        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -7179,7 +6534,6 @@ minimum_slots = 2
                 deployment_profile: DeploymentProfile::Production,
                 ..WyrdServerConfig::default()
             };
-            config.verification.operator_keys = production_operator_keys(directory.path());
             config.bifrost.oracle.calibration_profile = profile;
             config.validate()
         };
@@ -7437,9 +6791,9 @@ provider = "anthropic"
     /// The signing-key file loads through [`read_secret_file`], and its
     /// refusal quotes no key material.
     ///
-    /// The PEM mints every access token, so it shares the sealing keys'
-    /// owner-only rule; that reader's full refusal matrix is proven by the
-    /// sealing-key test, so this proves only the wiring: an owner-only file
+    /// The PEM mints every access token, so it is read owner-only; that
+    /// reader's refusal matrix is proven with the reader, so this proves only
+    /// the wiring: an owner-only file
     /// loads and a permissive one is refused as [`ConfigError::ReadSigningKey`].
     ///
     /// # Panics
@@ -7489,78 +6843,6 @@ provider = "anthropic"
                 );
             },
         );
-    }
-
-    /// Active and retained sealing-key files load only from bounded,
-    /// owner-only regular files, and no refusal quotes key material.
-    ///
-    /// Both files can decrypt every stored provider secret, so they share the
-    /// tenant wrapping key rule: permissive, non-regular, and oversized mounts
-    /// are refused as [`ConfigError::ReadSealingKey`].
-    ///
-    /// # Panics
-    /// Panics when a key file cannot be written, when an owner-only file is
-    /// refused, or when a refused file is accepted, refused with another
-    /// error, or refused with text containing the key.
-    #[test]
-    fn sealing_key_files_require_a_restrictive_regular_bounded_file() {
-        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        let _guard = ENV_LOCK.lock().expect("environment test lock");
-        let directory = tempfile::tempdir().expect("key temp directory");
-        let owner_only = directory.path().join("owner-only.key");
-        write_key_file(&owner_only, KEY, 0o600);
-        let permissive = directory.path().join("permissive.key");
-        write_key_file(&permissive, KEY, 0o644);
-        let oversized = directory.path().join("oversized.key");
-        write_key_file(&oversized, &KEY.repeat(4096), 0o600);
-
-        temp_env::with_vars(
-            [
-                ("WYRD_SEALING_KEY_FILE", Some(owner_only.as_os_str())),
-                (
-                    "WYRD_SEALING_RETAINED_KEYS_FILE",
-                    Some(owner_only.as_os_str()),
-                ),
-            ],
-            || {
-                let active = load_sealing_key().expect("owner-only active file loads");
-                assert_eq!(
-                    active.map(|key| key.expose_secret().to_owned()).as_deref(),
-                    Some(KEY)
-                );
-                let retained =
-                    load_sealing_retained_keys().expect("owner-only retained file loads");
-                assert_eq!(retained.len(), 1);
-            },
-        );
-
-        for (case, path) in [
-            ("permissive", permissive.as_path()),
-            ("non-regular", directory.path()),
-            ("oversized", oversized.as_path()),
-        ] {
-            temp_env::with_vars(
-                [
-                    ("WYRD_SEALING_KEY_FILE", Some(path.as_os_str())),
-                    ("WYRD_SEALING_RETAINED_KEYS_FILE", Some(path.as_os_str())),
-                ],
-                || {
-                    let active = load_sealing_key().expect_err(case);
-                    let retained = load_sealing_retained_keys().expect_err(case);
-                    for error in [active, retained] {
-                        let message = error.to_string();
-                        assert!(
-                            matches!(error, ConfigError::ReadSealingKey { .. }),
-                            "{case} refusal is a sealing-key read error: {message}"
-                        );
-                        assert!(
-                            !message.contains(KEY) && !message.contains(&KEY[..8]),
-                            "{case} refusal quotes key material: {message}"
-                        );
-                    }
-                },
-            );
-        }
     }
 
     /// A complete GitHub App section as the environment supplies it, with

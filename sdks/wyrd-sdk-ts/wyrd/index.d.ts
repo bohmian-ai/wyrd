@@ -1341,8 +1341,9 @@ export declare class NativeRun {
   verify(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Submits slot values: Window samples are recorded now on the
-   * JavaScript thread, so each queued sample write records its
-   * `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
+   * JavaScript thread when the state's writer is running, and otherwise
+   * after the first sample starts it; either way each sample's
+   * `bifrost.enqueue` PRODUCER span is opened now, in Node's tracer. Run evidence is
    * queued for one execution carrying the caller's optional `group_id`.
    *
    * # Errors
@@ -2223,7 +2224,7 @@ export declare function tableConfigFromJsonSchema(table: string, schemaJson: str
 
 /**
  * The catalog error `WyrdState.flush` and `WyrdState.shutdown` throw when the
- * tracer provider `startTelemetry` installed did not flush, built by the
+ * tracer provider `configure` installed did not flush, built by the
  * shared [`TelemetryFlushFailure`] so Python and TypeScript report the same
  * code and details. `cause` is payload-free; `native_code` is the stable code
  * of a native drain that also failed.
@@ -2231,7 +2232,7 @@ export declare function tableConfigFromJsonSchema(table: string, schemaJson: str
 export declare function telemetryFlushError(timedOut: boolean, cause: string, nativeCode?: string | undefined | null): NativeWyrdError
 
 /**
- * The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
+ * The catalog refusal `WyrdState.configure` throws when a global tracer
  * provider is already registered, so its title and remediation come from the
  * one Rust catalog.
  */

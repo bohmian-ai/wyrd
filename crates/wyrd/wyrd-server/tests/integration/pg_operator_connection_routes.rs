@@ -4,20 +4,17 @@
 //! repository-managed Postgres: create for every provider, redacted list and
 //! read, PATCH preserve/replace semantics, disable and re-enable, conflicts,
 //! `operators:read` versus `operators:write` separation with audited
-//! decisions, tenant isolation, malformed typed IDs, and a missing key
-//! refusing only credential writes. Row inspection proves only ciphertext and
-//! key-version metadata reach Postgres.
+//! decisions, tenant isolation, malformed typed IDs, and a missing or
+//! unreachable `[kms]` refusing only credential writes. Row inspection proves
+//! only the common envelope reaches Postgres.
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
-use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_server::components::operators::keys::OperatorKeys;
-use wyrd_server::config::{
-    DeploymentProfile, OperatorKeySource, OperatorKeysConfig, VaultKeysConfig, WyrdServerConfig,
-};
+use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
 use wyrd_spec::ids::DataTenantId;
+use wyrd_testing::kms::TransitFixture;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -110,7 +107,7 @@ async fn custom_role(server: &WyrdTestServer, name: &str, permissions: Value) {
     conn.commit().await.expect("role commits");
 }
 
-/// Read one connection's stored secret columns as text for inspection.
+/// Read one connection's config text, stored envelope, and secret version.
 ///
 /// # Panics
 /// Panics when the row cannot be read.
@@ -118,13 +115,13 @@ async fn stored_row(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     connection_id: &str,
-) -> (String, Vec<u8>, Vec<u8>, i32, i32) {
+) -> (String, Vec<u8>, i32) {
     let mut conn = server
         .tenant_conn_for(tenant)
         .await
         .expect("tenant connection opens");
     let row = sqlx::query_as(
-        "SELECT config::text, secret_ciphertext, wrapped_dek, key_version, secret_version \
+        "SELECT config::text, secret_ciphertext, secret_version \
            FROM wyrd.operator_connections WHERE connection_id = $1::uuid",
     )
     .bind(connection_id)
@@ -181,6 +178,230 @@ fn creates() -> [Value; 3] {
     ]
 }
 
+/// A secret rotation whose remote encryption is still in flight when the
+/// connection is disabled loses to the disable: the rotation returns the
+/// connection conflict, and the row keeps the disable's status, envelope, and
+/// secret version, with no second seal for the row the disable left.
+///
+/// # Panics
+/// Panics when either response, the stored row, or the read view differs.
+#[tokio::test]
+async fn rotation_racing_a_disable_conflicts_and_keeps_the_disable() {
+    let transit = TransitFixture::start_delayed(std::time::Duration::from_millis(500)).await;
+    let server = WyrdTestServer::builder()
+        .with_kms_for_test(transit.config("ops", &[]))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (_, jwt) = user(&server, "oc-race-admin", &["admin"]).await;
+    let (status, view) = call(
+        &server,
+        &jwt,
+        Method::POST,
+        "/v1/operator-connections",
+        Some(&creates()[0]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["connection_id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/operator-connections/{id}");
+    let (_, before, before_version) = stored_row(&server, tenant, &id).await;
+
+    let rotate = json!({ "provider": "slack", "bot_token": SECRETS[3] });
+    let rotation = call(&server, &jwt, Method::PATCH, &uri, Some(&rotate));
+    let disable = async {
+        while transit.requests("encrypt").await < 2 {
+            tokio::task::yield_now().await;
+        }
+        call(&server, &jwt, Method::DELETE, &uri, None).await
+    };
+    let ((rotated, problem), (disabled, disabled_view)) = tokio::join!(rotation, disable);
+
+    assert_eq!(
+        (disabled, disabled_view["status"].as_str()),
+        (StatusCode::OK, Some("disabled"))
+    );
+    assert_eq!(
+        (rotated, problem["code"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("WYRD_OPERATOR_409_CONNECTION_CONFLICT")
+        ),
+        "the rotation lost to the disable"
+    );
+    assert_eq!(
+        transit.requests("encrypt").await,
+        2,
+        "the losing rotation is not sealed again"
+    );
+    let (_, after, after_version) = stored_row(&server, tenant, &id).await;
+    assert_eq!(
+        (after, after_version),
+        (before, before_version),
+        "the disable left the stored secret unchanged"
+    );
+    let (_, read) = call(&server, &jwt, Method::GET, &uri, None).await;
+    assert_eq!(read["status"], "disabled", "the disable is kept");
+}
+
+/// Encryption renewal never undoes or bypasses the connection's authority: a
+/// renewal racing a disable conflicts and the disable's row is kept, renewing
+/// a disabled connection leaves it disabled, a reader is refused and audited,
+/// another tenant sees not-found, and a key outage leaves the row unchanged.
+/// A replacement secret still lands when the stored envelope cannot open.
+///
+/// # Panics
+/// Panics when any response, decision, or stored row differs.
+#[tokio::test]
+async fn renewal_keeps_revocation_and_refuses_without_authority() {
+    let transit = TransitFixture::start_delayed(std::time::Duration::from_millis(300)).await;
+    let server = WyrdTestServer::builder()
+        .with_kms_for_test(transit.config("ops", &[]))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (_, jwt) = user(&server, "oc-renew-admin", &["admin"]).await;
+    let (status, view) = call(
+        &server,
+        &jwt,
+        Method::POST,
+        "/v1/operator-connections",
+        Some(&creates()[0]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["connection_id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/operator-connections/{id}");
+    let renew = format!("{uri}/renew-encryption");
+
+    let renewal = call(&server, &jwt, Method::POST, &renew, None);
+    let disable = async {
+        while transit.requests("encrypt").await < 2 {
+            tokio::task::yield_now().await;
+        }
+        call(&server, &jwt, Method::DELETE, &uri, None).await
+    };
+    let ((renewed, problem), (disabled, _)) = tokio::join!(renewal, disable);
+    assert_eq!(disabled, StatusCode::OK);
+    assert_eq!(
+        (renewed, problem["code"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("WYRD_OPERATOR_409_CONNECTION_CONFLICT")
+        ),
+        "the renewal lost to the disable"
+    );
+    let (_, disabled_envelope, version) = stored_row(&server, tenant, &id).await;
+
+    let (status, view) = call(&server, &jwt, Method::POST, &renew, None).await;
+    assert_eq!(
+        (status, view["status"].as_str()),
+        (StatusCode::OK, Some("disabled")),
+        "renewal does not re-enable: {view}"
+    );
+    let (_, renewed_envelope, renewed_version) = stored_row(&server, tenant, &id).await;
+    assert_ne!(
+        renewed_envelope, disabled_envelope,
+        "the envelope is resealed"
+    );
+    assert_eq!(renewed_version, version, "the secret version is unchanged");
+
+    custom_role(
+        &server,
+        "operators_reader",
+        json!([{ "resource": "operators", "action": "read", "scope": "all" }]),
+    )
+    .await;
+    let (reader_id, reader) = user(&server, "oc-renew-reader", &["operators_reader"]).await;
+    let (status, problem) = call(&server, &reader, Method::POST, &renew, None).await;
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::FORBIDDEN,
+            Some("WYRD_PERMISSION_403_DENIED_RBAC")
+        )
+    );
+    assert_eq!(
+        decisions(&server, reader_id, "operator_connection.renew_encryption").await,
+        vec![("operators:write".to_owned(), "denied".to_owned())]
+    );
+    let other = server
+        .seed_tenant("oc-renew-other")
+        .await
+        .expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "oc-renew-foreign", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign = server
+        .exchange_api_key(foreign.api_key().expect("api key"))
+        .await
+        .expect("api key exchanges");
+    let (status, problem) = call(&server, &foreign, Method::POST, &renew, None).await;
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::NOT_FOUND,
+            Some("WYRD_OPERATOR_404_CONNECTION_NOT_FOUND")
+        )
+    );
+
+    transit.set_available(false);
+    let (status, problem) = call(&server, &jwt, Method::POST, &renew, None).await;
+    transit.set_available(true);
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("WYRD_OPERATOR_503_KEY_UNAVAILABLE")
+        )
+    );
+    let (_, after_outage, _) = stored_row(&server, tenant, &id).await;
+    assert_eq!(
+        after_outage, renewed_envelope,
+        "a failed renewal writes nothing"
+    );
+
+    let mut conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.operator_connections SET secret_ciphertext = '\\x00'::bytea \
+         WHERE connection_id = $1::uuid",
+    )
+    .bind(&id)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("envelope corrupts");
+    conn.commit().await.expect("corruption commits");
+    let (status, _) = call(&server, &jwt, Method::POST, &renew, None).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an envelope that cannot open cannot be renewed"
+    );
+    let replace = json!({ "provider": "slack", "bot_token": SECRETS[3] });
+    let (status, view) = call(&server, &jwt, Method::PATCH, &uri, Some(&replace)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replacement never opens the old value: {view}"
+    );
+    let (_, replaced, replaced_version) = stored_row(&server, tenant, &id).await;
+    assert!(
+        replaced.starts_with(b"WKMS"),
+        "a complete envelope is stored"
+    );
+    assert_eq!(
+        replaced_version,
+        version + 1,
+        "replacement is the next secret version"
+    );
+}
+
 /// A tenant administrator creates, lists, reads, updates, rotates, disables,
 /// and re-enables connections of every provider; only redacted metadata is
 /// returned, only ciphertext is stored, no route or query reveals a stored
@@ -197,6 +418,7 @@ async fn admin_manages_redacted_encrypted_connections() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let (admin, jwt) = user(&server, "oc-admin", &["admin"]).await;
+    let kms = WyrdKms::new(server.kms_config_for_test(), false).expect("the server's [kms] builds");
 
     let mut ids = Vec::new();
     for body in creates() {
@@ -212,14 +434,17 @@ async fn admin_manages_redacted_encrypted_connections() {
         assert_eq!(view["status"], "active");
         let id = view["connection_id"].as_str().expect("id").to_owned();
         assert_eq!(Uuid::parse_str(&id).expect("uuid").get_version_num(), 7);
-        let (config, ciphertext, wrapped, key_version, secret_version) =
-            stored_row(&server, tenant, &id).await;
+        let (config, ciphertext, secret_version) = stored_row(&server, tenant, &id).await;
         for secret in SECRETS {
             assert!(!config.contains(secret));
             assert!(!String::from_utf8_lossy(&ciphertext).contains(secret));
         }
-        assert!(!ciphertext.is_empty() && !wrapped.is_empty());
-        assert_eq!((key_version, secret_version), (1, 1));
+        assert!(
+            kms.is_current(&ciphertext)
+                .expect("a common [kms] envelope"),
+            "sealed through the deployment [kms] under its active key"
+        );
+        assert_eq!(secret_version, 1);
         ids.push(id);
     }
     let (_, http) = call(
@@ -278,7 +503,7 @@ async fn admin_manages_redacted_encrypted_connections() {
     );
     let metadata_only = stored_row(&server, tenant, &ids[0]).await;
     assert_eq!(
-        (&metadata_only.1, metadata_only.4),
+        (&metadata_only.1, metadata_only.2),
         (&before.1, 1),
         "omitted secret is preserved"
     );
@@ -301,7 +526,7 @@ async fn admin_manages_redacted_encrypted_connections() {
         "supplied secret replaces the ciphertext"
     );
     assert_eq!(
-        rotated.4, 2,
+        rotated.2, 2,
         "rotation bumps the secret version on the same identity"
     );
 
@@ -566,55 +791,75 @@ async fn read_write_separation_and_tenant_isolation() {
     );
 }
 
-/// Without a readable active key, credential writes refuse with the stable
-/// retryable key error and a constant detail that names no key location,
-/// while reads keep working.
+/// Without `[kms]`, or with a wrapping backend that cannot be reached,
+/// credential writes refuse with the stable retryable key error and a
+/// constant detail that names no backend location, while reads keep working.
 ///
 /// # Panics
-/// Panics when the refusal or the unaffected read differs.
+/// Panics when a refusal or the unaffected read differs.
 #[tokio::test(flavor = "current_thread")]
 async fn missing_key_refuses_only_credential_writes() {
-    let empty = tempfile::tempdir().expect("tempdir");
-    let server = WyrdTestServer::builder()
-        .with_operator_keys_for_test(OperatorKeysConfig {
-            source: OperatorKeySource::File,
-            dir: Some(empty.path().to_path_buf()),
-            ..OperatorKeysConfig::default()
-        })
-        .start_in_process()
-        .await
-        .expect("test server starts");
-    let (_, jwt) = user(&server, "oc-nokey", &["admin"]).await;
-    let (status, problem) = call(
-        &server,
-        &jwt,
-        Method::POST,
-        "/v1/operator-connections",
-        Some(&creates()[0]),
-    )
-    .await;
-    assert_eq!(
-        (status, problem["code"].as_str()),
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("port reserves");
+    let unreachable = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let cases = [
+        ("no [kms]", KmsConfig::default()),
         (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some("WYRD_OPERATOR_503_KEY_UNAVAILABLE")
-        )
-    );
-    let empty_dir = empty.path().display().to_string();
-    assert!(
-        !problem.to_string().contains(&empty_dir),
-        "the key directory stays internal: {problem}"
-    );
-    assert_eq!(
-        problem["detail"].as_str(),
-        Some("the Operator key provider could not supply a usable key; retry once it is restored")
-    );
-    assert_eq!(
-        call(&server, &jwt, Method::GET, "/v1/operator-connections", None)
+            "unreachable backend",
+            KmsConfig {
+                backend: Some(KmsBackendKind::VaultTransit),
+                active_key: Some("wyrd-operators".to_owned()),
+                endpoint: Some(unreachable.clone()),
+                vault_token: Some(secrecy::SecretString::from("boot-vault-token")),
+                ..KmsConfig::default()
+            },
+        ),
+    ];
+    for (case, kms) in cases {
+        let server = WyrdTestServer::builder()
+            .with_kms_for_test(kms)
+            .start_in_process()
             .await
-            .0,
-        StatusCode::OK
-    );
+            .expect("test server starts");
+        let (_, jwt) = user(&server, "oc-nokey", &["admin"]).await;
+        let (status, problem) = call(
+            &server,
+            &jwt,
+            Method::POST,
+            "/v1/operator-connections",
+            Some(&creates()[0]),
+        )
+        .await;
+        assert_eq!(
+            (status, problem["code"].as_str()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("WYRD_OPERATOR_503_KEY_UNAVAILABLE")
+            ),
+            "{case}: {problem}"
+        );
+        for selector in [unreachable.as_str(), "wyrd-operators", "boot-vault-token"] {
+            assert!(
+                !problem.to_string().contains(selector),
+                "{case} leaked {selector}: {problem}"
+            );
+        }
+        assert_eq!(
+            problem["detail"].as_str(),
+            Some(
+                "stored-secret encryption could not seal or open the Operator credential; \
+                 retry once [kms] is restored"
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            call(&server, &jwt, Method::GET, "/v1/operator-connections", None)
+                .await
+                .0,
+            StatusCode::OK,
+            "{case}"
+        );
+    }
 }
 
 /// Register one Operator Card named `name` with `spec` as `jwt`.
@@ -747,111 +992,4 @@ async fn registration_binds_exact_connection_authority() {
         ),
         "{problem}"
     );
-}
-
-/// A Vault-sourced key owner at `addr` using an inline token.
-///
-/// # Panics
-/// Panics when the owner cannot be built.
-fn vault_keys(addr: &str) -> OperatorKeys {
-    OperatorKeys::new(OperatorKeysConfig {
-        source: OperatorKeySource::Vault,
-        vault: Some(VaultKeysConfig {
-            addr: addr.to_owned(),
-            mount: "secret".to_owned(),
-            prefix: "wyrd/operator-keys".to_owned(),
-            token_file: None,
-            token: Some(secrecy::SecretString::from("boot-vault-token")),
-        }),
-        ..OperatorKeysConfig::default()
-    })
-    .expect("vault keys build")
-}
-
-/// A local Vault answering every tenant's version-1 key with `key`.
-async fn vault_serving(key: Option<String>) -> MockServer {
-    use wiremock::matchers::{method, path_regex};
-    let vault = MockServer::start().await;
-    let response = match key {
-        Some(key) => {
-            ResponseTemplate::new(200).set_body_json(json!({ "data": { "data": { "key": key } } }))
-        }
-        None => ResponseTemplate::new(404),
-    };
-    Mock::given(method("GET"))
-        .and(path_regex(
-            r"^/v1/secret/data/wyrd/operator-keys/[0-9a-f-]+/1$",
-        ))
-        .respond_with(response)
-        .mount(&vault)
-        .await;
-    vault
-}
-
-/// Multi-tenant production boot refuses readiness unless every active
-/// provisioned tenant's active key reads and decodes to 32 bytes, naming no
-/// key location; development and explicitly single-tenant deployments keep
-/// the deferred failure.
-///
-/// # Panics
-/// Panics when a broken key source is accepted, a readable one refused, or a
-/// refusal discloses a selector.
-#[tokio::test(flavor = "current_thread")]
-async fn production_boot_requires_every_active_tenant_key() {
-    use base64::Engine as _;
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let production = WyrdServerConfig {
-        deployment_profile: DeploymentProfile::Production,
-        ..WyrdServerConfig::default()
-    };
-    let engine = base64::engine::general_purpose::STANDARD;
-    let state = server.state();
-
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("port reserves");
-    let unreachable = format!("http://{}", closed.local_addr().expect("addr"));
-    drop(closed);
-    let missing = vault_serving(None).await;
-    let malformed = vault_serving(Some("not base64!".to_owned())).await;
-    let short = vault_serving(Some(engine.encode([4_u8; 16]))).await;
-    for (case, addr) in [
-        ("unavailable provider", unreachable.clone()),
-        ("missing tenant key", missing.uri()),
-        ("malformed key", malformed.uri()),
-        ("wrong-length key", short.uri()),
-    ] {
-        let keys = vault_keys(&addr);
-        let refused = wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &production)
-            .await
-            .expect_err(case)
-            .to_string();
-        for selector in [addr.as_str(), "wyrd/operator-keys", "boot-vault-token"] {
-            assert!(
-                !refused.contains(selector),
-                "{case} leaked {selector}: {refused}"
-            );
-        }
-    }
-
-    let readable = vault_serving(Some(engine.encode([4_u8; 32]))).await;
-    let keys = vault_keys(&readable.uri());
-    wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &production)
-        .await
-        .expect("readable 32-byte keys boot");
-    let reads = readable.received_requests().await.expect("recorded").len();
-    assert!(
-        reads >= 2,
-        "every active tenant, including the fixture, is checked: {reads}"
-    );
-
-    let keys = vault_keys(&unreachable);
-    wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &WyrdServerConfig::default())
-        .await
-        .expect("development defers key failures");
-    let mut single_tenant = production.clone();
-    single_tenant.auth.tenant_slug = Some(wyrd_spec::TenantSlug::new("acme").expect("slug"));
-    wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &single_tenant)
-        .await
-        .expect("an explicitly single-tenant deployment defers key failures");
 }

@@ -24,7 +24,7 @@ use wyrd_auth_oidc::{
     ClientAuth, CodeRedemption, IssuerVerification, ProviderMetadata, RelyingParty,
     RelyingPartyError, ScreenedHttp, VerifiedIdToken,
 };
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::WyrdKms;
 use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
@@ -82,8 +82,8 @@ pub enum PlatformLoginError {
 
 /// Federated login for the platform control plane.
 ///
-/// Owns the platform boundary, the sealing key its connection's client secret
-/// is sealed with, the relying party that runs the provider exchange and
+/// Owns the platform boundary, the `[kms]` facade its connection's client
+/// secret is sealed through, the relying party that runs the provider exchange and
 /// verifies its ID token, and the session minter — a login is only meaningful
 /// as the composition of all four.
 ///
@@ -94,8 +94,8 @@ pub enum PlatformLoginError {
 pub struct PlatformLogin {
     /// Cross-tenant boundary the connection and identity stores live behind.
     pool: OperatorPool,
-    /// Process sealing key the stored client secret is opened with.
-    sealing_key: Option<Arc<SealingKeyring>>,
+    /// Process stored-secret facade the stored client secret is opened with.
+    kms: Option<Arc<WyrdKms>>,
     /// Mints the platform session an accepted identity receives.
     sessions: Arc<PlatformSessions>,
     /// The relying party every provider request is made through.
@@ -111,18 +111,18 @@ impl Debug for PlatformLogin {
 }
 
 impl PlatformLogin {
-    /// Bind platform login to the boundary, key, session minter, and a
+    /// Bind platform login to the boundary, facade, session minter, and a
     /// relying party whose provider requests all go through `http`.
     #[must_use]
     pub fn new(
         pool: OperatorPool,
-        sealing_key: Option<Arc<SealingKeyring>>,
+        kms: Option<Arc<WyrdKms>>,
         sessions: Arc<PlatformSessions>,
         http: ScreenedHttp,
     ) -> Self {
         Self {
             pool,
-            sealing_key,
+            kms,
             sessions,
             relying_party: RelyingParty::new(http),
         }
@@ -150,7 +150,7 @@ impl PlatformLogin {
         let row = platform_oidc_connection(&self.pool)
             .await?
             .ok_or(PlatformLoginError::NotConfigured)?;
-        decode_connection(row, self.sealing_key.as_deref())
+        decode_connection(row, self.kms.as_deref()).await
     }
 
     /// Begin a platform login and return the provider authorization URL.
@@ -366,16 +366,19 @@ pub struct PlatformConnection {
 /// # Errors
 /// Returns [`PlatformLoginError::ConnectionUnusable`] when the row's URLs,
 /// claim mapping, or client authentication cannot be decoded — including when
-/// it carries a secret and no sealing key is configured. That fails closed
-/// rather than silently degrading to an unauthenticated client.
-fn decode_connection(
+/// it carries a secret and no `[kms]` is configured or it does not open.
+/// That fails closed rather than silently degrading to an unauthenticated
+/// client.
+async fn decode_connection(
     row: PlatformOidcConnectionRow,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<PlatformConnection, PlatformLoginError> {
-    platform_connection_from_row(row, sealing_key).map_err(|error| {
-        tracing::warn!(error = %error, "platform OIDC connection could not be decoded");
-        PlatformLoginError::ConnectionUnusable
-    })
+    platform_connection_from_row(row, kms)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "platform OIDC connection could not be decoded");
+            PlatformLoginError::ConnectionUnusable
+        })
 }
 
 /// Extract the subject's email only when the issuer asserts it is verified.

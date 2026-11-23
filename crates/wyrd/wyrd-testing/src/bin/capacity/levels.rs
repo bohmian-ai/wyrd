@@ -1,5 +1,6 @@
-//! The level commands every engine shares: `l1 <engine>`, the sequential
-//! `l1` aggregate, `l2 <engine>`, and `report <record.json>`.
+//! The level plumbing every engine shares: the declaration base, flags,
+//! the L2 `l2 <engine>` run, and `report <record.json>`; the L1 sweep and
+//! case process live in [`crate::sweep`].
 //!
 //! An engine contributes only a [`Plan`]: its declaration (question, sweep,
 //! controls, metrics, criteria, steps) and the [`Workload`] that drives its
@@ -24,7 +25,7 @@ use wyrd_testing::experiment::{
     Declaration, Engine, HISTORY_DIRECTORY, HostRecord, Invocation, LOCAL_DIRECTORY, Level, Mode,
     Options, Record, SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
-use wyrd_testing::profile::{ProfileMode, SAMPLY};
+use wyrd_testing::profile::{ProfileMode, SAMPLY, SYMBOLS, SymbolizedCapture};
 use wyrd_testing::release_server::{Host, HostLoad};
 
 use crate::flags;
@@ -35,7 +36,7 @@ pub const SWITCHES: [&str; 3] = ["--profile", "--allow-dirty", "--smoke"];
 /// Valued flags every level command accepts.
 pub const VALUED: [&str; 1] = ["--steps"];
 
-/// The engines `l1` runs, in order.
+/// The engines, in documentation order.
 pub const ENGINES: [Engine; 3] = [Engine::Bifrost, Engine::Verification, Engine::Gateway];
 
 /// Where the declared server runs, as records keep it.
@@ -293,8 +294,10 @@ pub async fn execute(plan: Plan, root: &Path, profile: Option<ProfileMode>) -> u
         profile: profile.map(|mode| Profiling {
             mode,
             program: PathBuf::from(SAMPLY),
+            symbols: root.join(SYMBOLS),
         }),
         interrupt,
+        setup_spent: std::time::Duration::ZERO,
     };
     let record = run(
         declaration.seal(),
@@ -327,93 +330,51 @@ pub async fn execute(plan: Plan, root: &Path, profile: Option<ProfileMode>) -> u
     }
 }
 
-/// Runs `l1` for every engine in order through `run_engine`, forwarding the
-/// shared arguments, and combines their exit codes ([`Verdict::combine`]).
-/// An invalid engine never stops the later engines, so each keeps its own
-/// record.
-pub fn aggregate(arguments: &[String], mut run_engine: impl FnMut(Engine, &[String]) -> u8) -> u8 {
-    let forwarded: Vec<String> = arguments.iter().skip(1).cloned().collect();
-    let codes: Vec<u8> = ENGINES
-        .iter()
-        .map(|engine| {
-            let code = run_engine(*engine, &forwarded);
-            eprintln!("l1 {}: exit {code}", engine.name());
-            code
-        })
-        .collect();
-    Verdict::combine(&codes)
-}
-
-/// Runs one engine's `l1` as a child of this binary under the repository's
-/// test Postgres wrapper, so each engine starts from a fresh database;
-/// Bifrost runs every experiment through [`spawn_experiments`].
-pub fn spawn_engine(root: &Path, engine: Engine, forwarded: &[String]) -> u8 {
-    if engine == Engine::Bifrost {
-        spawn_experiments(root, &crate::query::Experiment::ALL, forwarded)
-    } else {
-        spawn(root, &["l1", engine.name()], forwarded)
-    }
-}
-
-/// Runs each Bifrost L1 experiment of `experiments` in order as its own
-/// child under a fresh database ([`spawn`]) and combines their exit codes
-/// ([`Verdict::combine`]), never stopping early.
-pub fn spawn_experiments(
-    root: &Path,
-    experiments: &[crate::query::Experiment],
-    forwarded: &[String],
-) -> u8 {
-    let codes: Vec<u8> = experiments
-        .iter()
-        .map(|experiment| {
-            let code = spawn(
-                root,
-                &["l1", Engine::Bifrost.name(), experiment.name()],
-                forwarded,
-            );
-            eprintln!("l1 bifrost {}: exit {code}", experiment.name());
-            code
-        })
-        .collect();
-    Verdict::combine(&codes)
-}
-
-/// Runs this binary with `command` and `forwarded` as a child under the
-/// repository's test Postgres wrapper, so it starts from a fresh database,
-/// and returns its exit code capped at 2.
-pub fn spawn(root: &Path, command: &[&str], forwarded: &[String]) -> u8 {
-    let status = std::env::current_exe().and_then(|program| {
-        Command::new(root.join("scripts/postgres/with-test-postgres.sh"))
-            .current_dir(root)
-            .arg("--")
-            .arg(program)
-            .args(command)
-            .args(forwarded)
-            .status()
-    });
-    match status {
-        Ok(status) => status
-            .code()
-            .and_then(|code| u8::try_from(code).ok())
-            .map_or(Verdict::Invalid.exit_code(), |code| code.min(2)),
-        Err(error) => {
-            eprintln!("{}: could not start: {error}", command.join(" "));
-            Verdict::Invalid.exit_code()
-        }
-    }
-}
-
-/// Reads a persisted record and prints its report.
+/// Reads a persisted record and returns its report: an L1 sweep record's
+/// category table, an L1 case record's full report, or an experiment
+/// record's report.
 ///
 /// # Errors
 ///
 /// Returns a message when the record is unreadable, malformed, or of an
-/// unsupported schema version.
+/// unsupported protocol or schema version.
 pub fn report(path: &Path) -> Result<String, String> {
-    Record::read(path)
+    if let Some(report) = crate::summary::report(path)? {
+        return Ok(report);
+    }
+    Record::read_with_timings(path)
         .map(|record| record.render())
         .map_err(|error| error.to_string())
 }
+
+/// Reads two persisted records of one experiment and returns
+/// [`Record::compare`] of `before` against `after`.
+///
+/// # Errors
+///
+/// Returns a message when a record is unreadable, malformed, or of an
+/// unsupported schema version, or when the two do not compare.
+pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
+    let before = Record::read(before).map_err(|error| error.to_string())?;
+    let after = Record::read(after).map_err(|error| error.to_string())?;
+    before.compare(&after)
+}
+
+/// Functions each sampled thread group of a CPU capture spends its samples
+/// in, from the capture's Samply sidecar: [`SymbolizedCapture::report`] of
+/// the threads whose name contains `threads`, the top [`PROFILE_TOP`] each.
+///
+/// # Errors
+///
+/// Returns a message when the capture or its sidecar cannot be read.
+pub fn cpu_report(capture: &Path, threads: &str) -> Result<String, String> {
+    SymbolizedCapture::read(capture)
+        .map(|read| read.report(threads, PROFILE_TOP))
+        .map_err(|error| error.to_string())
+}
+
+/// Functions a `profile` report lists per thread group and ordering.
+const PROFILE_TOP: usize = 40;
 
 /// The results page; [`results`] replaces its [`RESULTS_SLOT`] with the
 /// records it shows.

@@ -12,6 +12,7 @@ use vala_bifrost_redux::scribe::geometry::{
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_verify::blocks::Checkpoints as _;
 use wyrd_server::verification::state::{RunState, StateError, revision_fence};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::Producer;
 use wyrd_spec::verification::state::ExecutionState;
@@ -20,8 +21,8 @@ use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::verification::VerificationFixture;
 
 use super::support::{
-    append_values, await_persistence_drained, published_rows, read_sql, register_table,
-    sorted_values, tenant_client, unique_table,
+    INGEST_BUSY, append_values, await_persistence_drained, endpoint_client, published_rows,
+    read_sql, register_table, sorted_values, tenant_client, tenant_key, unique_table,
 };
 
 /// Retention the idle-publication case configures.
@@ -577,6 +578,934 @@ async fn scribe_shutdown_drains_or_preserves_replay() {
         .expect("the cluster drains cleanly");
 }
 
+/// A complete WAL attempt whose batch was never accepted restores no rows
+/// after an abrupt restart, on an ordinary table as on a domain table.
+///
+/// One batch is accepted. While the tenant role cannot record batch
+/// receipts, a second batch is written to the WAL and refused, so its
+/// producer never sees an acknowledgement. After the pod is terminated and
+/// replaced on its retained roots, only the accepted rows read back.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, the accepted append fails, the
+/// unrecorded append is acknowledged, or the never-accepted rows reappear.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn replay_restores_only_accepted_batches() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("accepted_only_replay");
+    let node = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        server.node_id()
+    };
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let accepted: Vec<i64> = (0..24).collect();
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        let client = tenant_client(server, tenant).await;
+        append_values(&client, &table, Uuid::now_v7(), &accepted)
+            .await
+            .expect("the first append is acknowledged");
+        sqlx::query("REVOKE INSERT ON vala.scribe_batch_commits FROM wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is revoked");
+        let refused = append_values(
+            &client,
+            &table,
+            Uuid::now_v7(),
+            &(100..124).collect::<Vec<_>>(),
+        )
+        .await;
+        sqlx::query("GRANT INSERT ON vala.scribe_batch_commits TO wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is granted again");
+        assert!(
+            refused.is_err(),
+            "an unrecorded batch is never acknowledged"
+        );
+    }
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+    cluster
+        .restart_terminated_node_at_new_address(node, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let client = tenant_client(server, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        accepted,
+        "a never-accepted WAL attempt restores no rows"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// A published batch's receipt is deleted once its shard's persisted safe
+/// frontier covers it, and a restart still restores exactly the accepted rows.
+///
+/// The first batch is published, which hands its WAL segment off and lets
+/// the shard manifest record a frontier at or past its receipt's COMMIT
+/// segment. The second is accepted but still WAL-dependent, and the third is
+/// never accepted. Of the table's receipts the real deletion query removes
+/// only the first.
+/// The abrupt stop leaves a torn record after the last write. After the
+/// restart the published rows come from their own files, the WAL-dependent
+/// rows from the WAL under their kept receipt, the torn record is cut off and
+/// the never-accepted rows do not appear.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, an accepted append fails, the
+/// unrecorded append is acknowledged, no frontier covers the published
+/// receipt, the deletion keeps it or removes the WAL-dependent one, the restart
+/// refuses the torn tail, or the restored rows differ from the accepted ones.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("handed_off_receipts");
+    let node = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        server.node_id()
+    };
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let published: Vec<i64> = (0..24).collect();
+    let wal_only: Vec<i64> = (24..48).collect();
+    let (published_batch, wal_only_batch) = (Uuid::now_v7(), Uuid::now_v7());
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        let client = tenant_client(server, tenant).await;
+        append_values(&client, &table, published_batch, &published)
+            .await
+            .expect("the published append is acknowledged");
+        server
+            .flush_bifrost()
+            .await
+            .expect("the first batch publishes");
+        append_values(&client, &table, wal_only_batch, &wal_only)
+            .await
+            .expect("the WAL-only append is acknowledged");
+        sqlx::query("REVOKE INSERT ON vala.scribe_batch_commits FROM wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is revoked");
+        let refused = append_values(
+            &client,
+            &table,
+            Uuid::now_v7(),
+            &(100..124).collect::<Vec<_>>(),
+        )
+        .await;
+        sqlx::query("GRANT INSERT ON vala.scribe_batch_commits TO wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is granted again");
+        assert!(
+            refused.is_err(),
+            "an unrecorded batch is never acknowledged"
+        );
+    }
+
+    delete_handed_off_receipt(&cluster, tenant, published_batch).await;
+    let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
+        .await
+        .expect("tenant connection");
+    let kept = vala_sql::queries::scribe_batch_commits::committed_batches(
+        &mut conn,
+        &table,
+        &[published_batch, wal_only_batch],
+    )
+    .await
+    .expect("the receipts read");
+    conn.commit().await.expect("the read commits");
+    assert_eq!(
+        kept,
+        [wal_only_batch],
+        "only the WAL-dependent receipt of the table is kept"
+    );
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+    tear_wal_tail(&cluster, tenant, wal_only_batch).await;
+    cluster
+        .restart_terminated_node_at_new_address(node, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let client = tenant_client(server, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        (0..48).collect::<Vec<_>>(),
+        "exactly the accepted rows restore"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Another pod's losing copy of a batch restores nothing after the winning
+/// receipt is deleted.
+///
+/// The first pod accepts and publishes the batch. The second pod is then sent
+/// the same batch: it writes its own WAL attempt, loses the receipt to the
+/// first pod's and acknowledges it as already accepted. Once the first pod's
+/// frontier covers its receipt, the receipt is deleted, so the second pod's
+/// attempt has no receipt at all. That pod restarts abruptly and flushes, and
+/// the table still holds the batch exactly once.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, either append is refused, the
+/// receipt cannot be deleted, or the batch is read back other than once.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_deleted() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("losing_duplicate");
+    let (winner, loser) = {
+        let winner = cluster.server(0).expect("the first pod is running");
+        register_table(winner, tenant, BifrostNamespace::Datasets, &name).await;
+        let loser = cluster.server(1).expect("the second pod is running");
+        (winner.node_id(), loser.node_id())
+    };
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    {
+        let winner = cluster
+            .server_by_node(winner)
+            .expect("the first pod is running");
+        let key = tenant_key(winner, tenant).await;
+        let client = endpoint_client(winner, &key);
+        append_values(&client, &table, batch_id, &values)
+            .await
+            .expect("the first pod accepts the batch");
+        winner.flush_bifrost().await.expect("the batch publishes");
+        let loser = cluster
+            .server_by_node(loser)
+            .expect("the second pod is running");
+        let client = endpoint_client(loser, &key);
+        append_values(&client, &table, batch_id, &values)
+            .await
+            .expect("the second pod acknowledges the batch as already accepted");
+    }
+    delete_handed_off_receipt(&cluster, tenant, batch_id).await;
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(loser)
+        .await
+        .expect("the losing pod is terminated without a drain");
+    cluster
+        .restart_terminated_node_at_new_address(loser, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let restarted = cluster
+        .server_by_node(loser)
+        .expect("the replacement pod is running");
+    restarted
+        .flush_bifrost()
+        .await
+        .expect("anything the replacement restored publishes");
+    let client = tenant_client(restarted, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        values,
+        "the losing WAL attempt restores no second copy"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// A running pod that acknowledged another pod's batch as a duplicate accepts
+/// that batch id anew once the accepting pod's cleaner deletes its receipt.
+///
+/// The first pod accepts and publishes the batch. The second pod is sent the
+/// same batch and acknowledges it as already accepted, adding no copy. The
+/// first pod's receipt is aged past retry history and that pod's own cleaner
+/// deletes it. The second pod, still running, is sent the batch again: with
+/// no receipt left it accepts the batch as new under its own receipt, and the
+/// table holds the rows twice.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, an append or publication fails, the
+/// duplicate adds a copy, the first pod's cleaner does not delete the receipt
+/// within [`CLEANUP_DEADLINE`], or the second pod acknowledges the last retry
+/// without accepting it under its own receipt.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn a_running_duplicate_pod_accepts_anew_after_the_winning_receipt_is_deleted() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("running_duplicate");
+    let accepting = cluster.server(0).expect("the first pod is running");
+    let duplicate = cluster.server(1).expect("the second pod is running");
+    register_table(accepting, tenant, BifrostNamespace::Datasets, &name).await;
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let key = tenant_key(accepting, tenant).await;
+    let first = endpoint_client(accepting, &key);
+    let second = endpoint_client(duplicate, &key);
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    append_values(&first, &table, batch_id, &values)
+        .await
+        .expect("the first pod accepts the batch");
+    accepting
+        .flush_bifrost()
+        .await
+        .expect("the batch publishes");
+    append_values(&second, &table, batch_id, &values)
+        .await
+        .expect("the second pod acknowledges the batch as already accepted");
+    duplicate
+        .flush_bifrost()
+        .await
+        .expect("the second pod publishes anything it holds");
+    assert_eq!(
+        sorted_values(&second, &table).await,
+        values,
+        "the duplicate adds no copy"
+    );
+    let receipt = "SELECT wal_node_id FROM vala.scribe_batch_commits \
+                    WHERE data_tenant_id = $1 AND batch_id = $2";
+    let (winner,): (Uuid,) = sqlx::query_as(receipt)
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the first pod's receipt holds the batch");
+
+    sqlx::query(
+        "UPDATE vala.scribe_batch_commits SET ingested_at = ingested_at - interval '2 hours' \
+          WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt ages past retry history");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let left: Option<(Uuid,)> = sqlx::query_as(receipt)
+            .bind(tenant.as_uuid())
+            .bind(batch_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("receipts read");
+        if left.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first pod's cleaner never deleted its aged, handed-off receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    append_values(&second, &table, batch_id, &values)
+        .await
+        .expect("the second pod answers the retry");
+    let renewed: Option<(Uuid,)> = sqlx::query_as(receipt)
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("receipts read");
+    let (owner,) = renewed.expect("the second pod accepts the retry anew under a receipt");
+    assert_ne!(owner, winner, "the new receipt is the second pod's");
+    duplicate
+        .flush_bifrost()
+        .await
+        .expect("the second acceptance publishes");
+    let mut twice = [values.clone(), values].concat();
+    twice.sort_unstable();
+    assert_eq!(
+        sorted_values(&second, &table).await,
+        twice,
+        "the batch id accepted anew adds its rows a second time"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Staged rows restore and retire exactly once after their receipt is deleted.
+///
+/// The batch is staged locally but not published, so its stage records are
+/// its only copy once its WAL is handed off and its receipt deleted. An abrupt
+/// restart serves the rows from those records. Publishing then retires the
+/// records, and a second abrupt restart serves the published rows once, with
+/// no stage record or WAL left to restore a second copy.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start or restart, the append or a
+/// publication fails, the rows publish before the restart, the receipt cannot
+/// be deleted, or any read differs from the batch.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn staged_rows_restore_and_retire_once_after_their_receipt_is_deleted() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("staged_after_receipt");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let rows: Vec<i64> = (0..48).collect();
+    let batch_id = Uuid::now_v7();
+    let (node, key) = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        let key = tenant_key(server, tenant).await;
+        let client = endpoint_client(server, &key);
+        append_values(&client, &table, batch_id, &rows)
+            .await
+            .expect("the batch is acknowledged");
+        let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+        scribe
+            .flush_writable_for_test()
+            .await
+            .expect("every writable bucket freezes");
+        await_persistence_drained(&scribe).await;
+        assert_eq!(
+            published_rows(server, tenant, &name).await,
+            0,
+            "the rows are staged, not published"
+        );
+        (server.node_id(), key)
+    };
+    delete_handed_off_receipt(&cluster, tenant, batch_id).await;
+
+    for phase in ["staged", "published"] {
+        let roots = cluster
+            .terminate_node_abruptly_for_test(node)
+            .await
+            .expect("the pod is terminated without a drain");
+        cluster
+            .restart_terminated_node_at_new_address(node, roots)
+            .await
+            .expect("a replacement pod restarts on the retained roots");
+        let server = cluster.server(0).expect("the replacement pod is running");
+        let client = endpoint_client(server, &key);
+        assert_eq!(
+            sorted_values(&client, &table).await,
+            rows,
+            "the {phase} rows restore exactly once"
+        );
+        if phase == "staged" {
+            server
+                .flush_bifrost()
+                .await
+                .expect("the restored rows publish");
+            assert_eq!(
+                published_rows(server, tenant, &name).await,
+                rows.len() as u64,
+                "the committed files hold the batch once"
+            );
+        }
+    }
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Appends a torn record to the WAL segment holding `batch_id`'s COMMIT, as an
+/// abrupt stop in the middle of a write leaves it.
+///
+/// # Panics
+///
+/// Panics when the batch holds no receipt or its segment cannot be found or
+/// written.
+async fn tear_wal_tail(cluster: &WyrdTestCluster, tenant: DataTenantId, batch_id: Uuid) {
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let (node, epoch, shard, segment): (Uuid, i64, i16, i64) = sqlx::query_as(
+        "SELECT wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence \
+           FROM vala.scribe_batch_commits WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the batch holds a receipt");
+    let suffix = std::path::PathBuf::from(node.simple().to_string())
+        .join(epoch.to_string())
+        .join(format!("shard-{shard:02}"))
+        .join(format!("{segment}.wal"));
+    let path = cluster
+        .wal_dirs()
+        .find_map(|root| find_file(root, &suffix))
+        .expect("the batch's WAL segment exists");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("the WAL segment opens");
+    std::io::Write::write_all(&mut file, &[0xff; 13]).expect("the torn bytes are written");
+    file.sync_all().expect("the torn bytes sync");
+}
+
+/// Deletes `batch_id`'s receipt through the real deletion query once its
+/// shard's persisted safe frontier covers the receipt's COMMIT segment.
+///
+/// History is shrunk to zero age so only the frontier decides; other covered
+/// receipts of the same shard may go with it.
+///
+/// # Panics
+///
+/// Panics under the same conditions as [`await_handed_off`], or when the
+/// deletion fails or removes nothing.
+async fn delete_handed_off_receipt(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    batch_id: Uuid,
+) {
+    let shard = await_handed_off(cluster, tenant, batch_id).await;
+    let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
+        .await
+        .expect("tenant connection");
+    let deleted = vala_sql::queries::scribe_batch_commits::delete_handed_off(
+        &mut conn,
+        &shard,
+        &vala_sql::queries::scribe_batch_commits::RetryHistory {
+            max_age: Duration::ZERO,
+            ..Default::default()
+        },
+        chrono::Utc::now(),
+        100,
+    )
+    .await
+    .expect("the handed-off receipts are deleted");
+    conn.commit().await.expect("the deletion commits");
+    assert!(!deleted.is_empty(), "the handed-off receipt is deleted");
+}
+
+/// Waits until the shard's persisted safe frontier covers `batch_id`'s
+/// receipt COMMIT segment, returning that shard as the deletion query names it.
+///
+/// Waits for Scribe's own retirement pass to persist that frontier.
+///
+/// # Panics
+///
+/// Panics when the batch holds no receipt or no persisted frontier covers it
+/// within the case deadline.
+async fn await_handed_off(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    batch_id: Uuid,
+) -> vala_sql::queries::scribe_batch_commits::HandedOffShard {
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let (stream_node, epoch, shard, segment): (Uuid, i64, i16, i64) = sqlx::query_as(
+        "SELECT wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence \
+           FROM vala.scribe_batch_commits WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the batch holds a receipt");
+    let manifest_suffix = std::path::PathBuf::from(stream_node.simple().to_string())
+        .join(epoch.to_string())
+        .join(format!("shard-{shard:02}"))
+        .join("manifest");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let safe_segment = loop {
+        let safe_segment = cluster
+            .wal_dirs()
+            .find_map(|root| find_file(root, &manifest_suffix))
+            .and_then(|manifest| {
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(manifest).ok()?).ok()?
+                    ["safe_segment"]
+                    .as_i64()
+            });
+        match safe_segment {
+            Some(safe_segment) if safe_segment >= segment => break safe_segment,
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the shard's persisted frontier never covered the receipt's COMMIT segment"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    vala_sql::queries::scribe_batch_commits::HandedOffShard {
+        node_id: stream_node,
+        writer_epoch: epoch,
+        shard_id: shard,
+        safe_segment,
+    }
+}
+
+/// Longest a receipt-cleanup case waits for the pod's own cleaner.
+///
+/// Its scheduled cadence, with headroom for the sweep itself.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The pod deletes its own aged receipts, and refuses fresh writes as
+/// retryable busy while it cannot, without losing reads or accepted rows.
+///
+/// An accepted, published batch's receipt is aged past recent retry history.
+/// The pod's background cleaner deletes it without any test-driven deletion,
+/// and the same batch id is then accepted again as a new batch. With receipt
+/// deletion revoked the cleaner fails: fresh appends are refused with the
+/// retryable busy code while the accepted rows stay readable. Granting
+/// deletion again lets the cleaner recover and the pod admit again.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, an accepted append or a read fails,
+/// the cleaner does not delete the aged receipt, a refusal carries another
+/// code, or admission does not stop and resume within [`CLEANUP_DEADLINE`].
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn receipt_cleanup_failure_pauses_fresh_writes_until_it_recovers() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("receipt_cleanup");
+    let server = cluster.server(0).expect("the mixed pod is running");
+    register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let probe_name = unique_table("receipt_cleanup_probe");
+    register_table(server, tenant, BifrostNamespace::Datasets, &probe_name).await;
+    let probe = format!("{}.{probe_name}", BifrostNamespace::Datasets.as_str());
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let client = tenant_client(server, tenant).await;
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    append_values(&client, &table, batch_id, &values)
+        .await
+        .expect("the batch is accepted");
+    server.flush_bifrost().await.expect("the batch publishes");
+    sqlx::query(
+        "UPDATE vala.scribe_batch_commits SET ingested_at = ingested_at - interval '2 hours' \
+          WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt ages past retry history");
+
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let (left,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM vala.scribe_batch_commits \
+              WHERE data_tenant_id = $1 AND batch_id = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("receipts read");
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pod's cleaner never deleted the aged, handed-off receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    append_values(&client, &table, batch_id, &values)
+        .await
+        .expect("a batch id whose receipt is gone is accepted as a new batch");
+    server
+        .flush_bifrost()
+        .await
+        .expect("the second batch publishes");
+    let twice = [values.clone(), values.clone()].concat();
+    let mut twice_sorted = twice.clone();
+    twice_sorted.sort_unstable();
+    assert_eq!(sorted_values(&client, &table).await, twice_sorted);
+
+    sqlx::query("REVOKE DELETE ON vala.scribe_batch_commits FROM wyrd_tenant")
+        .execute(&pool)
+        .await
+        .expect("receipt deletion is revoked");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    let refusal = loop {
+        if let Err(error) = append_values(&client, &probe, Uuid::now_v7(), &[100]).await {
+            break error;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fresh writes were still admitted after cleanup could not delete"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        refusal.code(),
+        INGEST_BUSY,
+        "cleanup failure refuses as retryable busy"
+    );
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        twice_sorted,
+        "accepted rows stay readable while writes are refused"
+    );
+
+    sqlx::query("GRANT DELETE ON vala.scribe_batch_commits TO wyrd_tenant")
+        .execute(&pool)
+        .await
+        .expect("receipt deletion is granted again");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        match append_values(&client, &probe, Uuid::now_v7(), &[100]).await {
+            Ok(()) => break,
+            Err(error) if error.code() == INGEST_BUSY => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the pod never admitted again after cleanup recovered"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("a recovered pod admits the write: {error:?}"),
+        }
+    }
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Longest a restart may take while its first receipt sweep is blocked.
+const RESTART_DEADLINE: Duration = Duration::from_secs(60);
+
+/// A restarted pod serves its accepted rows while its first receipt sweep is
+/// blocked, refuses fresh writes as retryable busy, and admits them once the
+/// sweep completes, without another restart.
+///
+/// An accepted, published batch's receipt is handed off and the pod stops
+/// while the receipt is still recent, so its cleaner keeps it. The receipt is
+/// then aged past retry history and a transaction holds its row lock. The pod
+/// restarts on its retained roots: its cleaner reaches the receipt's DELETE
+/// and waits on the lock, yet the restart completes, the rows are read back
+/// and a fresh write is refused as busy. Releasing the lock lets the sweep
+/// delete the receipt, and the same pod then admits the fresh write.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start or restart within
+/// [`RESTART_DEADLINE`], an accepted append or a read fails, the cleaner never
+/// waits on the held lock, a refusal carries another code, or the receipt is
+/// not deleted and the write admitted within [`CLEANUP_DEADLINE`].
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn a_restart_serves_reads_while_its_first_receipt_sweep_is_blocked() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("blocked_sweep");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let probe_name = unique_table("blocked_sweep_probe");
+    let probe = format!("{}.{probe_name}", BifrostNamespace::Datasets.as_str());
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    let (node, key) = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        register_table(server, tenant, BifrostNamespace::Datasets, &probe_name).await;
+        let key = tenant_key(server, tenant).await;
+        append_values(&endpoint_client(server, &key), &table, batch_id, &values)
+            .await
+            .expect("the batch is accepted");
+        server.flush_bifrost().await.expect("the batch publishes");
+        (server.node_id(), key)
+    };
+    await_handed_off(&cluster, tenant, batch_id).await;
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    sqlx::query(
+        "UPDATE vala.scribe_batch_commits SET ingested_at = ingested_at - interval '2 hours' \
+          WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt ages past retry history");
+    let mut lock = pool.begin().await.expect("the lock transaction begins");
+    sqlx::query(
+        "SELECT 1 FROM vala.scribe_batch_commits \
+          WHERE data_tenant_id = $1 AND batch_id = $2 FOR UPDATE",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .fetch_one(&mut *lock)
+    .await
+    .expect("the receipt's row lock is held");
+    let blocked_deletes = || async {
+        let (waiting,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE wait_event_type = 'Lock' \
+                AND query LIKE '%vala.scribe_batch_commits%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("server activity reads");
+        waiting
+    };
+
+    let restarted = tokio::time::timeout(
+        RESTART_DEADLINE,
+        cluster.restart_terminated_node_at_new_address(node, roots),
+    )
+    .await;
+    let Ok(restarted) = restarted else {
+        panic!(
+            "the restart never completed while {} receipt DELETE waited on the held lock",
+            blocked_deletes().await
+        );
+    };
+    restarted.expect("a replacement pod restarts on the retained roots");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    while blocked_deletes().await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restarted pod's cleaner never waited on the held receipt lock"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let client = endpoint_client(server, &key);
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        values,
+        "accepted rows are served while the sweep is blocked"
+    );
+    let refusal = append_values(&client, &probe, Uuid::now_v7(), &[100])
+        .await
+        .expect_err("a fresh write is refused while the sweep is blocked");
+    assert_eq!(
+        refusal.code(),
+        INGEST_BUSY,
+        "a blocked sweep refuses as retryable busy"
+    );
+
+    lock.rollback().await.expect("the receipt lock is released");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let (left,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM vala.scribe_batch_commits \
+              WHERE data_tenant_id = $1 AND batch_id = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("receipts read");
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the released sweep never deleted the aged receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    loop {
+        match append_values(&client, &probe, Uuid::now_v7(), &[100]).await {
+            Ok(()) => break,
+            Err(error) if error.code() == INGEST_BUSY => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the pod never admitted again after its sweep completed"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("the pod admits the write once its sweep completes: {error:?}"),
+        }
+    }
+    assert_eq!(
+        sorted_values(&client, &probe).await,
+        vec![100],
+        "the admitted write's rows are read back"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Finds the file under `root` whose path ends with `suffix`.
+fn find_file(root: &std::path::Path, suffix: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(root).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            find_file(&path, suffix)
+        } else {
+            path.ends_with(suffix).then_some(path)
+        }
+    })
+}
+
 /// Starts one bound pod over a durable Bifrost data root and provisions one
 /// queued Verifier execution in its tenant.
 ///
@@ -653,21 +1582,22 @@ fn invocations(state: &ExecutionState) -> Vec<(String, u32)> {
         .collect()
 }
 
-/// Recovery loads exactly the accepted revision or fails closed.
+/// Recovery loads the newest readable revision and never overwrites a newer one.
 ///
 /// A writer accepts two invocations, which background persistence may
 /// coalesce into one revision or write as two. When the next revision's
-/// batch fence is durable but its row is not visible, as when the Scribe holding
-/// it was unavailable before the read discovered it, a takeover is refused
-/// as unavailable instead of starting fresh or loading the older revision,
-/// and changes nothing. Once every fenced revision is readable, a takeover
-/// loads the accepted revision exactly, and the same revision reads back
-/// after the pod restarts on its retained data root and replays its WAL.
+/// batch is held but its row is not visible, as when the Scribe holding it
+/// was unavailable before the read discovered it, a takeover recovers the
+/// newest readable revision, and its own write of the next revision is
+/// refused, so it never overwrites the held one. Once nothing else holds
+/// the revision, a takeover loads the accepted revision exactly, and the
+/// same revision reads back after the pod restarts on its retained data
+/// root and replays its WAL.
 ///
 /// # Panics
 ///
 /// Panics when the pod cannot start or restart, a revision is not accepted,
-/// recovery falls back to an older or fresh state, or a recovered state
+/// recovery starts fresh, a takeover overwrites a held revision, or a recovered state
 /// differs from the accepted one.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
@@ -720,12 +1650,19 @@ async fn execution_recovery_requires_exact_accepted_state() {
         1,
         "exactly the next fence is copied"
     );
-    let refused = take_over(&fixture, &server, execution).await;
+    let behind = take_over(&fixture, &server, execution)
+        .await
+        .expect("the newest readable revision recovers");
+    assert_eq!(behind.snapshot(), accepted);
+    behind
+        .begin(&Producer::plain(&TaskId::new("verdict").expect("task"), 1))
+        .await
+        .expect("the change is recorded in memory");
     assert!(
-        matches!(refused, Err(StateError::Unavailable(_))),
-        "a fenced revision no read can see fails closed: {:?}",
-        refused.as_ref().err()
+        matches!(behind.persisted().await, Err(StateError::Stale)),
+        "a revision another batch holds is never overwritten"
     );
+    drop(behind);
     sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
         .bind(unseen)
         .execute(&pool)
@@ -753,6 +1690,121 @@ async fn execution_recovery_requires_exact_accepted_state() {
             .expect("the accepted revision reads after replay"),
         Some(accepted)
     );
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// An execution's accepted revisions outlive their retry receipts.
+///
+/// A writer accepts two invocations and the pod publishes them, so their
+/// rows have custody of their own. Every revision receipt is then removed,
+/// as cleanup removes receipts outside recent history: a takeover still
+/// recovers the exact accepted state from its Bifrost records instead of
+/// starting fresh. A receipt for the revision after the newest visible one
+/// stands for an accepted row no read can see yet: a takeover recovers the
+/// newest readable revision, and its write of the held revision is refused.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or publish, a revision is not accepted,
+/// recovery starts fresh, a takeover overwrites a held revision, or a recovered
+/// state differs from the accepted one.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn execution_recovery_outlives_its_revision_receipts() {
+    let root = tempfile::tempdir().expect("durable Bifrost data root");
+    let (server, fixture, execution) = execution_pod(root.path()).await;
+    let (_, first) = fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is claimable");
+    let first = first.expect("a fresh execution's state claims");
+    for step in ["review", "judge"] {
+        first
+            .begin(&Producer::plain(&TaskId::new(step).expect("task"), 1))
+            .await
+            .expect("the revision is accepted");
+    }
+    first.persisted().await.expect("the revisions are accepted");
+    let accepted = first.snapshot();
+    drop(first);
+    server
+        .flush_bifrost()
+        .await
+        .expect("the accepted revisions publish");
+
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let tenant = server.data_tenant_id();
+    let fences: Vec<Uuid> = (1..=2)
+        .map(|revision| revision_fence(tenant, execution, revision))
+        .collect();
+    let (last,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)")
+            .bind(&fences)
+            .fetch_one(&pool)
+            .await
+            .expect("the accepted fences read");
+    assert!(last >= 1, "the accepted invocations are fenced");
+    let expired = sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)")
+        .bind(&fences)
+        .execute(&pool)
+        .await
+        .expect("the revision receipts are removed");
+    assert_eq!(
+        expired.rows_affected(),
+        u64::try_from(last).expect("count"),
+        "every receipt is gone"
+    );
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the accepted revision recovers without its receipts");
+    assert_eq!(
+        recovered.snapshot(),
+        accepted,
+        "recovery neither resets nor truncates the accepted revisions"
+    );
+    drop(recovered);
+
+    let unseen = revision_fence(tenant, execution, last + 1);
+    sqlx::query(
+        "INSERT INTO vala.scribe_batch_commits \
+         (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
+          wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
+          wal_lsn_max, request_id, ingested_at, table_version) \
+         VALUES ($1, 'bifrost.verification.execution_events', $2, \
+                 decode(repeat('00', 16), 'hex'), 1, gen_random_uuid(), 1, 0, 0, 0, 0, \
+                 gen_random_uuid(), statement_timestamp(), 1)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(unseen)
+    .execute(&pool)
+    .await
+    .expect("the next revision's receipt is recent");
+    let behind = take_over(&fixture, &server, execution)
+        .await
+        .expect("the newest readable revision recovers");
+    assert_eq!(behind.snapshot(), accepted);
+    behind
+        .begin(&Producer::plain(&TaskId::new("verdict").expect("task"), 1))
+        .await
+        .expect("the change is recorded in memory");
+    assert!(
+        matches!(behind.persisted().await, Err(StateError::Stale)),
+        "a revision another batch holds is never overwritten"
+    );
+    drop(behind);
+    sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
+        .bind(unseen)
+        .execute(&pool)
+        .await
+        .expect("the unseen receipt is withdrawn");
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the accepted revision recovers again");
+    assert_eq!(recovered.snapshot(), accepted);
+    drop(recovered);
     server.shutdown().await.expect("the server drains cleanly");
 }
 

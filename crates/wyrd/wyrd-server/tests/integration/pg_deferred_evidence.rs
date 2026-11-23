@@ -25,7 +25,7 @@ use wyrd_spec::ids::SlotName;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::github::PullRequest;
 
-use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY};
+use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY, expire_receipts};
 use super::pg_hosted_artifacts::client;
 
 /// The connected repository's slug.
@@ -655,21 +655,29 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
         .verification
         .blocks()
         .expect("blocks are hosted");
-    assert_eq!(
-        blocks.resources().scratch().used(),
-        0,
-        "the workspace's scratch is released while the park is unacknowledged"
-    );
     let sandbox = blocks.sandbox();
+    // The stalled write is the step's first revision, staged while Python
+    // still runs; the park queues behind it, so it stays unacknowledged.
+    // With no warm worker, an idle one proves the step ran and came back.
+    let released = || {
+        !sandbox.idle_worker_pids().is_empty()
+            && blocks.resources().scratch().used() == 0
+            && BTreeSet::from_iter(sandbox.charged_worker_pids())
+                == BTreeSet::from_iter(sandbox.idle_worker_pids())
+            && blocks.hold_model_calls_for_test().num_permits() == 1
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !released() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "compute is still held while the park is unacknowledged"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
-        BTreeSet::from_iter(sandbox.charged_worker_pids()),
-        BTreeSet::from_iter(sandbox.idle_worker_pids()),
-        "no Python worker is checked out while the park is unacknowledged"
-    );
-    assert_eq!(
-        blocks.hold_model_calls_for_test().num_permits(),
-        1,
-        "the model call is released while the park is unacknowledged"
+        deployment.status(parked).await["status"],
+        "running",
+        "the execution does not wait before its park is acknowledged"
     );
 
     stall.release();
@@ -905,6 +913,65 @@ async fn unacknowledged_publication_is_unavailable_and_its_retry_resumes() {
     );
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+}
+
+/// Accepted evidence outlives its retry receipt: its Bifrost record stays
+/// the authority once cleanup removes the receipt.
+///
+/// Evidence is accepted before any pull request and published, then its
+/// receipt is removed. Publishing it again still replays the original
+/// evidence and time, different content is still a conflict, and a pull
+/// request opened later consumes it and passes. Reading acceptances never
+/// touches receipts: while they cannot be read at all, a republication,
+/// which only reads, still replays.
+///
+/// # Panics
+/// Panics when the replay, conflict or consumption changes after the
+/// receipt is removed, or publication depends on the receipts.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_evidence_outlives_its_retry_receipt() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let (status, receipt) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["status"], "accepted");
+
+    expire_receipts(&deployment.server, &["bifrost.verification.evidence"]).await;
+    let (status, replay) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["status"], "replayed", "{replay}");
+    assert_eq!(replay["evidence_id"], receipt["evidence_id"]);
+    assert_eq!(replay["recorded_at"], receipt["recorded_at"]);
+    let (status, conflict) = deployment.publish_ci(C0, json!({"status": "red"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], "WYRD_VERIFICATION_409_EVIDENCE_CONFLICT");
+    let consumer = deployment.open(1, C0).await;
+    let served = deployment.until(consumer, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let grant = |statement: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("the receipt grant changes");
+        }
+    };
+    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    let (status, replay) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the replay reads no receipt: {replay}"
+    );
+    assert_eq!(replay["status"], "replayed", "{replay}");
 }
 
 /// A registered Artifact is admitted against the subscriber's slot before

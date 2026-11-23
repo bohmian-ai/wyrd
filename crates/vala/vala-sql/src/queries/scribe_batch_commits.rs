@@ -28,7 +28,7 @@ pub struct ScribeBatchCommit {
     /// Table version the batch was accepted under; a retry is compared under
     /// this version, never the table's current one.
     pub table_version: TableVersion,
-    /// SHA-256 digest over the batch's ordered logical slice identities.
+    /// XXH3-128 digest over the batch's ordered logical slice identities.
     ///
     /// This is a client-reproducible fact: it binds slice ordinals, the Arrow
     /// schema fingerprint, and the logical row identity, and deliberately not
@@ -36,7 +36,7 @@ pub struct ScribeBatchCommit {
     /// attempt. An honest retry of the same batch therefore
     /// produces this same digest, which is what makes idempotent acknowledgement
     /// distinguishable from a genuine identity contradiction.
-    pub slice_set_digest: [u8; 32],
+    pub slice_set_digest: [u8; 16],
     /// Number of validated slices in the closed set.
     pub slice_count: i32,
     /// WAL writer node identity.
@@ -291,7 +291,7 @@ pub struct AcceptedScribeBatch {
     /// Table version the retry was prepared under.
     pub table_version: TableVersion,
     /// Ordered logical slice-set digest of the retry.
-    pub slice_set_digest: [u8; 32],
+    pub slice_set_digest: [u8; 16],
     /// Closed slice-set cardinality of the retry.
     pub slice_count: i32,
 }
@@ -360,14 +360,16 @@ pub async fn accepted_version(
         .transpose()
 }
 
-/// The batch ids among `batch_ids` that hold a durable fence on
+/// The batch ids among `batch_ids` that hold a recent batch receipt on
 /// `logical_table_fqn`, in no particular order.
 ///
-/// A fence commits before its batch is acknowledged and is never removed, so
-/// an id answered here names a batch whose rows are authoritative in Bifrost,
-/// whether or not a query can see them yet, and an id not answered was never
-/// acknowledged. A caller that derives its batch ids from its own record
-/// identity learns which of its records were accepted without a record index.
+/// A receipt commits before its batch is acknowledged, so an id answered
+/// here names a batch whose rows are authoritative in Bifrost, whether or
+/// not a query can see them yet. Receipts are recent retry history, not
+/// lasting history: one is removed only after its batch has durable custody,
+/// so an id not answered names a batch that was never acknowledged or whose
+/// rows a query already sees. Only Scribe's own retry, recovery and cleanup
+/// paths ask here; record readers outside Scribe read their Bifrost rows.
 ///
 /// # Errors
 ///
@@ -383,6 +385,168 @@ pub async fn committed_batches(
     )
     .bind(logical_table_fqn)
     .bind(batch_ids)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// One WAL shard stream and the highest segment its persisted safe frontier
+/// covers.
+///
+/// Every receipt whose terminal COMMIT segment is at or below
+/// `safe_segment` names a batch whose slices are all in staged or published
+/// custody, so it no longer guards WAL-dependent data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandedOffShard {
+    /// Node of the WAL stream.
+    pub node_id: uuid::Uuid,
+    /// Writer epoch of the WAL stream.
+    pub writer_epoch: i64,
+    /// Shard of the WAL stream.
+    pub shard_id: i16,
+    /// Highest segment sequence of the shard's persisted safe frontier.
+    pub safe_segment: i64,
+}
+
+/// Recent retry history a receipt stays in, per tenant-qualified table.
+///
+/// A receipt leaves it when either its age passes `max_age` from its
+/// acceptance, measured on PostgreSQL time, or it falls outside the
+/// `newest` identities of its table across every client and pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryHistory {
+    /// Age after which a receipt leaves recent history.
+    pub max_age: std::time::Duration,
+    /// Newest accepted identities per table that stay in recent history.
+    pub newest: i64,
+}
+
+impl Default for RetryHistory {
+    /// One hour and 10,000 identities per tenant-qualified table.
+    fn default() -> Self {
+        Self {
+            max_age: std::time::Duration::from_hours(1),
+            newest: 10_000,
+        }
+    }
+}
+
+/// One tenant's receipts in one WAL shard stream of a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptStream {
+    /// Tenant owning the receipts.
+    pub tenant: DataTenantId,
+    /// Writer epoch of the WAL stream.
+    pub writer_epoch: i64,
+    /// Shard of the WAL stream.
+    pub shard_id: i16,
+}
+
+/// Lists every tenant, writer epoch and shard holding receipts written by
+/// `node_id`, so its cleaner can reach receipts of earlier epochs too.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the read.
+// tenant-isolation: cross-tenant OperatorPool read of WAL stream coordinates, never rows.
+pub async fn receipt_streams(
+    operator: &OperatorPool,
+    node_id: uuid::Uuid,
+) -> Result<Vec<ReceiptStream>, SqlError> {
+    // ponytail: scans the node's receipts on the stream index each sweep;
+    // bounded by retry history, which is what the cleaner keeps small.
+    let rows: Vec<(uuid::Uuid, i64, i16)> = sqlx::query_as(
+        "SELECT DISTINCT data_tenant_id, wal_writer_epoch, wal_shard_id \
+           FROM vala.scribe_batch_commits WHERE wal_node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_all(operator.pool())
+    .await
+    .map_err(SqlError::from)?;
+    rows.into_iter()
+        .map(|(tenant, writer_epoch, shard_id)| {
+            Ok(ReceiptStream {
+                tenant: DataTenantId::new(tenant).map_err(|error| {
+                    SqlError::InvariantViolation {
+                        detail: format!("receipt tenant {tenant} is invalid: {error}"),
+                    }
+                })?,
+                writer_epoch,
+                shard_id,
+            })
+        })
+        .collect()
+}
+
+/// Deletes at most `limit` of the tenant's receipts that `shard` handed off
+/// and that left recent retry history at `cutoff`, returning their batch ids.
+///
+/// Only receipts accepted at or before `cutoff` are candidates and age is
+/// measured from it, so one sweep's work is finite however many receipts
+/// arrive meanwhile. The one statement reads, per table of the shard, the
+/// newest identity outside count history (the `history.newest + 1`th by
+/// acceptance), selects the shard's handed-off receipts older than that
+/// identity or than the age history, and deletes only rows whose current
+/// coordinates still name `shard` at or below its safe segment, so a
+/// candidate replaced by a later acceptance of the same identity elsewhere is
+/// never removed. Its cost is one index walk of `history.newest` entries per
+/// table plus the shard's receipts, and does not depend on table statistics.
+/// Deleting a receipt removes no accepted row and no other custody.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the tenant-scoped
+/// delete.
+pub async fn delete_handed_off(
+    conn: &mut TenantConn<'_>,
+    shard: &HandedOffShard,
+    history: &RetryHistory,
+    cutoff: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<uuid::Uuid>, SqlError> {
+    // `horizon` is each table's newest identity outside count history, one
+    // `scribe_batch_commits_history_idx` walk of `newest` entries per table.
+    // Both CTEs are MATERIALIZED so each runs once whatever the planner
+    // believes: receipts arrive faster than statistics, and an inlined
+    // subquery re-run per shard row turns one sweep quadratic.
+    sqlx::query_scalar(
+        "WITH horizon AS MATERIALIZED ( \
+           SELECT tables.logical_table_fqn, edge.ingested_at, edge.batch_id \
+             FROM (SELECT DISTINCT logical_table_fqn FROM vala.scribe_batch_commits \
+                    WHERE wal_node_id = $1 AND wal_writer_epoch = $2 \
+                      AND wal_shard_id = $3 AND wal_segment_sequence <= $4) AS tables \
+             LEFT JOIN LATERAL ( \
+               SELECT ingested_at, batch_id FROM vala.scribe_batch_commits AS newer \
+                WHERE newer.data_tenant_id = wyrd.current_tenant() \
+                  AND newer.logical_table_fqn = tables.logical_table_fqn \
+                ORDER BY ingested_at DESC, batch_id DESC \
+               OFFSET $6 LIMIT 1) AS edge ON true), \
+         due AS MATERIALIZED ( \
+           SELECT receipt.logical_table_fqn, receipt.batch_id \
+             FROM vala.scribe_batch_commits AS receipt \
+             JOIN horizon USING (logical_table_fqn) \
+            WHERE receipt.wal_node_id = $1 AND receipt.wal_writer_epoch = $2 \
+              AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4 \
+              AND receipt.ingested_at <= $8 \
+              AND (receipt.ingested_at < $8 - ($5 * interval '1 second') \
+                   OR (receipt.ingested_at, receipt.batch_id) \
+                      <= (horizon.ingested_at, horizon.batch_id)) \
+            LIMIT $7) \
+         DELETE FROM vala.scribe_batch_commits AS receipt USING due \
+          WHERE receipt.logical_table_fqn = due.logical_table_fqn \
+            AND receipt.batch_id = due.batch_id \
+            AND receipt.wal_node_id = $1 AND receipt.wal_writer_epoch = $2 \
+            AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4 \
+          RETURNING receipt.batch_id",
+    )
+    .bind(shard.node_id)
+    .bind(shard.writer_epoch)
+    .bind(shard.shard_id)
+    .bind(shard.safe_segment)
+    .bind(history.max_age.as_secs_f64())
+    .bind(history.newest)
+    .bind(limit)
+    .bind(cutoff)
     .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
@@ -662,7 +826,7 @@ mod tests {
             logical_table_fqn: "bifrost.bifrost.events".to_owned(),
             batch_id: uuid::Uuid::now_v7(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            slice_set_digest: [7; 32],
+            slice_set_digest: [7; 16],
             slice_count: 2,
             wal_node_id: uuid::Uuid::now_v7(),
             wal_writer_epoch: 4,

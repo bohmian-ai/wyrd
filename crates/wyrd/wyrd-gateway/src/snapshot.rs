@@ -4,6 +4,7 @@
 //! gateway executes against them unchanged, so a concurrent administrative
 //! replacement affects only newly admitted calls.
 
+use secrecy::SecretString;
 use serde::Deserialize;
 use url::Url;
 use wyrd_spec::DataTenantId;
@@ -47,6 +48,17 @@ impl GatewayTenantSnapshot {
         self.credentials
             .iter()
             .find(|credential| &credential.name == name)
+    }
+
+    /// Whether any managed secret in this snapshot is still unopened.
+    #[must_use]
+    pub fn unprepared(&self) -> bool {
+        self.credentials.iter().any(|credential| {
+            matches!(
+                credential.source,
+                GatewayCredentialSource::ManagedSecret { secret: None, .. }
+            )
+        })
     }
 }
 
@@ -131,11 +143,16 @@ pub enum GatewayCredentialSource {
         /// Opaque backend reference.
         reference: ExternalSecretReference,
     },
-    /// Sealed tenant-submitted secret. The snapshot carries the opaque
-    /// envelope only; the deployment sealing keyring opening it is process
-    /// configuration.
+    /// Tenant-submitted secret, opened from its stored envelope when the
+    /// snapshot was loaded, so an attempt reads memory only.
     ManagedSecret {
-        /// Versioned sealing-keyring envelope of the bound payload.
-        sealed: Vec<u8>,
+        /// The opened provider key, or `None` when this load could not open
+        /// the envelope; resolution then fails until a later load prepares
+        /// it.
+        secret: Option<SecretString>,
+        /// Whether the envelope went unopened because the key service was
+        /// unavailable, so a background reload is retrying it and a call is
+        /// refused retryably rather than as an unusable credential.
+        pending: bool,
     },
 }

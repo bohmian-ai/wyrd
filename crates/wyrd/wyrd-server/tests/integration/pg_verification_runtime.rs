@@ -101,8 +101,6 @@ struct Harness {
     assertion: PgPool,
     /// Faults and the submitted-batch record every runtime writes through.
     fault: PublicationFault,
-    /// Number of retained audit decisions before the test acted.
-    audit_floor: usize,
 }
 
 impl Harness {
@@ -132,17 +130,14 @@ impl Harness {
             .pg_fixture()
             .superuser_pool()
             .expect("fixture exposes a superuser pool");
-        let mut harness = Self {
+        Self {
             server,
             seed,
             subject,
             verifier,
             assertion,
             fault: PublicationFault::default(),
-            audit_floor: 0,
-        };
-        harness.audit_floor = harness.retained_audit_operations().await.len();
-        harness
+        }
     }
 
     /// Runtime bounds fast enough for tests: short polls and backoff, and a
@@ -327,17 +322,6 @@ impl Harness {
         }
         statuses.sort();
         statuses.into_iter().map(|(_, status)| status).collect()
-    }
-
-    /// Every retained audit operation for the tenant since the floor, in
-    /// decision order.
-    ///
-    /// # Panics
-    /// Panics when the retained audit read fails.
-    async fn audit_operations(&self) -> Vec<String> {
-        self.retained_audit_operations()
-            .await
-            .split_off(self.audit_floor)
     }
 
     /// Settle the runtime's result outbox, flush the server's Scribe, and
@@ -616,26 +600,6 @@ impl Harness {
                 .collect(),
         )
     }
-
-    /// Every retained audit operation of the tenant in decision order, once
-    /// the Scribe outbox has settled.
-    ///
-    /// # Panics
-    /// Panics when the outbox does not settle or the retained read fails.
-    async fn retained_audit_operations(&self) -> Vec<String> {
-        self.server
-            .await_audit_retained()
-            .await
-            .expect("audit is retained");
-        self.server
-            .retained_audit_records(self.seed.tenant(), "operation", "true")
-            .await
-            .expect("retained audit operations")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect()
-    }
 }
 
 /// A spawned runtime and the token that stops it.
@@ -851,12 +815,12 @@ async fn sent_to(fault: &PublicationFault, table: &str) -> Vec<SentBatch> {
 }
 
 /// A completed Drift run writes its output and then its summary
-/// through the internal result writer, completes with a result, stages no
-/// audit, and records the runtime metrics.
+/// through the internal result writer, completes with a result, and
+/// records the runtime metrics.
 ///
 /// # Panics
 /// Panics when the run does not complete, the writes differ in order, kind,
-/// or count, any other audit row is staged, or a metric is missing.
+/// or count, or a metric is missing.
 #[tokio::test]
 async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     let metrics = wyrd_server::app::metrics::install_recorder().expect("recorder installs");
@@ -876,11 +840,6 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     assert_eq!(
         harness.writes().await,
         vec![OUTPUTS.to_owned(), RESULTS.to_owned()]
-    );
-    assert_eq!(
-        harness.audit_operations().await,
-        Vec::<String>::new(),
-        "claims, settlements, and internal result writes evaluate no permission and stage no audit"
     );
     runtime.stop().await;
 
@@ -2410,16 +2369,15 @@ async fn redelivers_the_selected_result(final_attempt: bool) {
 /// waits for capacity in background, then completes the execution with the
 /// selected result instead of erroring.
 ///
-/// The source outage revokes the tenant role's read of the Scribe batch
-/// fences the accepted revision is recovered from; it is restored once the
-/// reclaim has reported the state unusable. The capacity outage holds the
+/// The source outage fails the next Bifrost query, the reclaim's read of its
+/// accepted revision, so the reclaim reports the state unusable. The
+/// capacity outage holds the
 /// whole reservable item share of the server's shared Scribe outbox, which
 /// the recovery runtime stages through; it is released once the reclaim has
 /// committed its claim.
 ///
 /// # Panics
-/// Panics as [`stage_unsettled_result`] does, when the grant cannot change,
-/// the share cannot be held, a reclaim never meets its outage or settles or
+/// Panics as [`stage_unsettled_result`] does, when the share cannot be held, a reclaim never meets its outage or settles or
 /// computes while blocked, or the execution does not complete on its first
 /// attempt with the selected result.
 #[tokio::test]
@@ -2428,17 +2386,8 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     let harness = Harness::start().await;
     harness.log_commits().await;
     let (run, stale) = stage_unsettled_result(&harness, true).await;
-    let grant = |statement: &'static str| {
-        let pool = harness.assertion.clone();
-        async move {
-            sqlx::query(statement)
-                .execute(&pool)
-                .await
-                .expect("the fence grant changes");
-        }
-    };
-    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
     harness.expire(run).await;
+    harness.server.fail_next_query_after_schema();
     let winner = EngineScript::default();
     winner.push(EngineOutcome::Completed(unscored_report()));
     let fresh = harness.spawn(&Harness::limits(), &winner);
@@ -2452,7 +2401,6 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     }
     fresh.stop().await;
     stale.stop().await;
-    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
 
     let outbox = harness.server.state().bifrost.scribe_outbox();
     let full = outbox

@@ -118,6 +118,20 @@ fn record_lane_finished(lane: &'static str) {
     metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).decrement(1.0);
 }
 
+/// Records the time since `queued`, when a `lane` job was submitted, as one
+/// [`LANE_WAIT_SECONDS`] observation, only while benchmarking.
+fn record_lane_wait(lane: &'static str, queued: std::time::Instant) {
+    if wyrd_benchmark::enabled() {
+        metrics::histogram!(LANE_WAIT_SECONDS, "lane" => lane)
+            .record(queued.elapsed().as_secs_f64());
+    }
+}
+
+/// Benchmark-only histogram of a lane job's wait from submission until a
+/// worker started it, by `lane`; the job's own run is
+/// `bifrost_scribe_lane_job_seconds`.
+const LANE_WAIT_SECONDS: &str = "bifrost_scribe_lane_wait_seconds";
+
 fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Duration) {
     let status = if succeeded { "completed" } else { "failed" };
     metrics::counter!("bifrost_scribe_lane_jobs_total", "lane" => lane, "status" => status)
@@ -140,6 +154,13 @@ fn record_lane_saturation(lane: &'static str) {
     metrics::counter!("bifrost_scribe_lane_saturation_total", "lane" => lane).increment(1);
 }
 
+/// One claimed application queue slot of the ingress lane.
+///
+/// Claimed by [`ScribeIngressCpuPool::try_slot`] and consumed by
+/// [`ScribeIngressCpuPool::spawn`]; dropping an unused slot returns it.
+#[derive(Debug)]
+pub(crate) struct IngressSlot(tokio::sync::OwnedSemaphorePermit);
+
 /// The latency-sensitive native decode lane. Its queue is application-bounded;
 /// Rayon never becomes the source of untracked backpressure.
 #[derive(Debug, Clone)]
@@ -156,12 +177,34 @@ pub struct ScribeIngressCpuPool {
     capacity: usize,
     /// Conform plans shared by every decode this lane runs.
     conform: Arc<ConformPlans>,
+    /// IPC encoder contexts this lane's workers reuse, once Scribe build
+    /// charges them; empty until then.
+    encoders: Arc<crate::scribe::preprocess::EncoderContexts>,
     /// The process workload manager whose CPU lanes every job runs on, once
     /// the pool joins them at Scribe build.
     workloads: Option<WorkloadManager>,
 }
 
 impl ScribeIngressCpuPool {
+    /// Lets each of this lane's workers keep one IPC encoder context of at
+    /// most `cap` retained bytes, charged to `resources`.
+    pub(crate) fn retain_encoders(
+        &mut self,
+        resources: crate::resources::ScribeResources,
+        cap: usize,
+    ) {
+        self.encoders = Arc::new(crate::scribe::preprocess::EncoderContexts::new(
+            self.pool.current_num_threads(),
+            resources,
+            cap,
+        ));
+    }
+
+    /// The IPC encoder contexts this lane's workers reuse.
+    pub(crate) const fn encoders(&self) -> &Arc<crate::scribe::preprocess::EncoderContexts> {
+        &self.encoders
+    }
+
     /// Runs every later job on the process CPU lanes as Bifrost work.
     pub(crate) fn join_lanes(&mut self, workloads: &WorkloadManager) {
         self.workloads = Some(workloads.clone());
@@ -201,6 +244,7 @@ impl ScribeIngressCpuPool {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-ingress-cpu-{index}"))
+            .start_handler(crate::scribe::preprocess::mark_ingress_worker)
             .build()?;
         register_lane_gauges("ingress");
         Ok(Self {
@@ -215,6 +259,7 @@ impl ScribeIngressCpuPool {
             drained: Arc::new(Notify::new()),
             capacity,
             conform: Arc::default(),
+            encoders: Arc::default(),
             workloads: None,
         })
     }
@@ -295,7 +340,9 @@ impl ScribeIngressCpuPool {
         let failed = Arc::clone(&self.failed);
         let conform = Arc::clone(&self.conform);
         let workloads = self.workloads.clone();
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("ingress", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
@@ -366,13 +413,62 @@ impl ScribeIngressCpuPool {
         T: Send + 'static,
         F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
     {
-        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+        let slot = self.claim_slot()?;
+        self.spawn(slot, tenant, job).await
+    }
+
+    /// Claims one application queue slot for a job that cannot wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the lane is full, counting the
+    /// refusal as lane saturation.
+    pub(crate) fn claim_slot(&self) -> Result<IngressSlot, ScribeError> {
+        self.try_slot().ok_or_else(|| {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
             record_lane_saturation("ingress");
-            return Err(ScribeError::IngestBusy {
+            ScribeError::IngestBusy {
                 table: "ingress".to_owned(),
-            });
-        };
+            }
+        })
+    }
+
+    /// Claims one of this lane's application queue slots without waiting.
+    ///
+    /// Returns `None` when the lane is full. Unlike [`Self::run`], a miss is
+    /// not counted as saturation: a caller that can fall back to running the
+    /// job later, such as a group's optional second conversion, has refused
+    /// nothing.
+    pub(crate) fn try_slot(&self) -> Option<IngressSlot> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(IngressSlot)
+    }
+
+    /// Starts `job` on this lane in `slot` as `tenant`'s work and returns its
+    /// completion.
+    ///
+    /// The job and the slot move to the worker at once, so dropping the
+    /// returned future never cancels the job: the job still owns whatever
+    /// memory it carries until it finishes, and the slot frees only then.
+    ///
+    /// # Errors
+    ///
+    /// The returned future yields the job's own error, or
+    /// [`ScribeError::Internal`] when the worker panics or drops its result.
+    pub(crate) fn spawn<T, F>(
+        &self,
+        slot: IngressSlot,
+        tenant: Option<DataTenantId>,
+        job: F,
+    ) -> impl std::future::Future<Output = Result<T, ScribeError>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
+    {
+        let IngressSlot(permit) = slot;
         self.depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("ingress");
         let (sender, receiver) = oneshot::channel();
@@ -383,7 +479,9 @@ impl ScribeIngressCpuPool {
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
         let workloads = self.workloads.clone();
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("ingress", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
@@ -411,9 +509,11 @@ impl ScribeIngressCpuPool {
             record_lane_job("ingress", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
-        receiver.await.map_err(|_| ScribeError::Internal {
-            detail: "Scribe ingress CPU worker dropped its result".to_owned(),
-        })?
+        async move {
+            receiver.await.map_err(|_| ScribeError::Internal {
+                detail: "Scribe ingress CPU worker dropped its result".to_owned(),
+            })?
+        }
     }
 
     pub(crate) fn snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
@@ -2111,6 +2211,12 @@ pub(crate) enum ScribeWalIoOp {
         wal: WalHandle,
         segments: Vec<WalSegmentRef>,
     },
+    /// Trims, fsyncs and detaches one shard's non-empty active WAL generation,
+    /// so the shard owner's rotation never fsyncs on an async worker.
+    CloseActiveGeneration {
+        /// Fixed shard WAL handle whose active generation closes.
+        wal: WalHandle,
+    },
 }
 
 /// Results produced by [`ScribeWalIoPool`].
@@ -2130,6 +2236,9 @@ pub(crate) enum ScribeWalIoResult {
     },
     WalSynced,
     Completed,
+    /// The closed generation's segment, or `None` when the stream held no
+    /// accepted record and nothing closed.
+    GenerationClosed(Option<WalSegmentRef>),
     /// Reports a fully settled in-worker replay after each manifest was durably
     /// advanced before generation retirement and all safe reader pins closed.
     ReplayStreamCompleted {
@@ -2168,6 +2277,9 @@ pub struct ScribeWalIoPool {
     /// Retire operations submitted through the production lane in unit tests.
     #[cfg(test)]
     retire_submissions: Arc<AtomicU64>,
+    /// Generation closes submitted through the production lane in unit tests.
+    #[cfg(test)]
+    close_submissions: Arc<AtomicU64>,
     /// Sync operations submitted through the production lane in unit tests.
     #[cfg(test)]
     sync_submissions: Arc<AtomicU64>,
@@ -2233,6 +2345,8 @@ impl ScribeWalIoPool {
             #[cfg(test)]
             retire_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            close_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
             sync_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             write_submissions: Arc::new(AtomicU64::new(0)),
@@ -2250,6 +2364,10 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
             self.sync_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(&operation, ScribeWalIoOp::CloseActiveGeneration { .. }) {
+            self.close_submissions.fetch_add(1, Ordering::AcqRel);
         }
         #[cfg(test)]
         if matches!(
@@ -2286,7 +2404,9 @@ impl ScribeWalIoPool {
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("wal_io");
         let active = Arc::clone(&self.active);
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("wal_io", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("wal_io");
@@ -2351,6 +2471,12 @@ impl ScribeWalIoPool {
     #[cfg(test)]
     pub(crate) fn retire_submissions_for_test(&self) -> u64 {
         self.retire_submissions.load(Ordering::Acquire)
+    }
+
+    /// Returns generation closes observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn close_submissions_for_test(&self) -> u64 {
+        self.close_submissions.load(Ordering::Acquire)
     }
 
     /// Returns sync submissions observed at the production WAL lane boundary.
@@ -2423,6 +2549,9 @@ fn execute_wal_io(
             wal.retire_segments(&segments)?;
             Ok(ScribeWalIoResult::Completed)
         }
+        ScribeWalIoOp::CloseActiveGeneration { wal } => wal
+            .close_active_generation()
+            .map(ScribeWalIoResult::GenerationClosed),
     }
 }
 
@@ -4041,8 +4170,12 @@ mod tests {
         let seal_key = idle_seal_key();
         let mut settlement = ReplayRetirementSettlement::new(root.path());
         for index in 1_u64..=2 {
-            let path = shard_dir.join(format!("retirement-{index}.wal"));
-            std::fs::write(&path, index.to_le_bytes()).expect("retirement fixture");
+            let path = shard_dir.join(format!("{}.wal", index - 1));
+            crate::scribe::wal::WalSegment::create(
+                &path,
+                crate::scribe::wal::SegmentHeader::new(*node.as_bytes(), 1, index - 1, 0),
+            )
+            .expect("retirement fixture");
             let segment = crate::scribe::wal::WalSegmentRef { path };
             wal.retain_segments(std::slice::from_ref(&segment))
                 .expect("generation reference");

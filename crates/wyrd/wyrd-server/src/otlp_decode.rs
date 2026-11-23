@@ -1,9 +1,17 @@
 //! Allocation-free OTLP wire preflight for server-owned decode adapters.
 
+use std::borrow::Cow;
 use std::mem::size_of;
 
-use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
-use vala_bifrost_redux::tables::traces::SpanOutputWidths;
+use crate::state::ServerGate;
+use vala_bifrost_redux::gate::{
+    AuthContext, IngestError, IngestOutcome, OtlpWireLimits, PreparedExport,
+};
+use vala_bifrost_redux::tables::signal::{
+    AttributeList, AttributePool, PoolRange, PooledEntry, PooledValue, ResourceInput, ScopeInput,
+};
+use vala_bifrost_redux::tables::traces::input::{EventInput, LinkInput, SpanInput, StatusInput};
+use vala_bifrost_redux::tables::traces::{SpanOutputWidths, TraceInput};
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
@@ -180,6 +188,29 @@ impl ProjectedOutput {
     }
 }
 
+/// How many of each view and pooled value a borrowed decode of one trace
+/// export holds, counted by [`preflight_trace_protobuf`].
+///
+/// Resource and scope attributes are decoded into owned messages, so they are
+/// not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TracePoolCounts {
+    /// Resource groups.
+    pub(crate) resources: usize,
+    /// Scope groups.
+    pub(crate) scopes: usize,
+    /// Spans.
+    pub(crate) spans: usize,
+    /// Span events.
+    pub(crate) events: usize,
+    /// Span links.
+    pub(crate) links: usize,
+    /// Span, event, and link attribute entries, nested entries included.
+    pub(crate) entries: usize,
+    /// Array items.
+    pub(crate) values: usize,
+}
+
 /// Bounded counters used while walking one trace export.
 #[derive(Debug)]
 struct TraceWireFacts {
@@ -191,6 +222,8 @@ struct TraceWireFacts {
     decode_bytes: usize,
     /// Conservative projected canonical output.
     output: ProjectedOutput,
+    /// The views and pooled values a borrowed decode holds.
+    pool: TracePoolCounts,
 }
 
 impl TraceWireFacts {
@@ -201,6 +234,7 @@ impl TraceWireFacts {
             widths: SpanOutputWidths::new(),
             decode_bytes: size_of::<ExportTraceServiceRequest>(),
             output: ProjectedOutput::default(),
+            pool: TracePoolCounts::default(),
         }
     }
 
@@ -232,6 +266,7 @@ impl TraceWireFacts {
     ///
     /// Returns the stable malformed-request error on arithmetic overflow.
     fn add_attribute(&mut self) -> Result<(), IngestError> {
+        self.pool.entries += 1;
         self.add_decode_bytes(size_of::<KeyValue>())
     }
 }
@@ -491,7 +526,7 @@ impl<'a> WireFields<'a> {
 pub(crate) fn preflight_trace_protobuf(
     bytes: &[u8],
     limits: OtlpWireLimits,
-) -> Result<OtlpDecodePlan, IngestError> {
+) -> Result<(OtlpDecodePlan, TracePoolCounts), IngestError> {
     if bytes.len() > limits.request_bytes {
         return Err(IngestError::PayloadTooLarge {
             bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -509,6 +544,7 @@ pub(crate) fn preflight_trace_protobuf(
                 .output
                 .open(facts.decode_bytes, size_of::<ResourceSpans>());
             facts.add_decode_bytes(size_of::<ResourceSpans>())?;
+            facts.pool.resources += 1;
             visit_resource_spans(resource, &mut facts)?;
             facts
                 .output
@@ -516,11 +552,67 @@ pub(crate) fn preflight_trace_protobuf(
         }
     }
     enforce_expanded_ceiling(facts.decode_bytes, facts.output.bytes(), limits)?;
-    Ok(OtlpDecodePlan {
-        wire_bytes: bytes.len(),
-        decode_bytes: facts.decode_bytes,
-        projected_bytes: facts.output.bytes(),
-    })
+    Ok((
+        OtlpDecodePlan {
+            wire_bytes: bytes.len(),
+            decode_bytes: facts.decode_bytes,
+            projected_bytes: facts.output.bytes(),
+        },
+        facts.pool,
+    ))
+}
+
+/// Byte lengths of a message's singular length-delimited fields, kept
+/// last-wins while the message is walked once.
+///
+/// Protobuf retains only the final occurrence of a singular field, so the
+/// preflight charges each one after the walk instead of rescanning the message
+/// per field.
+#[derive(Clone, Copy, Debug)]
+struct LastLengths<const N: usize>([Option<usize>; N]);
+
+impl<const N: usize> Default for LastLengths<N> {
+    /// No field seen yet.
+    fn default() -> Self {
+        Self([None; N])
+    }
+}
+
+impl<const N: usize> LastLengths<N> {
+    /// Records one occurrence of the singular field at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same wrong-wire refusal a rescan would, when the occurrence
+    /// is not length-delimited.
+    fn record(&mut self, index: usize, value: WireValue<'_>) -> Result<(), IngestError> {
+        let WireValue::Bytes(value) = value else {
+            return Err(wrong_wire("singular bytes field"));
+        };
+        self.0[index] = Some(value.len());
+        Ok(())
+    }
+
+    /// Keeps every field `later` carries, as merging a later message does.
+    fn merge(&mut self, later: Self) {
+        for (slot, value) in self.0.iter_mut().zip(later.0) {
+            if value.is_some() {
+                *slot = value;
+            }
+        }
+    }
+
+    /// Charges every retained field's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable malformed-request error on arithmetic overflow.
+    fn charge(self, facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+        self.0
+            .into_iter()
+            .flatten()
+            .try_for_each(|bytes| facts.add_value_bytes(bytes))
+    }
 }
 
 /// Visits one `ResourceSpans` message and its nested scope groups.
@@ -529,9 +621,7 @@ pub(crate) fn preflight_trace_protobuf(
 ///
 /// Returns a stable malformed-request error for invalid wire shapes or limits.
 fn visit_resource_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    if let Some(schema_url) = last_bytes_field(bytes, 3)? {
-        facts.add_value_bytes(schema_url.len())?;
-    }
+    let mut schema_url = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -541,15 +631,16 @@ fn visit_resource_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), 
                     .output
                     .open(facts.decode_bytes, size_of::<ScopeSpans>());
                 facts.add_decode_bytes(size_of::<ScopeSpans>())?;
+                facts.pool.scopes += 1;
                 visit_scope_spans(scope, facts)?;
                 facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
-            (3, WireValue::Bytes(_)) => {}
-            (1..=3, _) => return Err(wrong_wire("resource spans")),
+            (3, value) => schema_url.record(0, value)?,
+            (1 | 2, _) => return Err(wrong_wire("resource spans")),
             _ => {}
         }
     }
-    Ok(())
+    schema_url.charge(facts)
 }
 
 /// Visits one OTLP resource and counts attribute/entity backing storage.
@@ -558,6 +649,7 @@ fn visit_resource_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), 
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_resource(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+    let pool = facts.pool;
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -571,25 +663,33 @@ fn visit_resource(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Ingest
             _ => {}
         }
     }
+    facts.pool = pool;
     Ok(())
 }
 
 /// Visits one instrumentation scope and its repeated attributes.
 ///
+/// Returns its retained name and version lengths, which merge across every
+/// occurrence of the scope in its `ScopeSpans`.
+///
 /// # Errors
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
-fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<LastLengths<2>, IngestError> {
+    let pool = facts.pool;
+    let mut text = LastLengths::<2>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (1 | 2, WireValue::Bytes(_)) | (4, WireValue::Varint(_)) => {}
-            (1..=4, _) => return Err(wrong_wire("instrumentation scope")),
+            (1 | 2, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
+            (4, WireValue::Varint(_)) => {}
+            (3 | 4, _) => return Err(wrong_wire("instrumentation scope")),
             _ => {}
         }
     }
-    Ok(())
+    facts.pool = pool;
+    Ok(text)
 }
 
 /// Visits one `ScopeSpans` message and its repeated spans.
@@ -598,32 +698,29 @@ fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErr
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_scope_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in [1, 2] {
-        if let Some(text) = last_bytes_across_messages(bytes, 1, tag)? {
-            facts.add_value_bytes(text.len())?;
-        }
-    }
-    if let Some(schema_url) = last_bytes_field(bytes, 3)? {
-        facts.add_value_bytes(schema_url.len())?;
-    }
+    let mut scope_text = LastLengths::<2>::default();
+    let mut schema_url = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(scope)) => visit_scope(scope, facts)?,
+            (1, WireValue::Bytes(scope)) => scope_text.merge(visit_scope(scope, facts)?),
             (2, WireValue::Bytes(span)) => {
                 facts.output.open(facts.decode_bytes, size_of::<Span>());
                 facts.add_decode_bytes(size_of::<Span>())?;
+                facts.pool.spans += 1;
                 visit_span(span, facts)?;
                 facts
                     .output
                     .close_record(facts.decode_bytes, facts.widths.row);
             }
-            (3, WireValue::Bytes(_)) => {}
-            (1..=3, _) => return Err(wrong_wire("scope spans")),
+            (3, value) => schema_url.record(0, value)?,
+            (1, _) => return Err(wrong_wire("optional OTLP message")),
+            (2, _) => return Err(wrong_wire("scope spans")),
             _ => {}
         }
     }
-    Ok(())
+    scope_text.charge(facts)?;
+    schema_url.charge(facts)
 }
 
 /// Visits one span, including events, links, and attributes.
@@ -632,38 +729,36 @@ fn visit_scope_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Ing
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in 1..=5 {
-        if let Some(value) = last_bytes_field(bytes, tag)? {
-            facts.add_value_bytes(value.len())?;
-        }
-    }
-    if let Some(message) = last_bytes_across_messages(bytes, 15, 2)? {
-        facts.add_value_bytes(message.len())?;
-    }
+    let mut text = LastLengths::<5>::default();
+    let mut status_message = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
+            (1..=5, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
             (9, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (11, WireValue::Bytes(event)) => {
                 facts.output.add(facts.widths.event);
                 facts.add_decode_bytes(size_of::<wyrd_tonic::otlp::trace::v1::span::Event>())?;
+                facts.pool.events += 1;
                 visit_span_event(event, facts)?;
             }
             (13, WireValue::Bytes(link)) => {
                 facts.output.add(facts.widths.link);
                 facts.add_decode_bytes(size_of::<wyrd_tonic::otlp::trace::v1::span::Link>())?;
+                facts.pool.links += 1;
                 visit_span_link(link, facts)?;
             }
-            (15, WireValue::Bytes(status)) => visit_status(status, facts)?,
-            (1..=5, WireValue::Bytes(_))
-            | (6 | 10 | 12 | 14, WireValue::Varint(_))
+            (15, WireValue::Bytes(status)) => status_message.merge(visit_status(status, facts)?),
+            (15, _) => return Err(wrong_wire("optional OTLP message")),
+            (6 | 10 | 12 | 14, WireValue::Varint(_))
             | (7 | 8, WireValue::Fixed64(_))
             | (16, WireValue::Fixed32(_)) => {}
-            (1..=16, _) => return Err(wrong_wire("span")),
+            (6..=16, _) => return Err(wrong_wire("span")),
             _ => {}
         }
     }
-    Ok(())
+    text.charge(facts)?;
+    status_message.charge(facts)
 }
 
 /// Visits one entity reference and accounts for repeated string elements.
@@ -672,41 +767,40 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
 ///
 /// Returns a stable malformed-request error for invalid framing or limits.
 fn visit_entity_ref(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in [1, 2] {
-        if let Some(value) = last_bytes_field(bytes, tag)? {
-            facts.add_value_bytes(value.len())?;
-        }
-    }
+    let mut text = LastLengths::<2>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
+            (1 | 2, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
             (3 | 4, WireValue::Bytes(value)) => {
                 facts.add_decode_bytes(size_of::<String>())?;
                 facts.add_value_bytes(value.len())?;
             }
-            (1..=4, _) => return Err(wrong_wire("entity reference")),
+            (3 | 4, _) => return Err(wrong_wire("entity reference")),
             _ => {}
         }
     }
-    Ok(())
+    text.charge(facts)
 }
 
-/// Visits one span status and accounts for its message backing storage.
+/// Visits one span status, returning its retained message length, which
+/// merges across every occurrence of the status in its span.
 ///
 /// # Errors
 ///
 /// Returns a stable malformed-request error for invalid framing or limits.
-fn visit_status(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+fn visit_status(bytes: &[u8], facts: &TraceWireFacts) -> Result<LastLengths<1>, IngestError> {
+    let mut message = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (2, WireValue::Bytes(_)) | (3, WireValue::Varint(_)) => {}
-            (2 | 3, _) => return Err(wrong_wire("span status")),
+            (2, value) => message.record(0, value)?,
+            (3, WireValue::Varint(_)) => {}
+            (3, _) => return Err(wrong_wire("span status")),
             _ => {}
         }
     }
-    Ok(())
+    Ok(message)
 }
 
 /// Visits one span event and its repeated attributes.
@@ -715,19 +809,18 @@ fn visit_status(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestEr
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_span_event(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    if let Some(name) = last_bytes_field(bytes, 2)? {
-        facts.add_value_bytes(name.len())?;
-    }
+    let mut name = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
+            (2, value) => name.record(0, value)?,
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (2, WireValue::Bytes(_)) | (1, WireValue::Fixed64(_)) | (4, WireValue::Varint(_)) => {}
-            (1..=4, _) => return Err(wrong_wire("span event")),
+            (1, WireValue::Fixed64(_)) | (4, WireValue::Varint(_)) => {}
+            (1 | 3 | 4, _) => return Err(wrong_wire("span event")),
             _ => {}
         }
     }
-    Ok(())
+    name.charge(facts)
 }
 
 /// Visits one span link and its identifier, trace-state, and attributes.
@@ -736,26 +829,25 @@ fn visit_span_event(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Inge
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_span_link(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in 1..=3 {
-        if let Some(value) = last_bytes_field(bytes, tag)? {
-            facts.add_value_bytes(value.len())?;
-        }
-    }
+    let mut text = LastLengths::<3>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
+            (1..=3, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
             (4, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (1..=3, WireValue::Bytes(_))
-            | (5, WireValue::Varint(_))
-            | (6, WireValue::Fixed32(_)) => {}
-            (1..=6, _) => return Err(wrong_wire("span link")),
+            (5, WireValue::Varint(_)) | (6, WireValue::Fixed32(_)) => {}
+            (4..=6, _) => return Err(wrong_wire("span link")),
             _ => {}
         }
     }
-    Ok(())
+    text.charge(facts)
 }
 
 /// Visits one key/value attribute and its optional recursive value.
+///
+/// The entry is walked once. Its value, almost always one occurrence carrying
+/// one oneof field, is visited directly; anything protobuf must merge takes
+/// the general [`visit_merged_any_value`] path, so both charge the same bytes.
 ///
 /// # Errors
 ///
@@ -766,8 +858,24 @@ fn visit_attribute(
     facts: &mut TraceWireFacts,
 ) -> Result<(), IngestError> {
     facts.add_attribute()?;
-    if let Some(key) = last_bytes_field(bytes, 1)? {
-        facts.add_value_bytes(key.len())?;
+    let mut key = LastLengths::<1>::default();
+    let mut value_body = None;
+    let mut value_count = 0_usize;
+    let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
+    while let Some((tag, value)) = fields.next()? {
+        match (tag, value) {
+            (1, value) => key.record(0, value)?,
+            (2, WireValue::Bytes(body)) => {
+                value_body = Some(body);
+                value_count = value_count.saturating_add(1);
+            }
+            (2, _) => return Err(wrong_wire("optional any value")),
+            _ => {}
+        }
+    }
+    key.charge(facts)?;
+    if let (1, Some(body)) = (value_count, value_body) {
+        return visit_any_value(body, value_depth + 1, facts);
     }
     visit_merged_any_value(
         AnyValueBodies::Repeated {
@@ -776,19 +884,14 @@ fn visit_attribute(
         },
         value_depth + 1,
         facts,
-    )?;
-    let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
-    while let Some((tag, value)) = fields.next()? {
-        match (tag, value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
-            (1 | 2, _) => return Err(wrong_wire("key/value")),
-            _ => {}
-        }
-    }
-    Ok(())
+    )
 }
 
-/// Visits one recursive OTLP `AnyValue` without constructing it.
+/// Visits one recursive OTLP `AnyValue` body without constructing it.
+///
+/// A body carrying exactly one oneof field, the shape every exporter writes,
+/// is charged from that field alone; a body protobuf must merge goes through
+/// [`visit_merged_any_value`].
 ///
 /// # Errors
 ///
@@ -799,7 +902,66 @@ fn visit_any_value(
     depth: usize,
     facts: &mut TraceWireFacts,
 ) -> Result<(), IngestError> {
-    visit_merged_any_value(AnyValueBodies::Single(bytes), depth, facts)
+    if depth > facts.limits.value_depth {
+        return Err(malformed("OTLP value nesting depth exceeded"));
+    }
+    let mut only = None;
+    let mut oneofs = 0_usize;
+    let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
+    while let Some((tag, value)) = fields.next()? {
+        if (1..=7).contains(&tag) {
+            only = Some((tag, value));
+            oneofs = oneofs.saturating_add(1);
+        }
+    }
+    let Some((tag, value)) = only.filter(|_| oneofs == 1) else {
+        return visit_merged_any_value(AnyValueBodies::Single(bytes), depth, facts);
+    };
+    validate_any_value_wire(tag, value)?;
+    visit_selected_value(tag, value, depth, facts)
+}
+
+/// Charges the retained oneof field of one `AnyValue`.
+///
+/// # Errors
+///
+/// Returns a stable malformed-request error for invalid nested fields, excess
+/// depth, or configured capacity excess.
+fn visit_selected_value(
+    tag: u32,
+    value: WireValue<'_>,
+    depth: usize,
+    facts: &mut TraceWireFacts,
+) -> Result<(), IngestError> {
+    match (tag, value) {
+        (1 | 7, WireValue::Bytes(value)) => facts.add_value_bytes(value.len()),
+        (2 | 3, WireValue::Varint(_)) | (4, WireValue::Fixed64(_)) => Ok(()),
+        (5, WireValue::Bytes(array)) => {
+            let mut values = WireFields::with_group_depth(array, facts.limits.value_depth);
+            while let Some((value_tag, value)) = values.next()? {
+                if let (1, WireValue::Bytes(value)) = (value_tag, value) {
+                    facts.add_decode_bytes(size_of::<AnyValue>())?;
+                    facts.pool.values += 1;
+                    visit_any_value(value, depth + 1, facts)?;
+                } else if value_tag == 1 {
+                    return Err(wrong_wire("OTLP value array"));
+                }
+            }
+            Ok(())
+        }
+        (6, WireValue::Bytes(list)) => {
+            let mut values = WireFields::with_group_depth(list, facts.limits.value_depth);
+            while let Some((value_tag, value)) = values.next()? {
+                if let (1, WireValue::Bytes(value)) = (value_tag, value) {
+                    visit_attribute(value, depth, facts)?;
+                } else if value_tag == 1 {
+                    return Err(wrong_wire("OTLP key/value list"));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(wrong_wire("OTLP any value")),
+    }
 }
 
 /// Visits only the retained final oneof run across merged `AnyValue` bodies.
@@ -830,32 +992,7 @@ fn visit_merged_any_value(
             if ordinal < selection.run_start || tag != selection.tag {
                 continue;
             }
-            match (tag, value) {
-                (1 | 7, WireValue::Bytes(value)) => facts.add_value_bytes(value.len())?,
-                (2 | 3, WireValue::Varint(_)) | (4, WireValue::Fixed64(_)) => {}
-                (5, WireValue::Bytes(array)) => {
-                    let mut values = WireFields::with_group_depth(array, facts.limits.value_depth);
-                    while let Some((value_tag, value)) = values.next()? {
-                        if let (1, WireValue::Bytes(value)) = (value_tag, value) {
-                            facts.add_decode_bytes(size_of::<AnyValue>())?;
-                            visit_any_value(value, depth + 1, facts)?;
-                        } else if value_tag == 1 {
-                            return Err(wrong_wire("OTLP value array"));
-                        }
-                    }
-                }
-                (6, WireValue::Bytes(list)) => {
-                    let mut values = WireFields::with_group_depth(list, facts.limits.value_depth);
-                    while let Some((value_tag, value)) = values.next()? {
-                        if let (1, WireValue::Bytes(value)) = (value_tag, value) {
-                            visit_attribute(value, depth, facts)?;
-                        } else if value_tag == 1 {
-                            return Err(wrong_wire("OTLP key/value list"));
-                        }
-                    }
-                }
-                _ => return Err(wrong_wire("OTLP any value")),
-            }
+            visit_selected_value(tag, value, depth, facts)?;
         }
         Ok(())
     })?;
@@ -1510,17 +1647,31 @@ fn merge_status(bytes: &[u8], status: &mut Status) -> Result<(), IngestError> {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
+///
+/// The entry is walked once; a wrongly typed key or value is still refused
+/// only after the value and key decode, the order a rescan reports them in.
 pub(crate) fn decode_key_value(bytes: &[u8]) -> Result<KeyValue, IngestError> {
-    let scanned = Scanned::<3>::of(bytes)?;
-    let value = scanned.singular(2, decode_any_value, decode_merged_any_value)?;
-    let key = scanned.string(1)?;
+    let (mut key, mut value_body, mut values, mut wrong_wire_type) = (None, None, 0_usize, false);
     let mut fields = WireFields::new(bytes);
     while let Some((tag, wire_value)) = fields.next()? {
         match (tag, wire_value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
-            (1 | 2, _) => return Err(wrong_wire("key/value")),
+            (1, WireValue::Bytes(body)) => key = Some(body),
+            (2, WireValue::Bytes(body)) => {
+                value_body = Some(body);
+                values = values.saturating_add(1);
+            }
+            (1 | 2, _) => wrong_wire_type = true,
             _ => {}
         }
+    }
+    let value = match (values, value_body) {
+        (0, _) => None,
+        (1, Some(body)) => Some(decode_any_value(body)?),
+        _ => decode_merged_any_value(bytes, 2)?,
+    };
+    let key = key.map(fixed_string).transpose()?.unwrap_or_default();
+    if wrong_wire_type {
+        return Err(wrong_wire("key/value"));
     }
     Ok(KeyValue { key, value })
 }
@@ -1591,8 +1742,47 @@ pub(crate) struct AnyValueSelection {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
+///
+/// A body carrying exactly one oneof field, the shape every exporter writes,
+/// is built from that field without a separate selection pass; any body
+/// protobuf must merge takes [`decode_any_value_bodies`].
 pub(crate) fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, IngestError> {
-    decode_any_value_bodies(AnyValueBodies::Single(bytes))
+    let mut only = None;
+    let mut oneofs = 0_usize;
+    let mut fields = WireFields::new(bytes);
+    while let Some((tag, value)) = fields.next()? {
+        if (1..=7).contains(&tag) {
+            only = Some((tag, value));
+            oneofs = oneofs.saturating_add(1);
+        }
+    }
+    let Some((tag, value)) = only.filter(|_| oneofs == 1) else {
+        return decode_any_value_bodies(AnyValueBodies::Single(bytes));
+    };
+    validate_any_value_wire(tag, value)?;
+    let value = match (tag, value) {
+        (1, WireValue::Bytes(bytes)) => any_value::Value::StringValue(fixed_string(bytes)?),
+        (2, WireValue::Varint(value)) => any_value::Value::BoolValue(value != 0),
+        (3, WireValue::Varint(value)) => any_value::Value::IntValue(protobuf_i64(value)),
+        (4, WireValue::Fixed64(value)) => any_value::Value::DoubleValue(f64::from_bits(value)),
+        (5, WireValue::Bytes(bytes)) => {
+            let mut array = ArrayValue {
+                values: Vec::with_capacity(repeated_message_count(bytes, 1)?),
+            };
+            merge_array_value(bytes, &mut array)?;
+            any_value::Value::ArrayValue(array)
+        }
+        (6, WireValue::Bytes(bytes)) => {
+            let mut list = KeyValueList {
+                values: Vec::with_capacity(repeated_message_count(bytes, 1)?),
+            };
+            merge_key_value_list(bytes, &mut list)?;
+            any_value::Value::KvlistValue(list)
+        }
+        (7, WireValue::Bytes(bytes)) => any_value::Value::BytesValue(fixed_bytes(bytes)),
+        _ => return Err(wrong_wire("OTLP any value")),
+    };
+    Ok(AnyValue { value: Some(value) })
 }
 
 /// Merges every occurrence of a singular `AnyValue` field.
@@ -1768,6 +1958,494 @@ fn merge_key_value_list(bytes: &[u8], value: &mut KeyValueList) -> Result<(), In
     Ok(())
 }
 
+/// Borrows one preflighted trace export straight from its protobuf wire.
+///
+/// Text and bytes borrow `bytes`; attributes land in the input's pool. The
+/// export is walked once, plus one pass per span for its events and links.
+/// Returns `None` when [`decode_trace_protobuf`] must decide instead: for any
+/// framing, wire-type, or UTF-8 refusal, and for any encoding protobuf merges,
+/// which is a singular message (resource, scope, status, attribute value)
+/// occurring twice or an `AnyValue` carrying two oneof fields. Repeated
+/// scalars and strings keep protobuf's last-wins rule here.
+///
+/// `counts` sizes every view and pool exactly, so the input never outgrows
+/// the generated request [`OtlpDecodePlan::reservation_bytes`] admitted.
+pub(crate) fn decode_trace_input(bytes: &[u8], counts: TracePoolCounts) -> Option<TraceInput<'_>> {
+    let mut decoder = TraceInputDecoder {
+        pool: PoolDecoder::new(bytes, counts.entries, counts.values),
+        input: TraceInput {
+            resources: Vec::with_capacity(counts.resources),
+            scopes: Vec::with_capacity(counts.scopes),
+            spans: Vec::with_capacity(counts.spans),
+            events: Vec::with_capacity(counts.events),
+            links: Vec::with_capacity(counts.links),
+            pool: AttributePool::default(),
+        },
+    };
+    decoder.request(bytes)?;
+    decoder.input.pool = decoder.pool.finish()?;
+    Some(decoder.input)
+}
+
+/// One trace protobuf export, borrowed from its wire whenever
+/// [`decode_trace_input`] can.
+#[derive(Debug)]
+pub(crate) enum DecodedTrace<'a> {
+    /// Borrowed straight from the wire.
+    Borrowed(TraceInput<'a>),
+    /// Built by [`decode_trace_protobuf`] for an encoding protobuf merges.
+    Generated(Box<ExportTraceServiceRequest>),
+}
+
+/// Decodes one preflighted trace export, borrowing it when possible.
+///
+/// # Errors
+///
+/// Returns the stable malformed-request error [`decode_trace_protobuf`]
+/// returns for a refused export.
+pub(crate) fn decode_trace(
+    bytes: &[u8],
+    counts: TracePoolCounts,
+) -> Result<DecodedTrace<'_>, IngestError> {
+    match decode_trace_input(bytes, counts) {
+        Some(input) => Ok(DecodedTrace::Borrowed(input)),
+        None => {
+            decode_trace_protobuf(bytes).map(|request| DecodedTrace::Generated(Box::new(request)))
+        }
+    }
+}
+
+impl DecodedTrace<'_> {
+    /// Authorize, attribute, and project the export through
+    /// [`ServerGate::prepare_trace_input`].
+    ///
+    /// The returned batch owns its data, so the caller may release the wire
+    /// before dispatching it.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, attribution, or projection errors.
+    pub(crate) async fn prepare(
+        &self,
+        gate: &ServerGate,
+        auth: &AuthContext,
+    ) -> Result<PreparedExport<IngestOutcome>, IngestError> {
+        match self {
+            Self::Borrowed(input) => gate.prepare_trace_input(auth, input).await,
+            Self::Generated(request) => {
+                gate.prepare_trace_input(auth, &TraceInput::from_generated(&request.resource_spans))
+                    .await
+            }
+        }
+    }
+}
+
+/// Fills one [`TraceInput`] from protobuf wire; see [`decode_trace_input`].
+#[derive(Debug)]
+struct TraceInputDecoder<'a> {
+    /// The export's attributes, pooled as they are reached.
+    pool: PoolDecoder<'a>,
+    /// The input being filled; its pool is moved in when the walk ends.
+    input: TraceInput<'a>,
+}
+
+impl<'a> TraceInputDecoder<'a> {
+    /// Walks the export's resource groups.
+    fn request(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(group)) => self.resource_spans(group)?,
+                (1, _) => return None,
+                _ => {}
+            }
+        }
+        Some(())
+    }
+
+    /// Walks one resource group and its scope groups.
+    fn resource_spans(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_scope = self.input.scopes.len();
+        let (mut resource, mut resources, mut schema_url) = (None, 0_usize, "");
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(body)) => (resource, resources) = (Some(body), resources + 1),
+                (2, WireValue::Bytes(body)) => self.scope_spans(body)?,
+                (3, WireValue::Bytes(body)) => schema_url = text(body)?,
+                (1..=3, _) => return None,
+                _ => {}
+            }
+        }
+        if resources > 1 {
+            return None;
+        }
+        self.input.resources.push(ResourceInput {
+            resource: match resource {
+                Some(body) => Some(Cow::Owned(decode_resource(body).ok()?)),
+                None => None,
+            },
+            schema_url,
+            scopes: first_scope..self.input.scopes.len(),
+        });
+        Some(())
+    }
+
+    /// Walks one scope group and its spans.
+    fn scope_spans(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_span = self.input.spans.len();
+        let (mut scope, mut scopes, mut schema_url) = (None, 0_usize, "");
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(body)) => (scope, scopes) = (Some(body), scopes + 1),
+                (2, WireValue::Bytes(body)) => self.span(body)?,
+                (3, WireValue::Bytes(body)) => schema_url = text(body)?,
+                (1..=3, _) => return None,
+                _ => {}
+            }
+        }
+        if scopes > 1 {
+            return None;
+        }
+        self.input.scopes.push(ScopeInput {
+            scope: match scope {
+                Some(body) => Some(Cow::Owned(decode_scope(body).ok()?)),
+                None => None,
+            },
+            schema_url,
+            records: first_span..self.input.spans.len(),
+        });
+        Some(())
+    }
+
+    /// Walks one span, then its events and links, so each list stays
+    /// contiguous.
+    fn span(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_entry = self.pool.entries();
+        let mut span = SpanInput {
+            trace_id: &[],
+            span_id: &[],
+            trace_state: "",
+            parent_span_id: &[],
+            flags: 0,
+            name: "",
+            kind: 0,
+            start_time_unix_nano: 0,
+            end_time_unix_nano: 0,
+            attributes: AttributeList::Pooled(PoolRange::default()),
+            dropped_attributes_count: 0,
+            events: 0..0,
+            dropped_events_count: 0,
+            links: 0..0,
+            dropped_links_count: 0,
+            status: None,
+        };
+        let (mut status, mut statuses) = (None, 0_usize);
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(body)) => span.trace_id = body,
+                (2, WireValue::Bytes(body)) => span.span_id = body,
+                (3, WireValue::Bytes(body)) => span.trace_state = text(body)?,
+                (4, WireValue::Bytes(body)) => span.parent_span_id = body,
+                (5, WireValue::Bytes(body)) => span.name = text(body)?,
+                (6, WireValue::Varint(value)) => span.kind = protobuf_i32(value),
+                (7, WireValue::Fixed64(value)) => span.start_time_unix_nano = value,
+                (8, WireValue::Fixed64(value)) => span.end_time_unix_nano = value,
+                (9, WireValue::Bytes(body)) => self.pool.entry(body)?,
+                (10, WireValue::Varint(value)) => {
+                    span.dropped_attributes_count = protobuf_u32(value);
+                }
+                (11 | 13, WireValue::Bytes(_)) => {}
+                (12, WireValue::Varint(value)) => span.dropped_events_count = protobuf_u32(value),
+                (14, WireValue::Varint(value)) => span.dropped_links_count = protobuf_u32(value),
+                (15, WireValue::Bytes(body)) => (status, statuses) = (Some(body), statuses + 1),
+                (16, WireValue::Fixed32(value)) => span.flags = value,
+                (1..=16, _) => return None,
+                _ => {}
+            }
+        }
+        if statuses > 1 {
+            return None;
+        }
+        span.attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
+        span.status = match status {
+            Some(body) => Some(status_input(body)?),
+            None => None,
+        };
+        let (first_event, first_link) = (self.input.events.len(), self.input.links.len());
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (11, WireValue::Bytes(body)) => self.event(body)?,
+                (13, WireValue::Bytes(body)) => self.link(body)?,
+                _ => {}
+            }
+        }
+        span.events = first_event..self.input.events.len();
+        span.links = first_link..self.input.links.len();
+        self.input.spans.push(span);
+        Some(())
+    }
+
+    /// Walks one span event.
+    fn event(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_entry = self.pool.entries();
+        let (mut time_unix_nano, mut name, mut dropped_attributes_count) = (0, "", 0);
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Fixed64(value)) => time_unix_nano = value,
+                (2, WireValue::Bytes(body)) => name = text(body)?,
+                (3, WireValue::Bytes(body)) => self.pool.entry(body)?,
+                (4, WireValue::Varint(value)) => dropped_attributes_count = protobuf_u32(value),
+                (1..=4, _) => return None,
+                _ => {}
+            }
+        }
+        let attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
+        self.input.events.push(EventInput {
+            time_unix_nano,
+            name,
+            attributes,
+            dropped_attributes_count,
+        });
+        Some(())
+    }
+
+    /// Walks one span link.
+    fn link(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_entry = self.pool.entries();
+        let mut link = LinkInput {
+            trace_id: &[],
+            span_id: &[],
+            trace_state: "",
+            attributes: AttributeList::Pooled(PoolRange::default()),
+            dropped_attributes_count: 0,
+            flags: 0,
+        };
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(body)) => link.trace_id = body,
+                (2, WireValue::Bytes(body)) => link.span_id = body,
+                (3, WireValue::Bytes(body)) => link.trace_state = text(body)?,
+                (4, WireValue::Bytes(body)) => self.pool.entry(body)?,
+                (5, WireValue::Varint(value)) => {
+                    link.dropped_attributes_count = protobuf_u32(value);
+                }
+                (6, WireValue::Fixed32(value)) => link.flags = value,
+                (1..=6, _) => return None,
+                _ => {}
+            }
+        }
+        link.attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
+        self.input.links.push(link);
+        Some(())
+    }
+}
+
+/// Pools one export's attribute entries and values straight from its wire.
+///
+/// A nested array or key/value list is pooled after the list holding it, so
+/// every list stays contiguous: until [`Self::finish`] resolves it, its
+/// placeholder range is its body's offsets in `wire`. Every method returns
+/// `None` for wire the generated decoder must decide: a framing, wire-type,
+/// or UTF-8 refusal, or an encoding protobuf merges.
+#[derive(Debug)]
+pub(crate) struct PoolDecoder<'a> {
+    /// The whole export.
+    wire: &'a [u8],
+    /// The pool being filled.
+    pool: AttributePool<'a>,
+}
+
+impl<'a> PoolDecoder<'a> {
+    /// Starts an empty pool over `wire`, sized for `entries` key/value
+    /// entries and `values` values.
+    pub(crate) fn new(wire: &'a [u8], entries: usize, values: usize) -> Self {
+        Self {
+            wire,
+            pool: AttributePool {
+                entries: Vec::with_capacity(entries),
+                values: Vec::with_capacity(values),
+            },
+        }
+    }
+
+    /// The number of entries pooled so far.
+    pub(crate) fn entries(&self) -> usize {
+        self.pool.entries.len()
+    }
+
+    /// Pools one top-level value, such as a log body, returning its position
+    /// in [`AttributePool::values`].
+    pub(crate) fn push_value(&mut self, bytes: &'a [u8]) -> Option<usize> {
+        let value = self.value(bytes)?;
+        self.pool.values.push(value);
+        Some(self.pool.values.len() - 1)
+    }
+
+    /// Resolves every placeholder list and yields the finished pool.
+    pub(crate) fn finish(mut self) -> Option<AttributePool<'a>> {
+        self.resolve_nested()?;
+        Some(self.pool)
+    }
+
+    /// Pools one key/value entry.
+    pub(crate) fn entry(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let (mut key, mut value, mut values) = ("", None, 0_usize);
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, wire)) = fields.next().ok()? {
+            match (tag, wire) {
+                (1, WireValue::Bytes(body)) => key = text(body)?,
+                (2, WireValue::Bytes(body)) => (value, values) = (Some(body), values + 1),
+                (1 | 2, _) => return None,
+                _ => {}
+            }
+        }
+        let value = match (values, value) {
+            (0, _) => PooledValue::Empty,
+            (1, Some(body)) => self.value(body)?,
+            _ => return None,
+        };
+        self.pool.entries.push(PooledEntry { key, value });
+        Some(())
+    }
+
+    /// Reads one `AnyValue`, leaving a nested list as a placeholder.
+    fn value(&self, bytes: &'a [u8]) -> Option<PooledValue<'a>> {
+        let (mut only, mut oneofs) = (None, 0_usize);
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            if (1..=7).contains(&tag) {
+                (only, oneofs) = (Some((tag, value)), oneofs + 1);
+            }
+        }
+        let Some((tag, value)) = only else {
+            return Some(PooledValue::Empty);
+        };
+        if oneofs > 1 {
+            return None;
+        }
+        Some(match (tag, value) {
+            (1, WireValue::Bytes(body)) => PooledValue::String(text(body)?),
+            (2, WireValue::Varint(value)) => PooledValue::Bool(value != 0),
+            (3, WireValue::Varint(value)) => PooledValue::Int(protobuf_i64(value)),
+            (4, WireValue::Fixed64(value)) => PooledValue::Double(f64::from_bits(value)),
+            (5, WireValue::Bytes(body)) => PooledValue::Array(self.wire_range(body)),
+            (6, WireValue::Bytes(body)) => PooledValue::Kvlist(self.wire_range(body)),
+            (7, WireValue::Bytes(body)) => PooledValue::Bytes(body),
+            _ => return None,
+        })
+    }
+
+    /// The offsets of `body`, a subslice of the export, in [`Self::wire`].
+    fn wire_range(&self, body: &[u8]) -> PoolRange {
+        let start = body.as_ptr().addr() - self.wire.as_ptr().addr();
+        PoolRange {
+            start,
+            end: start + body.len(),
+        }
+    }
+
+    /// Pools every placeholder list and points it at its items.
+    ///
+    /// One cursor per pool visits each value once; a list's items are
+    /// appended behind the cursor, so their own placeholders are visited too.
+    fn resolve_nested(&mut self) -> Option<()> {
+        let (mut entry, mut item) = (0, 0);
+        loop {
+            if entry < self.pool.entries.len() {
+                let value = self.resolve(self.pool.entries[entry].value)?;
+                self.pool.entries[entry].value = value;
+                entry += 1;
+            } else if item < self.pool.values.len() {
+                let value = self.resolve(self.pool.values[item])?;
+                self.pool.values[item] = value;
+                item += 1;
+            } else {
+                return Some(());
+            }
+        }
+    }
+
+    /// Pools a placeholder list's items; any other value is returned as is.
+    fn resolve(&mut self, value: PooledValue<'a>) -> Option<PooledValue<'a>> {
+        Some(match value {
+            PooledValue::Array(body) => PooledValue::Array(self.array(body)?),
+            PooledValue::Kvlist(body) => PooledValue::Kvlist(self.kvlist(body)?),
+            other => other,
+        })
+    }
+
+    /// Pools the items of the `ArrayValue` at `body` in the wire.
+    fn array(&mut self, body: PoolRange) -> Option<PoolRange> {
+        let start = self.pool.values.len();
+        let mut fields = WireFields::new(&self.wire[body.start..body.end]);
+        while let Some((tag, wire)) = fields.next().ok()? {
+            match (tag, wire) {
+                (1, WireValue::Bytes(item)) => {
+                    let item = self.value(item)?;
+                    self.pool.values.push(item);
+                }
+                (1, _) => return None,
+                _ => {}
+            }
+        }
+        Some(PoolRange {
+            start,
+            end: self.pool.values.len(),
+        })
+    }
+
+    /// Pools the entries of the `KeyValueList` at `body` in the wire.
+    fn kvlist(&mut self, body: PoolRange) -> Option<PoolRange> {
+        let start = self.pool.entries.len();
+        let mut fields = WireFields::new(&self.wire[body.start..body.end]);
+        while let Some((tag, wire)) = fields.next().ok()? {
+            match (tag, wire) {
+                (1, WireValue::Bytes(entry)) => self.entry(entry)?,
+                (1, _) => return None,
+                _ => {}
+            }
+        }
+        Some(self.range_from(start))
+    }
+
+    /// The pooled entries pushed since `start`.
+    pub(crate) fn range_from(&self, start: usize) -> PoolRange {
+        PoolRange {
+            start,
+            end: self.pool.entries.len(),
+        }
+    }
+}
+
+/// Reads one span status.
+fn status_input(bytes: &[u8]) -> Option<StatusInput<'_>> {
+    let mut status = StatusInput {
+        message: "",
+        code: 0,
+    };
+    let mut fields = WireFields::new(bytes);
+    while let Some((tag, value)) = fields.next().ok()? {
+        match (tag, value) {
+            (2, WireValue::Bytes(body)) => status.message = text(body)?,
+            (3, WireValue::Varint(value)) => status.code = protobuf_i32(value),
+            (2 | 3, _) => return None,
+            _ => {}
+        }
+    }
+    Some(status)
+}
+
+/// Borrows one protobuf string, refusing invalid UTF-8.
+pub(crate) fn text(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes).ok()
+}
+
 /// Constructs the stable malformed error for a known field's wire mismatch.
 pub(crate) fn wrong_wire(field: &str) -> IngestError {
     malformed(&format!("invalid protobuf wire type for {field}"))
@@ -1783,6 +2461,16 @@ mod tests {
     use super::*;
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, status};
     use wyrd_tonic::prost::Message;
+
+    /// The trace preflight's plan alone, shaped like the metrics preflight.
+    fn trace_plan(bytes: &[u8], limits: OtlpWireLimits) -> Result<OtlpDecodePlan, IngestError> {
+        preflight_trace_protobuf(bytes, limits).map(|(plan, _)| plan)
+    }
+
+    /// The logs preflight's plan alone, shaped like the metrics preflight.
+    fn logs_plan(bytes: &[u8], limits: OtlpWireLimits) -> Result<OtlpDecodePlan, IngestError> {
+        crate::otlp_logs_decode::preflight_logs_protobuf(bytes, limits).map(|(plan, _)| plan)
+    }
 
     /// Builds one attribute for rich trace decode fixtures.
     fn attribute(key: &str, value: any_value::Value) -> KeyValue {
@@ -2175,7 +2863,7 @@ mod tests {
             }],
         };
         let bytes = request.encode_to_vec();
-        let plan =
+        let (plan, _) =
             preflight_trace_protobuf(&bytes, vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS)
                 .expect("valid trace wire preflight");
         assert_eq!(plan.wire_bytes, bytes.len());
@@ -2194,13 +2882,8 @@ mod tests {
         assert!(matches!(error, IngestError::Decode(_)));
     }
 
-    /// Proves the fixed constructor preserves rich generated trace semantics.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture fails to encode or decode identically.
-    #[test]
-    fn trace_fixed_decode_round_trips_all_generated_shapes() {
+    /// Builds one trace export using every generated trace field.
+    fn rich_trace_request() -> ExportTraceServiceRequest {
         let nested = any_value::Value::KvlistValue(KeyValueList {
             values: vec![attribute(
                 "array",
@@ -2225,7 +2908,7 @@ mod tests {
                 }),
             )],
         });
-        let request = ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
                     attributes: vec![attribute("resource", nested)],
@@ -2287,11 +2970,21 @@ mod tests {
                 }],
                 schema_url: "https://resource/v1".to_owned(),
             }],
-        };
+        }
+    }
+
+    /// Proves the fixed constructor preserves rich generated trace semantics.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture fails to encode or decode identically.
+    #[test]
+    fn trace_fixed_decode_round_trips_all_generated_shapes() {
+        let request = rich_trace_request();
         let mut bytes = request.encode_to_vec();
         bytes.extend_from_slice(&[0xa0, 0x06, 0x01]);
         bytes.extend_from_slice(&[0xab, 0x06, 0x08, 0x01, 0xac, 0x06]);
-        let plan =
+        let (plan, _) =
             preflight_trace_protobuf(&bytes, vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS)
                 .expect("rich trace preflight must succeed");
         let decoded = decode_trace_protobuf(&bytes).expect("rich trace must decode");
@@ -2501,7 +3194,7 @@ mod tests {
         push_raw_message_field(&mut request_wire, 1, &resource_wire);
         let expected_request = ExportTraceServiceRequest::decode(request_wire.as_slice())
             .expect("prost must decode the complete split fixture");
-        let plan = preflight_trace_protobuf(
+        let (plan, _) = preflight_trace_protobuf(
             &request_wire,
             vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS,
         )
@@ -2673,14 +3366,8 @@ mod tests {
             }],
         };
         [
-            (
-                preflight_trace_protobuf as Preflight,
-                traces.encode_to_vec(),
-            ),
-            (
-                crate::otlp_logs_decode::preflight_logs_protobuf,
-                logs.encode_to_vec(),
-            ),
+            (trace_plan as Preflight, traces.encode_to_vec()),
+            (logs_plan, logs.encode_to_vec()),
             (
                 crate::otlp_metrics_decode::preflight_metrics_protobuf,
                 metrics.encode_to_vec(),
@@ -2706,7 +3393,7 @@ mod tests {
         let groups = 2000;
         let requests: [(Preflight, Vec<u8>, usize); 3] = [
             (
-                preflight_trace_protobuf,
+                trace_plan,
                 ExportTraceServiceRequest {
                     resource_spans: vec![ResourceSpans::default(); groups],
                 }
@@ -2714,7 +3401,7 @@ mod tests {
                 size_of::<ResourceSpans>(),
             ),
             (
-                crate::otlp_logs_decode::preflight_logs_protobuf,
+                logs_plan,
                 ExportLogsServiceRequest {
                     resource_logs: vec![ResourceLogs::default(); groups],
                 }
@@ -2770,5 +3457,312 @@ mod tests {
                 Err(IngestError::PayloadTooLarge { .. })
             ));
         }
+    }
+    /// Encodes one length-delimited protobuf field.
+    fn field(tag: u32, body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        wyrd_tonic::prost::encoding::encode_key(
+            tag,
+            wyrd_tonic::prost::encoding::WireType::LengthDelimited,
+            &mut bytes,
+        );
+        wyrd_tonic::prost::encoding::encode_varint(body.len() as u64, &mut bytes);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// Wraps one encoded span body in a one-span trace export.
+    fn export_of_span(span: &[u8]) -> Vec<u8> {
+        field(1, &field(2, &field(2, span)))
+    }
+
+    /// Builds spans covering nesting, duplicate keys, empty values, a Card
+    /// reference, and a span projection rejects.
+    fn edge_trace_request() -> ExportTraceServiceRequest {
+        let card = "0190f7a4-1c2b-7d3e-8f40-123456789abc";
+        let good = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            name: "edge".to_owned(),
+            attributes: vec![
+                attribute("dup", any_value::Value::IntValue(1)),
+                KeyValue {
+                    key: "absent".to_owned(),
+                    value: None,
+                },
+                KeyValue {
+                    key: "unset".to_owned(),
+                    value: Some(AnyValue { value: None }),
+                },
+                KeyValue {
+                    key: "deep".to_owned(),
+                    value: Some(alternating_value(7)),
+                },
+                attribute(
+                    "wyrd.card.uid",
+                    any_value::Value::StringValue(card.to_owned()),
+                ),
+                attribute("dup", any_value::Value::StringValue("last".to_owned())),
+            ],
+            events: vec![span::Event {
+                name: "exception".to_owned(),
+                attributes: vec![
+                    attribute(
+                        "exception.type",
+                        any_value::Value::StringValue("Boom".to_owned()),
+                    ),
+                    KeyValue {
+                        key: "nested".to_owned(),
+                        value: Some(alternating_value(5)),
+                    },
+                ],
+                ..span::Event::default()
+            }],
+            ..Span::default()
+        };
+        let rejected = Span {
+            trace_id: vec![0; 3],
+            ..good.clone()
+        };
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![good.clone(), rejected, good],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        }
+    }
+
+    /// Computes the heap one borrowed trace input holds, owned resources and
+    /// scopes included.
+    fn borrowed_trace_capacity(input: &TraceInput<'_>) -> usize {
+        use vala_bifrost_redux::tables::traces::input::{EventInput, LinkInput};
+        input.resources.capacity() * size_of::<ResourceInput<'_>>()
+            + input
+                .resources
+                .iter()
+                .filter_map(|group| group.resource.as_deref())
+                .map(decoded_resource_capacity)
+                .sum::<usize>()
+            + input.scopes.capacity() * size_of::<ScopeInput<'_>>()
+            + input
+                .scopes
+                .iter()
+                .filter_map(|group| group.scope.as_deref())
+                .map(decoded_scope_capacity)
+                .sum::<usize>()
+            + input.spans.capacity() * size_of::<SpanInput<'_>>()
+            + input.events.capacity() * size_of::<EventInput<'_>>()
+            + input.links.capacity() * size_of::<LinkInput<'_>>()
+            + input.pool.entries.capacity() * size_of::<PooledEntry<'_>>()
+            + input.pool.values.capacity() * size_of::<PooledValue<'_>>()
+    }
+
+    /// Builds the shapes generated decode stores most compactly: empty
+    /// attributes and nested one-item arrays.
+    fn compact_trace_request() -> ExportTraceServiceRequest {
+        let nested = AnyValue {
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(any_value::Value::ArrayValue(ArrayValue {
+                        values: vec![AnyValue::default()],
+                    })),
+                }],
+            })),
+        };
+        let mut attributes = vec![KeyValue::default(); 64];
+        attributes.push(KeyValue {
+            key: String::new(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![nested; 64],
+                })),
+            }),
+        });
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue::default(); 8],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![
+                        Span {
+                            attributes,
+                            events: vec![span::Event::default(); 8],
+                            links: vec![span::Link::default(); 8],
+                            ..Span::default()
+                        };
+                        4
+                    ],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        }
+    }
+
+    /// Proves a borrowed decode projects and attributes exactly like the
+    /// generated decode of the same wire.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture falls back or either projection differs.
+    #[test]
+    fn borrowed_trace_decode_projects_like_generated_decode() {
+        use vala_bifrost_redux::gate::attribution::span_card_uids;
+        use vala_bifrost_redux::tables::traces::project_trace_input;
+        let mut rich = rich_trace_request().encode_to_vec();
+        rich.extend_from_slice(&[0xa0, 0x06, 0x01]);
+        rich.extend_from_slice(&[0xab, 0x06, 0x08, 0x01, 0xac, 0x06]);
+        let many = ExportTraceServiceRequest {
+            resource_spans: (0..3)
+                .map(|resource| ResourceSpans {
+                    scope_spans: (0..2)
+                        .map(|scope| ScopeSpans {
+                            spans: (0..4)
+                                .map(|span| Span {
+                                    trace_id: vec![resource + 1; 16],
+                                    span_id: vec![scope + 1; 8],
+                                    name: format!("span-{span}"),
+                                    attributes: vec![attribute(
+                                        "index",
+                                        any_value::Value::IntValue(span),
+                                    )],
+                                    ..Span::default()
+                                })
+                                .collect(),
+                            ..ScopeSpans::default()
+                        })
+                        .collect(),
+                    ..ResourceSpans::default()
+                })
+                .collect(),
+        };
+        for bytes in [
+            rich,
+            many.encode_to_vec(),
+            edge_trace_request().encode_to_vec(),
+            compact_trace_request().encode_to_vec(),
+            Vec::new(),
+        ] {
+            let generated = decode_trace_protobuf(&bytes).expect("fixture decodes");
+            let generated_input = TraceInput::from_generated(&generated.resource_spans);
+            let (plan, counts) = preflight_trace_protobuf(
+                &bytes,
+                vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS,
+            )
+            .expect("fixture preflights");
+            let borrowed = decode_trace_input(&bytes, counts).expect("fixture borrows");
+            assert!(
+                borrowed_trace_capacity(&borrowed) <= plan.reservation_bytes(),
+                "a borrowed decode must fit the generated reservation"
+            );
+            let (expected, expected_outcome) =
+                project_trace_input(&generated_input, None, usize::MAX)
+                    .expect("generated projects");
+            let (batch, outcome) =
+                project_trace_input(&borrowed, None, usize::MAX).expect("borrowed projects");
+            assert_eq!(batch, expected);
+            assert_eq!(outcome.accepted_spans, expected_outcome.accepted_spans);
+            assert_eq!(outcome.rejected_spans, expected_outcome.rejected_spans);
+            assert_eq!(
+                outcome.rejection_message,
+                expected_outcome.rejection_message
+            );
+            assert_eq!(span_card_uids(&borrowed), span_card_uids(&generated_input));
+        }
+    }
+
+    /// Proves wire that protobuf must merge, or that the generated decoder
+    /// refuses, is left to the generated decoder.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the borrowed decoder accepts a merge or refused encoding.
+    #[test]
+    fn borrowed_trace_decode_defers_merges_and_refusals() {
+        let span = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            name: "merge".to_owned(),
+            ..Span::default()
+        }
+        .encode_to_vec();
+        let with = |extra: &[u8]| export_of_span(&[span.as_slice(), extra].concat());
+        let text = |value: &str| {
+            AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_owned())),
+            }
+            .encode_to_vec()
+        };
+        let statuses = [
+            field(
+                15,
+                &Status {
+                    message: "a".to_owned(),
+                    code: 0,
+                }
+                .encode_to_vec(),
+            ),
+            field(
+                15,
+                &Status {
+                    message: String::new(),
+                    code: 2,
+                }
+                .encode_to_vec(),
+            ),
+        ]
+        .concat();
+        let two_values = field(
+            9,
+            &[field(1, b"key"), field(2, &text("a")), field(2, &text("b"))].concat(),
+        );
+        let two_oneofs = field(
+            9,
+            &[
+                field(1, b"key"),
+                field(2, &[text("a"), vec![0x18, 0x03]].concat()),
+            ]
+            .concat(),
+        );
+        let resource = Resource::default().encode_to_vec();
+        let two_resources = field(
+            1,
+            &[
+                field(1, &resource),
+                field(1, &resource),
+                field(2, &field(2, &span)),
+            ]
+            .concat(),
+        );
+        let two_scopes = field(
+            1,
+            &field(
+                2,
+                &[
+                    field(1, &InstrumentationScope::default().encode_to_vec()),
+                    field(1, &InstrumentationScope::default().encode_to_vec()),
+                    field(2, &span),
+                ]
+                .concat(),
+            ),
+        );
+        for bytes in [
+            with(&statuses),
+            with(&two_values),
+            with(&two_oneofs),
+            two_resources,
+            two_scopes,
+        ] {
+            decode_trace_protobuf(&bytes).expect("merge fixture decodes");
+            assert!(decode_trace_input(&bytes, TracePoolCounts::default()).is_none());
+        }
+        let invalid_name = with(&field(5, &[0xff]));
+        assert!(decode_trace_protobuf(&invalid_name).is_err());
+        assert!(decode_trace_input(&invalid_name, TracePoolCounts::default()).is_none());
     }
 }

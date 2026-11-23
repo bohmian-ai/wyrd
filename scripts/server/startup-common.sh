@@ -88,15 +88,15 @@ image="$("$root/scripts/build.sh" image debian "$tag")"
 source_commit="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
 echo "image: $image source: $source_commit" | tee "$root/target/startup-$startup_journey-image-provenance.txt"
 # The server reads only owner-only key files, so the signing key and the
-# single-tenant deployment's file operator KEK are written into a volume as
-# the image's serving user, the way mounted secrets are delivered.
+# deployment's file-backed [kms] key are written into a volume as the image's
+# serving user, the way mounted secrets are delivered.
 docker volume create "$keys" >/dev/null
 put_key() {
   docker run --rm -i -u root -v "$keys:/run/wyrd" "$image" sh -c \
-    "mkdir -p /run/wyrd/kek && cat >/run/wyrd/$1 && chown -R wyrd:wyrd /run/wyrd && chmod 0600 /run/wyrd/$1"
+    "mkdir -p /run/wyrd/kms && cat >/run/wyrd/$1 && chown -R wyrd:wyrd /run/wyrd && chmod 0600 /run/wyrd/$1"
 }
 openssl genpkey -algorithm ed25519 2>/dev/null | put_key signing.pem
-openssl rand -base64 32 | tr -d '\n' | put_key kek/v1
+openssl rand -base64 32 | tr -d '\n' | put_key kms/v1
 
 echo "== fresh external Postgres"
 docker network create "$net" >/dev/null

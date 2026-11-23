@@ -563,10 +563,51 @@ fn diagnostic_metrics() -> Vec<Metric> {
             "resume",
             "the execution task's answer send until the handler resumed on it",
         ),
+        (
+            "admission",
+            "the caller's task from receiving the call until it spawned the execution task: admission phases and the work between them",
+        ),
+        (
+            "pressure",
+            "inside admission: the pause for process memory pressure before any reservation",
+        ),
+        (
+            "capture_slot",
+            "inside admission: a capturing call's wait for a Scribe outbox slot under its item and reserved-byte limits",
+        ),
+        (
+            "execute",
+            "the execution task's provider attempts until the engine returned: provider waits, credential, translation, and engine work",
+        ),
+        (
+            "settle",
+            "the settlement from the engine's return until the answer (a stream's head) was sent",
+        ),
     ] {
         metrics.extend(Metric::diagnostic(
             &format!("wait.{wait}"),
             &format!("server: `wyrd_gateway_wait_seconds{{wait={wait}}}`, {what}; overlaps the phases and is never summed; every call {WINDOW}"),
+        ));
+    }
+    for (stage, what) in [
+        (
+            "frames",
+            "one outbox write's projection of its rows into frames, before any chunk is encoded",
+        ),
+        ("permit", "one chunk's wait for a process delivery permit"),
+        (
+            "encode_queue",
+            "one chunk's wait for the blocking pool to start its encoding",
+        ),
+        ("encode", "one chunk's encoding on the blocking pool"),
+        (
+            "submit",
+            "one encoded stream's submission until Scribe answered it",
+        ),
+    ] {
+        metrics.extend(Metric::diagnostic(
+            &format!("outbox_stage.{stage}"),
+            &format!("server: `wyrd_scribe_outbox_stage_seconds{{stage={stage}}}`, {what}; chunks of one write overlap up to the frames in flight, so stages are never summed into `outbox_write.scribe`; {WINDOW}"),
         ));
     }
     metrics.extend(Population::root_metrics(Role::Driver, &run::DRIVER_ROOTS));

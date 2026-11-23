@@ -4,11 +4,11 @@
 //!
 //! One acceptance is one `bifrost.verification.evidence` row, written through
 //! Scribe as its own batch under a batch id its source, input, and
-//! subscriber derive. The batch fence, committed before Scribe acknowledges,
-//! is the authoritative record that the subscriber accepted evidence for
-//! that source and input: an unfenced acceptance is absent, and a fenced one
-//! whose row a query cannot see yet is unavailable, never absent. Nothing is
-//! mirrored in PostgreSQL; the queue only learns that a consumer is due.
+//! subscriber derive. The row is the lasting record that the subscriber
+//! accepted evidence for that source and input. Consumers read Bifrost alone;
+//! an unreadable acceptance can appear absent, while its fixed batch identity
+//! refuses conflicting writes. Failed reads are unavailable and retry. Nothing
+//! is mirrored in PostgreSQL; the queue only learns that a consumer is due.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -19,7 +19,6 @@ use sha2::{Digest as _, Sha256};
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
-use vala_bifrost_redux::contracts::committed_batches;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::EvidenceTable;
@@ -34,7 +33,7 @@ use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_U
 use wyrd_spec::verification::execution::InputDeclaration;
 
 use super::inputs::InputResolver;
-use crate::scribe_outbox::{ScribeTable, ScribeWrite, fenced_batch_id};
+use crate::scribe_outbox::{ScribeTable, ScribeWrite};
 use crate::state::AppState;
 
 /// The table every acceptance is a row of, and the logical table of every
@@ -137,11 +136,14 @@ impl<'a> DeferredEvidence<'a> {
     /// Every acceptance `subscribers` hold for `input` of `source`, read
     /// through `records`. A subscriber without one is absent from the map.
     ///
+    /// Reads come only from Bifrost. An acceptance Scribe accepted but no
+    /// query sees yet is absent here: a waiting execution stays parked until
+    /// a later read sees it, and a resubmission is absorbed, or refused when
+    /// different, under the acceptance's batch id.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::ServiceUnavailable`] when the fences cannot be
-    /// read, or an accepted row is not visible yet, so an acceptance is never
-    /// mistaken for absence; the query error or an internal error when a
-    /// row cannot be read or is malformed.
+    /// Returns the query error, or an internal error when a row is
+    /// malformed.
     pub(crate) async fn accepted(
         &self,
         records: &InputResolver<'_>,
@@ -149,38 +151,11 @@ impl<'a> DeferredEvidence<'a> {
         input: &SlotName,
         subscribers: &[CardUid],
     ) -> Result<BTreeMap<CardUid, Accepted>, WyrdError> {
-        let fences: Vec<Uuid> = subscribers
-            .iter()
-            .map(|verifier| self.fence(source, input, verifier))
-            .collect();
-        let mut conn = self
-            .app
-            .postgres
-            .vala()
-            .tenant_conn(self.tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let fenced = committed_batches(&mut conn, EVIDENCE_TABLE, &fences)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let held: Vec<&CardUid> = subscribers
-            .iter()
-            .zip(&fences)
-            .filter(|(_, fence)| fenced.contains(fence))
-            .map(|(verifier, _)| verifier)
-            .collect();
-        if held.is_empty() {
-            return Ok(BTreeMap::new());
-        }
         let mut rows = records.published(source, input).await?;
-        held.into_iter()
-            .map(|verifier| {
-                let accepted = rows
-                    .remove(verifier)
-                    .ok_or_else(|| unavailable(&"accepted evidence is not visible yet"))?;
-                Ok((verifier.clone(), accepted))
-            })
-            .collect()
+        Ok(subscribers
+            .iter()
+            .filter_map(|verifier| rows.remove_entry(verifier))
+            .collect())
     }
 
     /// Accept `published` for `input` of `source` for each of `subscribers`,
@@ -254,15 +229,6 @@ impl<'a> DeferredEvidence<'a> {
             }
         }
     }
-
-    /// The batch fence of `verifier`'s acceptance of `input` for `source`.
-    fn fence(&self, source: EvidenceSource<'_>, input: &SlotName, verifier: &CardUid) -> Uuid {
-        fenced_batch_id(
-            self.tenant,
-            ScribeTable::Evidence,
-            key(source, input, verifier),
-        )
-    }
 }
 
 /// The batch identity of `verifier`'s acceptance of `input` for `source`:
@@ -332,15 +298,6 @@ fn row(
         .collect();
     StagedRow::new(Arc::clone(&SCHEMA), cells)
         .map_err(|error| WyrdError::internal(format!("evidence row: {error}")))
-}
-
-/// An unreadable fence or invisible accepted row as a retryable
-/// unavailability.
-fn unavailable(error: &dyn std::fmt::Display) -> WyrdError {
-    WyrdError::ServiceUnavailable {
-        message: format!("deferred evidence cannot be read now: {error}"),
-        details: serde_json::json!({ "table": EVIDENCE_TABLE }),
-    }
 }
 
 /// A full 40-character lowercase hex commit, the only commit a PR execution

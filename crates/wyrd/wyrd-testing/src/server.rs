@@ -50,9 +50,9 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
+use wyrd_kms::{KmsBackendKind, KmsConfig};
 use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
@@ -60,8 +60,8 @@ use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::{BifrostExternalDependencies, BootedServer, StartInputs};
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
-    BifrostRuntimeRole, ForgeRuntimeConfig, GatewayConfig, IssuerEntry, OperatorKeySource,
-    OperatorKeysConfig, ServeMode, ServerTarget, WorkloadBindingEntry,
+    BifrostRuntimeRole, ForgeRuntimeConfig, GatewayConfig, IssuerEntry, ServeMode, ServerTarget,
+    WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -251,8 +251,11 @@ const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 /// fixture handle to the server's lifetime, so nothing is removed while a
 /// background task may still read it.
 struct WyrdTestServerInner {
-    /// Lifetime guard of the generated Operator key directory, when used.
-    operator_keys_dir: Option<TempDir>,
+    /// The `[kms]` configuration this server booted with; restarts and
+    /// replicas inherit it unless their builder supplies another.
+    kms: KmsConfig,
+    /// Lifetime guard of the generated `[kms]` key directory, when used.
+    kms_dir: Option<Arc<TempDir>>,
     /// Lifetime guard retained only for local storage-backed servers.
     storage_root: Option<Arc<TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
@@ -476,8 +479,6 @@ pub struct WyrdTestServerBuilder {
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
-    /// Provider-secret sealing keyring; `None` uses the deterministic test key.
-    sealing_keyring: Option<Arc<SealingKeyring>>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -584,8 +585,11 @@ pub struct WyrdTestServerBuilder {
     serve_task_panic_for_test: bool,
     /// Register the test-support MCP context probe in the `/mcp` tool catalog.
     mcp_context_probe: bool,
-    /// Operator connection key source; `None` generates a file key.
-    operator_keys: Option<OperatorKeysConfig>,
+    /// `[kms]` configuration; `None` generates a file key, or inherits the
+    /// running server's on a restart or replica.
+    kms: Option<KmsConfig>,
+    /// Lifetime guard of an inherited generated `[kms]` key directory.
+    kms_dir: Option<Arc<TempDir>>,
     /// Hosted Verifier Deployment limits; `None` keeps the defaults with no
     /// prewarmed worker.
     verification_limits: Option<HostedLimits>,
@@ -671,7 +675,6 @@ impl Default for WyrdTestServerBuilder {
             auth_verify_settings: None,
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
-            sealing_keyring: None,
             forge_interval: Duration::from_mins(1),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
@@ -721,7 +724,8 @@ impl Default for WyrdTestServerBuilder {
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
-            operator_keys: None,
+            kms: None,
+            kms_dir: None,
             verification_limits: None,
             verification_runtime_limits: None,
             verification_worker: None,
@@ -743,26 +747,27 @@ fn test_verification_limits() -> HostedLimits {
     }
 }
 
-/// Write key version 1 as an owner-only file in a fresh directory and return
-/// the file-sourced Operator key config over it.
+/// Write one random owner-only `file` key named `test` in a fresh directory
+/// and return the `[kms]` configuration over it, as `wyrd init` writes one.
 ///
 /// # Errors
 /// Returns [`WyrdTestServerError::Start`] when the directory or file cannot
 /// be created.
-fn generated_operator_keys() -> Result<(OperatorKeysConfig, Option<TempDir>), WyrdTestServerError> {
+fn generated_kms() -> Result<(KmsConfig, Arc<TempDir>), WyrdTestServerError> {
     let start = |error: std::io::Error| WyrdTestServerError::Start(error.to_string());
     let dir = tempfile::tempdir().map_err(start)?;
     let mut key = [0_u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
-    let path = dir.path().join("v1");
+    let path = dir.path().join("test");
     std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode(key)).map_err(start)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(start)?;
-    let config = OperatorKeysConfig {
-        source: OperatorKeySource::File,
-        dir: Some(dir.path().to_path_buf()),
-        ..OperatorKeysConfig::default()
+    let config = KmsConfig {
+        backend: Some(KmsBackendKind::File),
+        active_key: Some("test".to_owned()),
+        key_dir: Some(dir.path().to_path_buf()),
+        ..KmsConfig::default()
     };
-    Ok((config, Some(dir)))
+    Ok((config, Arc::new(dir)))
 }
 
 /// Test server errors.
@@ -1035,6 +1040,7 @@ impl WyrdTestServer {
         let storage_root = self.inner.storage_root.clone();
         let data_dir = Arc::clone(&self.inner.bifrost_data_dir);
         let data_path = self.inner.bifrost_data_path.clone();
+        self.inherit_kms(&mut builder);
         self.shutdown().await?;
         builder.bifrost_data_dir.get_or_insert(data_dir);
         builder.bifrost_data_path.get_or_insert(data_path);
@@ -1051,18 +1057,20 @@ impl WyrdTestServer {
     /// Postgres fixture and artifact storage, leaving this server running.
     ///
     /// The replica builds its own application state, auth handles, and
-    /// sealing keyring from `builder`, so a journey can prove that durable
-    /// state written through one replica is served by another without a
-    /// restart, and that replicas holding different keyrings interoperate
-    /// during sealing-key rotation. Like [`Self::start_in_process`], it runs
-    /// the current-authority propagation worker.
+    /// `[kms]` facade from `builder` (this server's `[kms]` unless it names
+    /// another), so a journey can prove that durable state written through
+    /// one replica is served by another without a restart, and that replicas
+    /// holding different key sets interoperate during rotation. Like
+    /// [`Self::start_in_process`], it runs the current-authority propagation
+    /// worker.
     ///
     /// # Errors
     /// Returns an error when the replica fails to start.
     pub async fn start_replica(
         &self,
-        builder: WyrdTestServerBuilder,
+        mut builder: WyrdTestServerBuilder,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        self.inherit_kms(&mut builder);
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
         let storage_root = self.inner.storage_root.clone();
@@ -1106,6 +1114,7 @@ impl WyrdTestServer {
         &self,
         mut builder: WyrdTestServerBuilder,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        self.inherit_kms(&mut builder);
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
@@ -3567,7 +3576,7 @@ impl WyrdTestServer {
     /// `state` (`Active` or `Candidate`).
     ///
     /// Reads the stored column byte-for-byte through a [`TenantConn`], so a
-    /// journey can assert ciphertext at rest and which sealing key a rotation
+    /// journey can assert ciphertext at rest and which `[kms]` key a rotation
     /// left it under. Returns `None` when no such connection exists or it
     /// stores no secret.
     ///
@@ -3590,7 +3599,7 @@ impl WyrdTestServer {
     ///
     /// Opens a [`TenantConn`] on the supplied tenant and reads the stored
     /// column byte-for-byte (never text-decoded), so the journey can assert the
-    /// sealing key wrote ciphertext at rest rather than plaintext. Returns
+    /// `[kms]` envelope holds ciphertext at rest rather than plaintext. Returns
     /// `None` when no issuer with that URL exists for the tenant, and `None`
     /// when the issuer stores no secret (public client).
     ///
@@ -4311,11 +4320,26 @@ impl WyrdTestServer {
         Some(self.inner.bifrost_data_root.wal())
     }
 
-    /// Directory of the generated owner-only Operator key files (`v1`, ...),
-    /// or `None` when the builder supplied its own key source.
+    /// The `[kms]` configuration this server booted with.
     #[must_use]
-    pub fn operator_keys_dir_for_test(&self) -> Option<&Path> {
-        self.inner.operator_keys_dir.as_ref().map(TempDir::path)
+    pub fn kms_config_for_test(&self) -> &KmsConfig {
+        &self.inner.kms
+    }
+
+    /// Directory of the generated owner-only `[kms]` key files, or `None`
+    /// when the builder supplied its own configuration.
+    #[must_use]
+    pub fn kms_dir_for_test(&self) -> Option<&Path> {
+        self.inner.kms_dir.as_deref().map(TempDir::path)
+    }
+
+    /// Give `builder` this server's `[kms]` unless it names its own, so a
+    /// restart or replica opens what this server sealed.
+    fn inherit_kms(&self, builder: &mut WyrdTestServerBuilder) {
+        if builder.kms.is_none() {
+            builder.kms = Some(self.inner.kms.clone());
+            builder.kms_dir.clone_from(&self.inner.kms_dir);
+        }
     }
 
     async fn raw_call(
@@ -4851,15 +4875,15 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Read Operator connection keys from `config` instead of the default
-    /// generated owner-only file key version 1.
+    /// Boot with `config` as `[kms]` instead of the default generated file
+    /// key, through the same facade construction production uses.
     ///
-    /// A multi-replica rotation journey points a second server at the first
-    /// server's [`WyrdTestServer::operator_keys_dir_for_test`] with a newer
-    /// active version.
+    /// A rotation journey points a second server at the first server's
+    /// [`WyrdTestServer::kms_dir_for_test`] with a new active key and the old
+    /// one retained.
     #[must_use]
-    pub fn with_operator_keys_for_test(mut self, config: OperatorKeysConfig) -> Self {
-        self.operator_keys = Some(config);
+    pub fn with_kms_for_test(mut self, config: KmsConfig) -> Self {
+        self.kms = Some(config);
         self
     }
 
@@ -5062,18 +5086,6 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_trusted_issuer_configs(mut self, configs: Vec<IssuerEntry>) -> Self {
         self.trusted_issuer_configs = configs;
-        self
-    }
-
-    /// Seal provider client secrets with `keyring` instead of the
-    /// deterministic test key.
-    ///
-    /// Start runs the production sealed-secret rewrap with this keyring, the
-    /// way a booting replica does, so a server started with a new write key
-    /// and the old key retained converges stored ciphertext onto the new key.
-    #[must_use]
-    pub fn with_sealing_keyring(mut self, keyring: Arc<SealingKeyring>) -> Self {
-        self.sealing_keyring = Some(keyring);
         self
     }
 
@@ -5663,11 +5675,13 @@ impl WyrdTestServerBuilder {
         if let Some(limits) = self.verification_runtime_limits.take() {
             config.verification.runtime = *limits;
         }
-        let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
-            Some(config) => (config, None),
-            None => generated_operator_keys()?,
+        let (kms, kms_dir) = if let Some(kms) = self.kms.take() {
+            (kms, self.kms_dir.take())
+        } else {
+            let (kms, dir) = generated_kms()?;
+            (kms, Some(dir))
         };
-        config.verification.operator_keys = operator_keys;
+        config.kms = kms;
         config.auth.tenant_slug = Some(
             fixture
                 .tenant_slug()
@@ -5718,9 +5732,8 @@ impl WyrdTestServerBuilder {
                     data_root,
                 },
                 signing_key: crate::keys::private_key_pem(),
-                sealing_key: Some(self.sealing_keyring.clone().unwrap_or_else(|| {
-                    Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32])))
-                })),
+                kms: wyrd_server::boot::build_kms(&config)
+                    .map_err(|error| start(error.to_string()))?,
                 verify_settings: self.auth_verify_settings.unwrap_or_default(),
                 token_exchange: self.access_ttl.map_or_else(
                     TokenExchangeSettings::default,
@@ -5758,7 +5771,8 @@ impl WyrdTestServerBuilder {
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
-                operator_keys_dir,
+                kms: config.kms.clone(),
+                kms_dir,
                 storage_root,
                 bifrost_data_dir: data_dir,
                 bifrost_data_path,

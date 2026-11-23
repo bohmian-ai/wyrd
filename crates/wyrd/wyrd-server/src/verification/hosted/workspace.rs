@@ -12,8 +12,9 @@
 //! process memory whole. A verified file is then renamed into `inputs/`;
 //! uploaded evidence declared as an archive is unpacked from its staged file
 //! after [`zip_guard`] or the equivalent tar.gz checks, each entry streamed
-//! to its own file, and the staged archive removed. JSON inputs are written
-//! under `inputs/` too, and `work/` starts empty. Artifact files are staged
+//! to its own file, and the staged archive removed. A JSON input is encoded
+//! in process memory, charged there until the placement pass writes it
+//! straight to its `inputs/` place, and `work/` starts empty. Artifact files are staged
 //! unchanged. No file is parsed when mounted: `fs.read` and `fs.search`
 //! serve the actual UTF-8 lines of a file, and only `fs.extract` runs the
 //! extractor, on request, into a new `/work` file. Every `/inputs` file keeps
@@ -105,8 +106,9 @@ impl Workspaces {
     /// execution deadlines and the execution is deferred instead. Each file
     /// is charged to scratch for its declared size before it is fetched,
     /// then streamed into the workspace's private staging directory and
-    /// verified there; only once every file is staged are they placed under
-    /// `/inputs` on the blocking pool. An Artifact file keeps its stored
+    /// verified there; a JSON input is encoded and charged to process memory
+    /// instead. Only once every file is staged or encoded are they placed
+    /// under `/inputs` on the blocking pool. An Artifact file keeps its stored
     /// content type only as a hint for `fs.extract`; it is never unpacked.
     ///
     /// # Errors
@@ -161,11 +163,13 @@ impl Workspaces {
             let sources = &input.sources;
             match &input.value {
                 CallValue::Json(value) => {
-                    let staged = workspace.staged(pending.len());
-                    pending.push(
-                        self.stage_json(&mut workspace, &mut count, path, value, sources, staged)
-                            .await?,
-                    );
+                    pending.push(self.stage_json(
+                        &mut workspace,
+                        &mut count,
+                        path,
+                        value,
+                        sources,
+                    )?);
                 }
                 CallValue::Evidence(declaration) => {
                     let file = evidence.file(declaration).await?;
@@ -183,7 +187,7 @@ impl Workspaces {
                     evidence.stage(&file, sniff, &staged).await?;
                     pending.push(Pending {
                         path: path.clone(),
-                        staged,
+                        body: Body::Staged(staged),
                         size: file.size,
                         format,
                         sources: sources.clone(),
@@ -247,18 +251,13 @@ impl Workspaces {
                         });
                     }
                     let manifest = serde_json::to_value(&manifest).unwrap_or(Value::Null);
-                    let staged = workspace.staged(pending.len());
-                    pending.push(
-                        self.stage_json(
-                            &mut workspace,
-                            &mut count,
-                            &format!("{path}/manifest.json"),
-                            &manifest,
-                            &BTreeSet::new(),
-                            staged,
-                        )
-                        .await?,
-                    );
+                    pending.push(self.stage_json(
+                        &mut workspace,
+                        &mut count,
+                        &format!("{path}/manifest.json"),
+                        &manifest,
+                        &BTreeSet::new(),
+                    )?);
                     directories.push(path.clone());
                 }
             }
@@ -288,36 +287,36 @@ impl Workspaces {
         Ok(workspace)
     }
 
-    /// Stage `value` as a UTF-8 JSON file for `/inputs` path `path` at
-    /// `staged`, charging the encoded bytes to process memory while they are
-    /// written and to the workspace's scratch for as long as they stay.
+    /// Encode `value` as a UTF-8 JSON file for `/inputs` path `path`,
+    /// charging the encoded bytes to process memory until the placement pass
+    /// writes them and to the workspace's scratch for as long as they stay.
     ///
     /// # Errors
     /// Returns [`BlockError::Busy`] when memory or scratch cannot hold the
-    /// file, `count`'s combined-limit refusal, and [`BlockError::Retryable`]
-    /// for a local IO failure.
-    async fn stage_json(
+    /// file, and `count`'s combined-limit refusal.
+    fn stage_json(
         &self,
         workspace: &mut Workspace,
         count: &mut impl FnMut(u64) -> Result<(), BlockError>,
         path: &str,
         value: &Value,
         sources: &BTreeSet<SlotName>,
-        staged: PathBuf,
     ) -> Result<Pending, BlockError> {
         // The encoding is counted and admitted before it is built, so a
         // refusal never allocates it.
         let size = crate::verification::encoded_len(value, true);
-        let _charge = self.memory.try_charge(size).map_err(|_| BlockError::Busy {
+        let memory = self.memory.try_charge(size).map_err(|_| BlockError::Busy {
             reason: "process memory cannot hold the workspace inputs now".to_owned(),
         })?;
         count(size)?;
         workspace.reserve(size)?;
         let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
-        tokio::fs::write(&staged, bytes).await.map_err(io)?;
         Ok(Pending {
             path: path.to_owned(),
-            staged,
+            body: Body::Encoded {
+                bytes,
+                _memory: memory,
+            },
             size,
             format: Some(MediaFormat::Json),
             sources: sources.clone(),
@@ -344,11 +343,7 @@ impl Workspaces {
     ) -> Result<(), BlockError> {
         let manifest = match &stored.publication.content {
             PublicationContent::Json { value } => {
-                let staged = workspace.staged(pending.len());
-                pending.push(
-                    self.stage_json(workspace, count, path, value, sources, staged)
-                        .await?,
-                );
+                pending.push(self.stage_json(workspace, count, path, value, sources)?);
                 return Ok(());
             }
             PublicationContent::File { manifest } => manifest,
@@ -379,7 +374,7 @@ impl Workspaces {
                 } else {
                     path.to_owned()
                 },
-                staged,
+                body: Body::Staged(staged),
                 size: stored.size,
                 format: None,
                 sources: sources.clone(),
@@ -449,19 +444,32 @@ pub struct Staged {
     pub sources: BTreeSet<SlotName>,
 }
 
-/// One verified file in the staging directory, waiting for its `/inputs`
-/// place.
+/// One verified file, staged or encoded, waiting for its `/inputs` place.
 struct Pending {
     /// Authored `/inputs/...` path.
     path: String,
-    /// Its host path in the staging directory.
-    staged: PathBuf,
+    /// Where its bytes wait.
+    body: Body,
     /// Its length, already charged to scratch.
     size: u64,
     /// Format, or `None` when unknown.
     format: Option<MediaFormat>,
     /// Original slots behind the file.
     sources: BTreeSet<SlotName>,
+}
+
+/// Where a [`Pending`] file's bytes wait for placement.
+enum Body {
+    /// Streamed and verified at this host path in the staging directory.
+    Staged(PathBuf),
+    /// Encoded JSON, written straight to its `/inputs` place, so it takes
+    /// no staging file and no rename.
+    Encoded {
+        /// The encoded file.
+        bytes: Vec<u8>,
+        /// Its process memory charge, returned once the bytes are dropped.
+        _memory: ByteCharge,
+    },
 }
 
 impl Drop for Workspace {
@@ -655,7 +663,7 @@ impl Workspace {
             std::fs::write(&path, &file.bytes).map_err(io)?;
             workspace.install(Pending {
                 path: file.path,
-                staged: path,
+                body: Body::Staged(path),
                 size,
                 format: file.format,
                 sources: file.sources,
@@ -729,9 +737,9 @@ impl Workspace {
         Ok(())
     }
 
-    /// Place staged `file` under its `/inputs` path: rename a plain file
-    /// into place, or unpack an archive from its staged file, then remove
-    /// that file and return its scratch.
+    /// Place `file` under its `/inputs` path: write encoded bytes there,
+    /// rename a staged plain file into place, or unpack an archive from its
+    /// staged file, then remove that file and return its scratch.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an invalid or duplicate path, an
@@ -741,15 +749,22 @@ impl Workspace {
     fn install(&mut self, file: Pending) -> Result<(), BlockError> {
         relative(&file.path, "/inputs/")
             .ok_or_else(|| terminal(format!("{} is not an /inputs path", file.path)))?;
+        let staged = match &file.body {
+            Body::Encoded { bytes, .. } => {
+                let host = self.claim(&file.path, file.format, &file.sources)?;
+                return std::fs::write(host, bytes).map_err(io);
+            }
+            Body::Staged(staged) => staged,
+        };
         match file.format {
-            Some(MediaFormat::Zip) => self.unzip(&file)?,
-            Some(MediaFormat::TarGz) => self.untar(&file)?,
+            Some(MediaFormat::Zip) => self.unzip(&file, staged)?,
+            Some(MediaFormat::TarGz) => self.untar(&file, staged)?,
             _ => {
                 let host = self.claim(&file.path, file.format, &file.sources)?;
-                return std::fs::rename(&file.staged, host).map_err(io);
+                return std::fs::rename(staged, host).map_err(io);
             }
         }
-        std::fs::remove_file(&file.staged).map_err(io)?;
+        std::fs::remove_file(staged).map_err(io)?;
         self.inputs_bytes = self.inputs_bytes.saturating_sub(file.size);
         if let Some(charge) = &mut self.scratch {
             charge
@@ -791,14 +806,15 @@ impl Workspace {
         Ok(host)
     }
 
-    /// Unpack a staged zip archive under its path after [`zip_guard`].
+    /// Unpack `file`'s zip archive, staged at `staged`, under its path
+    /// after [`zip_guard`].
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a guarded limit, an entry that is
     /// a link or escapes the archive, or a file over the file limit, and
     /// [`Self::write_entry`]'s errors.
-    fn unzip(&mut self, file: &Pending) -> Result<(), BlockError> {
-        let open = || std::fs::File::open(&file.staged).map_err(io);
+    fn unzip(&mut self, file: &Pending, staged: &Path) -> Result<(), BlockError> {
+        let open = || std::fs::File::open(staged).map_err(io);
         zip_guard(open()?, &self.limits.extract()).map_err(extract_refused)?;
         let mut archive = zip::ZipArchive::new(open()?)
             .map_err(|error| terminal(format!("{}: {error}", file.path)))?;
@@ -820,20 +836,21 @@ impl Workspace {
         Ok(())
     }
 
-    /// Unpack a staged tar.gz archive under its path, admitting only regular
-    /// files and directories, under the entry, byte, and ratio limits.
+    /// Unpack `file`'s tar.gz archive, staged at `staged`, under its path,
+    /// admitting only regular files and directories, under the entry, byte,
+    /// and ratio limits.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an unreadable archive, a link or
     /// special entry, an escaping path, or a limit, and
     /// [`Self::write_entry`]'s errors.
-    fn untar(&mut self, file: &Pending) -> Result<(), BlockError> {
+    fn untar(&mut self, file: &Pending, staged: &Path) -> Result<(), BlockError> {
         let budget = self
             .limits
             .archive_max_bytes
             .min(file.size.saturating_mul(self.limits.archive_max_ratio));
         let unreadable = |error: std::io::Error| terminal(format!("{}: {error}", file.path));
-        let staged = std::fs::File::open(&file.staged).map_err(io)?;
+        let staged = std::fs::File::open(staged).map_err(io)?;
         // The decoder is capped, so a header understating sizes cannot
         // inflate the stream past the archive budget.
         let mut decoder =

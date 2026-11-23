@@ -53,7 +53,7 @@ pub use kinds::{
     Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Service,
     Table, Trigger,
 };
-pub use verifier::{Action, Check, InputSlot, Requirement, Step, Verifier};
+pub use verifier::{Action, Check, InputSlot, Requirement, Step, Trace, Verifier};
 pub use wyrd_spec::verification::ExecutionPlan;
 
 /// One step of a location inside an authored value.

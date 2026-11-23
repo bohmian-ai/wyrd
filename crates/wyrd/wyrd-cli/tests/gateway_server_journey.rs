@@ -122,8 +122,9 @@ fn document(dir: &Path, name: &str, value: &Value) -> String {
 }
 
 /// An administrator drives the credential, deployment, and capture lifecycle
-/// through the compiled CLI; a reader is denied and a referenced credential
-/// cannot be deleted.
+/// through the compiled CLI, renewing a managed credential's encryption without
+/// rotating it; a reader is denied and a referenced credential cannot be
+/// deleted.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn gateway_commands_manage_redacted_tenant_configuration() {
@@ -272,7 +273,22 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
         ))["source"],
         "managed_secret"
     );
-    for (output, secret) in [(&submitted, SUBMITTED), (&rotated, ROTATED)] {
+    let renewed = gateway(
+        &endpoint,
+        &token,
+        &["credential", "renew-encryption", "managed"],
+    );
+    let renewed_view = ok_json(&renewed);
+    assert_eq!(
+        (&renewed_view["state"], &renewed_view["rotated_at"]),
+        (&rotated_view["state"], &rotated_view["rotated_at"]),
+        "renewing encryption keeps the credential and is not a rotation"
+    );
+    for (output, secret) in [
+        (&submitted, SUBMITTED),
+        (&rotated, ROTATED),
+        (&renewed, ROTATED),
+    ] {
         let diagnostics = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),

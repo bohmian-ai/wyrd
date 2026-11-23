@@ -347,7 +347,7 @@ impl PyRunBifrost {
     /// # Errors
     /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
     /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
+    /// `bifrost.datasets`, the errors of starting the writer on the first write,
     /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
     /// server's error for an unknown, unauthorized, or unavailable table.
     fn write_to(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
@@ -468,7 +468,8 @@ impl PyObserveHandle {
     ///
     /// # Errors
     /// As [`PyObserveHandle::verify`] for Run evidence; for window samples,
-    /// `WYRD_SDK_400_BIFROST_NOT_STARTED`, `WYRD_SDK_409_BIFROST_CLOSED`, or
+    /// the errors of starting the writer on the first write,
+    /// `WYRD_SDK_409_BIFROST_CLOSED`, or
     /// `WYRD_CLIENT_429_QUEUE_FULL`.
     #[pyo3(signature = (verifier, /, *value, group_id=None, **named))]
     fn submit(

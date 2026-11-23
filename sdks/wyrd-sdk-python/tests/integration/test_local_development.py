@@ -2,7 +2,7 @@
 
 They declare and pull an assistant, invoke a model through the Gateway with
 the stock OpenAI client, observe and verify a Run, export its spans through
-``state.start_telemetry``, and query the evidence back. No key is issued and
+``state.configure``, and query the evidence back. No key is issued and
 nothing is flushed on the server's behalf. ``work`` is that whole workflow for
 one client, so the signed-in story proves the same steps for a saved login.
 """
@@ -97,6 +97,7 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     declare(cards, "cards/verify_in_real_time/latency-model.yaml")
     declare(cards, "cards/verify_in_real_time/assistant.yaml")
     state = hydrated(pull(cards, "assistant", bundle_home), client)
+    state.configure()
     state.start_bifrost()
 
     assert invoke(client) == "hi"
@@ -106,8 +107,6 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     result = run.for_card("agent").observe.verify("answer-check", "yes")
     assert (result.verdict, result.verifier.name) == ("passed", "answer-check")
 
-    state.start_telemetry()
-    state.start_telemetry()
     export(run.for_card("agent"))
     # Shutdown flushes the exported span.
     state.shutdown()
@@ -199,7 +198,7 @@ def test_start_telemetry_refuses_the_applications_own_provider(
     trace.set_tracer_provider(own)
 
     with pytest.raises(WyrdError) as refused:
-        state.start_telemetry()
+        state.configure()
 
     assert refused.value.code == "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS"
     assert trace.get_tracer_provider() is own
@@ -1017,7 +1016,7 @@ def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], se
         assert b"typed-but-unsent" not in shown + stdout + stderr
         assert not (home / "wyrd/config.toml").exists()
         assert not (home / "wyrd/credentials.toml").exists()
-        assert not (home / "wyrd/server/sealing.key").exists()
+        assert not (home / "wyrd/server/kms/local").exists()
     finally:
         os.close(master)
         os.close(slave)
@@ -1237,20 +1236,20 @@ def test_guided_setup_prompt_surfaces() -> None:
             assert read_setup_prompt(cli_path, home, env) == printed.stdout
 
 
-QUICKSTART_RUNNERS = {
-    "python": lambda root: [sys.executable, "quickstart.py"],
+SETUP_CHECK_RUNNERS = {
+    "python": lambda root: [sys.executable, "check.py"],
     "rust": lambda root: [
         *("mise", "exec", "--", "cargo", "run", "--locked", "-q"),
         *("--manifest-path", str(root / "Cargo.toml"), "-p", "wyrd-rust-examples"),
-        *("--bin", "quickstart"),
+        *("--bin", "setup_check"),
     ],
-    "typescript": lambda root: ["node", str(root / "examples/quickstart/quickstart.ts")],
+    "typescript": lambda root: ["node", str(root / "examples/setup-check/check.ts")],
 }
-"""Language → the command a reader runs in a directory holding the Quickstart files."""
+"""Language → the command a reader runs in a directory holding the setup check's files."""
 
 
 GET_SERVICE = "wyrd get --kind Service --name support-reply --version 1.0.0"
-"""The Quickstart's published command that reads the Service, whose ``metadata.uid`` the query needs."""
+"""The command that reads the setup check's Service, whose ``metadata.uid`` the query needs."""
 
 QUERY_VERDICTS = "wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql"
 """The Quickstart's published query command, naming the default address ``wyrd init`` prints."""
@@ -1286,37 +1285,35 @@ def stored_verdicts(cli_path: str, reader: Path, env: dict[str, str], sql: str) 
 
 
 @pytest.mark.local_dev
-@pytest.mark.parametrize("language", QUICKSTART_RUNNERS)
+@pytest.mark.parametrize("language", SETUP_CHECK_RUNNERS)
 def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
     """The manual path the setup prompt also follows stores one Run's two verdicts.
 
-    After ``wyrd init``, the Quickstart program runs from a directory holding
-    only its Card files with the saved local setup and no model key, prints a
-    passed and a failed verdict for the Service, and the prompt's ``cards.get``
-    and the published ``wyrd get`` and ``wyrd query`` readback finds both
-    verdicts under one stored Run. The Quickstart page publishes that readback,
-    Setup's Manual tab links to it, and its query is the setup prompt's.
+    After ``wyrd init``, the setup check runs from a directory holding only
+    its Card files with the saved local setup and no model key, prints a
+    passed and a failed verdict for the Service, and the ``wyrd get`` and
+    ``wyrd query`` readback finds both verdicts under one stored Run. Setup
+    publishes the check, the Quickstart publishes the readback, and its query
+    is the setup prompt's.
     """
     root = Path(__file__).resolve().parents[4]
     cli_path = str(root / "target/debug/wyrd")
-    example = root / "examples/quickstart"
+    example = root / "examples/setup-check"
     reader = tmp_path / "project"
     reader.mkdir()
-    for name in ("no-refund-promise.yaml", "support-reply.yaml", "quickstart.py"):
+    for name in ("no-refund-promise.yaml", "support-reply.yaml", "check.py"):
         shutil.copy(example / name, reader)
     prompt = subprocess.check_output([cli_path, "init", "--print-prompt"], text=True)
-    sql = (example / "stored-verdicts.sql").read_text()
+    sql = (root / "examples/finance-release/stored-verdicts.sql").read_text()
     assert sql.splitlines()[-1] == prompt.split("```sql\n", 1)[1].split("```", 1)[0].strip()
     docs = root / "docs/src/content/docs/get-started"
     quickstart = (docs / "quickstart.md").read_text()
-    assert GET_SERVICE in quickstart and QUERY_VERDICTS in quickstart
-    assert 'file="examples/quickstart/stored-verdicts.sql"' in quickstart
-    assert (
-        "/get-started/quickstart/#3-confirm-the-stored-verdicts" in (docs / "setup.md").read_text()
-    )
+    assert QUERY_VERDICTS in quickstart
+    assert 'file="examples/finance-release/stored-verdicts.sql"' in quickstart
+    assert 'file="examples/setup-check/check.py"' in (docs / "setup.md").read_text()
     with local_deployment() as (home, env), installed_local_cli(cli_path, home, env, ""):
         ran = subprocess.run(
-            QUICKSTART_RUNNERS[language](root), cwd=reader, env=env, capture_output=True, text=True
+            SETUP_CHECK_RUNNERS[language](root), cwd=reader, env=env, capture_output=True, text=True
         )
         assert ran.returncode == 0, ran.stdout + ran.stderr
         verdicts = [line.split(":")[0] for line in ran.stdout.splitlines() if not line[0].isspace()]
@@ -1324,6 +1321,138 @@ def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
         assert "  subject:  Service/support-reply@1.0.0#" in ran.stdout
         runs = stored_verdicts(cli_path, reader, env, sql)
         assert {"passed", "failed"} in runs.values(), runs
+
+
+HOOK_TOKEN = "on-call-hook-token"
+"""The bearer token the reader stores on the on-call-hooks connection."""
+
+HOOK_PATH = "/hooks/checkout-latency"
+"""The path on the connection's origin that ``page-on-call.yaml`` posts to."""
+
+
+def record_slow_requests(reader: Path, env: dict[str, str], runtime_key: str) -> None:
+    """Record five slow requests with the Service's own key, clear of a minute boundary."""
+    # A window is one minute: keep the samples clear of the boundary they would straddle.
+    if time.time() % 60 >= 50:
+        time.sleep(61 - time.time() % 60)
+    recorded = subprocess.run(
+        [sys.executable, "record.py", "250"],
+        cwd=reader,
+        env={**env, "WYRD_API_KEY": runtime_key},
+        capture_output=True,
+        text=True,
+    )
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    assert recorded.stdout == "recorded 5 requests at 250 ms\n"
+
+
+DISPATCHES_RUNNERS = {
+    "python": [sys.executable, "dispatches.py"],
+    # The Rust program reads no local file; it builds with the repository's toolchain.
+    "rust": [
+        *("mise", "-C", str(Path(__file__).resolve().parents[4]), "exec", "--"),
+        *("cargo", "run", "--locked", "-q", "-p", "wyrd-rust-examples"),
+        *("--bin", "failed_verification_dispatches"),
+    ],
+    # Node resolves wyrd-ai and zod from the examples package beside the file.
+    "typescript": [
+        "node",
+        str(
+            Path(__file__).resolve().parents[4]
+            / "examples/respond-to-a-failed-verification/dispatches.ts"
+        ),
+    ],
+}
+"""Language → the command a reader runs for the Failures guide's ``dispatches`` program."""
+
+
+def read_dispatches(language: str, reader: Path, env: dict[str, str]) -> list[str]:
+    """Run the guide's ``dispatches`` program as the administrator and return what it printed."""
+    ran = subprocess.run(
+        DISPATCHES_RUNNERS[language], cwd=reader, env=env, capture_output=True, text=True
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert HOOK_TOKEN not in ran.stdout + ran.stderr
+    return ran.stdout.splitlines()
+
+
+@pytest.mark.local_dev
+@pytest.mark.parametrize("language", DISPATCHES_RUNNERS)
+def test_failed_verification_pages_on_call_across_restart(
+    language: str, tmp_path: Path, receiver: Receiver
+) -> None:
+    """The Failures guide pages its on-call hook from ``wyrd init``, before and after a restart.
+
+    The reader stores the hook's origin and token once with ``wyrd
+    operator-connection create`` and no key setting, declares and pulls the
+    guide's Service, and creates its runtime account. Slow requests recorded
+    with that account fail the every-minute window, and ``dispatches.py``
+    prints the ``failed`` verdict and a ``delivered`` dispatch; the hook
+    receives the Operator's body with the stored token. After ``wyrd init``
+    restarts with the saved setup, the same stored connection pages again.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    reader = tmp_path / "project"
+    shutil.copytree(root / "examples/respond-to-a-failed-verification", reader)
+    shutil.copy(root / "examples/scheduled-check/record.py", reader)
+    connection = json.dumps(
+        {
+            "provider": "http",
+            "name": "on-call-hooks",
+            "origin": receiver.url,
+            "auth": {"scheme": "bearer", "token": HOOK_TOKEN},
+        }
+    )
+    earlier = len(receiver.to(HOOK_PATH))
+    printed = ["verdict: failed", "dispatch: delivered"]
+
+    with local_deployment() as (home, env):
+        caller = {**env, "WYRD_SERVER_URL": f"http://{env['WYRD_SERVER_BIND']}"}
+
+        def wyrd(*args: str, stdin: str | None = None) -> str:
+            ran = subprocess.run(
+                [cli_path, *args],
+                input=stdin,
+                cwd=reader,
+                env=caller,
+                capture_output=True,
+                text=True,
+            )
+            assert ran.returncode == 0, ran.stdout + ran.stderr
+            assert HOOK_TOKEN not in ran.stdout + ran.stderr
+            return ran.stdout
+
+        # First run: store the connection, declare and pull the Service, page once.
+        with installed_local_cli(cli_path, home, env, ""):
+            wyrd("operator-connection", "create", "--body-file", "-", stdin=connection)
+            wyrd("declare", "checkout-alerts.yaml")
+            wyrd(
+                *("pull", "--kind", "Service", "--name", "checkout-alerts"),
+                *("--version", "1.0.0", "--output-dir", ".wyrd-bundle"),
+            )
+            issued = wyrd(
+                *("principal", "credential", "create-principal", "--name", "checkout-runtime"),
+                *("--role", "workload", "--workload-name", "checkout-alerts"),
+            )
+            runtime_key = next(
+                line.split()[1] for line in issued.splitlines() if line.startswith("credential:")
+            )
+            record_slow_requests(reader, env, runtime_key)
+            assert read_dispatches(language, reader, env) == printed
+        first_pages = receiver.to(HOOK_PATH)[earlier:]
+        assert len(first_pages) == 1, first_pages
+        assert first_pages[0].headers["authorization"] == f"Bearer {HOOK_TOKEN}"
+        assert first_pages[0].body["verdict"] == "failed", first_pages[0].body
+
+        # Restart: the saved setup opens the same stored connection.
+        with installed_local_cli(cli_path, home, env, ""):
+            record_slow_requests(reader, env, runtime_key)
+            assert read_dispatches(language, reader, env) == printed
+        restart_pages = receiver.to(HOOK_PATH)[earlier + 1 :]
+        assert len(restart_pages) == 1, restart_pages
+        assert restart_pages[0].headers["authorization"] == f"Bearer {HOOK_TOKEN}"
+        assert restart_pages[0].body["verdict"] == "failed", restart_pages[0].body
 
 
 EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")

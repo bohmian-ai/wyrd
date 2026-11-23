@@ -25,6 +25,106 @@ const SCRIBE_EVENT: &str = "Scribe";
 /// boundary under `bifrost.scribe.write.`.
 pub(crate) const WRITE_TIMING: &str = "bifrost.scribe.write";
 
+/// Benchmark-only histogram of one shard group's serial work, by `stage`,
+/// each recorded once per committed group:
+///
+/// - `cycle`: the whole group, from the shard taking it until its last ACK;
+///   every other stage nests inside it.
+/// - `rotate`: the retained-commit retry and the generation rotation check
+///   before the group writes.
+/// - `prepare`: duplicate and identity checks, memory accounting, and WAL
+///   record construction: the group's WAL slice writing less `convert` and
+///   `wal_write`.
+/// - `convert`: elapsed Variant layout conversion of the group's slices on the
+///   ingress CPU lane, up to two at once, lane queueing included.
+/// - `convert_job`: one slice's conversion on its lane worker, recorded per
+///   slice; summed over a group it is the conversion CPU time the `convert`
+///   elapsed time overlaps.
+/// - `wal_write`: the group's SLICE records on the WAL IO lane, lane queueing
+///   included.
+/// - `commit`, `sync`, `fence`, `insert`: the [`GroupStages`] steps; `commit`
+///   and `sync` include WAL IO lane queueing.
+/// - `fence_conn`: inside `fence`, waiting for the tenant's `PostgreSQL`
+///   connections; the rest of `fence` is its statements and commit.
+/// - `publish`: recording the committed batches and publishing the
+///   inspection snapshot, after `insert` and before any ACK.
+/// - `ack`: completing every waiter of the group.
+pub(crate) const GROUP_STAGE_SECONDS: &str = "bifrost_scribe_group_stage_seconds";
+
+/// Benchmark-only histogram of one shard group's size, by `measure`, each
+/// recorded once per group: `requests`, `slices`, `rows`, `logical_bytes`
+/// (the slices' logical Arrow bytes), and `wal_bytes` (the SLICE records'
+/// encoded payload bytes) once it commits, and when the shard takes it,
+/// `queued_requests` and `queued_bytes` still waiting behind it.
+pub(crate) const GROUP_SIZE: &str = "bifrost_scribe_group_size";
+
+/// Benchmark-only count of shard groups by why they closed, `reason`:
+/// `limit` at [`crate::scribe::shards::MAX_GROUP_ITEMS`] requests,
+/// `duplicate` before a second copy of one batch, or `exhausted` when no
+/// request was left.
+pub(crate) const GROUP_CLOSE_TOTAL: &str = "bifrost_scribe_group_close_total";
+
+/// Benchmark counter of optional Variant conversions that found no ingress
+/// lane slot or root capacity and waited for the group's oldest conversion
+/// instead of starting.
+pub(crate) const CONVERSION_DEFERRED_TOTAL: &str = "bifrost_scribe_conversion_deferred_total";
+
+/// Benchmark-only count of the rows of captured memtable batches live reads
+/// examined: each batch its bounds did not prune, counted once when the read
+/// evaluates it, before any row filter, so it measures the input a read
+/// worked through rather than the rows it returned. A memory batch reads no
+/// storage, so these rows are never Oracle's physical `rows_scanned`.
+pub(crate) const LIVE_ROWS_EXAMINED_TOTAL: &str = "bifrost_scribe_live_rows_examined_total";
+
+/// Benchmark-only count of the decoded Arrow bytes of the columns live reads
+/// examined in the batches [`LIVE_ROWS_EXAMINED_TOTAL`] counts: each read
+/// column's recorded byte size, the in-memory bytes the read worked through.
+/// It is never Oracle's physical `bytes_scanned`, which counts Parquet bytes
+/// read from storage.
+pub(crate) const LIVE_BYTES_EXAMINED_TOTAL: &str = "bifrost_scribe_live_bytes_examined_total";
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    /// Rows and bytes [`record_live_scan`] counted on this thread, mirrored
+    /// for tests: per thread, so one test's reads never count another's.
+    pub(crate) static LIVE_SCAN: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts one examined captured batch's `rows` and decoded `bytes` into
+/// [`LIVE_ROWS_EXAMINED_TOTAL`] and [`LIVE_BYTES_EXAMINED_TOTAL`], only while
+/// benchmarking.
+pub(crate) fn record_live_scan(rows: u64, bytes: u64) {
+    #[cfg(feature = "test-support")]
+    {
+        LIVE_SCAN.with(|counted| {
+            let (counted_rows, counted_bytes) = counted.get();
+            counted.set((counted_rows + rows, counted_bytes + bytes));
+        });
+    }
+    if wyrd_benchmark::enabled() {
+        metrics::counter!(LIVE_ROWS_EXAMINED_TOTAL).increment(rows);
+        metrics::counter!(LIVE_BYTES_EXAMINED_TOTAL).increment(bytes);
+    }
+}
+
+/// Records `elapsed` as one observation of group `stage` of
+/// [`GROUP_STAGE_SECONDS`], only while benchmarking.
+pub(crate) fn record_group_stage(stage: &'static str, elapsed: Duration) {
+    if wyrd_benchmark::enabled() {
+        metrics::histogram!(GROUP_STAGE_SECONDS, "stage" => stage).record(elapsed.as_secs_f64());
+    }
+}
+
+/// Records `value` as one observation of group `measure` of [`GROUP_SIZE`],
+/// only while benchmarking; a value past `u32::MAX` is recorded as that.
+pub(crate) fn record_group_size(measure: &'static str, value: usize) {
+    if wyrd_benchmark::enabled() {
+        let value = f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+        metrics::histogram!(GROUP_SIZE, "measure" => measure).record(value);
+    }
+}
+
 /// The serial group-commit stages one shard cycle runs, in order.
 #[derive(Debug, Default)]
 pub(crate) struct GroupStages {
@@ -45,6 +145,20 @@ impl GroupStages {
     pub(crate) fn add(&self, other: &Self) {
         for ((_, mine), (_, theirs)) in self.steps().into_iter().zip(other.steps()) {
             mine.add(theirs);
+        }
+    }
+
+    /// Records each stage once as its [`GROUP_STAGE_SECONDS`] observation,
+    /// only while benchmarking.
+    pub(crate) fn record_group(&self) {
+        for (stage, time) in [
+            ("commit", &self.commit),
+            ("sync", &self.sync),
+            ("fence", &self.fence),
+            ("insert", &self.insert),
+        ] {
+            let nanos = u64::try_from(time.value()).unwrap_or(u64::MAX);
+            record_group_stage(stage, Duration::from_nanos(nanos));
         }
     }
 

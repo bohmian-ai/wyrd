@@ -1530,7 +1530,7 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `start_telemetry` found a process-global tracer, meter, or logger
+    /// Wyrd's managed telemetry setup found a process-global tracer, meter, or logger
     /// provider Wyrd did not install for this state: the application's own,
     /// or one bound to another state's configured Service.
     ///
@@ -1542,7 +1542,7 @@ pub enum WyrdError {
         code = "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
         status = 409,
         title = "An OpenTelemetry provider is already installed",
-        remediation = "Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry."
+        remediation = "Turn off Wyrd's managed telemetry setup and add each state's Wyrd span, log, and metric exporters to the application's own providers."
     )]
     SdkTelemetryProviderExists {
         /// Human-readable error message.
@@ -1600,20 +1600,6 @@ pub enum WyrdError {
         remediation = "Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown."
     )]
     SdkTelemetryFlushFailed {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// An observation was attempted before `start_bifrost` connected a writer.
-    #[error("[WYRD_SDK_400_BIFROST_NOT_STARTED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_SDK_400_BIFROST_NOT_STARTED",
-        status = 400,
-        title = "WyrdState Bifrost writer is not started",
-        remediation = "Call start_bifrost on the state before opening a run and emitting observations."
-    )]
-    SdkBifrostNotStarted {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2501,13 +2487,14 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// The tenant already has an Operator connection of this provider and name.
+    /// The tenant already has an Operator connection of this provider and
+    /// name, or an update lost to a concurrent write.
     #[error("[WYRD_OPERATOR_409_CONNECTION_CONFLICT] {message}")]
     #[wyrd_error(
         code = "WYRD_OPERATOR_409_CONNECTION_CONFLICT",
         status = 409,
-        title = "Operator connection name conflict",
-        remediation = "Choose another name, or PATCH the existing connection to rotate its secret."
+        title = "Operator connection conflict",
+        remediation = "For a create, choose another name or PATCH the existing connection to rotate its secret; for a concurrent update, read the connection again and retry."
     )]
     OperatorConnectionConflict {
         /// Human-readable error message.
@@ -2529,13 +2516,14 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// The server has no usable key-encryption key for Operator connection secrets.
+    /// Stored-secret encryption could not seal or open an Operator connection
+    /// secret.
     #[error("[WYRD_OPERATOR_503_KEY_UNAVAILABLE] {message}")]
     #[wyrd_error(
         code = "WYRD_OPERATOR_503_KEY_UNAVAILABLE",
         status = 503,
         title = "Operator connection key unavailable",
-        remediation = "Restore the configured Operator key provider so it can supply the active key, then retry."
+        remediation = "Configure [kms] (WYRD_KMS_*) and restore its wrapping backend so it can serve the active and retained keys, then retry."
     )]
     OperatorKeyUnavailable {
         /// Human-readable error message.
@@ -4350,7 +4338,6 @@ impl WyrdError {
             | Self::SdkStateConfigFrozen { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }
             | Self::SdkTelemetryFlushFailed { message, details }
-            | Self::SdkBifrostNotStarted { message, details }
             | Self::SdkBifrostClosed { message, details }
             | Self::SdkInvalidObservation { message, details }
             | Self::SdkCardKindMismatch { message, details }

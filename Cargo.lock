@@ -287,7 +287,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "arrow"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -307,7 +307,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -320,7 +320,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -338,7 +338,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "bytes",
  "half",
@@ -349,7 +349,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -370,7 +370,7 @@ dependencies = [
 [[package]]
 name = "arrow-cmp"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -394,7 +394,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -406,7 +406,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -426,7 +426,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -441,7 +441,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -478,7 +478,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -490,7 +490,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "serde_core",
  "serde_json",
@@ -499,7 +499,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1112,7 +1112,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -1125,7 +1125,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-compute"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1141,7 +1141,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-schema",
  "base64 0.23.1",
@@ -5987,7 +5987,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -9463,7 +9463,7 @@ dependencies = [
 
 [[package]]
 name = "vala-bifrost-redux"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -9513,6 +9513,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "twox-hash",
  "typetag",
  "ulid",
  "url",
@@ -9536,7 +9537,7 @@ dependencies = [
 
 [[package]]
 name = "vala-drift"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -9553,7 +9554,7 @@ dependencies = [
 
 [[package]]
 name = "vala-ingest"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "bytes",
@@ -9564,7 +9565,7 @@ dependencies = [
 
 [[package]]
 name = "vala-sql"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "metrics",
@@ -9584,7 +9585,7 @@ dependencies = [
 
 [[package]]
 name = "vala-verify"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -10108,6 +10109,8 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-compression",
+ "aws-lc-rs",
+ "aws-lc-sys",
  "axum",
  "axum-core",
  "base64 0.22.1",
@@ -10133,6 +10136,7 @@ dependencies = [
  "digest 0.11.3",
  "either",
  "errno",
+ "fastrand",
  "flate2",
  "foldhash 0.2.0",
  "form_urlencoded",
@@ -10161,7 +10165,6 @@ dependencies = [
  "icu_properties",
  "idna",
  "indexmap 2.14.2",
- "jiff",
  "lazy_static",
  "lexical-parse-float",
  "lexical-parse-integer",
@@ -10174,7 +10177,6 @@ dependencies = [
  "md-5",
  "memchr",
  "moka",
- "monty-types",
  "nix",
  "num-bigint 0.4.8",
  "num-integer",
@@ -10188,7 +10190,9 @@ dependencies = [
  "opentelemetry_sdk",
  "percent-encoding",
  "petgraph 0.8.3",
+ "phf 0.12.1",
  "phf_shared 0.11.3",
+ "phf_shared 0.12.1",
  "ppv-lite86",
  "proc-macro2",
  "prost",
@@ -10212,7 +10216,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_core",
- "serde_derive",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
@@ -10226,6 +10229,7 @@ dependencies = [
  "sqlx",
  "sqlx-core",
  "sqlx-postgres",
+ "strum",
  "subtle",
  "syn 2.0.118",
  "syn 3.0.5",
@@ -10264,7 +10268,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wyrd"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -10281,7 +10285,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-ai"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -10314,7 +10318,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -10340,8 +10344,8 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
- "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-kms",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
@@ -10351,7 +10355,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth-issue"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -10374,7 +10378,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth-oidc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "flate2",
@@ -10397,7 +10401,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth-verify"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -10425,7 +10429,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-bench"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "criterion",
  "hdrhistogram",
@@ -10439,7 +10443,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-benchmark"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "backtrace",
  "flate2",
@@ -10458,7 +10462,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-cards"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "pyo3",
@@ -10480,7 +10484,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "assert_cmd",
@@ -10534,7 +10538,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-client"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -10593,7 +10597,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-config"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "pyo3",
  "serde",
@@ -10612,7 +10616,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-crypt"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -10625,8 +10629,10 @@ dependencies = [
 
 [[package]]
 name = "wyrd-dev-fixtures"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
  "secrecy",
  "serde_json",
  "sqlx",
@@ -10642,7 +10648,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-error-derive"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -10651,7 +10657,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-gateway"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10676,7 +10682,7 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-benchmark",
- "wyrd-crypt",
+ "wyrd-kms",
  "wyrd-runtime",
  "wyrd-skald-providers",
  "wyrd-skald-spec",
@@ -10684,12 +10690,11 @@ dependencies = [
  "wyrd-tls",
  "wyrd-utils",
  "wyrd-vault",
- "zeroize",
 ]
 
 [[package]]
 name = "wyrd-interfaces"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "flate2",
@@ -10706,8 +10711,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-kms"
+version = "0.4.2"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "object_store",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-crypt",
+ "wyrd-dev-fixtures",
+ "wyrd-spec",
+ "wyrd-tls",
+ "wyrd-utils",
+ "wyrd-vault",
+ "zeroize",
+]
+
+[[package]]
 name = "wyrd-loader"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "calamine",
@@ -10730,7 +10764,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -10761,7 +10795,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-queue"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -10784,7 +10818,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-runtime"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "metrics",
@@ -10802,17 +10836,20 @@ dependencies = [
 
 [[package]]
 name = "wyrd-rust-examples"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",
+ "opentelemetry",
  "reqwest 0.13.4",
+ "schemars 1.2.1",
  "secrecy",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "wiremock",
  "workspace-hack",
  "wyrd-ai",
@@ -10821,7 +10858,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sdk-python"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -10855,7 +10892,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sdk-ts"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "chrono",
@@ -10877,7 +10914,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sdk-ts-testing"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "chrono",
@@ -10899,7 +10936,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-semver"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "schemars 1.2.1",
  "semver",
@@ -10912,7 +10949,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -10999,11 +11036,11 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-gateway",
+ "wyrd-kms",
  "wyrd-loader",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
- "wyrd-server",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
@@ -11019,14 +11056,13 @@ dependencies = [
  "wyrd-tonic",
  "wyrd-types",
  "wyrd-utils",
- "wyrd-vault",
  "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "wyrd-skald-agent"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -11052,7 +11088,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-cache"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "mini-moka",
  "serde",
@@ -11063,7 +11099,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-prompt"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "pyo3",
@@ -11079,7 +11115,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-providers"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -11112,7 +11148,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-runtime"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -11127,7 +11163,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-spec"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "insta",
@@ -11143,7 +11179,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-tool"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "schemars 1.2.1",
@@ -11158,7 +11194,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-spec"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -11192,7 +11228,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sql"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -11225,7 +11261,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-storage"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -11248,17 +11284,19 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "wiremock",
  "workspace-hack",
  "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-testing",
  "wyrd-tls",
+ "wyrd-utils",
 ]
 
 [[package]]
 name = "wyrd-telemetry"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "http",
  "metrics",
@@ -11279,7 +11317,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-testing"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow",
  "async-stream",
@@ -11293,6 +11331,7 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "ed25519-dalek",
+ "flate2",
  "futures-util",
  "hdrhistogram",
  "hex",
@@ -11344,6 +11383,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-gateway",
+ "wyrd-kms",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
@@ -11360,7 +11400,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-tls"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "rustls",
  "thiserror 2.0.21",
@@ -11369,7 +11409,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-tonic"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -11398,7 +11438,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow-schema",
  "bohmian-parquet-variant-compute",
@@ -11412,8 +11452,9 @@ dependencies = [
 
 [[package]]
 name = "wyrd-utils"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "pyo3",
  "secrecy",
@@ -11421,6 +11462,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "temp-env",
  "thiserror 2.0.21",
  "walkdir",
  "workspace-hack",
@@ -11430,22 +11472,27 @@ dependencies = [
 
 [[package]]
 name = "wyrd-vault"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "reqwest 0.13.4",
  "secrecy",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "url",
  "wiremock",
  "workspace-hack",
+ "wyrd-crypt",
  "wyrd-tls",
+ "zeroize",
 ]
 
 [[package]]
 name = "wyrd-version"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "schemars 1.2.1",
  "semver",

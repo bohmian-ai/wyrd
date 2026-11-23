@@ -848,14 +848,9 @@ impl VerificationFixture {
         execution: ExecutionId,
     ) -> Result<Option<ExecutionState>, VerificationFixtureError> {
         let query = self.system_query(state).await?;
-        let accepted = RunState::accepted(
-            state,
-            self.tenant,
-            execution,
-            &InputResolver::new(&query, None),
-        )
-        .await
-        .map_err(|error| VerificationFixtureError::Card(format!("{error:?}")))?;
+        let accepted = RunState::accepted(execution, &InputResolver::new(&query, None))
+            .await
+            .map_err(|error| VerificationFixtureError::Card(format!("{error:?}")))?;
         Ok((accepted.0 > 0).then_some(accepted.1))
     }
 

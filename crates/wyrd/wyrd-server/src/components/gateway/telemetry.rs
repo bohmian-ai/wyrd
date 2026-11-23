@@ -84,7 +84,10 @@ impl Phase {
 /// Waits are diagnostics beside the phases, never part of them: dispatch
 /// and resumption are handoffs between the caller's task and the call's
 /// execution task, and the provider waits split the exchanges the `answer`
-/// point already subtracts. They overlap phases and are never summed.
+/// point already subtracts. Admission, execution, and settlement time the
+/// call's consecutive steps between those handoffs, executing and waiting
+/// alike, so a call's own time is their sum with dispatch and resumption.
+/// They overlap phases and are never summed with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wait {
     /// The spawn of an admitted call's execution task until it starts;
@@ -99,6 +102,24 @@ pub(crate) enum Wait {
     ProviderHeaders,
     /// Ended provider exchanges' body receipt outside every header wait.
     ProviderBody,
+    /// The caller's task from receiving the call until it spawns the
+    /// admitted call's execution task: every admission phase and what lies
+    /// between them.
+    Admission,
+    /// Inside admission, the pause for process memory pressure before the
+    /// call holds any reservation.
+    Pressure,
+    /// Inside admission, a capturing unbound call's wait for a Scribe outbox
+    /// slot, item and reserved-byte limits alike.
+    CaptureSlot,
+    /// The execution task's provider attempts, from their start until the
+    /// engine returns: the provider waits, credential and translation, and
+    /// the engine's own work around them.
+    Execute,
+    /// The settlement step from the engine's return until the answer is sent:
+    /// a buffered call's accounting, evidence facts, observation, and
+    /// response, or an opened stream's response head.
+    Settle,
 }
 
 impl Wait {
@@ -109,6 +130,11 @@ impl Wait {
             Self::Resume => "resume",
             Self::ProviderHeaders => "provider_headers",
             Self::ProviderBody => "provider_body",
+            Self::Admission => "admission",
+            Self::Pressure => "pressure",
+            Self::CaptureSlot => "capture_slot",
+            Self::Execute => "execute",
+            Self::Settle => "settle",
         }
     }
 }
@@ -403,6 +429,11 @@ mod tests {
             (Wait::ProviderHeaders, 80),
             (Wait::ProviderBody, 20),
             (Wait::Resume, 2),
+            (Wait::Admission, 3),
+            (Wait::Pressure, 5),
+            (Wait::CaptureSlot, 6),
+            (Wait::Execute, 101),
+            (Wait::Settle, 4),
         ] {
             call.wait(wait, Duration::from_millis(ms));
         }
@@ -413,6 +444,11 @@ mod tests {
             ("provider_headers", 80),
             ("provider_body", 20),
             ("resume", 2),
+            ("admission", 3),
+            ("pressure", 5),
+            ("capture_slot", 6),
+            ("execute", 101),
+            ("settle", 4),
         ] {
             let recorded = interval
                 .histogram(

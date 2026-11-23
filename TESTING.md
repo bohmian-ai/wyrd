@@ -160,17 +160,28 @@ mise run test:wyrd | test:skald | test:vala | test:shared   # family lanes
 mise run test:sql                        # SQL-backed integration
 mise run test:tonic                      # wyrd-tonic at its required feature union
 mise run test:storage:matrix             # object-store emulators
+mise run test:kms:vault                  # WyrdKms over a real dev Vault Transit
+mise run test:kms:gcp:cloud              # WyrdKms over real Cloud KMS (credentialed)
+mise run test:kms:aws:cloud              # WyrdKms over real AWS KMS (credentialed)
 mise run py:test:unit                    # Python
 mise run ts:test:unit                    # TypeScript
 mise run test:rust                       # full Rust aggregate
 ```
 
+The two KMS cloud lanes read `WYRD_KMS_BACKEND` and `WYRD_KMS_ACTIVE_KEY`
+from an untracked `mise.local.toml` and the provider's standard credentials.
+They need a key provisioned in advance with encrypt and decrypt access only,
+and fail naming the missing setting. CI runs them on pushes to `main` in
+`kms-integration-cloud.yml`.
+
 `test:rust` is the broad Rust aggregate. Capability work uses its capability
 lane instead; Bifrost-only pull requests run `verify:bifrost`.
 
 Performance is measured by opt-in benchmark experiments, never by a test lane,
-`gate`, or CI: `mise run bench:l1` (or `bench:l1:<engine>`) and
+`gate`, or CI: `mise run benchmark:l1:<category>` and
 `mise run bench:l2:<engine>` for `bifrost`, `verification`, and `gateway`.
+`mise run test:benchmark:l1` is the harness lane for the L1 sweep path: short
+smoke sweeps that check workflow and evidence integrity, never performance.
 `benchmarks/README.md` explains levels, verdicts, records, baselines, and
 how reviewed same-method references are qualified and promoted.
 

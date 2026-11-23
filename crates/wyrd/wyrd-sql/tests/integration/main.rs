@@ -18,6 +18,8 @@ mod pg_operator_connections;
 mod pg_platform_identity;
 mod pg_platform_social;
 mod pg_query_compile;
+/// Cross-tenant stored-secret maintenance slots.
+mod pg_stored_secrets;
 mod pg_tenant_slug;
 mod pg_verification_bindings;
 mod pg_verifier_executions;

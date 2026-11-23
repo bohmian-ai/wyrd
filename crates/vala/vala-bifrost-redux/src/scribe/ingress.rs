@@ -564,8 +564,9 @@ impl ScribeImpl {
     /// and any preprocessing error from [`prepare_append`].
     async fn preprocess(&self, admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
         let tenant = admitted.tenant;
+        let encoders = Arc::clone(self.ingress_cpu.encoders());
         self.ingress_cpu
-            .run(Some(tenant), move || prepare_append(admitted))
+            .run(Some(tenant), move || prepare_append(admitted, &encoders))
             .await
     }
 
@@ -1501,8 +1502,9 @@ mod tests {
     /// A decode owner much larger than the tiny projected batch is carried by
     /// the frame. After the durable ACK, no transport, decode, or prepared
     /// category charge remains, and the only Scribe bytes left are the
-    /// memtable's own active ownership — the decode charge was neither added
-    /// to nor left behind the memtable charge.
+    /// memtable's own active ownership plus the ingress worker's retained
+    /// encoder context — the decode charge was neither added to nor left
+    /// behind the memtable charge.
     ///
     /// # Panics
     ///
@@ -1558,7 +1560,13 @@ mod tests {
             memtable < decode_bytes,
             "the decode charge was transferred and resized, not retained"
         );
-        assert_eq!(after.scribe_total_bytes, baseline + memtable);
+        let encoders = scribe.ingress_cpu.encoders().charged_bytes();
+        assert_eq!(
+            after.categories[MemoryCategory::Metadata as usize],
+            encoders,
+            "the only other charge is the worker's retained encoder context"
+        );
+        assert_eq!(after.scribe_total_bytes, baseline + memtable + encoders);
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await;

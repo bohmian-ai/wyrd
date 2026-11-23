@@ -4,7 +4,7 @@ CREATE TABLE vala.scribe_batch_commits (
     data_tenant_id uuid NOT NULL REFERENCES platform.tenants(data_tenant_id),
     logical_table_fqn text NOT NULL,
     batch_id uuid NOT NULL,
-    slice_set_digest bytea NOT NULL CHECK (octet_length(slice_set_digest) = 32),
+    slice_set_digest bytea NOT NULL CHECK (octet_length(slice_set_digest) = 16),
     slice_count integer NOT NULL CHECK (slice_count > 0),
     wal_node_id uuid NOT NULL,
     wal_writer_epoch bigint NOT NULL,
@@ -18,6 +18,12 @@ CREATE TABLE vala.scribe_batch_commits (
     ingested_at timestamptz NOT NULL,
     PRIMARY KEY (data_tenant_id, logical_table_fqn, batch_id)
 );
+
+-- Receipt cleanup ranks each table's receipts newest first to keep recent
+-- retry history; this order serves that ranking without a sort.
+CREATE INDEX scribe_batch_commits_history_idx
+    ON vala.scribe_batch_commits
+       (data_tenant_id, logical_table_fqn, ingested_at DESC, batch_id DESC);
 
 ALTER TABLE vala.scribe_batch_commits ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vala.scribe_batch_commits FORCE ROW LEVEL SECURITY;

@@ -148,6 +148,28 @@ pub struct GrpcRouterConfig {
     pub tenant_spans: Option<Arc<dyn wyrd_telemetry::TenantSpanSink>>,
 }
 
+/// HTTP/2 receive window each gRPC connection grants its peer, in bytes.
+///
+/// hyper's 1 MiB default is shared by every stream on a connection, so
+/// concurrent OTLP exports of several hundred KiB each stall on flow-control
+/// credit before the server reads them. This bounds the unread request bytes
+/// one connection can buffer ahead of decode admission.
+const CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+
+/// HTTP/2 receive window each gRPC stream grants its peer, in bytes.
+///
+/// Kept below [`CONNECTION_WINDOW_BYTES`] so one request cannot take a
+/// connection's whole window.
+const STREAM_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Largest HTTP/2 frame payload the server accepts, in bytes.
+///
+/// A peer may send frames no larger than this, and hyper's 16 KiB default
+/// splits one several-hundred-KiB OTLP export into dozens of DATA frames,
+/// each handled on its connection's single task. One MiB carries a typical
+/// export in one frame and stays within [`STREAM_WINDOW_BYTES`].
+const MAX_FRAME_BYTES: u32 = 1024 * 1024;
+
 /// Build and return the configured tonic router.
 ///
 /// `tonic_health 0.12.x` does **not** expose `Health::from_reporter`.
@@ -180,8 +202,11 @@ where
 {
     wyrd_tls::install_crypto_provider()?;
     let tenant_spans = cfg.tenant_spans;
-    let mut server =
-        Server::builder().trace_fn(move |request| request_span(request, tenant_spans.as_ref()));
+    let mut server = Server::builder()
+        .initial_connection_window_size(CONNECTION_WINDOW_BYTES)
+        .initial_stream_window_size(STREAM_WINDOW_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
+        .trace_fn(move |request| request_span(request, tenant_spans.as_ref()));
     if let Some(identity) = cfg.tls_identity {
         server = server
             .tls_config(ServerTlsConfig::new().identity(identity))

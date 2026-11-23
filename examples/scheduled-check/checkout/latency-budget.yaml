@@ -1,0 +1,20 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: latency-budget
+  version: 1.0.0
+spec:
+  description: Checkout requests average at most 100 ms in each window.
+  inputs:
+    # Each recorded sample is one request's latency, in milliseconds.
+    latency: {type: samples, features: [latency]}
+  requirements:
+    - id: latency-within-budget
+      statement: Mean checkout latency stays at or below 100 ms
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Custom
+        signal: {kind: Metric, name: latency}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: latency, baseline_value: 0.0, alert_threshold: 100.0}

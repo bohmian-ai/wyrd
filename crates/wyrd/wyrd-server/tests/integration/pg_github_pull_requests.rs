@@ -3123,3 +3123,54 @@ async fn a_lost_review_set_superseded_before_its_retry_is_still_retained() {
         "the retried older set does not become current"
     );
 }
+
+/// Publish everything `server`'s Scribe holds, so accepted rows have custody of
+/// their own, then remove every batch receipt of the tenant's `tables`,
+/// as cleanup removes receipts outside recent retry history.
+///
+/// # Panics
+/// Panics when the flush or the removal fails, or no receipt was held.
+pub(crate) async fn expire_receipts(server: &WyrdTestServer, tables: &[&str]) {
+    server.flush_bifrost().await.expect("accepted rows publish");
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let removed = sqlx::query(
+        "DELETE FROM vala.scribe_batch_commits \
+          WHERE data_tenant_id = $1 AND logical_table_fqn = ANY($2)",
+    )
+    .bind(server.data_tenant_id().as_uuid())
+    .bind(tables)
+    .execute(&pool)
+    .await
+    .expect("the receipts are removed");
+    assert!(removed.rows_affected() > 0, "receipts were held");
+}
+
+/// Record a recent receipt of the tenant's `table` under `batch_id`
+/// whose row no query can see, as an accepted batch Scribe has not
+/// made visible yet.
+///
+/// # Panics
+/// Panics when the receipt cannot be written.
+pub(crate) async fn invisible_receipt(server: &WyrdTestServer, table: &str, batch_id: Uuid) {
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    sqlx::query(
+        "INSERT INTO vala.scribe_batch_commits \
+         (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
+          wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
+          wal_lsn_max, request_id, ingested_at, table_version) \
+         VALUES ($1, $2, $3, decode(repeat('00', 16), 'hex'), 1, gen_random_uuid(), 1, 0, \
+                 0, 0, 0, gen_random_uuid(), statement_timestamp(), 1)",
+    )
+    .bind(server.data_tenant_id().as_uuid())
+    .bind(table)
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt is recorded");
+}

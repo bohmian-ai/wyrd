@@ -36,7 +36,7 @@ use uuid::Uuid;
 use wyrd_auth_oidc::{
     ProviderMetadata, RelyingParty, RelyingPartyError, ScreenedHttp, TrustedIssuer,
 };
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::{SecretPurpose, SecretScope, WyrdKms};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -50,9 +50,10 @@ use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     HumanConnectionWrite, LoginState, deactivate_active_human_connection,
     human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
-    insert_login_state, live_human_connections, lock_human_connection_slot,
-    promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
-    stamp_human_candidate_tested,
+    insert_login_state, list_service_account_roles, list_user_roles, live_human_connections,
+    lock_human_connection_slot, promote_tested_human_candidate, remove_human_connection,
+    renew_human_connection_secret, replace_human_candidate, service_account_by_id,
+    stamp_human_candidate_tested, user_by_id,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
@@ -64,7 +65,7 @@ use crate::authority::TenantAuthority;
 use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::{ExchangeError, verify_api_key};
 use crate::login::LOGIN_STATE_TTL;
-use crate::pg_resolvers::{human_connection_trusted_issuer, seal_secret};
+use crate::pg_resolvers::{ClientSecretOwner, IssuerSealError, human_connection_trusted_issuer};
 
 /// How long a successful candidate test authorizes activation.
 pub const CONNECTION_TEST_VALIDITY: Duration = Duration::from_mins(15);
@@ -86,16 +87,16 @@ const CONNECTION_RESOURCE: &str = "identity:oidc_connection";
 /// The tenant human-connection owner.
 ///
 /// Holds the role-separated runtime store (every statement runs on an RLS
-/// [`TenantConn`] acquired through [`WyrdPostgres`]), the deployment sealing
-/// keyring, and the human-login relying party. Built once per server and cheap to clone;
+/// [`TenantConn`] acquired through [`WyrdPostgres`]), the deployment
+/// stored-secret facade, and the human-login relying party. Built once per server and cheap to clone;
 /// clones share the relying party's provider cache.
 #[derive(Clone)]
 pub struct HumanConnections {
     /// Runtime Postgres handle every tenant transaction is acquired from.
     postgres: WyrdPostgres,
-    /// Sealing keyring for provider client secrets; `None` on a keyless
-    /// deployment, which can then stage only public clients.
-    keyring: Option<Arc<SealingKeyring>>,
+    /// Stored-secret facade for provider client secrets; `None` without
+    /// `[kms]`, which can then stage only public clients.
+    kms: Option<Arc<WyrdKms>>,
     /// The human-login relying party; every provider request it makes goes
     /// through the screened, redirect-disabled, proxy-free HTTP capability.
     relying_party: RelyingParty,
@@ -114,8 +115,26 @@ impl Debug for HumanConnections {
 pub struct StagedCandidate {
     /// The candidate revision the caller expects to replace; `None` creates.
     expected_revision: Option<u64>,
+    /// The candidate id read while staging, `None` when there was none; the
+    /// write lands only while the locked candidate is still this one.
+    observed: Option<Uuid>,
+    /// The id the secret is sealed to: the observed candidate's, else a
+    /// fresh one the insert uses.
+    connection_id: Uuid,
     /// The sealed row write, its JWKS TTL filled in under the slot lock.
     write: HumanConnectionWrite,
+}
+
+/// A connection secret resealed by [`HumanConnections::stage_renewal`], ready
+/// for [`HumanConnections::renew_encryption`].
+#[derive(Debug)]
+pub struct StagedRenewal {
+    /// The connection whose secret was renewed.
+    connection_id: Uuid,
+    /// The envelope read and opened; the swap lands only while it is stored.
+    observed: Vec<u8>,
+    /// The same secret resealed under a fresh data key.
+    renewed: Vec<u8>,
 }
 
 /// The candidate revision a test sign-in is begun for.
@@ -143,18 +162,18 @@ pub struct ActiveHumanConnection {
 }
 
 impl HumanConnections {
-    /// Build the owner over the runtime store, keyring, screened HTTP, and
+    /// Build the owner over the runtime store, facade, screened HTTP, and
     /// the process audit stage its decisions are staged on.
     #[must_use]
     pub fn new(
         postgres: WyrdPostgres,
-        keyring: Option<Arc<SealingKeyring>>,
+        kms: Option<Arc<WyrdKms>>,
         http: ScreenedHttp,
         audit: Arc<dyn AuditStage>,
     ) -> Self {
         Self {
             postgres,
-            keyring,
+            kms,
             relying_party: RelyingParty::new(http),
             audit,
         }
@@ -211,29 +230,67 @@ impl HumanConnections {
         Ok(response)
     }
 
-    /// Prepare a candidate write without IO: seal the secret under the
-    /// keyring's write key.
+    /// Prepare `tenant`'s candidate write: read which candidate it replaces
+    /// in one short transaction, then, holding none, seal the secret into the
+    /// common envelope bound to the tenant, issuer, client id, method, and
+    /// that candidate's id (or a fresh id for a new candidate).
     ///
     /// `input` must come from [`ConnectionInput::from_slice`], which is the one
     /// place its cross-field rules are checked; the durable table re-asserts
-    /// the Public-has-no-secret invariant. Callers run this before
-    /// authorizing, so every refusal it can produce is a deployment or input
-    /// fact rather than an unaudited decision.
+    /// the Public-has-no-secret invariant. Callers run this after authorizing
+    /// and before [`Self::put_candidate`] opens its write transaction, so a
+    /// refusal here follows a staged decision and a key-service wait holds no
+    /// lock.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when a secret must be sealed without
-    /// a keyring, and [`WyrdError::Internal`] when sealing or JSON encoding
-    /// fails.
-    pub fn stage(&self, input: ConnectionInput) -> Result<StagedCandidate, WyrdError> {
+    /// `[kms]`, [`WyrdError::ServiceUnavailable`] when sealing fails,
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
+    /// [`WyrdError::Internal`] when JSON encoding fails.
+    pub async fn stage(
+        &self,
+        tenant: DataTenantId,
+        input: ConnectionInput,
+    ) -> Result<StagedCandidate, WyrdError> {
+        let mut conn = self.begin(tenant).await?;
+        let observed =
+            human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
+                .await
+                .map_err(store_error)?
+                .map(|row| row.connection_id);
+        conn.commit().await.map_err(store_error)?;
+        let connection_id = observed.unwrap_or_else(Uuid::now_v7);
+        let owner_id = connection_id.to_string();
         let client_secret_enc = match &input.client_secret {
             Some(secret) => {
-                let keyring = self.require_keyring()?;
-                Some(seal_secret(keyring, secret.expose().as_bytes()).map_err(internal)?)
+                let kms = self.require_kms()?;
+                let owner = ClientSecretOwner {
+                    scope: SecretScope::Tenant(tenant),
+                    purpose: SecretPurpose::AuthHumanConnection,
+                    issuer_url: input.issuer.as_str(),
+                    client_id: &input.client_id,
+                    connection_id: Some(&owner_id),
+                };
+                Some(
+                    owner
+                        .seal_secret(
+                            input.client_auth.as_str(),
+                            secret.expose().as_bytes(),
+                            Some(kms),
+                        )
+                        .await
+                        .map_err(|_: IssuerSealError| WyrdError::ServiceUnavailable {
+                            message: "provider client secret protection is unavailable".to_owned(),
+                            details: json!({ "reason": "kms_unavailable" }),
+                        })?,
+                )
             }
             None => None,
         };
         Ok(StagedCandidate {
             expected_revision: input.expected_revision,
+            observed,
+            connection_id,
             write: HumanConnectionWrite {
                 issuer_url: input.issuer.as_str().to_owned(),
                 client_auth: input.client_auth.as_str().to_owned(),
@@ -253,8 +310,9 @@ impl HumanConnections {
     ///
     /// # Errors
     /// Returns [`WyrdError::ConnectionConflict`] when `expected_revision` does
-    /// not match the current candidate (or is supplied when none exists), and
-    /// the audit/store errors of [`Self::list`].
+    /// not match the current candidate (or is supplied when none exists) or
+    /// the candidate is no longer the one [`Self::stage`] read, and the
+    /// audit/store errors of [`Self::list`].
     pub async fn put_candidate(
         &self,
         tenant: DataTenantId,
@@ -265,6 +323,8 @@ impl HumanConnections {
         let callback = provider_callback(origin)?;
         let StagedCandidate {
             expected_revision,
+            observed,
+            connection_id,
             mut write,
         } = staged;
         let mut conn = self.begin_locked(tenant, decision).await?;
@@ -272,11 +332,12 @@ impl HumanConnections {
             human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
                 .await
                 .map_err(store_error)?;
-        let revision_matches = match (&candidate, expected_revision) {
-            (Some(row), Some(expected)) => u64::try_from(row.revision).ok() == Some(expected),
-            (None, None) => true,
-            _ => false,
-        };
+        let revision_matches = candidate.as_ref().map(|row| row.connection_id) == observed
+            && match (&candidate, expected_revision) {
+                (Some(row), Some(expected)) => u64::try_from(row.revision).ok() == Some(expected),
+                (None, None) => true,
+                _ => false,
+            };
         if !revision_matches {
             return commit_refusal(
                 conn,
@@ -296,9 +357,98 @@ impl HumanConnections {
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| internal("locked candidate vanished during replace"))?,
-            None => insert_human_candidate(&mut conn, &write)
+            None => insert_human_candidate(&mut conn, connection_id, &write)
                 .await
                 .map_err(store_error)?,
+        };
+        conn.commit().await.map_err(store_error)?;
+        view(row, &callback)
+    }
+
+    /// Read live connection `connection_id`'s sealed client secret in one
+    /// short transaction, then, holding none, renew its encryption: the same
+    /// secret resealed under a fresh data key bound to the same tenant,
+    /// issuer, client id, method, and connection id.
+    ///
+    /// Callers run this after authorizing and before
+    /// [`Self::renew_encryption`], as [`Self::stage`] precedes
+    /// [`Self::put_candidate`].
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::NotFound`] when this tenant has no Active or
+    /// Candidate connection with `connection_id`,
+    /// [`WyrdError::ConnectionConflict`] when it holds no client secret,
+    /// [`WyrdError::ServiceUnavailable`] when `[kms]` is missing or the
+    /// secret cannot be opened or resealed, and the store errors of
+    /// [`Self::list`].
+    pub async fn stage_renewal(
+        &self,
+        tenant: DataTenantId,
+        connection_id: Uuid,
+    ) -> Result<StagedRenewal, WyrdError> {
+        let mut conn = self.begin(tenant).await?;
+        let row = live_human_connections(&mut conn)
+            .await
+            .map_err(store_error)?
+            .into_iter()
+            .find(|row| {
+                row.connection_id == connection_id
+                    && row.state != HumanConnectionState::Inactive.as_str()
+            })
+            .ok_or_else(|| not_found("no active or candidate human connection has this id"))?;
+        conn.commit().await.map_err(store_error)?;
+        let observed = row
+            .client_secret_enc
+            .ok_or_else(|| conflict("the connection holds no client secret"))?;
+        let owner_id = connection_id.to_string();
+        let renewed = ClientSecretOwner {
+            scope: SecretScope::Tenant(tenant),
+            purpose: SecretPurpose::AuthHumanConnection,
+            issuer_url: &row.issuer_url,
+            client_id: &row.client_id,
+            connection_id: Some(&owner_id),
+        }
+        .renew_secret(&row.client_auth, &observed, self.kms.as_deref())
+        .await
+        .map_err(|_: IssuerSealError| WyrdError::ServiceUnavailable {
+            message: "provider client secret protection is unavailable".to_owned(),
+            details: json!({ "reason": "kms_unavailable" }),
+        })?;
+        Ok(StagedRenewal {
+            connection_id,
+            observed,
+            renewed,
+        })
+    }
+
+    /// Store a renewal staged by [`Self::stage_renewal`]. The connection
+    /// keeps its id, revision, state, and test stamp, so login and every
+    /// session bound to it continue unchanged.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::ConnectionConflict`] when the connection was
+    /// deactivated, removed, replaced, or renewed after it was read, and the
+    /// audit/store errors of [`Self::list`].
+    pub async fn renew_encryption(
+        &self,
+        tenant: DataTenantId,
+        staged: StagedRenewal,
+        decision: &AuditEvent,
+        origin: &Url,
+    ) -> Result<HumanConnectionView, WyrdError> {
+        let callback = provider_callback(origin)?;
+        let mut conn = self.begin_locked(tenant, decision).await?;
+        let Some(row) = renew_human_connection_secret(
+            &mut conn,
+            staged.connection_id,
+            &staged.observed,
+            &staged.renewed,
+        )
+        .await
+        .map_err(store_error)?
+        else {
+            return commit_refusal(conn, conflict("the connection changed during the renewal"))
+                .await;
         };
         conn.commit().await.map_err(store_error)?;
         view(row, &callback)
@@ -408,7 +558,8 @@ impl HumanConnections {
             return Ok(None);
         };
         row.jwks_uri = Some(jwks_uri.to_string());
-        let trusted = human_connection_trusted_issuer(tenant, row, self.keyring.as_deref())
+        let trusted = human_connection_trusted_issuer(tenant, row, self.kms.as_deref())
+            .await
             .map_err(|error| {
                 tracing::error!(error = %error, tenant_id = %tenant, "tested candidate is unusable");
                 WyrdError::AuthVerifyUnavailable {
@@ -673,7 +824,8 @@ impl HumanConnections {
             connection_id: row.connection_id,
             connection_revision: row.revision,
         };
-        let trusted = human_connection_trusted_issuer(tenant, row, self.keyring.as_deref())
+        let trusted = human_connection_trusted_issuer(tenant, row, self.kms.as_deref())
+            .await
             .map_err(|error| {
                 tracing::error!(error = %error, tenant_id = %tenant, "active human connection is unusable");
                 WyrdError::AuthVerifyUnavailable {
@@ -684,20 +836,21 @@ impl HumanConnections {
         Ok(Some(ActiveHumanConnection { trusted, binding }))
     }
 
-    /// The deployment sealing keyring, required wherever this owner seals.
+    /// The deployment stored-secret facade, required wherever this owner
+    /// seals.
     ///
-    /// A provider client secret is sealed before it is stored, so a keyless
-    /// deployment can stage only public-client connections.
+    /// A provider client secret is sealed before it is stored, so a
+    /// deployment without `[kms]` can stage only public-client connections.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
-    /// when no sealing keyring is configured.
-    pub(crate) fn require_keyring(&self) -> Result<&Arc<SealingKeyring>, WyrdError> {
-        self.keyring.as_ref().ok_or_else(|| WyrdError::Validation {
-            message: "a deployment sealing key (WYRD_SEALING_KEY_FILE) is required to seal \
-                      provider client secrets at rest"
+    /// Returns [`WyrdError::Validation`] with reason `kms_unconfigured` when
+    /// no `[kms]` is configured.
+    pub(crate) fn require_kms(&self) -> Result<&WyrdKms, WyrdError> {
+        self.kms.as_deref().ok_or_else(|| WyrdError::Validation {
+            message: "stored-secret encryption ([kms], WYRD_KMS_*) is required to store \
+                      provider client secrets"
                 .to_owned(),
-            details: json!({ "reason": "sealing_key_missing" }),
+            details: json!({ "reason": "kms_unconfigured" }),
         })
     }
 
@@ -710,8 +863,11 @@ impl HumanConnections {
         self.postgres.tenant_conn(tenant).await.map_err(store_error)
     }
 
-    /// Open a tenant transaction, take the slot lock, and stage `decision` on
-    /// the audit stage.
+    /// Stage `decision` on the audit stage, then open a tenant transaction
+    /// and take the slot lock.
+    ///
+    /// The decision is staged first so a transaction or lock failure still
+    /// records the allowance it followed.
     ///
     /// # Errors
     /// Returns the store error when the transaction or lock fails.
@@ -720,11 +876,11 @@ impl HumanConnections {
         tenant: DataTenantId,
         decision: &AuditEvent,
     ) -> Result<TenantConn<'_>, WyrdError> {
+        self.audit.stage(tenant, decision.clone());
         let mut conn = self.begin(tenant).await?;
         lock_human_connection_slot(&mut conn)
             .await
             .map_err(store_error)?;
-        self.audit.stage(tenant, decision.clone());
         Ok(conn)
     }
 

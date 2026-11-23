@@ -1,6 +1,6 @@
 ---
 id: TASK-012-R1
-status: proposed
+status: complete
 approved_spec_revision: 16
 requirements: [REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024]
 acceptance: [AC-015, AC-016, AC-017, AC-018]
@@ -1040,7 +1040,9 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      - The baselines are 17 days and many commits old, so these deltas are
        not attributed to this remediation. No same-day baseline at
        `5c9808411` was run.
-   Status: OPEN.
+   Status: ACCEPTED (maintainer approval, 2026-11-18). The maintainer
+   declared the task complete with the open items below recorded, not
+   resolved. TASK-013 inherits them as known gaps.
    - The L1 records are VALID, but AC-018's no-regression criterion is not
      met. Gateway has a newly missed 1 KiB c64 target and +42% peak memory
      at 64 KiB c1.

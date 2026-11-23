@@ -29,13 +29,12 @@ reqwest = { workspace = true }
 skald-providers = { workspace = true }
 skald-spec = { workspace = true }
 url = { workspace = true }
-wyrd-crypt = { workspace = true }
+wyrd-kms = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-tls = { workspace = true }
 wyrd-utils = { workspace = true }
 wyrd-vault = { workspace = true }
-zeroize = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

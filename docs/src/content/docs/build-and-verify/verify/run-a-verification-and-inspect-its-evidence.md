@@ -1,221 +1,91 @@
 ---
-title: Background checks
-description: Queue a Verifier with submit, follow its execution from any process, tell a failed verdict from a check that never ran, and read the stored evidence.
+title: Investigate a failed verification
+description: Find a stored failed result, read which requirement failed, the evidence it judged, and the exact Verifier and subject versions, without rerunning any check.
 pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 3
-draft: true
 ---
 
-`submit` queues a Verifier and returns an execution ID right away. This guide follows that ID to a result: is it still running, did it settle without a verdict, what did each requirement find, and what evidence was it judged on. It also covers what a `202` does and does not promise.
+Start from a stored failure and find out why it failed: which requirement, against what evidence, judged by which versions.
 
-## Prerequisites
+The result `verify` returns is compact: the verdict and each requirement's outcome. Wyrd also keeps the execution's details, which hold each check as written, the value it found, the pinned evidence, and the exact Cards involved. Reading them does not run any check again.
 
-- A Verifier bound to the run's Card. Here `my-review` takes one file slot, `document`.
-- `verifier:run` on the Verifier to submit or cancel, `executions:read` on the Card it verifies to read an execution's status, invocations, and publications, and `bifrost_query:read` to query its Bifrost evidence. `workload` holds all three.
+## Before you start
 
-## 1. Submit and keep the ID
+Finish [Verify an agent's workflow](/build-and-verify/verify/verify-an-agent-workflow/) in the same directory. Its `skipped` case stored a failed `refund-workflow` result.
+
+## 1. Write the investigation
+
+The program finds the newest failed `refund-workflow` result in `bifrost.verification.results`, then reads its execution's details and prints each requirement that did not pass:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-```python
-from wyrd import verify
+<CodeFromFile file="examples/refund-agent/investigate.py" lang="python" title="investigate.py" />
 
-with state.run() as run:
-    execution = run.observe.submit("my-review", document=verify.File("report.pdf"))
-save(execution.id)
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/refund-agent/investigate.rs" lang="rust" title="src/bin/investigate.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/refund-agent/investigate.ts" lang="typescript" title="investigate.ts" />
+
+</LangTab>
+</LangTabs>
+
+`verify` returns its verdict before Wyrd stores the record, so a new result may not be queryable yet. The program retries for up to a minute. A missing row says nothing about the verdict. [What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains when a record is durable.
+
+## 2. Run it
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```bash
+uv run investigate.py
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
-```rust
-use wyrd_ai::verify::{File, Input, Inputs, Submission};
-
-let run = state.run();
-let submission = run
-    .observe()
-    .submit("my-review", Inputs::named([("document", Input::from(File::path("report.pdf")))]))
-    .await?;
-if let Submission::Queued(execution) = submission {
-    save(execution.id().to_string());
-}
+```bash
+cargo run --bin investigate
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
-```typescript
-import { verify } from "wyrd-ai";
-
-const run = state.run();
-const submitted = await run.observe.submit("my-review", { document: verify.File.path("report.pdf") });
-if (submitted.kind === "queued") save(submitted.execution.id);
+```bash
+node investigate.ts
 ```
 
 </LangTab>
 </LangTabs>
 
-`submit` uploads any missing files, then sends `POST /v1/verification/enqueue` with an `Idempotency-Key`. A transport retry reuses the key, so it returns the same execution ID instead of queuing twice.
+<CodeFromFile file="examples/refund-agent/investigate-output.txt" lang="text" title="output" />
 
-### What the 202 means
+## 3. Read the result
 
-The `202` and its `execution_id` confirm the execution is durably queued:
+Each line answers one question:
 
-- The server answers only after the evidence is written and the queued execution is committed. If the response is lost, submitting again with the same key returns the same execution, even from another server replica.
-- A second submission with the same key but different content is refused with `409 WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. It never runs and leaves the original execution unchanged.
-- If the server cannot commit the execution, for example because it stops abruptly, the submission is never acknowledged: `submit` fails with `WYRD_SERVER_503_SERVICE_UNAVAILABLE` or a transport error. Submit again; nothing is retried for you.
-- A completed execution can rarely lack a stored result for the same reason, so `wait` keeps polling and never reports a verdict it has not read.
+- **What judged what.** `refund-workflow@0.1.0` judged `refund-agent@0.1.0`. These are exact versions: a later version of either Card does not change this record.
+- **Which requirement failed.** `looked-up-order`. `reply-names-order` passed, so it is not printed.
+- **What it found.** The check expected `look-up-order` among the trace's span names, and the stored trace held only `answer-refund` and `draft-reply`. The agent never ran its lookup.
 
-## 2. Wait for the result
+The details also hold the pinned evidence under `outcome.evidence`: the reply text and the trace ID the check read. Over MCP, the same read is [`verification.get_execution_details`](/reference/mcp-tools/).
 
-From the same process, or from another one using only the ID:
+A read sees only executions in the caller's own tenant. An unknown execution and one in another tenant both answer `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, so a refused read reveals nothing about other tenants.
 
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
+## If it fails
 
-```python
-import wyrd
-
-execution = wyrd.verify.Execution.connect(execution_id)
-result = execution.wait(900)
-print(result.verdict)
-```
-
-</LangTab>
-<LangTab lang="rust">
-
-```rust
-use std::time::Duration;
-use wyrd_ai::verify::Execution;
-
-let execution = Execution::connect(execution_id.parse()?).await?;
-let result = execution.wait(Duration::from_secs(900)).await?;
-println!("{:?}", result.outcome.verdict);
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-import { verify } from "wyrd-ai";
-
-const execution = await verify.Execution.connect(executionId);
-const result = await execution.wait({ timeoutMs: 900_000 });
-console.log(result.outcome.verdict);
-```
-
-</LangTab>
-</LangTabs>
-
-`connect` uses the ambient credentials, or the client you pass (`client=` in Python, `{ client }` in TypeScript, `connect_with` in Rust). It reads as that principal, so it sees only executions in its own tenant that it may read.
-
-`wait` polls `GET /v1/verification/executions/{execution_id}`, backing off from 100 ms to 2 s. It returns the same `VerificationResult` that `verify` returns, raises the execution's own error when it errored or timed out, raises `WYRD_SDK_409_VERIFICATION_CANCELLED` when it was cancelled, and raises `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the timeout passes first. A timeout does not cancel the execution; wait again later.
-
-To read once without waiting, call `status()`:
-
-| `status` | Means | Next |
-| --- | --- | --- |
-| not found | Not queued yet, lost before it was, or not visible to you | Read again; after a few minutes, treat it as lost |
-| `pending`, `running`, `retrying` | Not finished | Read again |
-| `waiting` | Parked until the deferred inputs named in `waiting` are published | Publish them, or read again |
-| `completed` | A verdict exists; `result` holds it once stored | Read `result.outcome` |
-| `errored`, `timed_out`, `cancelled` | The Verifier did not reach a verdict | Read `error.code` and `error.message`. No Operator runs |
-
-Status is not the verdict. A completed execution of a passing check and of a failing one look the same until you read the verdict (`result.verdict` in Python, `result.outcome.verdict` in Rust and TypeScript).
-
-## 3. Read the evidence
-
-The result holds each judgment. What the execution ran, its steps, each check with its provenance, and the pinned inputs, is one explicit read of the execution's details; you rarely need SQL:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-```python
-for requirement in result.requirements:
-    print(requirement["id"], requirement["outcome"], requirement["reason"], requirement["citations"])
-details = verify.Execution.connect(result.execution_id).details()
-for step in details["outcome"]["steps"]:
-    print(step["id"], step["status"], step["attempts"], step.get("reason"))
-```
-
-</LangTab>
-<LangTab lang="rust">
-
-```rust
-for requirement in &result.outcome.requirements {
-    println!("{} {:?} {}", requirement.id, requirement.outcome, requirement.reason);
-}
-let details = Execution::connect(result.execution_id).await?.details().await?;
-for step in &details.outcome.steps {
-    println!("{} {:?} {} {:?}", step.id, step.status, step.attempts, step.reason);
-}
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-for (const requirement of result.outcome.requirements) {
-  console.log(requirement.id, requirement.outcome, requirement.reason, requirement.citations);
-}
-const details = await (await verify.Execution.connect(result.execution_id)).details();
-for (const step of details.outcome.steps) {
-  console.log(step.id, step.status, step.attempts, step.reason, step.tool_calls);
-}
-```
-
-</LangTab>
-</LangTabs>
-
-| Where | What it tells you |
+| You see | Fix |
 | --- | --- |
-| `result.outcome.requirements[]` | Each verdict, its reason, the actual value, and citations into the original files |
-| `result.outcome.requirements[].data` | The custom data an `agent` or `code` check returned, when it declares a [custom data](/reference/verifier-card/#custom-data) schema; absent otherwise, or when the data failed its schema |
-| `details.outcome.evidence` | The exact inputs judged, by slot, with file digests |
-| `details.outcome.steps[]` | Whether each step `succeeded`, `failed`, or was `skipped`, how many attempts it took, and every tool its Agent called with argument and output digests |
-| `details.outcome.requirements[]` | The same judgments, each with its check as written, its provenance (code hash, extraction version, Agent and Prompt versions, effective model route, drift window and baseline), and every tool an `agent` check called |
-| `tool_calls[].recipient` | On a step or an `agent` check's requirement in details: `model` for a call the model made, `code` for one a `code.run` program made with [`call_tool`](/reference/agent-tools-and-authorization/#tools-from-python) |
+| `no failed refund-workflow result yet` | Run the refund agent from [Verify an agent's workflow](/build-and-verify/verify/verify-an-agent-workflow/) first, against the same server |
+| `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | Read with a credential from the tenant that ran the check, such as the one `wyrd init` saved |
 
-Details are readable once the execution's records are stored; until then, and for an unknown execution, the read answers `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`. Over MCP, use `verification.get_execution_details`.
+## Next
 
-An `inconclusive` requirement whose step `failed` means the evidence could not be prepared; read the step `reason`. One with a citation reason means a judge passed without valid evidence.
-
-The same result is stored in `bifrost.verification.results`, and the pinned inputs in `bifrost.verification.execution_inputs`; query them with `bifrost.query` over MCP or the SDK's `Bifrost`:
-
-```sql
-SELECT verdict, verifier_version, run_id, binding_id
-FROM bifrost.verification.results
-WHERE execution_id = $1
-```
-
-## 4. Check a binding
-
-When a scheduled Verifier seems never to run, read its binding with `verification.get_binding` (`GET /v1/verification/bindings/{binding_id}`). The binding IDs are in the Service's Card status, `status.verification.binding_ids`.
-
-| Field | Tells you |
-| --- | --- |
-| `card_uid`, `verifier_card_uid` | Exactly what is checked, and by which Verifier version |
-| `readiness` | `ready`, `baseline_not_ready` (a drift baseline is still fitting or failed), or `verifier_unavailable` |
-| `active` | Whether the Service has authenticated in the last 24 hours. An inactive binding does not run on its schedule |
-| `next_run_at` | The next scheduled window |
-
-If `active` is false, deploy the Service. If `readiness` is `baseline_not_ready`, see [Monitor drift](/build-and-verify/verify/monitor-drift/#4-wait-for-the-baseline-to-fit).
-
-## Operators
-
-Only a `failed` verdict from a submitted or scheduled execution runs the binding's `on_failure` Operators, once per execution even if the request was replayed. `passed`, `inconclusive`, execution errors, and `verify` calls never do. Each dispatch is delivered and retried on its own; a delivery failure never changes the verdict. To set one up, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
-
-## What can go wrong
-
-| Code or symptom | Cause | Fix |
-| --- | --- | --- |
-| `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | The execution has not settled | Wait again |
-| `WYRD_SDK_409_VERIFICATION_CANCELLED` | The execution was cancelled; its status keeps the `cancelled` code | Submit again; a cancelled execution never resumes |
-| `WYRD_SERVER_503_SERVICE_UNAVAILABLE` on submit | The submission was lost before it was durably admitted, so it was never acknowledged | Submit again; a retry under the same `Idempotency-Key` names the same execution |
-| `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` on submit | The same `Idempotency-Key` was reused with different content | Use a new key for new content; the original execution is unaffected |
-| `WYRD_PERMISSION_403_DENIED_RBAC` on submit | No `verifier:run` on the bound Verifier | Use a credential with `workload` or a role that includes it |
-| Not found from another process | That principal is in another tenant or may not read the execution | Connect with the submitting principal or one granted read access |
-| `completed` but no Operator fired | The verdict was `passed` or `inconclusive` | Read `result.outcome.verdict` |
+[What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains which tables hold results, inputs, and outputs. [Bifrost](/understand/bifrost/) covers querying them with SQL. [Check on a schedule](/build-and-verify/verify/monitor-drift/) has the server run a check with no call from the application.

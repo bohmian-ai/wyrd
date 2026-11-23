@@ -383,6 +383,32 @@ impl Platform {
         .await
     }
 
+    /// Run one bounded wrapping-key maintenance pass over every stored secret.
+    ///
+    /// Moves envelopes not under the deployment's active wrapping key onto it:
+    /// `routine` rewraps each data key, `recovery` reseals each value under a
+    /// fresh data key. The report counts only this pass's observations;
+    /// repeat with the same mode while `remaining` is non-zero. The CLI's
+    /// transport for `wyrd platform stored-secrets maintain`; not projected
+    /// into any SDK.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks platform credential
+    /// administration, the deployment has no `[kms]`, or the catalog read
+    /// fails.
+    #[cfg(feature = "internal")]
+    pub async fn maintain_stored_secrets(
+        &self,
+        request: &wyrd_spec::security::stored_secret::StoredSecretMaintenanceRequest,
+    ) -> Result<wyrd_spec::security::stored_secret::StoredSecretMaintenanceReport, WyrdError> {
+        self.call(
+            Method::POST,
+            "/platform/stored-secrets/maintenance",
+            Some(request),
+        )
+        .await
+    }
+
     /// Stage every writable row on the server replica, publishing nothing.
     ///
     /// Reaches the benchmark control that only a server built with its `bench`

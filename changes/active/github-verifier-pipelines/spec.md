@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 16
+revision: 17
 status: approved
 ---
 
@@ -10,7 +10,10 @@ Approved amendment: [revision 16 — shared workload management](spec-revisions/
 is incorporated into this specification. The maintainer explicitly approved it
 on 2026-11-16. Its REQ-019–024 and AC-015–018 govern TASK-012-R1-allocation,
 required before TASK-013, and supersede conflicting earlier resource-policy
-text as specified in the amendment. Other pipeline behavior is unchanged.
+text as specified in the amendment. Approved amendment
+[revision 17 — hot-read optimization](spec-revisions/17-hot-read-optimization.md),
+approved on 2026-11-18, extends REQ-024 for TASK-012-R2's captured hot-source
+execution and identity statistics. Other pipeline behavior is unchanged.
 
 A connected repository declares its review policy once. Pull requests then run
 that policy through Wyrd's existing verification queue and engine, with exact
@@ -372,7 +375,8 @@ than external client upload-session SQL/inventory ACK on engine publication.
 External upload completion contracts remain unchanged. Bifrost memory/workspace
 policy, query semantics, catalog and durable-write/WAL/fence contracts remain
 unchanged; revision 16 permits only the specified shared pressure/CPU-dispatch
-integration into its existing owners;
+integration into its existing owners, and revision 17 the specified captured
+hot-source execution and identity statistics;
 Agent access continues through Agent tools, with no new Verifier query surface.
 
 A crash can lose unaccepted progress/results and direct requests do not resume.

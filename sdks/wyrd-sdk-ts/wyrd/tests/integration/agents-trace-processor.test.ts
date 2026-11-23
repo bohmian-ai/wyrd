@@ -233,8 +233,8 @@ async function expectObserved(server: NativeWyrdTestServer, result: Awaited<Retu
 
 test("managed framework telemetry", async ({ server, provider, bundle, serviceKey }) => {
   const state = ambientState(bundle, serviceKey);
+  await state.configure();
   await state.startBifrost();
-  await state.startTelemetry();
   const ask = direct(provider.url);
   const held = trace.getTracer("framework-app").startSpan("held");
 
@@ -268,7 +268,7 @@ test("owned provider framework telemetry", async ({ server, provider, bundle, se
 
 test("framework execution edges", async ({ server, provider, bundle, serviceKey }) => {
   const state = ambientState(bundle, serviceKey);
-  await state.startTelemetry();
+  await state.configure();
   const ask = direct(provider.url);
 
   const failedModel = state.run("agent");
@@ -331,7 +331,7 @@ test("framework sampling privacy and authorization", async ({ server, provider, 
   async function exported(key: string, sampler?: string) {
     vi.stubEnv("OTEL_TRACES_SAMPLER", sampler);
     const state = ambientState(bundle, key);
-    await state.startTelemetry();
+    await state.configure();
     const result = await turn(state, direct(provider.url));
     const refusal = await state.shutdown().catch((error: unknown) => error);
     trace.disable();
@@ -368,7 +368,7 @@ test("framework sampling privacy and authorization", async ({ server, provider, 
 test("ambient auth gateway telemetry", async ({ server, provider, bundle, serviceKey }) => {
   await configureGateway(WyrdClient.connect());
   const state = ambientState(bundle, serviceKey);
-  await state.startTelemetry();
+  await state.configure();
   const wyrd = WyrdClient.connect();
   const gateway = new OpenAI({ baseURL: `${wyrd.serverUrl}/v1`, apiKey: "wyrd", fetch: wyrd.httpAuth, maxRetries: 0 });
   const before = provider.received.length;

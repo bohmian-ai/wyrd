@@ -1,5 +1,6 @@
 ---
 title: Add people
+browserTitle: Add people with single sign-on | Wyrd
 description: Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
 pillar: wyrd
 section: Operate
@@ -13,7 +14,7 @@ You connect the provider once per tenant. Wyrd only trusts a connection after a 
 ## Before you start
 
 - A tenant and its `admin_credential`, from [Deploy for a team](/operate/deploy-wyrd-for-a-team/#4-create-the-first-tenant).
-- The server's sealing key, from [step 3 of that guide](/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness). Wyrd encrypts the provider's client secret with it and refuses to test a connection without it.
+- The server's `[kms]` key, from [step 3 of that guide](/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness). Wyrd encrypts the provider's client secret with it and refuses to test a connection without it.
 - Administrator access to your identity provider.
 - The `wyrd` CLI and `curl`.
 

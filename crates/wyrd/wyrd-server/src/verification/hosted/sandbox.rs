@@ -521,7 +521,11 @@ impl Sandbox {
             }),
             ..ReplConfig::default()
         };
-        let mut checkout = tokio::time::timeout_at(deadline, self.pool.checkout(&repl))
+        let mut checkout = envelopes
+            .time(
+                Envelope::Checkout,
+                tokio::time::timeout_at(deadline, self.pool.checkout(&repl)),
+            )
             .await
             .map_err(|_| busy("no Python worker was ready before the deadline".to_owned()))?
             .map_err(|error| failed(&error))?;
@@ -537,208 +541,226 @@ impl Sandbox {
         // A host refusal that must stop the operation rather than reach
         // Python, such as process scratch with no room for a `/work` write.
         let mut stopped = None;
-        let ran = tokio::time::timeout_at(deadline, async {
-            let program = async {
-                let mut calls = Calls::new();
-                let mut answered = Vec::new();
-                let mut event = run_turn(
-                    self.workloads.lanes(),
-                    context,
-                    envelopes,
-                    Box::pin(checkout.feed(code, globals, mounts, true, &mut on_print)),
-                    &mut calls,
-                    &mut answered,
-                )
-                .await?;
-                loop {
-                    event = match event {
-                        TurnEvent::Complete(value) => return Ok(Some(value)),
-                        TurnEvent::OsCall {
-                            function_name,
-                            args,
-                            ..
-                        } => {
-                            let writing = workspace.zip(written(&function_name, &args));
-                            let _writer = match writing {
-                                Some((workspace, bytes)) => {
-                                    let writer =
-                                        drive(workspace.writer(), &mut calls, &mut answered).await;
-                                    let admitted = {
-                                        let workspace = Arc::clone(workspace);
-                                        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-                                        drive(
-                                            tokio::task::spawn_blocking(move || {
-                                                workspace.admit_write(bytes)
-                                            }),
-                                            &mut calls,
-                                            &mut answered,
-                                        )
-                                        .await
-                                        .map_err(
-                                            |error| PoolError::Protocol(error.to_string().into()),
-                                        )?
+        let ran = envelopes
+            .time(
+                Envelope::Execute,
+                tokio::time::timeout_at(deadline, async {
+                    let program = async {
+                        let mut calls = Calls::new();
+                        let mut answered = Vec::new();
+                        let mut event = run_turn(
+                            self.workloads.lanes(),
+                            context,
+                            envelopes,
+                            Box::pin(checkout.feed(code, globals, mounts, true, &mut on_print)),
+                            &mut calls,
+                            &mut answered,
+                        )
+                        .await?;
+                        loop {
+                            event = match event {
+                                TurnEvent::Complete(value) => return Ok(Some(value)),
+                                TurnEvent::OsCall {
+                                    function_name,
+                                    args,
+                                    ..
+                                } => {
+                                    let writing = workspace.zip(written(&function_name, &args));
+                                    let _writer = match writing {
+                                        Some((workspace, bytes)) => {
+                                            let writer = drive(
+                                                workspace.writer(),
+                                                &mut calls,
+                                                &mut answered,
+                                            )
+                                            .await;
+                                            let admitted = {
+                                                let workspace = Arc::clone(workspace);
+                                                let bytes =
+                                                    u64::try_from(bytes).unwrap_or(u64::MAX);
+                                                drive(
+                                                    tokio::task::spawn_blocking(move || {
+                                                        workspace.admit_write(bytes)
+                                                    }),
+                                                    &mut calls,
+                                                    &mut answered,
+                                                )
+                                                .await
+                                                .map_err(|error| {
+                                                    PoolError::Protocol(error.to_string().into())
+                                                })?
+                                            };
+                                            if let Err(WriteRefusal::Scratch) = admitted {
+                                                stopped =
+                                                    Some(busy(WriteRefusal::Scratch.to_string()));
+                                                return Ok(None);
+                                            }
+                                            if let Err(refusal) = admitted {
+                                                event = run_turn(
+                                                    self.workloads.lanes(),
+                                                    context,
+                                                    envelopes,
+                                                    Box::pin(checkout.resume(
+                                                        ResumeValue::Error(MontyException::new(
+                                                            ExcType::OSError,
+                                                            Some(refusal.to_string()),
+                                                        )),
+                                                        &mut on_print,
+                                                    )),
+                                                    &mut calls,
+                                                    &mut answered,
+                                                )
+                                                .await?;
+                                                continue;
+                                            }
+                                            Some(writer)
+                                        }
+                                        None => None,
                                     };
-                                    if let Err(WriteRefusal::Scratch) = admitted {
-                                        stopped = Some(busy(WriteRefusal::Scratch.to_string()));
-                                        return Ok(None);
-                                    }
-                                    if let Err(refusal) = admitted {
-                                        event = run_turn(
-                                            self.workloads.lanes(),
-                                            context,
-                                            envelopes,
-                                            Box::pin(checkout.resume(
-                                                ResumeValue::Error(MontyException::new(
-                                                    ExcType::OSError,
-                                                    Some(refusal.to_string()),
+                                    let mounted = run_turn(
+                                        self.workloads.lanes(),
+                                        context,
+                                        envelopes,
+                                        Box::pin(checkout.resume_from_mounts(&mut on_print)),
+                                        &mut calls,
+                                        &mut answered,
+                                    )
+                                    .await?;
+                                    match mounted {
+                                        Some(event) => event,
+                                        None => {
+                                            run_turn(
+                                                self.workloads.lanes(),
+                                                context,
+                                                envelopes,
+                                                Box::pin(checkout.resume(
+                                                    ResumeValue::NotHandled,
+                                                    &mut on_print,
                                                 )),
-                                                &mut on_print,
-                                            )),
-                                            &mut calls,
-                                            &mut answered,
-                                        )
-                                        .await?;
-                                        continue;
+                                                &mut calls,
+                                                &mut answered,
+                                            )
+                                            .await?
+                                        }
                                     }
-                                    Some(writer)
                                 }
-                                None => None,
-                            };
-                            let mounted = run_turn(
-                                self.workloads.lanes(),
-                                context,
-                                envelopes,
-                                Box::pin(checkout.resume_from_mounts(&mut on_print)),
-                                &mut calls,
-                                &mut answered,
-                            )
-                            .await?;
-                            match mounted {
-                                Some(event) => event,
-                                None => {
+                                TurnEvent::NameLookup {
+                                    name,
+                                    object_id: None,
+                                    ..
+                                } if bridge.is_some() && name == CALL_TOOL => {
+                                    run_turn(
+                                        self.workloads.lanes(),
+                                        context,
+                                        envelopes,
+                                        Box::pin(checkout.resume_name_lookup(
+                                            MontyObject::function(
+                                                CALL_TOOL,
+                                                Some(CALL_TOOL_DOC.to_owned()),
+                                            ),
+                                            &mut on_print,
+                                        )),
+                                        &mut calls,
+                                        &mut answered,
+                                    )
+                                    .await?
+                                }
+                                TurnEvent::NameLookup { .. } => {
+                                    run_turn(
+                                        self.workloads.lanes(),
+                                        context,
+                                        envelopes,
+                                        Box::pin(checkout.resume_name_lookup(
+                                            None::<MontyObject>,
+                                            &mut on_print,
+                                        )),
+                                        &mut calls,
+                                        &mut answered,
+                                    )
+                                    .await?
+                                }
+                                TurnEvent::FunctionCall {
+                                    function_name,
+                                    args,
+                                    call_id,
+                                    object_id: None,
+                                    ..
+                                } if function_name == CALL_TOOL
+                                    && let Some(bridge) = bridge =>
+                                {
+                                    calls.push(request(bridge, &args, call_id));
                                     run_turn(
                                         self.workloads.lanes(),
                                         context,
                                         envelopes,
                                         Box::pin(
-                                            checkout.resume(ResumeValue::NotHandled, &mut on_print),
+                                            checkout.resume(ResumeValue::Future, &mut on_print),
                                         ),
                                         &mut calls,
                                         &mut answered,
                                     )
                                     .await?
                                 }
-                            }
-                        }
-                        TurnEvent::NameLookup {
-                            name,
-                            object_id: None,
-                            ..
-                        } if bridge.is_some() && name == CALL_TOOL => {
-                            run_turn(
-                                self.workloads.lanes(),
-                                context,
-                                envelopes,
-                                Box::pin(checkout.resume_name_lookup(
-                                    MontyObject::function(
-                                        CALL_TOOL,
-                                        Some(CALL_TOOL_DOC.to_owned()),
-                                    ),
-                                    &mut on_print,
-                                )),
-                                &mut calls,
-                                &mut answered,
-                            )
-                            .await?
-                        }
-                        TurnEvent::NameLookup { .. } => {
-                            run_turn(
-                                self.workloads.lanes(),
-                                context,
-                                envelopes,
-                                Box::pin(
-                                    checkout.resume_name_lookup(None::<MontyObject>, &mut on_print),
-                                ),
-                                &mut calls,
-                                &mut answered,
-                            )
-                            .await?
-                        }
-                        TurnEvent::FunctionCall {
-                            function_name,
-                            args,
-                            call_id,
-                            object_id: None,
-                            ..
-                        } if function_name == CALL_TOOL
-                            && let Some(bridge) = bridge =>
-                        {
-                            calls.push(request(bridge, &args, call_id));
-                            run_turn(
-                                self.workloads.lanes(),
-                                context,
-                                envelopes,
-                                Box::pin(checkout.resume(ResumeValue::Future, &mut on_print)),
-                                &mut calls,
-                                &mut answered,
-                            )
-                            .await?
-                        }
-                        TurnEvent::FunctionCall { .. } => {
-                            run_turn(
-                                self.workloads.lanes(),
-                                context,
-                                envelopes,
-                                Box::pin(checkout.resume(ResumeValue::NotFound, &mut on_print)),
-                                &mut calls,
-                                &mut answered,
-                            )
-                            .await?
-                        }
-                        TurnEvent::ResolveFutures { .. } => {
-                            if answered.is_empty() {
-                                let next = calls.next().await.ok_or_else(|| {
-                                    PoolError::Protocol("Python awaits no pending host call".into())
-                                })?;
-                                answered.push(next);
-                            }
-                            while let Some(Some(next)) = calls.next().now_or_never() {
-                                answered.push(next);
-                            }
-                            let mut results = Vec::with_capacity(answered.len());
-                            let mut deliveries = Vec::new();
-                            for (call_id, result) in answered.drain(..) {
-                                let Some((delivery, value)) = answer(bridge, result) else {
-                                    return Ok(None);
-                                };
-                                deliveries.extend(delivery);
-                                results.push((call_id, value));
-                            }
-                            // Python receives these values with this resumption;
-                            // one settled earlier but never resumed is dropped
-                            // undelivered with the operation.
-                            for delivery in deliveries {
-                                delivery.deliver();
-                            }
-                            run_turn(
-                                self.workloads.lanes(),
-                                context,
-                                envelopes,
-                                Box::pin(checkout.resume_futures(results, &mut on_print)),
-                                &mut calls,
-                                &mut answered,
-                            )
-                            .await?
+                                TurnEvent::FunctionCall { .. } => {
+                                    run_turn(
+                                        self.workloads.lanes(),
+                                        context,
+                                        envelopes,
+                                        Box::pin(
+                                            checkout.resume(ResumeValue::NotFound, &mut on_print),
+                                        ),
+                                        &mut calls,
+                                        &mut answered,
+                                    )
+                                    .await?
+                                }
+                                TurnEvent::ResolveFutures { .. } => {
+                                    if answered.is_empty() {
+                                        let next = calls.next().await.ok_or_else(|| {
+                                            PoolError::Protocol(
+                                                "Python awaits no pending host call".into(),
+                                            )
+                                        })?;
+                                        answered.push(next);
+                                    }
+                                    while let Some(Some(next)) = calls.next().now_or_never() {
+                                        answered.push(next);
+                                    }
+                                    let mut results = Vec::with_capacity(answered.len());
+                                    let mut deliveries = Vec::new();
+                                    for (call_id, result) in answered.drain(..) {
+                                        let Some((delivery, value)) = answer(bridge, result) else {
+                                            return Ok(None);
+                                        };
+                                        deliveries.extend(delivery);
+                                        results.push((call_id, value));
+                                    }
+                                    // Python receives these values with this resumption;
+                                    // one settled earlier but never resumed is dropped
+                                    // undelivered with the operation.
+                                    for delivery in deliveries {
+                                        delivery.deliver();
+                                    }
+                                    run_turn(
+                                        self.workloads.lanes(),
+                                        context,
+                                        envelopes,
+                                        Box::pin(checkout.resume_futures(results, &mut on_print)),
+                                        &mut calls,
+                                        &mut answered,
+                                    )
+                                    .await?
+                                }
+                            };
                         }
                     };
-                }
-            };
-            tokio::select! {
-                ran = program => ran,
-                () = victim.cancelled() => Ok(None),
-            }
-        })
-        .await;
+                    tokio::select! {
+                        ran = program => ran,
+                        () = victim.cancelled() => Ok(None),
+                    }
+                }),
+            )
+            .await;
         drop(on_print);
         let resettable = matches!(
             ran,

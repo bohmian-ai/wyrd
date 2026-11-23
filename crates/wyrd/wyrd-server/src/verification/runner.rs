@@ -56,7 +56,9 @@ use wyrd_spec::ids::{ApprovalId, CardUid, ExecutionId, SlotName, VerificationRes
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::{ExecutedOutcome, InputDeclaration};
-use wyrd_spec::verification::state::{ExecutionIdentity, RecordedApproval, TerminalSelection};
+use wyrd_spec::verification::state::{
+    ExecutionIdentity, ExecutionState, RecordedApproval, TerminalSelection,
+};
 use wyrd_spec::verification::{DriftWindow, VerificationError, VerificationVerdict};
 use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadiness};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
@@ -522,7 +524,7 @@ impl VerifierRunner {
                 return self
                     .record(
                         tenant,
-                        frozen,
+                        run,
                         &custody,
                         (TerminalStatus::Errored, error),
                         deadline,
@@ -631,33 +633,21 @@ impl VerifierRunner {
     async fn record(
         &self,
         tenant: DataTenantId,
-        frozen: Frozen<'_>,
+        run: &ClaimedExecution,
         custody: &Custody,
         (status, error): (TerminalStatus, VerificationError),
         deadline: tokio::time::Instant,
         lease: &HeldLease,
     ) -> Transition {
+        let frozen = Frozen::attempt(run);
         let execution_id = frozen.run.execution_id;
         let Some(system) = system_principal(custody.system) else {
             tracing::warn!(%execution_id, "the tenant has no SYSTEM principal; the failure is not recorded in the execution state");
             return Transition::Terminate(status, error);
         };
-        let recovered = async {
-            let query = self
-                .reader(tenant, system, None)
-                .await
-                .map_err(|error| StateError::Unavailable(error.to_string()))?;
-            RunState::accepted(
-                &self.state,
-                tenant,
-                execution_id,
-                &InputResolver::new(&query, None),
-            )
-            .await
-        };
-        let (revision, accepted) = match recovered.await {
+        let (revision, accepted) = match self.accepted(tenant, run, system, None).await {
             Ok(recovered) => recovered,
-            Err(unavailable) => return state_failure(execution_id, &unavailable),
+            Err(transition) => return transition,
         };
         let identity = accepted
             .identity
@@ -702,15 +692,11 @@ impl VerifierRunner {
         deadline: tokio::time::Instant,
         lease: &HeldLease,
     ) -> Result<RunState, Transition> {
-        let execution_id = run.lease.execution_id;
-        let query = self
-            .reader(tenant, system, Some(&run.authority))
-            .await
-            .map_err(|error| {
-                state_failure(execution_id, &StateError::Unavailable(error.to_string()))
-            })?;
-        RunState::recover(
-            &self.state,
+        let (revision, accepted) = self
+            .accepted(tenant, run, system, Some(&run.authority))
+            .await?;
+        Ok(RunState::at(
+            self.state.resources.workloads().clone(),
             Arc::clone(&self.outbox),
             tenant,
             frozen.row(
@@ -719,10 +705,58 @@ impl VerifierRunner {
             ),
             deadline,
             lease.lost().clone(),
-            &InputResolver::new(&query, None),
+            accepted,
+            revision,
+        ))
+    }
+
+    /// The accepted revision and state of claimed `run`, read as `system`
+    /// serving `served`.
+    ///
+    /// An execution no earlier claim leased starts fresh at revision 0 with
+    /// no read, since only a lease holder writes its state. Otherwise the
+    /// recovery reads are new Verification work: pressure admits them now or
+    /// the attempt defers, exactly as the engine's own reads do, so a paused
+    /// process never queues queries for work it would not run.
+    ///
+    /// # Errors
+    /// Returns the [`Transition`] the attempt ends in when pressure refuses
+    /// it or the state cannot be used.
+    async fn accepted(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        system: PrincipalId,
+        served: Option<&AcceptedAuthority>,
+    ) -> Result<(i64, ExecutionState), Transition> {
+        let execution_id = run.lease.execution_id;
+        if !run.claimed_before {
+            return Ok((0, ExecutionState::fresh()));
+        }
+        let recovered = crate::verification::hosted::blocks::as_one_operation(
+            &self.state,
+            tenant,
+            Some(tokio::time::Instant::now()),
+            async {
+                let recovered = async {
+                    let query = self
+                        .reader(tenant, system, served)
+                        .await
+                        .map_err(|error| StateError::Unavailable(error.to_string()))?;
+                    RunState::accepted(execution_id, &InputResolver::new(&query, None)).await
+                };
+                Ok(recovered.await)
+            },
         )
-        .await
-        .map_err(|error| state_failure(execution_id, &error))
+        .await;
+        match recovered {
+            Ok(Ok(recovered)) => Ok(recovered),
+            Ok(Err(error)) => Err(state_failure(execution_id, &error)),
+            Err(_) => Err(Transition::Defer(failure(
+                RUNTIME_BUSY,
+                "process memory pressure pauses new executions",
+            ))),
+        }
     }
 
     /// Prepare the claimed execution's frozen input, then run the engine

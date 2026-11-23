@@ -225,13 +225,15 @@ const NOT_VISIBLE: &str = "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND";
 /// judge Verifier's one tool-less Agent reaches it. They nest in the
 /// engine, overlap across concurrent Agents and each other, and are never
 /// summed or subtracted.
-pub(crate) const ENVELOPES: [(&str, &str, bool); 6] = [
+pub(crate) const ENVELOPES: [(&str, &str, bool); 8] = [
     ("server.workspace", "verification.direct.workspace", false),
     ("server.tool", "verification.direct.tool", false),
     ("server.sandbox", "verification.direct.sandbox", false),
     ("server.capacity", "verification.direct.capacity", false),
     ("server.runnable", "verification.direct.runnable", false),
     ("server.model", "verification.direct.model", true),
+    ("server.checkout", "verification.direct.checkout", false),
+    ("server.execute", "verification.direct.execute", false),
 ];
 
 /// Why a step's Verifier reaches no such envelope.
@@ -1361,6 +1363,21 @@ impl Workload for Bench {
             }
         }
         Ok(())
+    }
+    /// Reads the server's outstanding publication and maintenance work
+    /// ([`LocalServer::outstanding`]) before teardown; none before the
+    /// server started.
+    async fn outstanding(
+        &mut self,
+    ) -> std::result::Result<Option<serde_json::Value>, ExperimentError> {
+        match &self.server {
+            Some(server) => server
+                .outstanding()
+                .await
+                .map(Some)
+                .map_err(ExperimentError::workload),
+            None => Ok(None),
+        }
     }
 
     /// The server's PID, once it runs.
@@ -3710,11 +3727,13 @@ mod tests {
                 repetitions: 2,
                 budget_seconds: 600,
                 minimum_seconds: 0,
+                phases: None,
             };
             let options = Options {
                 artifacts: directory.path().join("artifacts"),
                 profile: None,
                 interrupt: CancellationToken::new(),
+                setup_spent: Duration::ZERO,
             };
             let mut workload = Calibration {
                 bench: Bench::new(Level::One, directory.path().join("logs"), false, None),

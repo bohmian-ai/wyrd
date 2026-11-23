@@ -6,38 +6,138 @@ an append-only record in [`history/`](#history). They are not part of any test
 lane, `gate`, verify lane, or CI job.
 
 ```bash
-mise run bench:smoke                 # every default plan at smoke scale
-mise run bench:l1                    # Level 1, all three engines in order
-mise run bench:l1:bifrost            # Level 1 Bifrost: writes-parquet, hot, parquet
-mise run bench:l1:bifrost:writes     # one Bifrost experiment: writes-parquet
-mise run bench:l1:bifrost:hot
-mise run bench:l1:bifrost:parquet
-mise run bench:l1:verification
-mise run bench:l1:gateway
+mise run benchmark:l1:verification   # L1: the 5 routine Verification cases
+mise run benchmark:l1:gateway        # L1: the 5 routine Gateway cases
+mise run benchmark:l1:bifrost        # L1: the 18 routine Bifrost cases
+mise run benchmark:l1:bifrost -- --list-cases
+mise run benchmark:l1:verification -- --cases direct-verify-c64 --profile cpu
 mise run bench:l2:bifrost            # Level 2, one engine
 mise run bench:l2:verification
 mise run bench:l2:gateway
-mise run bench:l1:gateway -- --profile --steps chat.c64
-mise run bench:l1:gateway -- --smoke # one plan at smoke scale
-mise run bench:results               # every record as one HTML page
+mise run bench:smoke                 # every L2 plan at smoke scale
+mise run test:benchmark:l1           # the L1 sweep harness smoke
+mise run bench:results               # every history record as one HTML page
 ```
 
-`--smoke` runs a normal command's whole workflow (fixture loading and
-publication waits, every selected step and phase, measured stop, drain,
-exact reconciliation, judgment, record, timing evidence and report) at
-smoke-scale fixtures with one short warmup and one repetition per step. It
-records `"mode": "smoke"` under `target/benchmarks/smoke/`, never in history, and a
-smoke record is never a calibration wherever it is moved. A
-smoke judges no criterion: every reading, errors and target misses included,
-is recorded beside an inapplicable criterion, so a smoke is VALID or INVALID.
-It is INVALID only when the measurement itself is broken (a missing reading
-or counter, a mismatched population, zero CPU, a failed record); a busy
-driver does not invalidate a smoke. A full command never runs a smoke first:
-run `--smoke` on the same command, or `bench:smoke` for every default plan's
-smoke. Every L1 experiment takes up to 5 minutes (Verification, Gateway,
-Bifrost `hot` and `parquet`) except Bifrost `writes-parquet`, which takes up
-to 8 (480 s), so `bench:l1:bifrost` takes up to 18 minutes (1,080 s) and
-`bench:l1` up to 28 in all. An L2 engine takes 20 to 30 minutes.
+## L1 cases and sweeps
+
+A **case** is one declared workload, fixture and load configuration, such
+as `direct-verify-c64` or `otlp-logs-c64`. A **sweep** is one category
+command over selected cases. A **phase** is part of a case's lifecycle, and
+a **window** is one measured admission interval.
+
+Each category has one command. With no arguments it runs the category's
+routine sweep, in declared order:
+
+| Command | Routine sweep |
+|---|---|
+| `mise run benchmark:l1:verification` | `direct-verify-c1`, `direct-verify-c64`, `direct-verify-r3000`, `direct-verify-python-r3000`, `direct-verify-typescript-r3000` |
+| `mise run benchmark:l1:gateway` | `buffered-1kib-capture-metadata.c1`, `buffered-1kib-capture-metadata.c64`, `streamed-1kib-capture-metadata.c64`, `buffered-64kib-capture-metadata.c64`, `buffered-64kib-capture-payload.c64` |
+| `mise run benchmark:l1:bifrost` | the eight `writes-parquet` cases (`otlp-spans`, `otlp-spans-1k`, `otlp-logs` and `native-write` at `-c1` and `-c64`), `point-memtable-c1`, `point-memtable-c64`, `point-staged-c1`, `point-c1`, `point-c64`, `full-scan-c1`, `span-trace-c64`, and `ui-sql/memtable-ui-c8`, `ui-sql/staged-ui-c8`, `ui-sql/published-ui-c8` |
+
+Every other registered case is **targeted**: it runs only when selected,
+through the same lifecycle and report. Targeted cases include the Python
+and TypeScript closed-loop Verification cases, the intermediate Rust client
+counts `direct-verify-c4`, `-c16` and `-c32`, the Agent-only
+`direct-verify-model-c1` and `-c64`, the single-client Gateway shapes, the
+other hot and Parquet read shapes, the single-client UI pages, and the
+`ui-sql-10x` and `ui-sql-learned` families. Arguments go after `--`:
+
+- `--list-cases` prints every exact selector with its family and its
+  routine or targeted status, and builds and runs nothing.
+- `--cases <id>[,<id>...]` runs exactly those cases in the given order. A
+  Bifrost id that recurs across families takes its family:
+  `ui-sql-10x/staged-ui-c8`; `family/id` is always accepted. An unknown,
+  ambiguous or repeated selector fails before any case starts.
+- `--profile cpu|heap|both` attaches the profilers to the routine sweep or
+  to a selection. Targets stay the same; the summary marks every reading
+  diagnostic.
+- `--allow-dirty` records a dirty source (see [Source](#source)); Gateway's
+  `--pace <requests/s>` offers every window open loop at that rate.
+
+The command prepares the release server, the `capacity` driver and, for
+Verification, the SDK modules once, before any case clock starts. It then
+runs the cases one at a time. Each case is its own `capacity` process under
+its own fresh repository PostgreSQL (a named Compose project), with its own
+server, WAL and object storage under a case-owned temporary root, and its
+own clients, SDK processes and local provider. A case prepares its whole
+declared fixture and only its own clients, whether it runs alone, in a
+subset, or in the routine sweep, so its declaration never depends on what
+else was selected.
+
+### The case clock
+
+| Phase | Maximum |
+|---|---:|
+| Setup: PostgreSQL creation, migrations, server and clients, fixture loading and exact fixture checks | 240 s |
+| Warmup | 30 s |
+| Measurement: three 30-second windows | 90 s |
+| Drain and capture, every inter-window drain and the final one together | 150 s |
+| Teardown: stop and reap owned processes, remove PostgreSQL, WAL and object storage | 60 s |
+| Persist and report the case record | 20 s |
+| **Total** | **590 s** |
+
+These are maximum allowances, not sleeps, enforced as absolute deadlines;
+nothing renews one after a window. Each window stop freezes the completed
+work, interval CPU and counters; requests still in flight drain before the
+next window opens and count as late evidence, never as window work. Before
+teardown the case reads the publication and maintenance work the server
+still holds (memtable bytes, staged members and bytes, outstanding claims
+and outbox items): a write case measures throughput to durable
+acknowledgement, and outstanding publication is reported beside it.
+
+A case is INVALID when a phase misses its deadline, an integrity or
+correctness check fails in any window, a sample floor is missed, or
+required lifecycle or measurement evidence is missing. Cleanup belongs to
+validity: the supervisor confirms that every owned process (identified by
+PID and start time), container, volume, network and the storage root is
+gone. A failed case is followed by the next once its cleanup is confirmed;
+when cleanup cannot be confirmed within the teardown allowance, the sweep
+stops and records every later case `NOT RUN`.
+
+The full-size phase timings are not yet verified on the supported
+benchmark hosts.
+
+### Aggregates and targets
+
+A case's rates and efficiencies are ratios of the three windows' summed
+work, seconds, input bytes and server CPU, never averages of window ratios.
+Its percentiles pool the three windows' histogram counts, keeping the sample
+count and bucket bounds. Existing performance targets, with their existing
+thresholds and operators, judge those aggregates before any display
+rounding. A target miss is a performance result: it never makes a case
+INVALID. The full case report keeps every window's readings, correctness
+checks and sample floors. Unavailable and inapplicable readings are never
+shown as zero.
+
+### The summary table
+
+A sweep ends with one Markdown table, printed with its coverage, mode and
+the saved sweep path. Paste it verbatim and put interpretation in prose
+below it. It has one row per selected case in saved order:
+
+| Column | Content |
+|---|---|
+| Case | The exact selector |
+| Status | `VALID`, `VALID (diagnostic)` when profiled, `INVALID: <reason>`, or `NOT RUN: <reason>` |
+| Throughput | Verifications/s, requests/s, acknowledged rows/s, queries/s, or UI pages/s |
+| Server CPU per unit | Server CPU microseconds per verification, request, row, query or page |
+| Headline latency | Verification server overhead p99; Gateway added overhead p99; Bifrost durable ACK p99, server query p99 (p95 for `full-scan-c1`), or UI client page p99; as its bucket interval with the pooled sample count |
+| Input | Bifrost only: OTLP input MiB/s and input MiB per server CPU-second; `unavailable` for native writes, whose input bytes are not measured; `n/a` for reads |
+| Target | Each target of the case judged on its aggregate: `met`, `missed`, `unsettled`, or `none` |
+| Record | The case record's file beside the sweep record, or `unavailable` |
+
+INVALID and NOT RUN rows carry their reasons and no performance cells.
+Bifrost sweeps add each write path's peak rows/s and each lookup's
+64-client scaling derived from the selected cases; a derived reading whose
+input was not selected or is not VALID says which, and never starts a case.
+
+`capacity report <sweep.json>` renders the same table again from the saved
+sweep and case records, without live services or temporary artifacts, and
+`capacity report <case-record.json>` renders one case's full report: its
+identity, verdict and reasons, phase timings against their allowances,
+windows, ownership and cleanup evidence, outstanding work, profile captures
+or notes, aggregate, and the engine report of its windows.
 
 ## Prerequisites
 
@@ -49,8 +149,8 @@ Before the experiment clock starts, it builds the release server and the
 while measuring.
 
 Each experiment starts its own plain-child server on the whole host, using a
-`file://` store in a temporary directory and a fresh Postgres. `bench:l1` gives
-each engine its own Postgres. No OS resource limits are applied: only Wyrd
+`file://` store in a temporary directory and a fresh Postgres. Each L1 case
+gets its own Postgres, server and storage. No OS resource limits are applied: only Wyrd
 configuration declares server limits.
 
 ## Measurement
@@ -92,11 +192,25 @@ configuration declares server limits.
   also pays for the competing work. Each report row stands on its own:
   its rate cell carries every `(W/T)/P`, `W/C`, and `C/W` metric, and its
   latency cell the server and client p50/p95/p99.
-- **Bytes have declared sources.** Writes report rows, retained Arrow MiB
-  (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
-  rows and bytes of each query's own executed plan, from the same snapshots. The L1
-  storage ratio is published Parquet bytes over retained Arrow bytes of one
-  settled sample per path, excluding WAL, staging, and catalog bytes.
+- **Bytes have declared sources.** An OTLP write's headline is
+  `input_mib_per_s_per_vcpu` and `input_mib_per_cpu_s`: the uncompressed
+  OTLP protobuf the clients sent and the server acknowledged, the bytes
+  ingest comparisons count. Rows per vCPU and per CPU-second follow. The
+  uncompressed Arrow MiB the server stored (`stored_mib_*`) come last: they
+  fall whenever the schema stores less per row, so they never measure ingest
+  speed. Queries report the mean scanned
+  rows and bytes of each query's own executed plan, from the same snapshots.
+  Those are physical Parquet facts; a memtable batch is never one. `ui-sql`
+  also reports `memtable_rows_per_query` and `memtable_bytes_per_query`: the
+  captured memtable rows Scribe live reads examined after batch pruning and
+  before any row filter, and the recorded decoded Arrow bytes of the columns
+  they read, from the window's `bifrost_scribe_live_rows_examined_total` and
+  `bifrost_scribe_live_bytes_examined_total` movement per answered query;
+  missing, never zero, without the counter or an answered query. Each OTLP
+  path's L1 `compression` is the input bytes of one settled sample per
+  published Parquet byte of it, input over stored; its `storage_ratio`, which
+  native also reports, is published Parquet bytes over retained Arrow bytes.
+  Both exclude WAL, staging, and catalog bytes.
 - The `timing` control records the method, precision, range, series bounds,
   the server's benchmark snapshot setting, and the host's measured timer
   resolution. Operator span export stays disabled.
@@ -110,7 +224,7 @@ run is discarded.
 
 | Level | Shape | Windows | Budget |
 |---|---|---|---|
-| L1 | Isolated closed-loop work at 1 and 64 clients per operation | 5 s warmup, then 3 × 5 s per step; 3 × 10 s for a step whose 5 s window cannot meet its sample floor, declared in its `window_seconds` | 300 s per experiment; 480 s for Bifrost `writes-parquet` |
+| L1 | One isolated case per process, closed loop or paced | 30 s warmup, then 3 × 30 s per case | 590 s per case, in the [case clock](#the-case-clock)'s phase allowances |
 | L2 | Competing open-loop work: every repetition runs capacity → overload → recovery from equivalent state | 120 s warmup, then 3 × 360 s | 1,800 s, at least 1,200 s |
 
 What each engine covers:
@@ -151,10 +265,10 @@ What each engine covers:
       attribute filters at 1. Each settled query must carry its own scan
       facts. After settlement, outside every window, it checks that span
       files shred exactly the keys over the 10% threshold and that a
-      span-time window prunes, and reads each write path's storage ratio.
+      span-time window prunes, and reads each write path's storage ratio and each OTLP path's compression.
     - Scaling is reported for reads measured at both 1 and 64.
   - L1 sanity floors are the only absolute throughput limits: the native
-    peak must reach at least 200k rows/s, and the OTLP peak at least 30 wire
+    peak must reach at least 200k rows/s, and the OTLP peak at least 30 input
     MiB per server CPU-second.
   - L2 `competing` runs the 100M-row fixture with Forge compaction on:
     - open-loop ingest split 50% spans, 30% logs, 20% native;
@@ -184,8 +298,8 @@ What each engine covers:
 
     The Python and TypeScript steps carry the same names with `python-` or
     `typescript-` after `direct-verify-`. Rust also has diagnostic
-    closed-loop steps `direct-verify-c4`, `-c16` and `-c32`, declared only
-    when `--steps` names them, to read throughput and CPU per verification
+    closed-loop cases `direct-verify-c4`, `-c16` and `-c32`, targeted with
+    `--cases`, to read throughput and CPU per verification
     against `server_concurrency` as load rises.
   - **The headline number: overhead.** Overhead is the server's elapsed
     time for one execution, less the union of the Verifier's blocks (model
@@ -296,17 +410,16 @@ Flags:
 |---|---|---|
 | `--profile` | every command | Adds optional samply CPU captures and per-step server heap profiles under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
-| `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
-| `--pace <requests/s>` | `bench:l1:gateway` | Offers every window open loop at that rate, at most one open call per step client, with each missed or capped arrival counted as an error. It is a matched-load diagnostic: the record names the rate in its `workload` control, adds post-drain resident and governed memory by owner to each repetition's observations, and stays under `target/benchmarks/`. |
-
-`bench:l1` accepts only `--profile`, `--allow-dirty`, and `--smoke`, and
-passes them to every engine.
+| `--list-cases`, `--cases a,b` | `benchmark:l1:*` | Lists the category's selectors, or runs exactly the selected cases in order (see [L1 cases and sweeps](#l1-cases-and-sweeps)). |
+| `--steps a,b` | `bench:l2:*` | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
+| `--smoke` | `bench:l2:*` | Runs the plan at smoke scale; the L1 smoke is `test:benchmark:l1`. |
+| `--pace <requests/s>` | `benchmark:l1:gateway` | Offers every window open loop at that rate, at most one open call per step client, with each missed or capped arrival counted as an error. It is a matched-load diagnostic: the record names the rate in its `workload` control, adds post-drain resident and governed memory by owner to each repetition's observations, and stays under `target/benchmarks/`. |
 
 The Bifrost experiments' server inherits `WYRD_SCRIBE_SHARD_COUNT` from the
 command's environment (default 1 shard). A set value is named in the record's
 `limits` control, so L2 calibration reads only records run at the same shard
 count. For example,
-`WYRD_SCRIBE_SHARD_COUNT=4 mise run bench:l1:bifrost:writes -- --steps native-write-c64`.
+`WYRD_SCRIBE_SHARD_COUNT=4 mise run benchmark:l1:bifrost -- --cases native-write-c64`.
 
 ## Verdicts
 
@@ -330,16 +443,31 @@ failure. Every run ends with one verdict and exit code:
   - a dirty source without `--allow-dirty`.
 
 Nothing exits 1. A performance target (an SLO, a sanity floor, a backlog or
-byte bound) judges the median of the three repetitions and is reported as
+byte bound) judges an L1 case's aggregate (see
+[Aggregates and targets](#aggregates-and-targets)) and an L2 run's median
+repetition, and is reported as
 `met`, `missed`, or `unsettled` when a reading's precision cannot decide it;
 a target never changes the verdict or the exit code. Strict targets (`<`)
-are missed on equality. `bench:l1` and `bench:l1:bifrost` run every
-experiment even after one is INVALID, keep each record, and exit 0 only when
-every experiment exits 0, else 2.
+are missed on equality. An L1 sweep continues after an INVALID case whose
+cleanup was confirmed, keeps each case record, and exits 0 only when every
+selected case is VALID, else 2.
 
 ## Records and reports
 
-Each run appends one JSON record, schema version 3; a reader refuses any
+An L1 sweep keeps one case record per attempted case and one sweep record
+beside them, both carrying the L1 case protocol and its version:
+
+```text
+target/benchmarks/l1/<category>/<sweep start>/sweep.json
+target/benchmarks/l1/<category>/<sweep start>/NN-<family>-<case>.json
+```
+
+A case record embeds the engine record of exactly that case with its
+lifecycle; the schema-3 comparison reader and the L2 calibration refuse it,
+so new-protocol evidence never enters a reader that assumes the earlier
+protocol. Earlier schema-3 L1 records keep their original interpretation.
+
+Each L2 run appends one JSON record, schema version 3; a reader refuses any
 other version. A clean, unprofiled full run of the whole plan, VALID or
 INVALID, appends to history:
 
@@ -347,7 +475,7 @@ INVALID, appends to history:
 benchmarks/history/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
 ```
 
-A `--steps`, `--profile`, `--pace` or dirty `--allow-dirty` run writes the same record under
+A `--steps`, `--profile` or dirty `--allow-dirty` L2 run writes the same record under
 `target/benchmarks/<engine>/<experiment>/` and a smoke under
 `target/benchmarks/smoke/`; neither ever enters history.
 
@@ -385,9 +513,36 @@ diagnostics says they are unavailable. Gateway L1 records each phase of
 `server_elapsed`, `provider_excluded`, and `residual`, and the Scribe
 `outbox_write.scribe` batch writes, each over its own window population.
 
+After the diagnostics, `capacity report` lists each measured repetition's
+server window: every timing series by boundary, outcome, case, and phase;
+every scan series; and every counter that moved, gauge, and histogram with an
+observation, read from the window's two snapshots the run keeps under
+`timings/<step>/repetition-N.json` in its raw evidence directory. Counts,
+nearest-rank bucket bounds, and mean bounds are of that window alone.
+Oracle's `oracle_query_profile_*_total{event}` counters break a query's time
+into planning and operator stages, such as `Oracle.physical_planning`,
+`LiveScribeExec.fragment_open_time`, and `DataSourceExec.time_elapsed_opening`.
+
 When reporting a run, paste this report, fresh or regenerated with
 `capacity report <record>`, and append interpretation below it. Do not
 replace it with hand-built tables or extract results from raw snapshots.
+
+To compare two VALID runs of one experiment, such as a change against its
+baseline:
+
+```bash
+target/profiling/release/capacity compare <before.json> <after.json>
+```
+
+Each step both runs measured gets one table, with a row for every metric
+(diagnostics aside): `before` and `after` are each run's median with its
+repetition range as `[min–max]`, `change` is the change of the medians, and
+`outside spread` says `outside: higher` or `outside: lower` when the two
+ranges do not overlap, adding `better` or `worse` for a metric that declares
+a direction, and `no measured change` when they overlap. A histogram median
+shows its bucket; its change compares the bucket upper bounds and it has no
+spread verdict. Runs of different experiments, or an INVALID run, are
+refused with exit 2.
 
 ## History
 
@@ -432,11 +587,34 @@ invocation on every platform, and saves the captures under the run's
 missing or a capture fails, the record carries a note instead, and the
 verdict is unchanged.
 
+Run a profiled experiment with its normal task, narrowed to the cases in
+question:
+
+```bash
+mise run benchmark:l1:gateway -- --cases buffered-64kib-capture-metadata.c64 --profile cpu
+```
+
+The captures land in the case's `profiles/` directory,
+`target/benchmarks/l1/<category>/<sweep start>/NN-<family>-<case>/profiles/`
+(an L2 run's under `target/benchmarks/<engine>/<experiment>/<UTC start>/profiles/`),
+and the case report lists each one. Read a CPU capture with the harness:
+
+```bash
+target/profiling/release/capacity profile profiles/<step>/cpu-server-<pid>.json.gz              # every thread group
+target/profiling/release/capacity profile profiles/<step>/cpu-server-<pid>.json.gz wyrd-scribe  # threads whose name contains it
+```
+
+For each thread group it prints the samples (about 1 ms of CPU each), then
+the top functions by self and by inclusive samples. Thread names are cut to
+15 characters (`wyrd-scribe-ing`, `tokio-rt-worker`), so filter by a prefix. `samply load` opens the
+same capture as a flame graph.
+
 A heap capture (`heap` or `both`) profiles the server. Once the fixtures are
 loaded, the run asks the `bench` server build to start sampling its heap:
 about one allocation per 512 KiB allocated, recorded with its call stack,
 through the same mimalloc allocator the server always uses. After each
-measured step, the run saves `profiles/heap-<step>.pb.gz`, a symbolized pprof
+measured step, the run saves `profiles/heap-<role>-<step>.pb.gz` for the
+server and the driver, a symbolized pprof
 profile with Go's four heap sample types: `alloc_space` and `alloc_objects`
 count everything the steps so far allocated, freed or not, and `inuse_space`
 and `inuse_objects` what they still hold. Memory allocated before sampling
@@ -447,12 +625,12 @@ frees before it ends is gone from `inuse_space`, but the allocator may keep
 its pages. `alloc_space` shows which code allocated it.
 
 ```bash
-pprof -top profiles/heap-<step>.pb.gz                      # what is held after <step>
-pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> still holds beyond <earlier>
-pprof -top -sample_index=alloc_space -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> allocated
+pprof -top profiles/heap-server-<step>.pb.gz                                      # what is held after <step>
+pprof -top -base profiles/heap-server-<earlier>.pb.gz profiles/heap-server-<step>.pb.gz  # what <step> still holds beyond <earlier>
+pprof -top -sample_index=alloc_space -base profiles/heap-server-<earlier>.pb.gz profiles/heap-server-<step>.pb.gz  # what <step> allocated
 ```
 
-`pprof` is Google's profile viewer (`go install github.com/google/pprof@latest`);
+`pprof` is Google's profile viewer, installed locally (`go install github.com/google/pprof@latest`);
 `-http=:8080` opens a flame graph. Each stack starts at the code that asked
 for memory, with the allocator and the standard library's `Vec` and `Box`
 plumbing trimmed. Inlined frames carry short names in the bench build's

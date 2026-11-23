@@ -1,0 +1,9 @@
+# The subject: your support app's Service, verified by no-refund-promise.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-reply
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./no-refund-promise.yaml

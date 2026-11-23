@@ -124,6 +124,7 @@ pub const CASES: &[&str] = &[
     "streamed-1kib-capture-metadata",
     "buffered-64kib-capture-metadata",
     "buffered-64kib-capture-payload",
+    "ui-sql",
     "probe",
 ];
 

@@ -7,8 +7,8 @@
 //! RLS-scoped tenant pool, so Postgres row-level security is the load-bearing
 //! tenant boundary — no per-query tenant filtering.
 //!
-//! Create resolves OIDC discovery exactly once to fill `jwks_uri`, encrypts the
-//! client secret with the process sealing key before insert, and never lets a
+//! Create resolves OIDC discovery exactly once to fill `jwks_uri`, seals the
+//! client secret through the deployment `[kms]` before insert, and never lets a
 //! plaintext secret reach a column, log, or response (GET redacts it). Reads and
 //! deletes never touch discovery.
 //!
@@ -34,21 +34,25 @@ use wyrd_auth_oidc::{
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerTokenPolicy, IssuerUrl, PrincipalId, TrustedIssuerView, WorkloadBindingView,
-    refuse_human_trusted_issuer,
+    IssuerTokenPolicy, IssuerUrl, PrincipalId, ReplaceTrustedIssuerSecretRequest,
+    TrustedIssuerView, WorkloadBindingView, refuse_human_trusted_issuer,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, delete_trusted_issuer, delete_workload_binding,
     delete_workload_bindings_for_issuer, insert_trusted_issuer, insert_workload_binding,
-    trusted_issuers_for_tenant, workload_bindings_for_tenant,
+    swap_trusted_issuer_secret, trusted_issuer_by_url, trusted_issuers_for_tenant,
+    workload_bindings_for_tenant,
 };
 use wyrd_sql::row_types::auth::{TrustedIssuerRow, WorkloadBindingRow};
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit;
-use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
+use crate::auth::pg_resolvers::{
+    binding_write_from_binding, issuer_write_from_trusted, renew_trusted_issuer_secret,
+    seal_trusted_issuer_replacement,
+};
 use crate::components::auth::Caller;
 use crate::config::DeploymentProfile;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
@@ -67,6 +71,8 @@ pub fn admin_router() -> OpenApiRouter<AppState> {
             list_trusted_issuers,
             delete_trusted_issuer_route
         ))
+        .routes(routes!(renew_trusted_issuer_encryption))
+        .routes(routes!(replace_trusted_issuer_secret))
         .routes(routes!(
             create_workload_binding,
             list_workload_bindings,
@@ -219,6 +225,12 @@ struct DeleteIssuerQuery {
     cascade: bool,
 }
 
+/// Query addressing one trusted issuer by URL.
+#[derive(Debug, Deserialize)]
+struct IssuerQuery {
+    issuer: String,
+}
+
 /// Query for addressing one workload binding by `(issuer, subject)`.
 #[derive(Debug, Deserialize)]
 struct BindingQuery {
@@ -244,8 +256,8 @@ struct BindingFilter {
 /// caller's tenant.
 ///
 /// Gated on `service_accounts:write`. Resolves OIDC discovery once to fill
-/// `jwks_uri`, encrypts any client secret with the process sealing key before
-/// insert (fails closed if a secret is supplied without a key), and writes
+/// `jwks_uri`, seals any client secret through the deployment `[kms]` before
+/// insert (fails closed if a secret is supplied without one), and writes
 /// through the RLS `TenantConn`. Returns the redacted [`TrustedIssuerView`]
 /// (never the secret).
 ///
@@ -258,7 +270,7 @@ struct BindingFilter {
 /// Returns a `400` for a Human issuer (`HUMAN_CONNECTION_REQUIRED`, before any
 /// authorization or IO), a missing secret, or a blocked issuer, the RBAC denial,
 /// a `503` when
-/// discovery, the sealing key, or the store is unavailable, and a `409` for a
+/// discovery, `[kms]`, or the store is unavailable, and a `409` for a
 /// duplicate issuer.
 #[utoipa::path(
     post,
@@ -279,9 +291,9 @@ struct BindingFilter {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "The issuer is already registered for this tenant \
           (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The sealing key or a tenant store write failed \
+        (status = 500, description = "A tenant store write failed \
           (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "OIDC discovery or the store is unavailable, or no \
+        (status = 503, description = "OIDC discovery, [kms], or the store is unavailable, or no \
           verifier is configured for the access token \
           (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -332,9 +344,10 @@ async fn create_trusted_issuer(
             .map_or(DEFAULT_JWKS_TTL, Duration::from_secs),
     };
 
-    // Encrypt before insert. A secret-bearing issuer with no sealing key fails
-    // closed here — plaintext never lands in a column.
-    let write = issuer_write_from_trusted(&trusted, state.auth.sealing_key.as_deref())
+    // Seal before the insert's transaction opens. A secret-bearing issuer
+    // with no `[kms]` fails closed here — plaintext never lands in a column.
+    let write = issuer_write_from_trusted(&trusted, state.auth.kms.as_deref())
+        .await
         .map_err(seal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
@@ -484,6 +497,207 @@ async fn delete_trusted_issuer_route(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/admin/trusted-issuers/renew-encryption?issuer=` — reseal a
+/// trusted issuer's unchanged client secret under a fresh data key.
+///
+/// Gated on `service_accounts:write`. The envelope is read in one short
+/// transaction, renewed with no transaction held, and swapped only if the row
+/// still holds the bytes that were read, so a renewal never restores a
+/// deleted issuer or overwrites a newer secret. Deleting the issuer is its
+/// revocation; renewal never changes the secret the provider accepts.
+///
+/// # Errors
+/// Returns a `401` without a usable token, a `403` without
+/// `service_accounts:write`, a `404` for an unknown issuer, a `409` when the
+/// issuer holds no client secret or changed during the renewal, and a `503`
+/// when the store or the key service is unavailable.
+#[utoipa::path(
+    post,
+    path = "/admin/trusted-issuers/renew-encryption",
+    params(("issuer" = String, Query, description = "Issuer URL whose secret to renew")),
+    responses(
+        (status = 200, description = "Secret resealed; the issuer is unchanged",
+         body = TrustedIssuerView),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such issuer in this tenant \
+          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The issuer holds no client secret, or was deleted or \
+          reconfigured during the renewal (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "The store or the key service is unavailable \
+          (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
+#[tracing::instrument(
+    level = "info",
+    skip(state, caller, query),
+    fields(operation = "admin.trusted_issuer.renew_encryption")
+)]
+async fn renew_trusted_issuer_encryption(
+    State(state): State<AppState>,
+    caller: Caller,
+    Query(query): Query<IssuerQuery>,
+) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
+    let issuer = normalize_issuer(&query.issuer);
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
+        "renew trusted issuer encryption",
+        "admin.trusted_issuer.renew_encryption",
+        &format!("trusted_issuer:{issuer}"),
+    )
+    .map_err(WyrdErrorResponse::from)?;
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
+
+    let mut conn = acquire_conn(&state, &caller).await?;
+    let row = trusted_issuer_by_url(&mut conn, &issuer)
+        .await
+        .map_err(sql_unavailable)?;
+    conn.commit().await.map_err(sql_unavailable)?;
+    let row = row.ok_or_else(|| issuer_not_found(&issuer))?;
+    let observed = row
+        .client_secret_enc
+        .clone()
+        .ok_or_else(|| issuer_conflict(&issuer, "the issuer holds no client secret"))?;
+    let renewed = renew_trusted_issuer_secret(
+        caller.data_tenant_id,
+        &row,
+        &observed,
+        state.auth.kms.as_deref(),
+    )
+    .await
+    .map_err(|_| {
+        WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "trusted issuer client secret protection is unavailable".to_owned(),
+            details: serde_json::json!({ "reason": "kms_unavailable" }),
+        })
+    })?;
+
+    let mut conn = acquire_conn(&state, &caller).await?;
+    let swapped = swap_trusted_issuer_secret(&mut conn, &issuer, &observed, &renewed)
+        .await
+        .map_err(sql_unavailable)?;
+    conn.commit().await.map_err(sql_unavailable)?;
+    let row = swapped.ok_or_else(|| {
+        issuer_conflict(&issuer, "the issuer changed during the encryption renewal")
+    })?;
+    trusted_issuer_view_from_row(row).map(Json)
+}
+
+/// `PUT /v1/admin/trusted-issuers/client-secret?issuer=` — replace a
+/// `SecretBasic` or `SecretPost` issuer's client secret in place.
+///
+/// Gated on `service_accounts:write`. The issuer row is read in one short
+/// transaction, the supplied secret is sealed with no transaction held and
+/// without opening the old envelope, and the new envelope is stored only if
+/// the row still holds the envelope that was read. The issuer URL, client id,
+/// method, and every workload binding are unchanged, so bound workloads keep
+/// exchanging with no reconfiguration. A replacement racing a deletion or
+/// another replacement loses with a conflict and restores nothing.
+///
+/// # Errors
+/// Returns a `400` for an empty secret, a `401` without a usable token, a
+/// `403` without `service_accounts:write`, a `404` for an unknown issuer, a
+/// `409` when the issuer has no client secret or changed during the
+/// replacement, and a `503` when the store or the key service is unavailable.
+#[utoipa::path(
+    put,
+    path = "/admin/trusted-issuers/client-secret",
+    params(("issuer" = String, Query, description = "Issuer URL whose secret to replace")),
+    request_body = ReplaceTrustedIssuerSecretRequest,
+    responses(
+        (status = 200, description = "Secret replaced; it is never returned",
+         body = TrustedIssuerView),
+        (status = 400, description = "The client secret is empty \
+          (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such issuer in this tenant \
+          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The issuer authenticates without a client secret, or was \
+          deleted or changed during the replacement (WYRD_AUTH_409_ADMIN_CONFLICT)",
+         body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE), or the key service is unavailable \
+          (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
+#[tracing::instrument(
+    level = "info",
+    skip(state, caller, query, request),
+    fields(operation = "admin.trusted_issuer.replace_secret")
+)]
+async fn replace_trusted_issuer_secret(
+    State(state): State<AppState>,
+    caller: Caller,
+    Query(query): Query<IssuerQuery>,
+    Json(request): Json<ReplaceTrustedIssuerSecretRequest>,
+) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
+    let issuer = normalize_issuer(&query.issuer);
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
+        "replace trusted issuer client secrets",
+        "admin.trusted_issuer.replace_secret",
+        &format!("trusted_issuer:{issuer}"),
+    )
+    .map_err(WyrdErrorResponse::from)?;
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
+    let secret = request.client_secret.expose();
+    if secret.is_empty() {
+        return Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
+            message: "client_secret must not be empty".to_owned(),
+            details: serde_json::json!({ "field": "client_secret" }),
+        }));
+    }
+
+    let mut conn = acquire_conn(&state, &caller).await?;
+    let row = trusted_issuer_by_url(&mut conn, &issuer)
+        .await
+        .map_err(sql_unavailable)?;
+    conn.commit().await.map_err(sql_unavailable)?;
+    let row = row.ok_or_else(|| issuer_not_found(&issuer))?;
+    let observed = row.client_secret_enc.clone().ok_or_else(|| {
+        issuer_conflict(&issuer, "the issuer authenticates without a client secret")
+    })?;
+    let sealed = seal_trusted_issuer_replacement(
+        caller.data_tenant_id,
+        &row,
+        secret.as_bytes(),
+        state.auth.kms.as_deref(),
+    )
+    .await
+    .map_err(|_| {
+        WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "trusted issuer client secret protection is unavailable".to_owned(),
+            details: serde_json::json!({ "reason": "kms_unavailable" }),
+        })
+    })?;
+
+    let mut conn = acquire_conn(&state, &caller).await?;
+    let swapped = swap_trusted_issuer_secret(&mut conn, &issuer, &observed, &sealed)
+        .await
+        .map_err(sql_unavailable)?;
+    conn.commit().await.map_err(sql_unavailable)?;
+    let row = swapped
+        .ok_or_else(|| issuer_conflict(&issuer, "the issuer changed during the replacement"))?;
+    trusted_issuer_view_from_row(row).map(Json)
 }
 
 // --------------------------------------------------------------------------
@@ -936,21 +1150,24 @@ fn map_binding_write_error(error: sqlx::Error, issuer: &IssuerUrl) -> WyrdErrorR
     }
 }
 
-/// Map a client-secret sealing failure to an admin response. A missing sealing
-/// key is a fail-closed `503` (never persist plaintext); an encrypt/serialize
-/// failure is a `500`.
+/// Map a client-secret sealing failure to an admin response. A missing
+/// `[kms]` or an unavailable key service is a fail-closed `503` (never
+/// persist plaintext); a serialize failure is a `500`.
 fn seal_error(error: crate::auth::pg_resolvers::IssuerSealError) -> WyrdErrorResponse {
     use crate::auth::pg_resolvers::IssuerSealError;
     match error {
-        IssuerSealError::SealingKeyMissing => {
-            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: "a client secret was supplied but no sealing key is configured; \
-                          refusing to store a plaintext secret"
-                    .to_owned(),
-                details: serde_json::json!({ "reason": "sealing_key_missing" }),
-            })
-        }
-        IssuerSealError::Encrypt | IssuerSealError::Serialize(_) => internal_error(error),
+        IssuerSealError::KmsMissing => WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+            message: "a client secret was supplied but no [kms] is configured; \
+                      refusing to store a plaintext secret"
+                .to_owned(),
+            details: serde_json::json!({ "reason": "kms_unconfigured" }),
+        }),
+        IssuerSealError::Encrypt => WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+            message: "the client secret could not be sealed; retry once [kms] is restored"
+                .to_owned(),
+            details: serde_json::json!({ "reason": "kms_unavailable" }),
+        }),
+        IssuerSealError::Serialize(_) => internal_error(error),
     }
 }
 
@@ -958,6 +1175,15 @@ fn seal_error(error: crate::auth::pg_resolvers::IssuerSealError) -> WyrdErrorRes
 fn issuer_not_found(issuer: &str) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::AdminNotFound {
         message: format!("trusted issuer {issuer} not found in tenant"),
+        details: serde_json::json!({ "issuer": issuer }),
+    })
+}
+
+/// `409` for a trusted issuer whose stored secret cannot be renewed or
+/// replaced.
+fn issuer_conflict(issuer: &str, message: &str) -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::AdminConflict {
+        message: message.to_owned(),
         details: serde_json::json!({ "issuer": issuer }),
     })
 }
@@ -1003,7 +1229,6 @@ mod pg_tests {
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer,
     };
-    use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         Permission, PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict,
@@ -1026,12 +1251,17 @@ mod pg_tests {
     const SECRET: &str = "super-secret";
     const SEEDED_ISSUER: &str = "https://idp.example.com/realms/wyrd";
 
-    /// Deterministic single-key sealing keyring shared by the admin route tests.
-    fn sealing_key() -> wyrd_crypt::SealingKeyring {
-        wyrd_crypt::SealingKeyring::new(SecretKey::from_bytes([7_u8; 32]))
+    /// Deterministic single-key `[kms]` facade shared by the admin route tests.
+    fn kms() -> Arc<wyrd_kms::WyrdKms> {
+        crate::test_support::seeded_kms(7, &[])
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
+        test_state_with(fixture, kms()).await
+    }
+
+    /// [`test_state`] sealing through `kms` instead of the seeded facade.
+    async fn test_state_with(fixture: &PgFixture, kms: Arc<wyrd_kms::WyrdKms>) -> AppState {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
@@ -1042,7 +1272,7 @@ mod pg_tests {
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         crate::state::AppState::from_owners_for_test(crate::state::AppStateInner {
             auth: crate::components::auth::ServerAuth {
-                sealing_key: Some(Arc::new(sealing_key())),
+                kms: Some(kms),
                 ..crate::components::auth::ServerAuth::default()
             },
             ..crate::test_support::test_owners(
@@ -1175,7 +1405,9 @@ mod pg_tests {
             principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl: Duration::from_hours(1),
         };
-        let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");
+        let write = issuer_write_from_trusted(&trusted, None)
+            .await
+            .expect("issuer encodes");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         upsert_trusted_issuer(&mut conn, &write)
             .await
@@ -1334,11 +1566,8 @@ mod pg_tests {
             "plaintext must never land in the column"
         );
 
-        // The sealing key round-trips: the resolver decrypts back to the original.
-        let resolver = PgIssuerResolver::new(
-            fixture.wyrd_postgres().clone(),
-            Some(Arc::new(sealing_key())),
-        );
+        // The `[kms]` facade round-trips: the resolver opens back to the original.
+        let resolver = PgIssuerResolver::new(fixture.wyrd_postgres().clone(), Some(kms()));
         let resolved = resolver
             .trusted_issuers(&tenant)
             .await
@@ -1362,6 +1591,408 @@ mod pg_tests {
             "list response must not echo the plaintext secret"
         );
         settle_audit(&state).await;
+    }
+
+    /// Renewing a trusted issuer's encryption reseals its unchanged client
+    /// secret under a fresh data key: the issuer and its redacted view are
+    /// unchanged and the resolver still opens the same secret. A caller
+    /// without `service_accounts:write` is refused, another tenant and a
+    /// deleted issuer get not-found, and renewal never restores a deletion.
+    ///
+    /// # Panics
+    /// Panics when a renewal outcome, stored envelope, or resolved secret
+    /// differs from the above.
+    #[tokio::test]
+    async fn renewing_issuer_encryption_keeps_the_secret_and_respects_deletion() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
+        let (_server, issuer) = discovery_server().await;
+        let created = create_trusted_issuer(
+            State(state.clone()),
+            writer(tenant),
+            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
+        )
+        .await
+        .expect("create succeeds")
+        .0;
+        let stored = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+                .await
+                .expect("query succeeds");
+            conn.commit().await.expect("commit");
+            row.and_then(|row| row.client_secret_enc)
+        };
+        let before = stored().await.expect("secret is stored");
+        let query = || {
+            Query(IssuerQuery {
+                issuer: issuer.as_str().to_owned(),
+            })
+        };
+
+        let renewed =
+            renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query())
+                .await
+                .expect("renewal succeeds")
+                .0;
+        assert_eq!(
+            serde_json::to_value(&renewed).expect("view"),
+            serde_json::to_value(&created).expect("view"),
+            "the issuer is unchanged and its view redacted"
+        );
+        assert_ne!(
+            stored().await.expect("secret is stored"),
+            before,
+            "the secret is resealed under a fresh data key"
+        );
+        let resolved = PgIssuerResolver::new(fixture.wyrd_postgres().clone(), Some(kms()))
+            .trusted_issuers(&tenant)
+            .await
+            .expect("resolve succeeds");
+        match &resolved[0].client_auth {
+            ClientAuth::SecretPost(secret) => assert_eq!(secret.expose_secret(), SECRET),
+            other => panic!("expected SecretPost, got {other:?}"),
+        }
+
+        let denied = renew_trusted_issuer_encryption(State(state.clone()), reader(tenant), query())
+            .await
+            .expect_err("a reader is refused");
+        assert_eq!(denied.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        let foreign = fixture
+            .seed_additional_tenant("issuer-renewal-foreign")
+            .await
+            .expect("second tenant seeds");
+        let hidden =
+            renew_trusted_issuer_encryption(State(state.clone()), writer(foreign), query())
+                .await
+                .expect_err("another tenant cannot see the issuer");
+        assert_eq!(hidden.0.code(), "WYRD_AUTH_404_ADMIN_NOT_FOUND");
+
+        delete_trusted_issuer_route(
+            State(state.clone()),
+            writer(tenant),
+            Query(DeleteIssuerQuery {
+                issuer: issuer.as_str().to_owned(),
+                cascade: false,
+            }),
+        )
+        .await
+        .expect("delete succeeds");
+        let gone = renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query())
+            .await
+            .expect_err("a deleted issuer has nothing to renew");
+        assert_eq!(gone.0.code(), "WYRD_AUTH_404_ADMIN_NOT_FOUND");
+        assert_eq!(stored().await, None, "renewal never restores a deletion");
+        assert_eq!(
+            decision_rows(&state, &scribe, "admin.trusted_issuer.renew_encryption").await,
+            vec![("allowed".to_owned(), 3), ("denied".to_owned(), 1)]
+        );
+    }
+
+    /// A trusted issuer's renewal through a remote key service fails closed on
+    /// an outage with the stored envelope unchanged, and a renewal racing the
+    /// issuer's deletion loses with a conflict: the deletion stands and no row
+    /// is restored.
+    ///
+    /// # Panics
+    /// Panics when the outage writes, the race does not conflict, or the
+    /// deleted issuer reappears.
+    #[tokio::test]
+    async fn issuer_renewal_survives_outage_and_loses_to_deletion() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let transit =
+            wyrd_testing::kms::TransitFixture::start_delayed(Duration::from_millis(300)).await;
+        let state = test_state_with(
+            &fixture,
+            Arc::new(
+                wyrd_kms::WyrdKms::new(&transit.config("issuer", &[]), false)
+                    .expect("transit facade"),
+            ),
+        )
+        .await;
+        let (_server, issuer) = discovery_server().await;
+        let _created = create_trusted_issuer(
+            State(state.clone()),
+            writer(tenant),
+            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
+        )
+        .await
+        .expect("create succeeds");
+        let stored = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+                .await
+                .expect("query succeeds");
+            conn.commit().await.expect("commit");
+            row.and_then(|row| row.client_secret_enc)
+        };
+        let before = stored().await.expect("secret is stored");
+        let query = || {
+            Query(IssuerQuery {
+                issuer: issuer.as_str().to_owned(),
+            })
+        };
+
+        transit.set_available(false);
+        let outage = renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query())
+            .await
+            .expect_err("a key outage refuses");
+        transit.set_available(true);
+        assert_eq!(outage.0.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+        assert_eq!(
+            stored().await,
+            Some(before),
+            "a refused renewal writes nothing"
+        );
+
+        let encrypts = transit.requests("encrypt").await;
+        let renewal =
+            renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query());
+        let delete = async {
+            while transit.requests("encrypt").await <= encrypts {
+                tokio::task::yield_now().await;
+            }
+            delete_trusted_issuer_route(
+                State(state.clone()),
+                writer(tenant),
+                Query(DeleteIssuerQuery {
+                    issuer: issuer.as_str().to_owned(),
+                    cascade: false,
+                }),
+            )
+            .await
+        };
+        let (lost, deleted) = tokio::join!(renewal, delete);
+        assert_eq!(deleted.expect("delete succeeds"), StatusCode::NO_CONTENT);
+        assert_eq!(
+            lost.expect_err("the renewal loses to the deletion")
+                .0
+                .code(),
+            "WYRD_AUTH_409_ADMIN_CONFLICT"
+        );
+        assert_eq!(stored().await, None, "the deletion stands");
+        settle_audit(&state).await;
+    }
+
+    /// Replacing a bound trusted issuer's client secret stores the supplied
+    /// secret in place: the issuer view and its workload binding are
+    /// unchanged and the resolver opens the new secret, even when the old
+    /// envelope can no longer be opened. An empty secret, a reader, a key
+    /// outage, and an issuer without a client secret change nothing, and a
+    /// replacement racing the issuer's deletion loses with a conflict and
+    /// restores nothing. Every authorized replacement stages one allowance.
+    ///
+    /// # Panics
+    /// Panics when a replacement outcome, stored envelope, binding, resolved
+    /// secret, or recorded decision differs from the above.
+    #[tokio::test]
+    async fn replacing_issuer_secret_keeps_its_bindings_and_loses_to_deletion() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let transit =
+            wyrd_testing::kms::TransitFixture::start_delayed(Duration::from_millis(300)).await;
+        let keys = Arc::new(
+            wyrd_kms::WyrdKms::new(&transit.config("issuer", &[]), false).expect("transit facade"),
+        );
+        let (state, scribe) =
+            RecordingScribe::attach(test_state_with(&fixture, Arc::clone(&keys)).await);
+        let (_server, issuer) = discovery_server().await;
+        let created = create_trusted_issuer(
+            State(state.clone()),
+            writer(tenant),
+            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
+        )
+        .await
+        .expect("create succeeds")
+        .0;
+        let subject = "system:serviceaccount:default/bound";
+        let account = seed_service_account(&fixture, tenant).await;
+        let _binding = create_workload_binding(
+            State(state.clone()),
+            writer(tenant),
+            Json(CreateWorkloadBindingRequest {
+                issuer: issuer.clone(),
+                subject: subject.to_owned(),
+                audience: None,
+                principal_id: account,
+                workload_uid: None,
+            }),
+        )
+        .await
+        .expect("binding create succeeds");
+        let stored = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+                .await
+                .expect("query succeeds");
+            conn.commit().await.expect("commit");
+            row.and_then(|row| row.client_secret_enc)
+        };
+        let resolved_secret = || async {
+            let resolved =
+                PgIssuerResolver::new(fixture.wyrd_postgres().clone(), Some(Arc::clone(&keys)))
+                    .trusted_issuers(&tenant)
+                    .await
+                    .expect("resolve succeeds");
+            match &resolved[0].client_auth {
+                ClientAuth::SecretPost(secret) => secret.expose_secret().to_owned(),
+                other => panic!("expected SecretPost, got {other:?}"),
+            }
+        };
+        let bound_subjects = || async {
+            list_workload_bindings(
+                State(state.clone()),
+                writer(tenant),
+                Query(BindingFilter {
+                    issuer: Some(issuer.as_str().to_owned()),
+                    subject: None,
+                }),
+            )
+            .await
+            .expect("binding list succeeds")
+            .0
+            .into_iter()
+            .map(|binding| binding.subject)
+            .collect::<Vec<_>>()
+        };
+        let query = || {
+            Query(IssuerQuery {
+                issuer: issuer.as_str().to_owned(),
+            })
+        };
+        let replacement = |secret: &str| {
+            Json(ReplaceTrustedIssuerSecretRequest {
+                client_secret: SecretBearer::new(secret.to_owned()),
+            })
+        };
+        let before = stored().await.expect("secret is stored");
+
+        let replaced = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            query(),
+            replacement("replacement-secret"),
+        )
+        .await
+        .expect("replacement succeeds")
+        .0;
+        assert_eq!(
+            serde_json::to_value(&replaced).expect("view"),
+            serde_json::to_value(&created).expect("view"),
+            "the issuer keeps its identity and its view stays redacted"
+        );
+        assert_ne!(stored().await.expect("secret is stored"), before);
+        assert_eq!(resolved_secret().await, "replacement-secret");
+        assert_eq!(bound_subjects().await, vec![subject.to_owned()]);
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        sqlx::query(
+            "UPDATE wyrd.auth_trusted_issuers SET client_secret_enc = '\\x00'::bytea \
+             WHERE issuer_url = $1",
+        )
+        .bind(issuer.as_str())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("envelope corrupts");
+        conn.commit().await.expect("corruption commits");
+        let _replaced = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            query(),
+            replacement("after-corruption"),
+        )
+        .await
+        .expect("replacement never opens the old envelope");
+        assert_eq!(resolved_secret().await, "after-corruption");
+        let current = stored().await;
+
+        let empty = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            query(),
+            replacement(""),
+        )
+        .await
+        .expect_err("an empty secret is refused");
+        assert_eq!(empty.0.code(), "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD");
+        let denied = replace_trusted_issuer_secret(
+            State(state.clone()),
+            reader(tenant),
+            query(),
+            replacement("unauthorized"),
+        )
+        .await
+        .expect_err("a reader is refused");
+        assert_eq!(denied.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        transit.set_available(false);
+        let outage = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            query(),
+            replacement("during-outage"),
+        )
+        .await
+        .expect_err("a key outage refuses");
+        transit.set_available(true);
+        assert_eq!(outage.0.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+        assert_eq!(
+            stored().await,
+            current,
+            "a refused replacement writes nothing"
+        );
+        seed_issuer(&fixture, tenant).await;
+        let keyless = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            Query(IssuerQuery {
+                issuer: SEEDED_ISSUER.to_owned(),
+            }),
+            replacement("no-secret-method"),
+        )
+        .await
+        .expect_err("an issuer without a client secret has nothing to replace");
+        assert_eq!(keyless.0.code(), "WYRD_AUTH_409_ADMIN_CONFLICT");
+
+        let encrypts = transit.requests("encrypt").await;
+        let racing = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            query(),
+            replacement("loses-the-race"),
+        );
+        let delete = async {
+            while transit.requests("encrypt").await <= encrypts {
+                tokio::task::yield_now().await;
+            }
+            delete_trusted_issuer_route(
+                State(state.clone()),
+                writer(tenant),
+                Query(DeleteIssuerQuery {
+                    issuer: issuer.as_str().to_owned(),
+                    cascade: true,
+                }),
+            )
+            .await
+        };
+        let (lost, deleted) = tokio::join!(racing, delete);
+        assert_eq!(deleted.expect("delete succeeds"), StatusCode::NO_CONTENT);
+        assert_safe_conflict(&lost.expect_err("the replacement loses to the deletion"));
+        assert_eq!(stored().await, None, "the deletion stands");
+        let gone = replace_trusted_issuer_secret(
+            State(state.clone()),
+            writer(tenant),
+            query(),
+            replacement("after-deletion"),
+        )
+        .await
+        .expect_err("a deleted issuer has nothing to replace");
+        assert_eq!(gone.0.code(), "WYRD_AUTH_404_ADMIN_NOT_FOUND");
+        assert_eq!(
+            decision_rows(&state, &scribe, "admin.trusted_issuer.replace_secret").await,
+            vec![("allowed".to_owned(), 7), ("denied".to_owned(), 1)]
+        );
     }
 
     /// Every physical identifier an administrative conflict must never
@@ -1688,7 +2319,9 @@ mod pg_tests {
                 principal_kind: IssuerTokenPolicy::Workload,
                 jwks_ttl: Duration::from_hours(1),
             };
-            let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");
+            let write = issuer_write_from_trusted(&trusted, None)
+                .await
+                .expect("issuer encodes");
             let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
             upsert_trusted_issuer(&mut conn, &write)
                 .await

@@ -121,6 +121,9 @@ check_selection "server change selects identity and storage journeys" \
 check_selection "gateway engine selects the gateway journeys" \
   "full_gate=false changed_packages=wyrd-gateway rust_packages~wyrd-server rust_packages~wyrd-testing ci_lanes~test:wyrd ci_lanes~test:gateway:gate" \
   "crates/wyrd/wyrd-gateway/src/lib.rs"
+check_selection "KMS crate selects the Vault Transit check" \
+  "full_gate=false changed_packages=wyrd-kms ci_lanes~test:wyrd ci_lanes~test:kms:vault" \
+  "crates/wyrd/wyrd-kms/src/lib.rs"
 check_selection "auth crate selects the identity journey" \
   "full_gate=false identity=true" \
   "crates/shared/wyrd-auth-oidc/src/lib.rs"
@@ -164,10 +167,10 @@ check_selection "Python example runs Python checks" "full_gate=false python=true
   "examples/python/demo.py"
 check_selection "docs example Card runs every language's journeys" \
   "full_gate=false docs=true python=true typescript=true ci_lanes~test:examples ci_lanes~py:test:integration ci_lanes~ts:test:integration" \
-  "examples/quickstart/no-refund-promise.yaml"
+  "examples/setup-check/no-refund-promise.yaml"
 check_selection "docs example Rust program runs the examples journeys only" \
   "full_gate=false python=false typescript=false ci_lanes~test:examples ci_lanes~check:examples" \
-  "examples/quickstart/quickstart.rs"
+  "examples/setup-check/check.rs"
 check_selection "crate error source regenerates the error reference" "full_gate=false docs=true" \
   "crates/shared/wyrd-client/src/error.rs"
 check_selection "SDK error source regenerates the error reference" "full_gate=false docs=true" \

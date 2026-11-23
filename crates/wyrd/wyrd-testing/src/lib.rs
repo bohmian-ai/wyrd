@@ -9,6 +9,7 @@ pub mod github;
 pub mod human_login;
 pub mod interleaving;
 pub mod keys;
+pub mod kms;
 pub mod listener_stall;
 pub mod logs;
 pub mod oidc_fixture;

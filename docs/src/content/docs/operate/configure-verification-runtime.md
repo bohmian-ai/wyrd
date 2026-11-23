@@ -1,5 +1,6 @@
 ---
 title: Verification runtime
+browserTitle: Configure the verification runtime | Wyrd
 description: Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 pillar: wyrd
 section: Operate

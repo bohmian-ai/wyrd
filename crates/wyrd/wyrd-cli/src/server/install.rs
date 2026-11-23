@@ -176,7 +176,7 @@ impl ServerInstaller {
     }
 
     /// Directory holding `versions/`, the `current` link, and the local
-    /// deployment's sealing key; it outlives every installed release.
+    /// deployment's `[kms]` key; it outlives every installed release.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root

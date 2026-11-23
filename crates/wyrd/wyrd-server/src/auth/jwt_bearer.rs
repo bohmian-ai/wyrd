@@ -888,10 +888,12 @@ mod pg_tests {
     ) -> AppState {
         // Seed issuers (and then bindings, which FK-reference them) directly into
         // Postgres so the production Pg resolvers serve them per-request. These
-        // test issuers use PrivateKeyJwt and carry no secret, so no sealing key is
+        // test issuers use PrivateKeyJwt and carry no secret, so no `[kms]` is
         // needed. Each issuer/binding carries its own tenant for tenant-scoping.
         for issuer in &trusted {
-            let write = issuer_write_from_trusted(issuer, None).expect("issuer encodes");
+            let write = issuer_write_from_trusted(issuer, None)
+                .await
+                .expect("issuer encodes");
             let mut conn = fixture
                 .tenant_conn_for(issuer.tenant_id)
                 .await

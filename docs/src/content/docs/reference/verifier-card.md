@@ -106,6 +106,16 @@ When to use each kind is in [Steps and checks](/understand/how-verification-work
 
 A `trace` check reads every retained span with the trace ID from `bifrost.traces.spans`, as the executing account, ordered by start time then span ID, up to 10,000 spans. A larger trace, a refused or failed query, a timed-out read, an undecodable span, or an input with no trace makes it `inconclusive`. A trace with no visible span is `inconclusive` under `verify`; in a queued execution, each attempt before the last ends with error code `evidence_unavailable` and status `retrying` (3 attempts, 30 s then 60 s apart), and the last is `inconclusive`. [Trace evidence](/understand/how-verification-works/#trace-evidence) explains the behavior.
 
+A `drift` check judges a scheduled window of `samples`. A Verifier with a `samples` slot or a `drift` check has only those, and is bound with a `schedule` Trigger and no `inputs`. `condition` is `Statistical`. A feature drifts when its score exceeds the threshold, and the requirement fails if any feature drifted; a window with no samples in a slot is `inconclusive`.
+
+| `method` | Scores | `profile` |
+| --- | --- | --- |
+| `Psi` | How far each feature's distribution moved from a baseline Data Card named by `signal.baseline_ref` | `binning_strategy` (`EqualWidth` or `Quantile`, 2 to 1000 bins) and `threshold`: `Fixed { value }`, or `ChiSquare { alpha }` / `Normal { alpha }` |
+| `Spc` | Control-chart signals on numeric features against a baseline | `{ sample_size }`, at least 2 |
+| `Custom` | One metric's mean against a fixed limit, with `signal: { kind: Metric, name }` | `{ metric_name, baseline_value, alert_threshold }`, `metric_name` equal to the signal's name. No baseline |
+
+The server fits a `Psi` or `Spc` baseline after declaration. Its state is the Verifier's `status.verification.baseline.state`: `pending`, `building`, `ready`, or `failed` with `baseline.error`. A window judged before `ready` is `inconclusive`.
+
 ## Comparison operators
 
 `assert`, `trace`, and `when` take an operator: its name, such as `operator: not_contains`, or `{kind: <name>, ...}` when it takes parameters.

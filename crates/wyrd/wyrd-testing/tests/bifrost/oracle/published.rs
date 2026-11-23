@@ -2662,7 +2662,7 @@ async fn prove_unvalidated_captures() -> Result<(), JourneyError> {
     captures_released(&cluster, "capture lost at open").await?;
 
     // Cancelling a query with a paused open read releases its capture. The
-    // producer pauses before its second batch, so a second live row exists.
+    // producer pauses after its first batch, holding the read open.
     crate::distributed::append_live_row(&writer, &fqn, 7, None).await?;
     let stream = crate::distributed::open_paused_live_query(&query, &sql, "cancelled read").await?;
     if retained_captures(&cluster) == 0 {

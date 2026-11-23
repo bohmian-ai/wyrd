@@ -21,8 +21,8 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
-use wyrd_server::components::operators::keys::OperatorKeys;
-use wyrd_server::config::{OperatorKeySource, OperatorKeysConfig, VaultKeysConfig};
+use wyrd_kms::{KmsConfig, WyrdKms};
+use wyrd_server::components::operators::secrets::OperatorSecrets;
 use wyrd_server::state::AppState;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
@@ -40,6 +40,7 @@ use wyrd_spec::verification::execution::{
 use wyrd_spec::verification::{
     DriftReport, DriftVerdict, FeatureDriftReport, FrozenTarget, VerificationVerdict,
 };
+use wyrd_testing::kms::{TransitFixture, transit_config};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -98,7 +99,16 @@ impl Delivery {
     /// # Panics
     /// Panics when startup, seeding, or a connection create fails.
     async fn start() -> Self {
-        let delivery = Self::boot().await;
+        Self::start_on(None).await
+    }
+
+    /// [`Self::start`] on a server booted with `kms` as its `[kms]`, or the
+    /// test server's generated file key when `None`.
+    ///
+    /// # Panics
+    /// Panics when startup, seeding, or a connection create fails.
+    async fn start_on(kms: Option<KmsConfig>) -> Self {
+        let delivery = Self::boot_on(kms).await;
         delivery
             .connect(&[
                 json!({ "provider": "slack", "name": "ops-slack", "workspace_id": "T0001",
@@ -118,10 +128,21 @@ impl Delivery {
     /// # Panics
     /// Panics when startup or seeding fails.
     async fn boot() -> Self {
-        let server = WyrdTestServer::builder()
-            .start_bound()
-            .await
-            .expect("bound server starts");
+        Self::boot_on(None).await
+    }
+
+    /// [`Self::boot`] on a server booted with `kms` as its `[kms]`, or the
+    /// test server's generated file key when `None`.
+    ///
+    /// # Panics
+    /// Panics when startup or seeding fails.
+    async fn boot_on(kms: Option<KmsConfig>) -> Self {
+        let builder = WyrdTestServer::builder();
+        let builder = match kms {
+            Some(kms) => builder.with_kms_for_test(kms),
+            None => builder,
+        };
+        let server = builder.start_bound().await.expect("bound server starts");
         let tenant = server.pg_fixture().data_tenant_id();
         let seed = VerificationFixture::provision(server.state(), tenant)
             .await
@@ -363,14 +384,14 @@ impl Delivery {
         )
     }
 
-    /// Spawn a runtime over this server's state as a replica holding `keys`
-    /// would run it, delivering to the mock provider.
+    /// Spawn a runtime over this server's state as a replica holding
+    /// `secrets` would run it, delivering to the mock provider.
     ///
     /// # Panics
     /// Panics when the runtime cannot compose.
     fn spawn_replica(
         &self,
-        keys: Arc<OperatorKeys>,
+        secrets: OperatorSecrets,
         limits: &RuntimeLimits,
         script: &EngineScript,
         crash: &CapabilityCrash,
@@ -381,7 +402,7 @@ impl Delivery {
             limits,
             script,
             crash,
-            Some(keys),
+            Some(secrets),
             ProviderEndpoints {
                 slack: base.join("/slack").expect("slack URL"),
                 pager_duty: base.join("/pagerduty").expect("pagerduty URL"),
@@ -390,7 +411,8 @@ impl Delivery {
     }
 
     /// Spawn a runtime over `state` delivering fixed providers to `endpoints`,
-    /// with `keys` standing in for the process's Operator keys when given.
+    /// with `secrets` standing in for the process's Operator secrets when
+    /// given.
     ///
     /// # Panics
     /// Panics when the runtime cannot compose.
@@ -400,7 +422,7 @@ impl Delivery {
         limits: &RuntimeLimits,
         script: &EngineScript,
         crash: &CapabilityCrash,
-        keys: Option<Arc<OperatorKeys>>,
+        secrets: Option<OperatorSecrets>,
         endpoints: ProviderEndpoints,
     ) -> Running {
         let builder = VerificationRuntime::builder(state)
@@ -408,8 +430,8 @@ impl Delivery {
             .engine_script(script.clone())
             .crash_switch(crash.clone())
             .provider_endpoints(endpoints);
-        let builder = match keys {
-            Some(keys) => builder.operator_keys(keys),
+        let builder = match secrets {
+            Some(secrets) => builder.operator_secrets(secrets),
             None => builder,
         };
         let runtime = builder.build().expect("the runtime composes");
@@ -802,13 +824,14 @@ async fn failed_verdict_fans_out_to_every_provider_independently() {
 }
 
 /// A transient failure retries after the 30-second backoff; the credential is
-/// rotated in Postgres and a second replica, on a newer key version, delivers
-/// the next attempt with the rotated token and rewraps the stored credential,
-/// with no Card revision.
+/// rotated in Postgres and a second replica, with a newer wrapping key active
+/// and the old one retained, delivers the next attempt with the rotated token,
+/// with no Card revision. Activating the newer key moves no stored credential:
+/// the replica's runner leaves the envelope exactly as the rotation stored it.
 ///
 /// # Panics
-/// Panics when the retry schedule, rotation, rewrap, or frozen kind counts
-/// differ between attempts.
+/// Panics when the retry schedule, rotation, or frozen kind counts differ
+/// between attempts, or the runner rewrites the stored credential.
 #[tokio::test]
 async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     let delivery = Delivery::start().await;
@@ -875,24 +898,22 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{view}");
+    let stored = || async {
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT secret_ciphertext FROM wyrd.operator_connections \
+              WHERE connection_id = $1::uuid",
+        )
+        .bind(&slack_id)
+        .fetch_one(&delivery.assertion)
+        .await
+        .expect("envelope reads")
+    };
+    let rotated = stored().await;
 
-    let dir = delivery
-        .server
-        .operator_keys_dir_for_test()
-        .expect("generated key directory");
-    std::fs::copy(dir.join("v1"), dir.join("v2")).expect("key v2 publishes");
-    let replica = Arc::new(
-        OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::File,
-            dir: Some(dir.to_path_buf()),
-            active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-            ..OperatorKeysConfig::default()
-        })
-        .expect("file keys build"),
-    );
+    let replica = rotated_file_kms(&delivery.server);
     delivery.make_retries_due(run).await;
     let second = delivery.spawn_replica(
-        Arc::clone(&replica),
+        OperatorSecrets::new(Some(Arc::clone(&replica))),
         &Delivery::limits(),
         &EngineScript::default(),
         &CapabilityCrash::default(),
@@ -900,25 +921,16 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     let rows = delivery
         .wait_dispatches(run, 1, |row| row.status == "delivered")
         .await;
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let version: i32 = sqlx::query_scalar(
-            "SELECT key_version FROM wyrd.operator_connections WHERE connection_id = $1::uuid",
-        )
-        .bind(&slack_id)
-        .fetch_one(&delivery.assertion)
-        .await
-        .expect("key version reads");
-        if version == 2 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "credential never rewrapped"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     second.stop().await;
+    let envelope = stored().await;
+    assert!(
+        !replica.is_current(&envelope).expect("a common envelope"),
+        "the runner moved the credential to the newly active key"
+    );
+    assert_eq!(
+        envelope, rotated,
+        "the runner left the stored credential unchanged"
+    );
     assert_eq!(rows[&posted.as_uuid()].attempts, 2);
     let posts = delivery.requests("/slack").await;
     let texts: Vec<Value> = posts
@@ -943,6 +955,201 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
             format!("Bearer {ROTATED_TOKEN}")
         ]
     );
+}
+
+/// Two rotations of one credential race through a slow key service: the
+/// rotation that commits first wins, the other returns the connection
+/// conflict without overwriting it, and the next delivery sends the winner's
+/// token.
+///
+/// # Panics
+/// Panics when both or neither rotation commits, the loser's response is not
+/// the conflict, or the delivery sends another token.
+#[tokio::test]
+async fn racing_rotations_keep_the_first_commit_and_deliver_it() {
+    let transit = TransitFixture::start_delayed(Duration::from_millis(500)).await;
+    let delivery = Delivery::start_on(Some(transit.config("ops", &[]))).await;
+    Mock::given(method("POST"))
+        .and(path("/slack"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&delivery.mock)
+        .await;
+    let posted = delivery.operator("posted", slack("C0123456789")).await;
+    let (_, list) = delivery
+        .call(Method::GET, "/v1/operator-connections", None)
+        .await;
+    let slack_id = list
+        .as_array()
+        .or_else(|| list["connections"].as_array())
+        .expect("connection list")
+        .iter()
+        .find(|view| view["provider"] == "slack")
+        .and_then(|view| view["connection_id"].as_str())
+        .expect("slack connection")
+        .to_owned();
+    let uri = format!("/v1/operator-connections/{slack_id}");
+    let sealed_before = transit.requests("encrypt").await;
+
+    let first = json!({ "provider": "slack", "bot_token": ROTATED_TOKEN });
+    let second = json!({ "provider": "slack", "bot_token": "xoxb-losing-slack-token" });
+    let first_rotation = delivery.call(Method::PATCH, &uri, Some(&first));
+    let second_rotation = async {
+        while transit.requests("encrypt").await <= sealed_before {
+            tokio::task::yield_now().await;
+        }
+        delivery.call(Method::PATCH, &uri, Some(&second)).await
+    };
+    let ((first_status, _), (second_status, problem)) =
+        tokio::join!(first_rotation, second_rotation);
+    assert_eq!(first_status, StatusCode::OK, "the first commit wins");
+    assert_eq!(
+        (second_status, problem["code"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("WYRD_OPERATOR_409_CONNECTION_CONFLICT")
+        ),
+        "the losing rotation conflicts"
+    );
+
+    delivery.fail_binding("owner", &[&posted]).await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        &Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    delivery
+        .wait_dispatches(run, 1, |row| row.status == "delivered")
+        .await;
+    running.stop().await;
+    let tokens: Vec<String> = delivery
+        .requests("/slack")
+        .await
+        .iter()
+        .filter_map(|post| {
+            post.headers
+                .get("authorization")?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(tokens, vec![format!("Bearer {ROTATED_TOKEN}")]);
+}
+
+/// The backend-wrapped DEK and payload nonce of a stored envelope, split by
+/// the documented common format.
+///
+/// # Panics
+/// Panics when `envelope` is shorter than its own length fields.
+fn wrapped_dek_and_nonce(envelope: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let ref_len = usize::from(u16::from_be_bytes([envelope[6], envelope[7]]));
+    let at = 8 + ref_len;
+    let wrapped_len = u32::from_be_bytes(envelope[at..at + 4].try_into().expect("length field"));
+    let wrapped_end = at + 4 + usize::try_from(wrapped_len).expect("length fits");
+    (
+        envelope[at + 4..wrapped_end].to_vec(),
+        envelope[wrapped_end..wrapped_end + 12].to_vec(),
+    )
+}
+
+/// Renewing a connection's encryption reseals the same credential under a
+/// fresh DEK and nonce on the same identity and secret version, and the next
+/// delivery sends the unchanged token with no client or Card change.
+///
+/// # Panics
+/// Panics when the renewal response, stored envelope, or delivered token
+/// differs.
+#[tokio::test]
+async fn renewed_encryption_keeps_the_credential_and_delivers_it() {
+    let transit = TransitFixture::start().await;
+    let delivery = Delivery::start_on(Some(transit.config("ops", &[]))).await;
+    Mock::given(method("POST"))
+        .and(path("/slack"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&delivery.mock)
+        .await;
+    let posted = delivery.operator("posted", slack("C0123456789")).await;
+    let (_, list) = delivery
+        .call(Method::GET, "/v1/operator-connections", None)
+        .await;
+    let before = list
+        .as_array()
+        .expect("connection list")
+        .iter()
+        .find(|view| view["provider"] == "slack")
+        .expect("slack connection")
+        .clone();
+    let slack_id = before["connection_id"].as_str().expect("id").to_owned();
+    let stored = |id: String| {
+        let pool = delivery.assertion.clone();
+        async move {
+            sqlx::query_as::<_, (Vec<u8>, i32)>(
+                "SELECT secret_ciphertext, secret_version FROM wyrd.operator_connections \
+                 WHERE connection_id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("row reads")
+        }
+    };
+    let (old_envelope, old_version) = stored(slack_id.clone()).await;
+
+    let (status, renewed) = delivery
+        .call(
+            Method::POST,
+            &format!("/v1/operator-connections/{slack_id}/renew-encryption"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    assert_eq!(
+        (
+            &renewed["connection_id"],
+            &renewed["status"],
+            &renewed["name"]
+        ),
+        (&before["connection_id"], &before["status"], &before["name"]),
+        "renewal keeps the connection identity and status"
+    );
+    assert!(
+        !renewed.to_string().contains(SLACK_TOKEN),
+        "the response is redacted"
+    );
+    let (new_envelope, new_version) = stored(slack_id.clone()).await;
+    assert_eq!(new_version, old_version, "the secret version is unchanged");
+    let (old_dek, old_nonce) = wrapped_dek_and_nonce(&old_envelope);
+    let (new_dek, new_nonce) = wrapped_dek_and_nonce(&new_envelope);
+    assert_ne!(new_dek, old_dek, "renewal wraps a fresh DEK");
+    assert_ne!(new_nonce, old_nonce, "renewal encrypts under a fresh nonce");
+
+    delivery.fail_binding("owner", &[&posted]).await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        &Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    delivery
+        .wait_dispatches(run, 1, |row| row.status == "delivered")
+        .await;
+    running.stop().await;
+    let tokens: Vec<String> = delivery
+        .requests("/slack")
+        .await
+        .iter()
+        .filter_map(|post| {
+            post.headers
+                .get("authorization")?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(tokens, vec![format!("Bearer {SLACK_TOKEN}")]);
 }
 
 /// A slow endpoint times out each attempt, retries after 30 seconds and then
@@ -1082,13 +1289,14 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
 
 /// Delivery re-checks authority and decrypts per attempt: a connection
 /// disabled after registration fails its dispatch closed without a provider
-/// call, and a key provider outage retries instead of failing.
+/// call, and an unreachable wrapping backend retries instead of failing.
 ///
 /// # Panics
 /// Panics when either dispatch settles differently or a provider is called.
 #[tokio::test]
 async fn revoked_connection_fails_closed_and_key_outage_retries() {
-    let delivery = Delivery::start().await;
+    let transit = TransitFixture::start().await;
+    let delivery = Delivery::start_on(Some(transit_config(&transit.uri(), "ops", &[]))).await;
     let origin = delivery.mock.uri();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(204))
@@ -1120,17 +1328,12 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
     assert_eq!(status, StatusCode::OK, "{view}");
     delivery.fail_binding("owner", &[&revoked, &hooked]).await;
 
-    let empty = tempfile::tempdir().expect("empty key directory");
-    let outage = Arc::new(
-        OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::File,
-            dir: Some(empty.path().to_path_buf()),
-            ..OperatorKeysConfig::default()
-        })
-        .expect("file keys build"),
-    );
+    let outage = OperatorSecrets::new(Some(Arc::new(
+        WyrdKms::new(&transit_config(&unreachable_endpoint(), "ops", &[]), false)
+            .expect("transit facade builds"),
+    )));
     let running = delivery.spawn_replica(
-        Arc::clone(&outage),
+        outage,
         &Delivery::limits(),
         &failing_script(1),
         &CapabilityCrash::default(),
@@ -1433,6 +1636,166 @@ async fn foreign_or_missing_connection_fails_at_delivery() {
             .expect("recorded")
             .is_empty(),
         "no provider is called without a connection in the dispatch's tenant"
+    );
+}
+
+/// A stored envelope opens only for the connection and tenant it was sealed
+/// for. With the same tenant's other connection's envelope, another tenant's
+/// envelope for the same connection name, or an altered envelope in place,
+/// each dispatch fails `credential_invalid` without a provider call, so no
+/// copied secret reaches a provider, while the untouched connection beside
+/// them still delivers with its own key.
+///
+/// # Panics
+/// Panics when an envelope cannot be replaced, a dispatch settles otherwise,
+/// or a provider receives anything but the intact connection's key.
+#[tokio::test]
+async fn copied_or_altered_envelopes_fail_closed_at_delivery() {
+    let delivery = Delivery::boot().await;
+    let origin = delivery.mock.uri();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&delivery.mock)
+        .await;
+    let connection = |name: &str, key: &str| {
+        json!({ "provider": "http", "name": name, "origin": origin,
+                "auth": { "scheme": "header", "name": "X-Api-Key", "value": key } })
+    };
+    delivery
+        .connect(&[
+            connection("hooks-cross-tenant", "cross-tenant-key"),
+            connection("hooks-cross-owner", "cross-owner-key"),
+            connection("hooks-altered", "altered-key"),
+            connection("hooks-intact", "intact-key"),
+        ])
+        .await;
+    let other = delivery
+        .server
+        .seed_tenant("operator-copied")
+        .await
+        .expect("tenant seeds");
+    let foreign_admin = delivery
+        .server
+        .bootstrap_service_in_tenant(other, "operator-copied-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign_jwt = delivery
+        .server
+        .exchange_api_key(foreign_admin.api_key().expect("api key"))
+        .await
+        .expect("api key exchanges");
+    let (status, view) = delivery
+        .call_as(
+            &foreign_jwt,
+            Method::POST,
+            "/v1/operator-connections",
+            Some(&connection("hooks-cross-tenant", "foreign-tenant-key")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+
+    let copy = |target: &str, source_tenant: DataTenantId, source: &str| {
+        sqlx::query(
+            "UPDATE wyrd.operator_connections SET secret_ciphertext = \
+               (SELECT secret_ciphertext FROM wyrd.operator_connections \
+                 WHERE data_tenant_id = $1 AND name = $2) \
+             WHERE data_tenant_id = $3 AND name = $4",
+        )
+        .bind(source_tenant.as_uuid())
+        .bind(source.to_owned())
+        .bind(delivery.seed.tenant().as_uuid())
+        .bind(target.to_owned())
+        .execute(&delivery.assertion)
+    };
+    copy("hooks-cross-tenant", other, "hooks-cross-tenant")
+        .await
+        .expect("cross-tenant envelope copies");
+    copy("hooks-cross-owner", delivery.seed.tenant(), "hooks-intact")
+        .await
+        .expect("cross-owner envelope copies");
+    sqlx::query(
+        "UPDATE wyrd.operator_connections \
+            SET secret_ciphertext = overlay(secret_ciphertext PLACING \
+                  decode(lpad(to_hex(get_byte(secret_ciphertext, length(secret_ciphertext) - 1) # 1), 2, '0'), 'hex') \
+                  FROM length(secret_ciphertext)) \
+          WHERE data_tenant_id = $1 AND name = 'hooks-altered'",
+    )
+    .bind(delivery.seed.tenant().as_uuid())
+    .execute(&delivery.assertion)
+    .await
+    .expect("envelope alters in place");
+
+    let hook_on = |connection: &str| {
+        json!({ "kind": "http", "method": "post", "url": format!("{origin}/hook/{connection}"),
+                "auth": { "scheme": "header", "name": "x-api-key", "connection": connection },
+                "body": { "verdict": "{{verdict}}" } })
+    };
+    let mut operators = Vec::new();
+    for name in [
+        "hooks-cross-tenant",
+        "hooks-cross-owner",
+        "hooks-altered",
+        "hooks-intact",
+    ] {
+        operators.push(
+            delivery
+                .seed
+                .operator(name, &hook_on(name))
+                .await
+                .expect("operator seeds"),
+        );
+    }
+    delivery
+        .fail_binding("owner", &operators.iter().collect::<Vec<_>>())
+        .await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        &Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let rows = delivery
+        .wait_dispatches(run, 4, |row| {
+            row.status != "pending" && row.status != "running"
+        })
+        .await;
+    running.stop().await;
+    let settled: Vec<(&str, Option<&str>)> = operators
+        .iter()
+        .map(|uid| {
+            let row = &rows[&uid.as_uuid()];
+            (row.status.as_str(), row.error_code.as_deref())
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        [
+            ("failed", Some("credential_invalid")),
+            ("failed", Some("credential_invalid")),
+            ("failed", Some("credential_invalid")),
+            ("delivered", None),
+        ]
+    );
+    let keys: Vec<(String, String)> = delivery
+        .mock
+        .received_requests()
+        .await
+        .expect("recorded")
+        .iter()
+        .map(|request| {
+            let key = request
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            (request.url.path().to_owned(), key.to_owned())
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [("/hook/hooks-intact".to_owned(), "intact-key".to_owned())],
+        "only the intact connection reaches its provider, with its own key"
     );
 }
 
@@ -1839,238 +2202,39 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
     runtime.stop().await;
 }
 
-/// Key versions of every Operator connection of `tenant`.
+/// Publish a new owner-only file key `next` beside `server`'s generated
+/// `[kms]` key and return a facade rotated onto it with that key retained,
+/// as a rolling replica configures it.
 ///
 /// # Panics
-/// Panics when the connection table cannot be read.
-async fn key_versions(pool: &PgPool, tenant: DataTenantId) -> Vec<i32> {
-    sqlx::query_scalar(
-        "SELECT key_version FROM wyrd.operator_connections \
-          WHERE data_tenant_id = $1 ORDER BY connection_id",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_all(pool)
-    .await
-    .expect("key versions read")
-}
-
-/// Rewrap runs beside delivery, never ahead of it: while a stalled key
-/// provider times out every rewrap of one tenant's stale rows, another
-/// tenant's due dispatch is still claimed and delivered; each timed-out pass
-/// rolls back and is retried, and shutdown cancels the stalled pass at once.
-/// Once the provider answers, one pass rewraps every row reading each key
-/// version exactly once.
-///
-/// # Panics
-/// Panics when delivery waits on rewrap, a stalled pass commits or blocks
-/// shutdown, or a key version is read more than once in a pass.
-#[tokio::test]
-async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
-    use base64::Engine as _;
-    let delivery = Delivery::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&delivery.mock)
-        .await;
-    let stale_tenant = delivery.seed.tenant();
-    assert_eq!(
-        key_versions(&delivery.assertion, stale_tenant).await,
-        vec![1, 1, 1]
-    );
-
-    let other_tenant = delivery.quiet_tenant("operator-rewrap-other").await.tenant;
-
-    let vault = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_mins(1)))
-        .mount(&vault)
-        .await;
-    let replica = Arc::new(
-        OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::Vault,
-            active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-            vault: Some(VaultKeysConfig {
-                addr: vault.uri(),
-                mount: "secret".to_owned(),
-                prefix: "wyrd/operator-keys".to_owned(),
-                token_file: None,
-                token: Some(secrecy::SecretString::from("rewrap-vault-token")),
-            }),
-            ..OperatorKeysConfig::default()
-        })
-        .expect("vault keys build"),
-    );
-    let limits = RuntimeLimits {
-        rewrap_interval: Duration::from_millis(50),
-        rewrap_tenant_budget: Duration::from_millis(300),
-        ..Delivery::limits()
-    };
-    let running = delivery.spawn_replica(
-        Arc::clone(&replica),
-        &limits,
-        &failing_script(1),
-        &CapabilityCrash::default(),
-    );
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let delivered = loop {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM wyrd.operator_dispatches WHERE data_tenant_id = $1",
-        )
-        .bind(other_tenant.as_uuid())
-        .fetch_optional(&delivery.assertion)
-        .await
-        .expect("dispatch reads");
-        if status.as_deref() == Some("delivered") {
-            break status;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the other tenant's dispatch was held back: {status:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert_eq!(delivered.as_deref(), Some("delivered"));
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while vault.received_requests().await.expect("recorded").len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a timed-out rewrap pass is retried"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stopping = tokio::time::Instant::now();
-    running.stop().await;
-    assert!(
-        stopping.elapsed() < Duration::from_secs(5),
-        "shutdown cancels a stalled rewrap pass: {:?}",
-        stopping.elapsed()
-    );
-    assert_eq!(
-        key_versions(&delivery.assertion, stale_tenant).await,
-        vec![1, 1, 1],
-        "timed-out and cancelled passes roll back"
-    );
-
-    let engine = base64::engine::general_purpose::STANDARD;
-    let v1 = std::fs::read_to_string(
-        delivery
-            .server
-            .operator_keys_dir_for_test()
-            .expect("generated key directory")
-            .join("v1"),
-    )
-    .expect("key v1 reads");
-    vault.reset().await;
-    let key_path =
-        |version: u32| format!("/v1/secret/data/wyrd/operator-keys/{stale_tenant}/{version}");
-    for (version, key) in [(1, v1.trim().to_owned()), (2, engine.encode([8_u8; 32]))] {
-        Mock::given(method("GET"))
-            .and(path(key_path(version)))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "data": { "data": { "key": key } } })),
-            )
-            .mount(&vault)
-            .await;
-    }
-    let running = delivery.spawn_replica(
-        Arc::clone(&replica),
-        &limits,
-        &EngineScript::default(),
-        &CapabilityCrash::default(),
-    );
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while key_versions(&delivery.assertion, stale_tenant).await != vec![2, 2, 2] {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "rewrap never completed"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    running.stop().await;
-    let reads: Vec<String> = vault
-        .received_requests()
-        .await
-        .expect("recorded")
-        .iter()
-        .map(|request| request.url.path().to_owned())
-        .collect();
-    assert_eq!(
-        reads,
-        vec![key_path(2), key_path(1)],
-        "one pass reads the active and the repeated old version once each"
-    );
-}
-
-/// A cross-tenant rewrap discovery stalled behind a lock on the connection
-/// table returns within the pass budget without touching a row, and the next
-/// pass after the stall clears rewraps every stale row.
-///
-/// # Panics
-/// Panics when the stalled pass outlives its budget, mutates a row, or the
-/// later pass does not rewrap.
-#[tokio::test]
-async fn stalled_rewrap_discovery_returns_within_the_pass_budget() {
+/// Panics when the server used no generated key or the key cannot be written.
+fn rotated_file_kms(server: &WyrdTestServer) -> Arc<WyrdKms> {
     use std::os::unix::fs::PermissionsExt as _;
 
     use base64::Engine as _;
-    let delivery = Delivery::start().await;
-    let tenant = delivery.seed.tenant();
-    let dir = delivery
-        .server
-        .operator_keys_dir_for_test()
-        .expect("generated key directory");
-    let v2 = dir.join("v2");
-    std::fs::write(
-        &v2,
-        base64::engine::general_purpose::STANDARD.encode([8_u8; 32]),
-    )
-    .expect("key v2 writes");
-    std::fs::set_permissions(&v2, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let keys = OperatorKeys::new(OperatorKeysConfig {
-        source: OperatorKeySource::File,
-        active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-        dir: Some(dir.to_path_buf()),
-        vault: None,
-    })
-    .expect("file keys build");
-    let state = delivery.server.state();
-    let operator = state.postgres.operator_pool().expect("operator pool");
+    let dir = server.kms_dir_for_test().expect("generated key directory");
+    let next = dir.join("next");
+    if !next.exists() {
+        std::fs::write(
+            &next,
+            base64::engine::general_purpose::STANDARD.encode([8_u8; 32]),
+        )
+        .expect("key next writes");
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let mut config = server.kms_config_for_test().clone();
+    config.retained_keys = vec![config.active_key.take().expect("active key")];
+    config.active_key = Some("next".to_owned());
+    Arc::new(WyrdKms::new(&config, false).expect("rotated file facade builds"))
+}
 
-    let mut lock = delivery.assertion.begin().await.expect("lock transaction");
-    sqlx::query("LOCK TABLE wyrd.operator_connections IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *lock)
-        .await
-        .expect("connection table locks");
-    let budget = Duration::from_millis(300);
-    let started = tokio::time::Instant::now();
-    let moved = tokio::time::timeout(
-        WAIT,
-        keys.rewrap_pass(state.postgres.wyrd(), &operator, budget, budget),
-    )
-    .await
-    .expect("the stalled pass returns")
-    .expect("a stalled discovery is not a pass failure");
-    let elapsed = started.elapsed();
-    assert_eq!(moved, 0);
-    assert!(
-        elapsed < budget + Duration::from_secs(2),
-        "the stalled discovery outlived the pass budget: {elapsed:?}"
-    );
-    lock.rollback().await.expect("lock releases");
-    assert_eq!(
-        key_versions(&delivery.assertion, tenant).await,
-        vec![1, 1, 1],
-        "a timed-out discovery mutates nothing"
-    );
-
-    let moved = keys
-        .rewrap_pass(state.postgres.wyrd(), &operator, WAIT, WAIT)
-        .await
-        .expect("the next pass runs");
-    assert_eq!(moved, 3);
-    assert_eq!(
-        key_versions(&delivery.assertion, tenant).await,
-        vec![2, 2, 2]
-    );
+/// A loopback URL nothing listens on.
+///
+/// # Panics
+/// Panics when no loopback port can be reserved.
+fn unreachable_endpoint() -> String {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("port reserves");
+    let endpoint = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    endpoint
 }

@@ -3,6 +3,14 @@
 Status: exploring — decision-complete recommendation for maintainer agreement;
 not approved for implementation.
 
+**Subsequent maintainer decision:** TASK-012-R2 and TASK-004B are independent
+across their worktrees. For TASK-012-R2, the
+[bounded design](task-012-r2-hot-reads.md) supersedes this document's joint
+implementation order, consolidated-corpus dependency and unagreed numerical
+UI objectives. Its fixed original SQL is sourced from an immutable local Git
+revision, not TASK-004B. This document retains the source audit and UI proposal;
+it is not the engine task's acceptance contract.
+
 ## Problem
 
 Fresh development data makes Observe and Verification navigation noticeably slower

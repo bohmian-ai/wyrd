@@ -1,5 +1,6 @@
 ---
 title: Permissions
+browserTitle: Grant and inspect permissions | Wyrd
 description: See a principal's access, bind or remove a role at an explicit scope, cut a principal off, and confirm the result in the audit log.
 pillar: wyrd
 section: Operate

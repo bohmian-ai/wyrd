@@ -18,16 +18,18 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Window};
-use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
+use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Role, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
-use crate::query::run::{Admission, Bench, Outcome, Sender, WRONG_RESULT, ask};
+use crate::query::run::{
+    Admission, Bench, OTLP_DRIVER_ROOT, OTLP_EXPORT_ROOT, Outcome, Sender, WRONG_RESULT, ask,
+};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
     Experiment, Half, Lane, OTLP_DECODE_PHASE, PAIR, PHASE_STATISTICS, Read, Residence, SETTLED,
-    SPLIT, Scale, WRITE_FIXTURE_ROWS, WRITE_PHASES, WriteOp, client, lanes, parquet_bytes,
-    platform, read_op, start, table_files,
+    SPLIT, Scale, WRITE_FIXTURE_ROWS, WRITE_PHASES, WriteOp, client, lanes, learn_span_layout,
+    parquet_bytes, platform, read_op, start, table_files,
 };
 
 /// Concurrent writers loading the read fixture.
@@ -35,9 +37,6 @@ const LOADERS: usize = 16;
 
 /// How long the read fixture may take to publish after its load.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Scribe's gauge of cached learned Variant layouts, by namespace.
-const LAYOUTS_LEARNED: &str = "bifrost_scribe_variant_layouts_learned";
 
 /// Scribe's counter of Arrow bytes inserted into memtables.
 pub const INSERTED: &str = "bifrost_scribe_memtable_bytes_inserted_total";
@@ -143,20 +142,9 @@ impl Isolated {
             WRITE_FIXTURE_ROWS + self.scale.spans / 2,
         )
         .await?;
-        let claims = platform
-            .publish_scribe()
+        learn_span_layout(server)
             .await
             .map_err(ExperimentError::workload)?;
-        let learned = server
-            .metrics()
-            .await
-            .map_err(ExperimentError::workload)?
-            .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
-        if claims == 0 || learned < 1.0 {
-            return Err(ExperimentError::workload(format!(
-                "publishing the span sample published {claims} claims and taught {learned} bifrost.traces Variant layouts"
-            )));
-        }
         let whole = Fixture {
             first: 0,
             rows: events,
@@ -289,6 +277,7 @@ impl Isolated {
             }
         };
         let timings = server.timings().await.map_err(ExperimentError::workload)?;
+        let driver_before = wyrd_benchmark::snapshot();
         let (opened, before) = Window::open(server)
             .await
             .map_err(ExperimentError::workload)?;
@@ -379,6 +368,25 @@ impl Isolated {
         };
         let population = Population::collect(server, &timings, &[cohort]).await;
         population.validate(&mut repetition, "measured");
+        let driver = match write {
+            Some(WriteOp::Spans | WriteOp::WideSpans | WriteOp::Logs) => {
+                let owed = Expected {
+                    boundary: OTLP_EXPORT_ROOT,
+                    ..cohort
+                };
+                let driver = Population::collect_driver(&driver_before, &[owed]).await;
+                driver.validate(&mut repetition, "measured");
+                Some(driver)
+            }
+            _ => None,
+        };
+        let reconciled = outcome.error_count() == 0 && outcome.busy == 0;
+        set_client_phases(
+            &mut repetition,
+            driver.as_ref(),
+            (case, phase.label()),
+            reconciled.then(|| outcome.answered()),
+        );
         population.percentiles(
             &mut repetition,
             boundary,
@@ -576,6 +584,29 @@ fn set_write_phases(
     }
 }
 
+/// Sets the driver's [`OTLP_DRIVER_ROOT`] diagnostics from the `driver`
+/// population of the `(case, phase)` cohort, each component's count checked
+/// against `answered` when given; without one, a step that sends no OTLP
+/// export, they are inapplicable.
+fn set_client_phases(
+    repetition: &mut Repetition,
+    driver: Option<&Population>,
+    cohort: (&str, &str),
+    answered: Option<u64>,
+) {
+    if let Some(driver) = driver {
+        driver.diagnose_roots(repetition, cohort, &[OTLP_DRIVER_ROOT], answered);
+        return;
+    }
+    let (root, _, components) = OTLP_DRIVER_ROOT;
+    let observation = format!("{}.{root}", Role::Driver.name());
+    let reason = "only an OTLP write step times its driver's exports";
+    repetition.inapplicable(&observation, reason);
+    for component in components {
+        repetition.inapplicable(&format!("{observation}.{component}"), reason);
+    }
+}
+
 /// Sets the client readings every closed-loop step shares: requests
 /// completed by the stop and late, errors, diagnostic client round-trip
 /// percentiles, and, for a `read`, measured and wrong queries.
@@ -608,7 +639,9 @@ fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, read: Option<Rea
 /// The `parquet` settled-state facts of the settled `server`, in
 /// [`SETTLED`] order: the span shredding and span-time pruning judgments
 /// over its `spans` spans, then each write path's storage ratio from its
-/// `samples` (path, table bytes before, inserted Arrow bytes, outcome).
+/// `samples` (path, table bytes before, inserted Arrow bytes, outcome),
+/// then each OTLP path's compression: the sample's acknowledged input bytes
+/// per published Parquet byte.
 async fn settled(
     server: &LocalServer,
     bench: &Bench,
@@ -648,28 +681,44 @@ async fn settled(
         }
     };
     let mut facts = vec![shredding, pruned];
+    let mut compression = Vec::new();
     for (op, _) in SPLIT {
-        let ratio = samples
-            .iter()
-            .find(|(sampled, ..)| *sampled == op)
-            .map_or_else(
+        let sampled = samples.iter().find(|(sampled, ..)| *sampled == op);
+        // `ratio` of the sample's published table growth, its inserted Arrow
+        // bytes, and its outcome, or why the sample cannot give one.
+        let settled = |ratio: fn(f64, f64, &Outcome) -> f64| {
+            sampled.map_or_else(
                 || Reading::missing("the path's storage sample was not taken"),
                 |(_, stored, inserted, sample)| {
-                    let stored = parquet_bytes(&root, op.table()).saturating_sub(*stored);
+                    let stored = parquet_bytes(&root, op.table())
+                        .saturating_sub(*stored)
+                        .to_f64()
+                        .unwrap_or(f64::MAX);
+                    let sent = sample.wire_bytes.to_f64().unwrap_or(0.0);
                     if sample.error_count() > 0 {
                         Reading::missing(format!(
                             "the storage sample failed with {:?}",
                             sample.errors
                         ))
-                    } else if *inserted > 0.0 && stored > 0 {
-                        Reading::exact(stored.to_f64().unwrap_or(f64::MAX) / inserted)
+                    } else if *inserted > 0.0
+                        && stored > 0.0
+                        && (op == WriteOp::Native || sent > 0.0)
+                    {
+                        Reading::exact(ratio(stored, *inserted, sample))
                     } else {
-                        Reading::missing("the storage sample inserted or published no bytes")
+                        Reading::missing("the storage sample sent, inserted, or published no bytes")
                     }
                 },
-            );
-        facts.push(ratio);
+            )
+        };
+        facts.push(settled(|stored, inserted, _| stored / inserted));
+        if op != WriteOp::Native {
+            compression.push(settled(|stored, _, sample| {
+                sample.wire_bytes.to_f64().unwrap_or(0.0) / stored
+            }));
+        }
     }
+    facts.extend(compression);
     SETTLED
         .iter()
         .zip(facts)
@@ -792,6 +841,21 @@ impl Workload for Isolated {
         self.bench = Some(bench);
         Ok(())
     }
+    /// Reads the server's outstanding publication and maintenance work
+    /// ([`LocalServer::outstanding`]) before teardown; none before the
+    /// server started.
+    async fn outstanding(
+        &mut self,
+    ) -> std::result::Result<Option<serde_json::Value>, ExperimentError> {
+        match &self.server {
+            Some(server) => server
+                .outstanding()
+                .await
+                .map(Some)
+                .map_err(ExperimentError::workload),
+            None => Ok(None),
+        }
+    }
 
     /// The server's PID, once it runs.
     fn processes(&self) -> Vec<u32> {
@@ -853,10 +917,10 @@ mod tests {
     use std::time::Duration;
 
     use wyrd_benchmark as timing;
-    use wyrd_testing::capacity::Population;
+    use wyrd_testing::capacity::{Expected, Population};
     use wyrd_testing::experiment::Repetition;
 
-    use super::set_write_phases;
+    use super::{set_client_phases, set_write_phases};
     use crate::query::WriteOp;
 
     /// A native append's recorded Scribe phases read back with their one
@@ -924,5 +988,59 @@ mod tests {
                 .is_some_and(|reason| reason.contains("Arrow IPC"))
         );
         assert!(repetition.invalid.is_empty());
+    }
+
+    /// An OTLP write step's driver export phases read back from the
+    /// driver's own recorder, one sample each, while a step without driver
+    /// exports marks them inapplicable rather than missing evidence.
+    ///
+    /// # Panics
+    /// Panics when a phase reading's samples or bounds are wrong, or a
+    /// native write's reason is not inapplicability.
+    #[tokio::test]
+    async fn otlp_client_phases_read_back_from_the_driver_recorder() {
+        timing::install().expect("the benchmark recorder installs");
+        let before = timing::snapshot();
+        let cohort = ("otlp-logs", "repetition-1");
+        let mut export = timing::Observation::start(crate::query::run::OTLP_EXPORT_ROOT, || {
+            timing::Cohort::of(Some(cohort.0), Some(cohort.1))
+        });
+        export.component("build", Duration::from_millis(2));
+        export.component("token", Duration::from_micros(5));
+        export.component("export", Duration::from_millis(30));
+        export.finish(timing::SUCCESS);
+        let expected = Expected {
+            boundary: crate::query::run::OTLP_EXPORT_ROOT,
+            outcome: timing::SUCCESS,
+            case: cohort.0,
+            phase: cohort.1,
+            count: 1,
+        };
+        let driver = Population::collect_driver(&before, &[expected]).await;
+
+        let mut repetition = Repetition::default();
+        set_client_phases(&mut repetition, Some(&driver), cohort, Some(1));
+        let wait = repetition.reading("diagnostic.driver.client.otlp.export.export.p50_us");
+        assert_eq!(wait.samples, Some(1), "{wait:?}");
+        assert!(
+            wait.value
+                .is_some_and(|us| (29_000.0..31_000.0).contains(&us)),
+            "{wait:?}"
+        );
+        let build = repetition.reading("diagnostic.driver.client.otlp.export.build.count");
+        assert_eq!(build.value, Some(1.0), "{build:?}");
+        assert!(repetition.invalid.is_empty(), "{:?}", repetition.invalid);
+
+        let mut native = Repetition::default();
+        set_client_phases(&mut native, None, cohort, None);
+        let build = native.reading("diagnostic.driver.client.otlp.export.build.p50_us");
+        assert!(
+            build
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("inapplicable")),
+            "{build:?}"
+        );
+        assert!(native.invalid.is_empty(), "{:?}", native.invalid);
     }
 }

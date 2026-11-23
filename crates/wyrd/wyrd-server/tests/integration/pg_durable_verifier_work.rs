@@ -249,14 +249,9 @@ impl Leased {
     /// Panics when the state is unreadable.
     async fn revision(&self) -> (i64, ExecutionState) {
         let query = Self::query(&self.server, self.system).await;
-        RunState::accepted(
-            self.server.state(),
-            self.server.data_tenant_id(),
-            self.lease.execution_id,
-            &InputResolver::new(&query, None),
-        )
-        .await
-        .expect("the state reads")
+        RunState::accepted(self.lease.execution_id, &InputResolver::new(&query, None))
+            .await
+            .expect("the state reads")
     }
 
     /// The publication `name` of `producer`, if accepted.
@@ -749,7 +744,12 @@ async fn directory_snapshot_is_complete_or_rejected() {
     put(&workspace, "nfc/caf\u{e9}", b"x");
     put(&workspace, "nfc/cafe\u{301}", b"y");
     put(&workspace, "kinds/a", b"x");
-    std::fs::create_dir_all(workspace.work_dir().join("kinds/A")).expect("directory");
+    // A case-insensitive filesystem already holds `kinds/a` under this name;
+    // the collision case below then has one entry and is not expected.
+    match std::fs::create_dir(workspace.work_dir().join("kinds/A")) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        made => made.expect("directory"),
+    }
     for index in 0..9 {
         put(&workspace, &format!("count/{index}"), b"x");
     }
@@ -2877,13 +2877,8 @@ async fn state_format_changes_preserve_existing_custody() {
         refused.as_ref().err()
     );
     let query = Leased::query(&leased.server, leased.system).await;
-    let kept = RunState::accepted(
-        state,
-        tenant,
-        leased.lease.execution_id,
-        &InputResolver::new(&query, None),
-    )
-    .await;
+    let kept =
+        RunState::accepted(leased.lease.execution_id, &InputResolver::new(&query, None)).await;
     assert!(
         matches!(kept, Err(StateError::Incompatible(_))),
         "the accepted revision is unchanged and still refused: {:?}",

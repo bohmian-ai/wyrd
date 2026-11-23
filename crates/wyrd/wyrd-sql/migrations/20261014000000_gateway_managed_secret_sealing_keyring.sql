@@ -1,10 +1,11 @@
--- Seal gateway managed-secret provider keys with the deployment sealing keyring.
+-- Store gateway managed-secret provider keys as the common stored-secret
+-- envelope.
 --
--- `secret_ciphertext` now holds the keyring's versioned envelope, which names
--- its sealing key and carries its own nonce, so the separate per-tenant key
--- version and nonce columns are gone. Boot rewrap reseals this column with
--- every other stored secret. An envelope sealed under a removed per-tenant
--- keyring no longer opens; its administrator resubmits the credential.
+-- `secret_ciphertext` holds the envelope, which names its wrapping key and
+-- carries its own data key and nonce bound to the tenant, credential name,
+-- and provider, so the separate key version and nonce columns are gone. Boot
+-- rewrap moves this column to the active `[kms]` key with every other
+-- auth-owned stored secret.
 ALTER TABLE wyrd.gateway_provider_credentials
     DROP COLUMN secret_key_version,
     DROP COLUMN secret_nonce;

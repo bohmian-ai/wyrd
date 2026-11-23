@@ -65,6 +65,16 @@ const TRUSTED_ISSUER_BY_URL_SQL: &str = r"
      WHERE issuer_url = $1
 ";
 
+const SWAP_TRUSTED_ISSUER_SECRET_SQL: &str = r"
+    UPDATE wyrd.auth_trusted_issuers
+       SET client_secret_enc = $3, updated_at = now()
+     WHERE issuer_url = $1 AND client_secret_enc = $2
+ RETURNING data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
+           client_auth, claim_mapping, group_role_map, default_roles,
+           principal_kind, jwks_ttl_secs, client_secret_enc,
+           created_at, updated_at
+";
+
 const DELETE_TRUSTED_ISSUER_SQL: &str = r"
     DELETE FROM wyrd.auth_trusted_issuers
      WHERE issuer_url = $1
@@ -194,6 +204,31 @@ pub async fn trusted_issuer_by_url(
 ) -> Result<Option<TrustedIssuerRow>, sqlx::Error> {
     sqlx::query_as::<_, TrustedIssuerRow>(TRUSTED_ISSUER_BY_URL_SQL)
         .bind(issuer_url)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Replace a trusted issuer's sealed client secret with `sealed` if it still
+/// holds exactly `observed`; both encryption renewal and secret replacement
+/// store through this swap.
+///
+/// Returns `None` when the issuer was deleted or reconfigured since
+/// `observed` was read, so neither action restores a deletion or overwrites
+/// a newer secret. Workload bindings reference the unchanged issuer row and
+/// are untouched. RLS on `TenantConn` scopes the update to the bound tenant.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn swap_trusted_issuer_secret(
+    conn: &mut TenantConn<'_>,
+    issuer_url: &str,
+    observed: &[u8],
+    sealed: &[u8],
+) -> Result<Option<TrustedIssuerRow>, sqlx::Error> {
+    sqlx::query_as::<_, TrustedIssuerRow>(SWAP_TRUSTED_ISSUER_SECRET_SQL)
+        .bind(issuer_url)
+        .bind(observed)
+        .bind(sealed)
         .fetch_optional(&mut **conn.transaction())
         .await
 }

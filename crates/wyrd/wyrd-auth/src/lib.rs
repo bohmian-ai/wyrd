@@ -29,7 +29,6 @@ pub mod refresh;
 pub mod repo;
 pub mod revoke;
 pub mod roles;
-pub mod sealing;
 pub mod seed;
 pub mod service_accounts;
 pub mod social;

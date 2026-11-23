@@ -44,6 +44,76 @@ export function toolTurn(calls: readonly unknown[]): Reply {
   };
 }
 
+/** The sharing-policy judge's first turn: `fs.read` the policy path its prompt in `body` names. */
+function readPolicy(body: string): ReturnType<typeof toolCall>[] {
+  const path = /read (\/inputs\/[\w./-]+) with fs\.read/i.exec(body)?.[1];
+  if (path === undefined) {
+    throw new Error("the judge's prompt names no policy to read");
+  }
+  return [toolCall("call-policy", "fs.read", { path })];
+}
+
+/**
+ * The sharing-policy judge's Verdict once `body` carries its `fs.read` result;
+ * no Verdict when the read has no `external-audit` line. When `byPurpose`, as
+ * for the finance release judge, it passes only an `external audit` purpose,
+ * or a `regulator request` when that policy line also permits regulators.
+ */
+function sharingVerdict(body: string, byPurpose: boolean): string {
+  const messages = (JSON.parse(body) as { messages: { role: string; content: string | null }[] }).messages;
+  const release = JSON.stringify(messages.filter(({ role }) => role === "user").map(({ content }) => content));
+  let output: { sources?: string[]; units?: { text: string; locator: unknown }[] };
+  try {
+    output = JSON.parse(messages.find(({ role }) => role === "tool")?.content ?? "") as typeof output;
+  } catch {
+    return "the policy did not read";
+  }
+  const line = (output.units ?? []).find(({ text }) => text.includes("external-audit"));
+  if (line === undefined) {
+    return "the policy did not read";
+  }
+  const report = { slot: "report", locator: { json_pointer: "/text" } };
+  const citations = [report, { slot: output.sources?.[0], locator: line.locator }];
+  if (release.includes("PROVIDER-UNCERTAIN")) {
+    return JSON.stringify({
+      outcome: "inconclusive",
+      reason: "the policy does not settle this release",
+      citations: [],
+    });
+  }
+  if (release.includes("BANK-ACCOUNT-DEMO-001")) {
+    return JSON.stringify({
+      outcome: "failed",
+      reason: "the report names a bank account identifier, which the policy forbids",
+      citations,
+    });
+  }
+  const permitted =
+    release.includes("external audit") || (release.includes("regulator request") && line.text.includes("regulator"));
+  if (byPurpose && !permitted) {
+    return JSON.stringify({
+      outcome: "failed",
+      reason: "the policy does not permit sharing for this purpose",
+      citations,
+    });
+  }
+  return JSON.stringify({ outcome: "passed", reason: "the policy permits sharing for this purpose", citations });
+}
+
+/**
+ * The sharing-policy judge's reply: it reads the policy its prompt names with
+ * `fs.read` first, then is inconclusive for a release naming
+ * `PROVIDER-UNCERTAIN`, fails one naming `BANK-ACCOUNT-DEMO-001`, and
+ * otherwise passes, citing the report text and the policy line permitting
+ * `external-audit`. With `byPurpose`, it also fails a purpose the policy does
+ * not permit.
+ */
+export function sharingPolicyJudge(request: ReceivedRequest, byPurpose = false): Reply {
+  return /"role"\s*:\s*"tool"/.test(request.body)
+    ? judgeReply(sharingVerdict(request.body, byPurpose))
+    : toolTurn(readPolicy(request.body));
+}
+
 /** One judge call's `bifrost.gateway.calls` identity and attribution. */
 export const JudgeCall = z.object({
   call_id: z.string(),

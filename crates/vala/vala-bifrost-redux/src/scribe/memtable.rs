@@ -13,16 +13,17 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, Statistics};
+use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::Accumulator as _;
+use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 
 use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
-use crate::scribe::wal::ScribeAppendMeta;
+use crate::scribe::wal::{ContentDigest, ScribeAppendMeta};
 use crate::tables::fields::PARQUET_FIELD_ID;
 
 /// Estimated Arrow bytes at which the active generation rotates.
@@ -541,7 +542,13 @@ impl Memtable {
                 }
             })?;
             let rows_accepted = batch.num_rows();
-            let (data_digest, data_len) = crate::scribe::preprocess::logical_data_identity(&batch)?;
+            let (data_digest, data_len) = if crate::scribe::preprocess::is_content_derived(
+                Uuid::from_bytes(replayed_meta.batch_id),
+            ) {
+                (ContentDigest::default(), 0)
+            } else {
+                crate::scribe::preprocess::logical_data_identity(&batch)?
+            };
             statistics.push(batch_statistics(&batch));
             batches.push(batch);
             metas.push(ScribeAppendMeta {
@@ -979,10 +986,16 @@ impl Memtable {
         let mut batches = Vec::new();
         let unbounded: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
             Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
-        let query = datafusion::execution::memory_pool::MemoryConsumer::new("test read")
-            .register(&unbounded);
+        let query = Arc::new(
+            datafusion::execution::memory_pool::MemoryConsumer::new("test read")
+                .register(&unbounded),
+        );
+        let mut retained = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required, None, None, &query, &mut batches)?;
+            source.prepare(required, None, None, &query, &mut retained)?;
+        }
+        for batch in retained {
+            batches.extend(batch.readable()?);
         }
         Ok(batches)
     }
@@ -1483,6 +1496,7 @@ impl MemtableBucket {
         self.bytes_accumulated += estimate_batch_bytes(&batch);
         self.tail.statistics.push(batch_statistics(&batch));
         self.tail.batches.push(batch);
+        #[cfg(test)]
         self.tail.wal_lsns.push(meta.wal_lsn_max);
         self.metas.push(meta);
         if self.tail.batches.len() == APPEND_RUN_LEN {
@@ -1667,8 +1681,8 @@ impl ImmutableEntry {
     ///
     /// # Panics
     ///
-    /// Panics when `frozen` does not carry one append meta per batch (see
-    /// [`AppendRun::new`]).
+    /// In test builds, panics when `frozen` does not carry one append meta
+    /// per batch, since tests name each batch by its meta's WAL position.
     fn pending(frozen: FrozenMemtable) -> Self {
         Self {
             seal_id: frozen.seal_id,
@@ -1684,11 +1698,14 @@ impl ImmutableEntry {
                 .map(|meta| meta.wal_lsn_max)
                 .max()
                 .unwrap_or_else(|| crate::scribe::wal::WalLsn::new(0)),
-            run: AppendRun::new(
-                Arc::clone(&frozen.batches),
-                Arc::clone(&frozen.statistics),
-                frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
-            ),
+            run: {
+                let run =
+                    AppendRun::new(Arc::clone(&frozen.batches), Arc::clone(&frozen.statistics));
+                #[cfg(test)]
+                let run =
+                    run.with_wal_lsns(frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect());
+                run
+            },
             frozen,
             state: ImmutableState::PendingCommit,
         }
@@ -1969,10 +1986,12 @@ impl LiveCapture {
     }
 
     /// Reads one partition range of the capture: its memory batches `pruning`
-    /// keeps, projected to `required` or, with `requirements`, filtered and
-    /// evaluated to their outputs over `required`, the accounting owners of those
+    /// keeps, retained for evaluation to `required` or, with `requirements`,
+    /// to their outputs over `required`, the accounting owners of those
     /// batches, its staged run paths in merge order, and the lease that keeps
-    /// those runs on disk.
+    /// those runs on disk. Opening evaluates no row: each batch is filtered,
+    /// projected, and reconstructed only when its consumer calls
+    /// [`LiveBatch::evaluate`].
     ///
     /// The batch list is sized once from the in-range sources, so a read
     /// never regrows it.
@@ -1981,22 +2000,24 @@ impl LiveCapture {
     /// half was fixed when the capture was taken, so a generation whose every
     /// batch is pruned is still not read again from its staged runs.
     ///
-    /// Projection shares the captured Arrow buffers, so the caller must hold
-    /// the returned owners for as long as any returned batch lives, and the
-    /// returned lease for as long as it reads any returned run path.
+    /// Evaluation shares the captured Arrow buffers, and each retained batch
+    /// holds its source's charge; the caller must still hold the returned
+    /// owners for as long as any evaluated batch lives, and the returned
+    /// lease for as long as it reads any returned run path.
     ///
-    /// Buffers the read allocates for the query, such as filtered, computed or
-    /// reconstructed columns, are reserved from `memory`, the querying
-    /// session's pool, as each batch is produced: only allocations the batch
+    /// Buffers evaluation allocates for the query, such as filtered, computed
+    /// or reconstructed columns, are reserved from `memory`, the querying
+    /// session's pool, as each batch is evaluated: only allocations the batch
     /// does not share with its captured generation, whose bytes the
     /// generation's charge already holds. One batch's logical fallback rows
     /// are reserved there too while it evaluates. Growth the pool refuses
-    /// fails the read and releases everything reserved so far.
+    /// fails that evaluation; what earlier ones reserved stays reserved until
+    /// the read's batches and owners drop.
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Arrow projection fails or `memory` refuses the read's growth.
+    /// when `requirements` do not plan over the required fields.
     pub(crate) fn read(
         &self,
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
@@ -2015,10 +2036,12 @@ impl LiveCapture {
         let mut batches =
             Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
         let mut charges = Vec::with_capacity(in_range.len());
-        let query = datafusion::execution::memory_pool::MemoryConsumer::new("Scribe live read")
-            .register(memory);
+        let query = Arc::new(
+            datafusion::execution::memory_pool::MemoryConsumer::new("Scribe live read")
+                .register(memory),
+        );
         for source in in_range {
-            source.project(required, pruning, requirements, &query, &mut batches)?;
+            source.prepare(required, pruning, requirements, &query, &mut batches)?;
             charges.push(Arc::clone(&source.charge));
         }
         let runs = self
@@ -2058,8 +2081,9 @@ pub(crate) fn on_capture_selected_for_test(hook: Box<dyn FnOnce()>) {
 /// One partition range read from a [`LiveCapture`].
 #[derive(Debug)]
 pub(crate) struct CapturedRead {
-    /// Memory batches projected to the read's columns.
-    pub(crate) batches: Vec<ReadableBatch>,
+    /// Memory batches the read retained, each evaluated to the read's
+    /// columns only when its consumer asks for it.
+    pub(crate) batches: Vec<LiveBatch>,
     /// Accounting owners of `batches`, which keep their bytes charged while
     /// the read holds them.
     pub(crate) owners: LiveReadOwners,
@@ -2067,6 +2091,23 @@ pub(crate) struct CapturedRead {
     pub(crate) runs: Vec<std::path::PathBuf>,
     /// Lease keeping `runs` on disk while the read holds it.
     pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
+}
+
+#[cfg(test)]
+impl CapturedRead {
+    /// Evaluates every retained memory batch, in capture order, dropping
+    /// those whose rows the read's filter all removes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first batch's evaluation error.
+    pub(crate) fn evaluated(&self) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let mut batches = Vec::with_capacity(self.batches.len());
+        for batch in &self.batches {
+            batches.extend(batch.readable()?);
+        }
+        Ok(batches)
+    }
 }
 
 /// Accounting owners of one live read's memory batches, held for as long as
@@ -2082,7 +2123,7 @@ pub(crate) struct LiveReadOwners {
     pub(crate) _sources: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
     /// The querying session's reservation of the buffers the read allocated
     /// for it, or `None` for batches that allocated nothing.
-    pub(crate) _query: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    pub(crate) _query: Option<Arc<datafusion::execution::memory_pool::MemoryReservation>>,
 }
 
 /// Most appends a writable bucket's tail holds before it seals into a shared
@@ -2104,7 +2145,9 @@ struct AppendRun {
     /// Exact bounds of each batch, index-aligned with `batches`; a batch
     /// without an entry reads with unknown bounds.
     statistics: Arc<[Arc<Statistics>]>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    /// Maximum WAL LSN of each append, index-aligned with `batches`, kept
+    /// only so tests can name each batch a read returns.
+    #[cfg(test)]
     wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
 }
 
@@ -2113,27 +2156,29 @@ impl AppendRun {
     ///
     /// `statistics` may be shorter than `batches`, as in a hand-built test
     /// generation; those batches read with unknown bounds.
+    fn new(batches: Arc<[RecordBatch]>, statistics: Arc<[Arc<Statistics>]>) -> Self {
+        Self {
+            batches,
+            statistics,
+            #[cfg(test)]
+            wal_lsns: Arc::from([]),
+        }
+    }
+
+    /// Returns this run naming each batch by its append's maximum WAL LSN.
     ///
     /// # Panics
     ///
     /// Panics when `wal_lsns` does not carry exactly one WAL position per
-    /// batch. A live read pairs batches with positions run by run, so a
-    /// mismatch would misalign every later run's bounds and pruning.
-    fn new(
-        batches: Arc<[RecordBatch]>,
-        statistics: Arc<[Arc<Statistics>]>,
-        wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
-    ) -> Self {
+    /// batch, which would make a test name the wrong batch.
+    #[cfg(test)]
+    fn with_wal_lsns(self, wal_lsns: Arc<[crate::scribe::wal::WalLsn]>) -> Self {
         assert_eq!(
-            batches.len(),
+            self.batches.len(),
             wal_lsns.len(),
             "an append run carries exactly one WAL position per batch"
         );
-        Self {
-            batches,
-            statistics,
-            wal_lsns,
-        }
+        Self { wal_lsns, ..self }
     }
 }
 
@@ -2144,7 +2189,9 @@ struct AppendTail {
     batches: Vec<RecordBatch>,
     /// Exact bounds of each batch, index-aligned with `batches`.
     statistics: Vec<Arc<Statistics>>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    /// Maximum WAL LSN of each append, index-aligned with `batches`, kept
+    /// only so tests can name each batch a read returns.
+    #[cfg(test)]
     wal_lsns: Vec<crate::scribe::wal::WalLsn>,
 }
 
@@ -2152,21 +2199,116 @@ impl AppendTail {
     /// Copies the tail into a run a capture holds while the bucket keeps
     /// appending.
     fn run(&self) -> AppendRun {
-        AppendRun::new(
+        let run = AppendRun::new(
             self.batches.as_slice().into(),
             self.statistics.as_slice().into(),
-            self.wal_lsns.as_slice().into(),
-        )
+        );
+        #[cfg(test)]
+        let run = run.with_wal_lsns(self.wal_lsns.as_slice().into());
+        run
     }
 
     /// Moves the tail into a sealed run, leaving it empty.
     fn seal(&mut self) -> AppendRun {
-        AppendRun::new(
+        let run = AppendRun::new(
             std::mem::take(&mut self.batches).into(),
             std::mem::take(&mut self.statistics).into(),
-            std::mem::take(&mut self.wal_lsns).into(),
-        )
+        );
+        #[cfg(test)]
+        let run = run.with_wal_lsns(std::mem::take(&mut self.wal_lsns).into());
+        run
     }
+}
+
+/// A capture's recorded batch bounds, read through one projection.
+///
+/// A pruning predicate planned over the projected fields asks for a projected
+/// column; it is answered from the source column the projection reads
+/// unchanged (`kept`), and a cast or null-filled column is unknown, exactly as
+/// the projected bounds [`ReadableSource::prepare`] builds would answer.
+struct RecordedBounds<'a> {
+    /// Every captured batch's recorded bounds under the source schema.
+    recorded: datafusion::common::pruning::PrunableStatistics,
+    /// The schema the predicate was planned over.
+    projected: &'a Schema,
+    /// The schema the bounds were recorded under.
+    source: &'a Schema,
+    /// Per projected column, the source column it reads unchanged.
+    kept: &'a [Option<usize>],
+}
+
+impl RecordedBounds<'_> {
+    /// Returns the source column answering projected `column`, if any.
+    fn source(&self, column: &datafusion::common::Column) -> Option<datafusion::common::Column> {
+        let at = self.projected.index_of(column.name()).ok()?;
+        let source = (*self.kept.get(at)?)?;
+        Some(datafusion::common::Column::new_unqualified(
+            self.source.field(source).name(),
+        ))
+    }
+}
+
+impl datafusion::common::pruning::PruningStatistics for RecordedBounds<'_> {
+    fn min_values(&self, column: &datafusion::common::Column) -> Option<arrow::array::ArrayRef> {
+        self.recorded.min_values(&self.source(column)?)
+    }
+
+    fn max_values(&self, column: &datafusion::common::Column) -> Option<arrow::array::ArrayRef> {
+        self.recorded.max_values(&self.source(column)?)
+    }
+
+    fn min_values_for_path(
+        &self,
+        column: &datafusion::common::Column,
+        field_path: &[String],
+    ) -> Option<arrow::array::ArrayRef> {
+        self.recorded
+            .min_values_for_path(&self.source(column)?, field_path)
+    }
+
+    fn max_values_for_path(
+        &self,
+        column: &datafusion::common::Column,
+        field_path: &[String],
+    ) -> Option<arrow::array::ArrayRef> {
+        self.recorded
+            .max_values_for_path(&self.source(column)?, field_path)
+    }
+
+    fn null_counts_for_path(
+        &self,
+        column: &datafusion::common::Column,
+        field_path: &[String],
+    ) -> Option<arrow::array::ArrayRef> {
+        self.recorded
+            .null_counts_for_path(&self.source(column)?, field_path)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.recorded.num_containers()
+    }
+
+    fn null_counts(&self, column: &datafusion::common::Column) -> Option<arrow::array::ArrayRef> {
+        self.recorded.null_counts(&self.source(column)?)
+    }
+
+    fn row_counts(&self) -> Option<arrow::array::ArrayRef> {
+        self.recorded.row_counts()
+    }
+
+    fn contained(
+        &self,
+        column: &datafusion::common::Column,
+        values: &std::collections::HashSet<ScalarValue>,
+    ) -> Option<arrow::array::BooleanArray> {
+        self.recorded.contained(&self.source(column)?, values)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Projected batch bounds `ReadableSource::prepare` built on this thread.
+    static PROJECTED_BOUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One bucket's or generation's batches, captured under the memtable read
@@ -2175,7 +2317,7 @@ impl AppendTail {
 /// Capturing shares each [`AppendRun`] by reference and copies only a
 /// writable bucket's tail, never row data, so the locks are held for a few
 /// pointer copies per run.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ReadableSource {
     /// Arrow schema shared by every batch.
     schema: SchemaRef,
@@ -2225,8 +2367,11 @@ impl ReadableSource {
             .fold(0_u64, u64::saturating_add)
     }
 
-    /// Appends each captured batch `pruning` keeps, projected to `required`,
-    /// to `output`, with its bounds projected like its columns.
+    /// Retains each captured batch `pruning` keeps for a read of `required`,
+    /// appending one [`LiveBatch`] per kept batch to `output` with its bounds
+    /// projected like its columns, and evaluating none of its rows: each
+    /// batch is filtered, projected, and reconstructed only when its consumer
+    /// asks for it (see [`LiveBatch::evaluate`]).
     ///
     /// Each required field resolves by field id (see [`projection_indices`]),
     /// so rows admitted under an earlier schema revision are emitted under the
@@ -2234,48 +2379,30 @@ impl ReadableSource {
     /// predates is filled with nulls and has unknown bounds. An empty
     /// `required` keeps every column.
     ///
-    /// `pruning` is planned over `required` and runs on the projected bounds
-    /// of every captured batch before any batch is projected, so a batch the
-    /// query's predicate rules out is never cast or assembled. `None` keeps
-    /// every batch. Bounds are shared unchanged when the projection reads
-    /// every written column, in order and uncast.
+    /// `pruning` is planned over `required` and runs here on the projected
+    /// bounds of every captured batch, so a batch the query's predicate rules
+    /// out is never retained. `None` keeps every batch. Bounds are shared
+    /// unchanged when the projection reads every written column, in order and
+    /// uncast.
     ///
-    /// A generation retained in a learned Variant layout is emitted in its
-    /// logical schema: each projected shredded Variant column is reconstructed
-    /// from its typed leaves and residual, so a capture never exposes a
-    /// physical layout and memory unions with staged and published rows value
-    /// for value. Before reconstruction such a batch is filtered by `pruning`'s
-    /// predicate, adapted to the physical layout by DataFusion's
-    /// [`DefaultPhysicalExprAdapterFactory`], so only matching rows are
-    /// reconstructed and Variant functions can read typed leaves. A filtered
-    /// batch's bounds become inexact. A predicate that does not adapt or
-    /// evaluate filters nothing here; the query's own filter still runs.
-    ///
-    /// With `requirements`, each batch is instead filtered exactly and
-    /// emitted as their outputs, evaluated on the batch's own layout (see
-    /// [`AdaptedRequirements::evaluate`]): a covered Variant path reads its
-    /// typed leaves, and only a root an output names whole is reconstructed.
-    ///
-    /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
-    ///
-    /// Each emitted batch grows `query` by the allocations it does not share
-    /// with its captured batch. While one batch is filtered or reconstructed,
-    /// a workspace reservation beside `query` holds the batches it copies;
-    /// it is released before that batch's output is reserved, so an
-    /// allocation the output keeps from it is charged once.
+    /// One generation pins one layout, so `requirements`, or `pruning`'s
+    /// predicate for a generation retained in a learned Variant layout, adapt
+    /// here once, to the first kept batch's physical columns, and serve every
+    /// batch of the source. A kept batch's bounds are inexact whenever its
+    /// evaluation may drop rows, since which rows it drops is unknown until
+    /// it runs.
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Variant reconstruction, Arrow cast, requirement evaluation, or
-    /// batch assembly fails, or `query` refuses the workspace or an output.
-    fn project(
+    /// when `requirements` do not plan over the required fields.
+    fn prepare(
         &self,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
         requirements: Option<&ReadRequirements>,
-        query: &datafusion::execution::memory_pool::MemoryReservation,
-        output: &mut Vec<ReadableBatch>,
+        query: &Arc<datafusion::execution::memory_pool::MemoryReservation>,
+        output: &mut Vec<LiveBatch>,
     ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required)?;
         let schema = Arc::new(Schema::new_with_metadata(
@@ -2298,124 +2425,194 @@ impl ReadableSource {
                 .iter()
                 .enumerate()
                 .all(|(at, column)| *column == Some(at));
-        let statistics: Vec<Arc<Statistics>> = self
+        let batches = self.batch_count();
+        // Prune first on each batch's recorded bounds, read through the
+        // projection, so only a batch the predicate may match pays for its
+        // projected bounds below.
+        let recorded = pruning.map(|pruning| {
+            let unknown = Arc::new(Statistics::new_unknown(&self.schema));
+            let recorded = self
+                .runs
+                .iter()
+                .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
+                .map(|bounds| Arc::clone(bounds.unwrap_or(&unknown)))
+                .collect();
+            pruning.keep_with(&RecordedBounds {
+                recorded: datafusion::common::pruning::PrunableStatistics::new(
+                    recorded,
+                    Arc::clone(&self.schema),
+                ),
+                projected: &schema,
+                source: &self.schema,
+                kept: &kept,
+            })
+        });
+        let pruned = Arc::new(Statistics::new_unknown(&schema));
+        let mut statistics: Vec<Arc<Statistics>> = self
             .runs
             .iter()
             .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
-            .map(|recorded| match recorded {
-                Some(bounds) if whole => Arc::clone(bounds),
-                Some(bounds) => Arc::new(Statistics {
-                    num_rows: bounds.num_rows,
-                    total_byte_size: Precision::Absent,
-                    column_statistics: kept
-                        .iter()
-                        .map(|column| {
-                            column.map_or_else(ColumnStatistics::new_unknown, |column| {
-                                bounds.column_statistics[column].clone()
-                            })
+            .enumerate()
+            .map(|(index, bounds)| {
+                if recorded.as_ref().is_some_and(|keep| !keep[index]) {
+                    return Arc::clone(&pruned);
+                }
+                match bounds {
+                    Some(bounds) if whole => Arc::clone(bounds),
+                    Some(bounds) => {
+                        #[cfg(test)]
+                        PROJECTED_BOUNDS.with(|built| built.set(built.get() + 1));
+                        Arc::new(Statistics {
+                            num_rows: bounds.num_rows,
+                            total_byte_size: Precision::Absent,
+                            column_statistics: kept
+                                .iter()
+                                .map(|column| {
+                                    column.map_or_else(ColumnStatistics::new_unknown, |column| {
+                                        bounds.column_statistics[column].clone()
+                                    })
+                                })
+                                .collect(),
                         })
-                        .collect(),
-                }),
-                None => Arc::new(Statistics::new_unknown(&schema)),
+                    }
+                    None => Arc::new(Statistics::new_unknown(&schema)),
+                }
             })
             .collect();
-        let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
-        // One generation pins one layout, so expressions adapt once to the
-        // first physical batch and serve them all.
-        let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
-        let mut adapted_requirements: Option<AdaptedRequirements> = None;
-        let refused = |error: datafusion::error::DataFusionError| ScribeError::Internal {
-            detail: format!("live-tail query memory refused: {error}"),
-        };
-        let workspace = query.new_empty();
-        for (index, ((batch, wal_lsn_max), mut statistics)) in self
+        let keep = pruning.zip(recorded).map(|(pruning, keep)| {
+            if self.bound_identities(pruning, &schema, &kept, &keep, &mut statistics) {
+                pruning
+                    .keep(&statistics, batches)
+                    .into_iter()
+                    .zip(&keep)
+                    .map(|(identity, recorded)| identity && *recorded)
+                    .collect()
+            } else {
+                keep
+            }
+        });
+        let mut selected = self
             .runs
             .iter()
-            .flat_map(|run| run.batches.iter().zip(run.wal_lsns.iter().copied()))
+            .enumerate()
+            .flat_map(|(run, appends)| (0..appends.batches.len()).map(move |at| (run, at)))
             .zip(statistics)
             .enumerate()
-        {
-            if keep.as_ref().is_some_and(|keep| !keep[index]) {
-                continue;
-            }
-            workspace.free();
-            let captured = batch;
-            let hold = |held: &[RecordBatch]| {
-                workspace
-                    .try_resize(crate::scribe::memory::unshared_arrow_bytes(
-                        held,
-                        &[captured],
-                    ))
-                    .map_err(refused)
-            };
-            let mut physical = physical_projection(batch, &schema, &projection);
-            let batch = if let Some(requirements) = requirements {
-                let adapted = match &mut adapted_requirements {
-                    Some(adapted) => adapted,
-                    None => adapted_requirements
-                        .insert(requirements.adapt(&schema, physical.schema_ref())?),
-                };
-                let Some((batch, evaluated)) = adapted.evaluate(
-                    requirements,
-                    physical,
-                    &statistics,
-                    |physical| self.logical_batch(&schema, &projection, physical),
-                    |physical, column| self.logical_column(&projection, physical, column),
-                    hold,
-                )?
-                else {
-                    continue;
-                };
-                statistics = evaluated;
-                batch
-            } else {
-                let shredded = projection.iter().any(|(_, source)| {
-                    source.is_some_and(|column| {
-                        batch.column(column).data_type() != self.schema.field(column).data_type()
-                    })
-                });
-                if let Some(pruning) = pruning.filter(|_| shredded) {
-                    let predicate = adapted.get_or_insert_with(|| {
-                        use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
-                        datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
-                            .create(Arc::clone(&schema), physical.schema())
-                            .ok()?
-                            .rewrite(Arc::clone(pruning.predicate().orig_expr()))
-                            .ok()
-                    });
-                    if let Some(kept) = predicate.as_ref().and_then(|predicate| {
-                        datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
-                    }) {
-                        if kept.num_rows() == 0 {
-                            continue;
-                        }
-                        hold(std::slice::from_ref(&kept))?;
-                        if kept.num_rows() != physical.num_rows() {
-                            statistics = Arc::new(statistics.as_ref().clone().to_inexact());
-                        }
-                        physical = kept;
-                    }
-                }
-                self.logical_batch(&schema, &projection, &physical)?
-            };
-            // The workspace is gone once the output exists, so the query
-            // takes over whatever allocations the output kept from it.
-            workspace.free();
-            query
-                .try_grow(crate::scribe::memory::unshared_arrow_bytes(
-                    std::slice::from_ref(&batch),
-                    &[captured],
-                ))
-                .map_err(refused)?;
-            output.push(ReadableBatch {
-                partition_day: self.seal_key.partition.time(),
-                wal_lsn_max,
-                batch,
+            .filter(|(index, _)| keep.as_ref().is_none_or(|keep| keep[*index]))
+            .map(|(_, selected)| selected)
+            .peekable();
+        let Some(((run, at), _)) = selected.peek() else {
+            return Ok(());
+        };
+        let first = physical_projection(&self.runs[*run].batches[*at], &schema, &projection, None);
+        let requirements = requirements
+            .map(|requirements| {
+                requirements
+                    .adapt(&schema, first.schema_ref())
+                    .map(|adapted| (requirements.clone(), adapted))
+            })
+            .transpose()?;
+        let mut source = PreparedSource {
+            source: self.clone(),
+            physical: Arc::clone(first.schema_ref()),
+            schema,
+            projection,
+            requirements,
+            predicate: None,
+            query: Arc::clone(query),
+        };
+        if source.requirements.is_none() && source.shredded(&self.runs[*run].batches[*at]) {
+            source.predicate = pruning.and_then(|pruning| {
+                use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+                datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+                    .create(Arc::clone(&source.schema), first.schema())
+                    .ok()?
+                    .rewrite(Arc::clone(pruning.predicate().orig_expr()))
+                    .ok()
+            });
+        }
+        let source = Arc::new(source);
+        for ((run, at), bounds) in selected {
+            let statistics = source.output_statistics(&self.runs[run].batches[at], &bounds)?;
+            output.push(LiveBatch {
+                source: Arc::clone(&source),
+                run,
+                at,
+                bounds,
                 statistics,
-                generation: self.generation,
             });
         }
         Ok(())
+    }
+
+    /// Adds the bounds of the identity columns `pruning` reads to every
+    /// batch's `statistics` that `keep` still keeps, returning whether any
+    /// bound was added.
+    ///
+    /// Recorded bounds cover only primitive columns, so a UTF8 or
+    /// fixed-size binary identity is bounded here, per query, and only when
+    /// the predicate reads it: appends pay nothing, and a query without an
+    /// identity predicate scans no identity values. A column is bounded only
+    /// when it is read uncast (`kept`) and stored in the type `schema` reads;
+    /// [`identity_bounds`] leaves a column holding an over-long value
+    /// unknown. `statistics` index-align with the captured batches and
+    /// `schema`'s columns.
+    fn bound_identities(
+        &self,
+        pruning: &crate::scan_sizing::BatchPruning,
+        schema: &SchemaRef,
+        kept: &[Option<usize>],
+        keep: &[bool],
+        statistics: &mut [Arc<Statistics>],
+    ) -> bool {
+        let columns: Vec<(usize, usize)> =
+            datafusion::physical_expr::utils::collect_columns(pruning.predicate().orig_expr())
+                .iter()
+                .map(datafusion::physical_expr::expressions::Column::index)
+                .filter_map(|at| {
+                    let field = schema.fields().get(at)?;
+                    matches!(
+                        field.data_type(),
+                        DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Utf8View
+                            | DataType::FixedSizeBinary(_)
+                    )
+                    .then_some((at, (*kept.get(at)?)?))
+                })
+                .collect();
+        if columns.is_empty() || keep.len() != statistics.len() {
+            return false;
+        }
+        let mut bounded = false;
+        let batches = self.runs.iter().flat_map(|run| run.batches.iter());
+        for ((batch, bounds), _) in batches
+            .zip(statistics.iter_mut())
+            .zip(keep)
+            .filter(|(_, keep)| **keep)
+        {
+            let mut added: Option<Statistics> = None;
+            for &(at, source) in &columns {
+                let Some(column) = batch.columns().get(source) else {
+                    continue;
+                };
+                if column.data_type() != schema.field(at).data_type() {
+                    continue;
+                }
+                if let Some((min, max)) = identity_bounds(column.as_ref()) {
+                    let column = &mut added
+                        .get_or_insert_with(|| Statistics::clone(bounds))
+                        .column_statistics[at];
+                    column.min_value = Precision::Exact(min);
+                    column.max_value = Precision::Exact(max);
+                }
+            }
+            if let Some(added) = added {
+                *bounds = Arc::new(added);
+                bounded = true;
+            }
+        }
+        bounded
     }
 
     /// Returns column `column` of `physical`, a [`physical_projection`] of
@@ -2514,6 +2711,15 @@ static VARIANT_RECONSTRUCTIONS: std::sync::atomic::AtomicUsize =
 #[must_use]
 pub fn variant_reconstructions_for_test() -> usize {
     VARIANT_RECONSTRUCTIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Returns the rows and decoded bytes of the captured batches live reads on
+/// this thread examined, as [`crate::scribe::profile::record_live_scan`]
+/// counts them.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn live_scan_for_test() -> (u64, u64) {
+    crate::scribe::profile::LIVE_SCAN.with(std::cell::Cell::get)
 }
 
 /// The ordered outputs and exact filter one live read evaluates in place of
@@ -2743,9 +2949,382 @@ impl AdaptedRequirements {
     }
 }
 
+/// One captured source's live read, prepared when the read opens: the
+/// source's appends, the required fields' projection, and the expressions
+/// adapted once to the source's layout, shared by every [`LiveBatch`] the
+/// read retained from it.
+///
+/// It holds the source's accounting charge and the query's reservation, so
+/// the captured buffers stay charged, and what evaluation allocates stays
+/// reserved, while any of its batches lives.
+#[derive(Debug)]
+struct PreparedSource {
+    /// The captured appends and their accounting owner.
+    source: ReadableSource,
+    /// The required fields in their logical types, the schema every
+    /// evaluated batch is emitted in before `requirements` apply.
+    schema: SchemaRef,
+    /// Each required field and the source column it reads, if any.
+    projection: Vec<(FieldRef, Option<usize>)>,
+    /// The first kept batch's physical projection schema, reused for every
+    /// batch that stores its projected columns in the same fields.
+    physical: SchemaRef,
+    /// The read's requirements and their adaptation to the source's layout.
+    requirements: Option<(ReadRequirements, AdaptedRequirements)>,
+    /// The pruning predicate adapted to a learned Variant layout, filtering
+    /// such a batch before reconstruction; `None` for a canonical layout, a
+    /// read with requirements, or a predicate that did not adapt.
+    predicate: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    /// The querying session's reservation of what evaluation allocates.
+    query: Arc<datafusion::execution::memory_pool::MemoryReservation>,
+}
+
+impl PreparedSource {
+    /// Whether `batch` stores a projected column in another type than the
+    /// source schema's, as a learned Variant layout does.
+    fn shredded(&self, batch: &RecordBatch) -> bool {
+        self.projection.iter().any(|(_, source)| {
+            source.is_some_and(|column| {
+                batch.column(column).data_type() != self.source.schema.field(column).data_type()
+            })
+        })
+    }
+
+    /// Returns the bounds `batch`'s evaluation is known to keep, from its
+    /// projected `bounds`: projected onto the requirements' outputs, and
+    /// inexact when a requirement filter or a shredded batch's predicate may
+    /// drop rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the bounds do not project onto the
+    /// outputs.
+    fn output_statistics(
+        &self,
+        batch: &RecordBatch,
+        bounds: &Arc<Statistics>,
+    ) -> Result<Arc<Statistics>, ScribeError> {
+        if let Some((requirements, adapted)) = &self.requirements {
+            let bounds = if requirements.filter.is_some() {
+                Statistics::clone(bounds).to_inexact()
+            } else {
+                Statistics::clone(bounds)
+            };
+            return requirements
+                .outputs
+                .project_statistics(bounds, &adapted.schema)
+                .map(Arc::new)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("live-tail requirement evaluation failed: {error}"),
+                });
+        }
+        Ok(if self.predicate.is_some() && self.shredded(batch) {
+            Arc::new(Statistics::clone(bounds).to_inexact())
+        } else {
+            Arc::clone(bounds)
+        })
+    }
+
+    /// Evaluates append `at` of run `run`, whose projected bounds are
+    /// `statistics`: projects it to the required fields, filters it exactly
+    /// and emits the requirements' outputs when the read has requirements,
+    /// and otherwise filters a learned-layout batch by the adapted predicate
+    /// before reconstructing its logical columns. Returns the batch with its
+    /// bounds, inexact once a row was dropped, or `None` when no row is kept.
+    ///
+    /// A shredded Variant column is reconstructed from its typed leaves and
+    /// residual, so memory unions with staged and published rows value for
+    /// value; with requirements, a covered Variant path reads its typed
+    /// leaves and only a root an output names whole is reconstructed (see
+    /// [`AdaptedRequirements::evaluate`]). A predicate that does not evaluate
+    /// filters nothing here; the query's own filter still runs.
+    ///
+    /// The batches at `ats` of `run` evaluate together: their physical
+    /// projections are concatenated into one batch first, so each step below
+    /// runs once for all of them. Every one of them stores its columns in
+    /// [`Self::physical`]'s layout (see [`LiveBatch::joins`]).
+    ///
+    /// The output grows the query's reservation by the allocations it does
+    /// not share with its captured batches. While the batches are joined,
+    /// filtered, or reconstructed, workspace reservations beside them hold
+    /// the batches evaluation copies; they are released before the output is
+    /// reserved, so an allocation the output keeps from them is charged once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when concatenation, Variant reconstruction,
+    /// Arrow cast, requirement evaluation, or batch assembly fails, or the
+    /// query's pool refuses a workspace or the output.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ats` is empty or names a batch `run` does not hold.
+    fn evaluate(
+        &self,
+        run: usize,
+        ats: &[usize],
+        mut statistics: Arc<Statistics>,
+    ) -> Result<Option<(RecordBatch, Arc<Statistics>)>, ScribeError> {
+        let source = &self.source;
+        let appends = &source.runs[run];
+        for &at in ats {
+            count_examined(
+                &appends.batches[at],
+                appends.statistics.get(at).map(AsRef::as_ref),
+                &self.projection,
+            );
+        }
+        let batch = &appends.batches[ats[0]];
+        let refused = |error: datafusion::error::DataFusionError| ScribeError::Internal {
+            detail: format!("live-tail query memory refused: {error}"),
+        };
+        // Every batch the output keeps derives from the source columns the
+        // projection reads, so only their allocations can be shared with it;
+        // they are collected once for every charge against these batches.
+        let captured = crate::scribe::memory::allocations(ats.iter().flat_map(|&at| {
+            self.projection.iter().filter_map(move |(_, source)| {
+                source.map(|column| appends.batches[at].column(column))
+            })
+        }));
+        let projected = |at: usize| {
+            physical_projection(
+                &appends.batches[at],
+                &self.schema,
+                &self.projection,
+                Some(&self.physical),
+            )
+        };
+        let joined = self.query.new_empty();
+        let (mut physical, held) = if let [at] = ats {
+            (projected(*at), captured.clone())
+        } else {
+            let parts: Vec<RecordBatch> = ats.iter().map(|&at| projected(at)).collect();
+            let physical =
+                arrow::compute::concat_batches(&self.physical, &parts).map_err(|error| {
+                    ScribeError::Internal {
+                        detail: format!("live-tail batch concatenation failed: {error}"),
+                    }
+                })?;
+            joined
+                .try_resize(crate::scribe::memory::unshared_beyond(
+                    std::slice::from_ref(&physical),
+                    captured.clone(),
+                ))
+                .map_err(refused)?;
+            // `joined` charges the concatenation, so a batch held below
+            // shares its allocations as it shares the captured ones.
+            let mut held = captured.clone();
+            held.extend(crate::scribe::memory::allocations(physical.columns()));
+            held.sort_unstable();
+            held.dedup();
+            (physical, held)
+        };
+        let workspace = self.query.new_empty();
+        let hold = |batches: &[RecordBatch]| {
+            workspace
+                .try_resize(crate::scribe::memory::unshared_beyond(
+                    batches,
+                    held.clone(),
+                ))
+                .map_err(refused)
+        };
+        let batch = if let Some((requirements, adapted)) = &self.requirements {
+            let Some((batch, evaluated)) = adapted.evaluate(
+                requirements,
+                physical,
+                &statistics,
+                |physical| source.logical_batch(&self.schema, &self.projection, physical),
+                |physical, column| source.logical_column(&self.projection, physical, column),
+                hold,
+            )?
+            else {
+                return Ok(None);
+            };
+            statistics = evaluated;
+            batch
+        } else {
+            if let Some(kept) = self
+                .predicate
+                .as_ref()
+                .filter(|_| self.shredded(batch))
+                .and_then(|predicate| {
+                    datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
+                })
+            {
+                if kept.num_rows() == 0 {
+                    return Ok(None);
+                }
+                hold(std::slice::from_ref(&kept))?;
+                if kept.num_rows() != physical.num_rows() {
+                    statistics = Arc::new(Statistics::clone(&statistics).to_inexact());
+                }
+                physical = kept;
+            }
+            source.logical_batch(&self.schema, &self.projection, &physical)?
+        };
+        // The workspaces are gone once the output exists, so the query takes
+        // over whatever allocations the output kept from them.
+        drop(workspace);
+        drop(joined);
+        self.query
+            .try_grow(crate::scribe::memory::unshared_beyond(
+                std::slice::from_ref(&batch),
+                captured,
+            ))
+            .map_err(refused)?;
+        Ok(Some((batch, statistics)))
+    }
+}
+
+/// One captured memory batch a live read retained, evaluated only when its
+/// consumer asks for it.
+///
+/// Cloning shares the prepared source; the batch's rows are never copied
+/// until [`Self::evaluate`] runs, and each evaluation works from the exact
+/// captured snapshot, never from the memtable's current state.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveBatch {
+    /// The prepared read of the source holding the batch.
+    source: Arc<PreparedSource>,
+    /// The append run holding the batch.
+    run: usize,
+    /// The batch's position in `run`.
+    at: usize,
+    /// The batch's bounds projected to the required fields.
+    bounds: Arc<Statistics>,
+    /// The bounds of the rows evaluation emits, inexact when it may drop rows.
+    statistics: Arc<Statistics>,
+}
+
+impl LiveBatch {
+    /// Returns the bounds of the rows [`Self::evaluate`] emits, column for
+    /// column with its output; inexact when evaluation may drop rows.
+    pub(crate) fn statistics(&self) -> &Arc<Statistics> {
+        &self.statistics
+    }
+
+    /// Returns the rows the captured batch holds before evaluation.
+    pub(crate) fn rows(&self) -> usize {
+        self.source.source.runs[self.run].batches[self.at].num_rows()
+    }
+
+    /// Whether [`Self::evaluate_joined`] can evaluate `other` together with
+    /// this batch: both are batches of one prepared read and append run, and
+    /// both store the read's columns in its physical layout, so their
+    /// physical projections concatenate.
+    pub(crate) fn joins(&self, other: &Self) -> bool {
+        let stores_like = |batch: &Self| {
+            stores_like(
+                &self.source.source.runs[batch.run].batches[batch.at],
+                &self.source.projection,
+                &self.source.physical,
+            )
+        };
+        Arc::ptr_eq(&self.source, &other.source)
+            && self.run == other.run
+            && stores_like(self)
+            && stores_like(other)
+    }
+
+    /// Evaluates `batches`, each joining the first (see [`Self::joins`]), as
+    /// one: their rows, in order, filtered, projected, and reconstructed in
+    /// one pass, or `None` when no row is kept or `batches` is empty. A lone
+    /// batch evaluates in whatever layout it stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when one of several batches does not join
+    /// the first, or
+    /// [`Self::evaluate`]'s error.
+    pub(crate) fn evaluate_joined(batches: &[Self]) -> Result<Option<RecordBatch>, ScribeError> {
+        let Some(first) = batches.first() else {
+            return Ok(None);
+        };
+        if batches.len() > 1 && !batches.iter().all(|batch| first.joins(batch)) {
+            return Err(ScribeError::Internal {
+                detail: "live-tail batches evaluated together do not join".to_owned(),
+            });
+        }
+        let ats: Vec<usize> = batches.iter().map(|batch| batch.at).collect();
+        Ok(first
+            .source
+            .evaluate(first.run, &ats, Arc::clone(&first.bounds))?
+            .map(|(batch, _)| batch))
+    }
+
+    /// Filters, projects, and reconstructs the batch now, returning its rows
+    /// in the read's output columns, or `None` when no row is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when evaluation fails or the query's pool
+    /// refuses what it allocates (see [`PreparedSource::evaluate`]).
+    #[cfg(test)]
+    pub(crate) fn evaluate(&self) -> Result<Option<RecordBatch>, ScribeError> {
+        Ok(self
+            .source
+            .evaluate(self.run, &[self.at], Arc::clone(&self.bounds))?
+            .map(|(batch, _)| batch))
+    }
+
+    /// Evaluates the batch as a [`ReadableBatch`] carrying its evaluated
+    /// bounds, or `None` when no row is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::evaluate`]'s error.
+    #[cfg(test)]
+    pub(crate) fn readable(&self) -> Result<Option<ReadableBatch>, ScribeError> {
+        let source = &self.source.source;
+        Ok(self
+            .source
+            .evaluate(self.run, &[self.at], Arc::clone(&self.bounds))?
+            .map(|(batch, statistics)| ReadableBatch {
+                partition_day: source.seal_key.partition.time(),
+                wal_lsn_max: source.runs[self.run].wal_lsns[self.at],
+                batch,
+                statistics,
+                generation: source.generation,
+            }))
+    }
+}
+
+/// Counts `batch`, one captured batch a live read is about to evaluate, as
+/// examined (see [`crate::scribe::profile::record_live_scan`]): all its rows,
+/// before any row filter, and the byte size `recorded` holds for each column
+/// `projection` reads, measured from the batch only when none was recorded.
+/// A required field the batch predates reads no stored column and adds no
+/// bytes. Outside a benchmark or test-support build nothing is counted, so
+/// an ordinary read does no accounting.
+fn count_examined(
+    batch: &RecordBatch,
+    recorded: Option<&Statistics>,
+    projection: &[(FieldRef, Option<usize>)],
+) {
+    if !(wyrd_benchmark::enabled() || cfg!(feature = "test-support")) {
+        return;
+    }
+    let bytes = projection
+        .iter()
+        .filter_map(|(_, source)| *source)
+        .map(|column| {
+            recorded
+                .and_then(|bounds| bounds.column_statistics.get(column))
+                .and_then(|bounds| bounds.byte_size.get_value().copied())
+                .or_else(|| batch.column(column).to_data().get_slice_memory_size().ok())
+                .unwrap_or(0) as u64
+        })
+        .fold(0_u64, u64::saturating_add);
+    crate::scribe::profile::record_live_scan(batch.num_rows() as u64, bytes);
+}
+
 /// Returns `batch`'s columns `projection` reads, unconverted, under the names
 /// of `schema`, with a projected field the batch predates filled with nulls:
 /// the stored layout a capture filters before reconstructing it in `schema`.
+///
+/// `cached` is a schema an earlier batch's projection built; it is reused,
+/// rather than rebuilt, when `batch` stores every projected column in a field
+/// of the same type, nullability, and metadata.
 ///
 /// # Panics
 ///
@@ -2755,33 +3334,63 @@ fn physical_projection(
     batch: &RecordBatch,
     schema: &SchemaRef,
     projection: &[(FieldRef, Option<usize>)],
+    cached: Option<&SchemaRef>,
 ) -> RecordBatch {
-    let (fields, columns): (Vec<_>, Vec<_>) = projection
+    let stored = batch.schema_ref();
+    let columns = projection
         .iter()
-        .zip(schema.fields())
-        .map(|((field, source), named)| match source {
-            Some(column) => (
-                Arc::new(
-                    batch
-                        .schema_ref()
-                        .field(*column)
-                        .clone()
-                        .with_name(named.name()),
-                ),
-                Arc::clone(batch.column(*column)),
-            ),
-            None => (
-                Arc::clone(named),
-                arrow::array::new_null_array(field.data_type(), batch.num_rows()),
-            ),
+        .map(|(field, source)| match source {
+            Some(column) => Arc::clone(batch.column(*column)),
+            None => arrow::array::new_null_array(field.data_type(), batch.num_rows()),
         })
-        .unzip();
+        .collect();
+    let physical = cached
+        .filter(|cached| stores_like(batch, projection, cached))
+        .map_or_else(
+            || {
+                Arc::new(Schema::new(
+                    projection
+                        .iter()
+                        .zip(schema.fields())
+                        .map(|((_, source), named)| match source {
+                            Some(column) => {
+                                Arc::new(stored.field(*column).clone().with_name(named.name()))
+                            }
+                            None => Arc::clone(named),
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            },
+            Arc::clone,
+        );
     RecordBatch::try_new_with_options(
-        Arc::new(Schema::new(fields)),
+        physical,
         columns,
         &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
     .expect("columns taken from one batch share its row count and their own fields")
+}
+
+/// Whether `batch` stores every column `projection` reads in a field of the
+/// type, nullability, and metadata of `physical`'s field for it, so its
+/// [`physical_projection`] is in `physical`'s layout.
+fn stores_like(
+    batch: &RecordBatch,
+    projection: &[(FieldRef, Option<usize>)],
+    physical: &Schema,
+) -> bool {
+    let stored = batch.schema_ref();
+    projection
+        .iter()
+        .zip(physical.fields())
+        .all(|((_, source), field)| {
+            source.is_none_or(|column| {
+                let stored = stored.field(column);
+                stored.data_type() == field.data_type()
+                    && stored.is_nullable() == field.is_nullable()
+                    && stored.metadata() == field.metadata()
+            })
+        })
 }
 
 /// Computes one append batch's exact row count, every column's byte size,
@@ -2829,6 +3438,67 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
         }
     }
     Arc::new(statistics)
+}
+
+/// Longest identity value, in bytes, a query-time bound holds.
+///
+/// Trace, span, and parent ids are at most 32 hex characters; a column holding
+/// a longer value is free text, whose bounds would cost a long comparison per
+/// row and rarely prune.
+const IDENTITY_BOUND_BYTES: usize = 64;
+
+/// Returns a UTF8 or fixed-size binary `column`'s minimum and maximum in one
+/// pass, or `None` when it holds no non-null value, holds a value longer than
+/// [`IDENTITY_BOUND_BYTES`], or has another type.
+///
+/// Values compare as bytes, which is `DataFusion`'s string and binary order.
+fn identity_bounds(column: &dyn arrow::array::Array) -> Option<(ScalarValue, ScalarValue)> {
+    use arrow::array::AsArray as _;
+    fn extrema<'a, T: AsRef<[u8]> + Ord + ?Sized + 'a>(
+        values: impl IntoIterator<Item = Option<&'a T>>,
+    ) -> Option<(&'a T, &'a T)> {
+        let mut bounds: Option<(&T, &T)> = None;
+        for value in values.into_iter().flatten() {
+            if value.as_ref().len() > IDENTITY_BOUND_BYTES {
+                return None;
+            }
+            bounds = Some(bounds.map_or((value, value), |(min, max)| {
+                (min.min(value), max.max(value))
+            }));
+        }
+        bounds
+    }
+    let text = |(min, max): (&str, &str)| (min.to_owned(), max.to_owned());
+    match column.data_type() {
+        DataType::Utf8 => extrema(column.as_string::<i32>())
+            .map(text)
+            .map(|(min, max)| (ScalarValue::Utf8(Some(min)), ScalarValue::Utf8(Some(max)))),
+        DataType::LargeUtf8 => extrema(column.as_string::<i64>())
+            .map(text)
+            .map(|(min, max)| {
+                (
+                    ScalarValue::LargeUtf8(Some(min)),
+                    ScalarValue::LargeUtf8(Some(max)),
+                )
+            }),
+        DataType::Utf8View => extrema(column.as_string_view())
+            .map(text)
+            .map(|(min, max)| {
+                (
+                    ScalarValue::Utf8View(Some(min)),
+                    ScalarValue::Utf8View(Some(max)),
+                )
+            }),
+        DataType::FixedSizeBinary(width) => {
+            extrema(column.as_fixed_size_binary()).map(|(min, max)| {
+                (
+                    ScalarValue::FixedSizeBinary(*width, Some(min.to_vec())),
+                    ScalarValue::FixedSizeBinary(*width, Some(max.to_vec())),
+                )
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Resolves each required field to its column in one captured schema.
@@ -3098,7 +3768,8 @@ pub(crate) mod tests {
                 )
                 .expect("capture read");
             let batches = read
-                .batches
+                .evaluated()
+                .expect("batches evaluate")
                 .into_iter()
                 .map(|readable| readable.batch)
                 .collect::<Vec<_>>();
@@ -3262,7 +3933,8 @@ pub(crate) mod tests {
                     &unbounded_pool(),
                 )
                 .expect("capture read")
-                .batches
+                .evaluated()
+                .expect("batches evaluate")
                 .iter()
                 .map(|batch| batch.wal_lsn_max.as_u64())
                 .collect::<Vec<_>>();
@@ -3272,6 +3944,442 @@ pub(crate) mod tests {
 
         assert_eq!(lsns(Some(&pruning)), vec![2]);
         assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// A capture read prunes on each batch's recorded bounds before building
+    /// projected bounds, so only the batch the predicate may match pays for
+    /// its projected statistics, and the read returns exactly that batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be taken or read, the wrong batches are
+    /// returned, or projected bounds are built for a pruned batch.
+    #[test]
+    fn capture_read_projects_bounds_only_for_batches_recorded_bounds_keep() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let written = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        for (lsn, id) in [(1, 10_i64), (2, 50), (3, 90)] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&written),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(Int64Array::from(vec![id])),
+                ],
+            )
+            .expect("batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("insert");
+        }
+        let required = Arc::new(Schema::new(vec![written.field(0).clone()]));
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &required,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &required).expect("id column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(50_i64),
+            )),
+        )
+        .expect("pruning plans");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        PROJECTED_BOUNDS.with(|built| built.set(0));
+
+        let batches = capture
+            .read(
+                &partitions,
+                required.fields(),
+                Some(&pruning),
+                None,
+                &unbounded_pool(),
+            )
+            .expect("capture read")
+            .evaluated()
+            .expect("batches evaluate");
+
+        let lsns: Vec<u64> = batches
+            .iter()
+            .map(|batch| batch.wal_lsn_max.as_u64())
+            .collect();
+        assert_eq!(lsns, vec![2]);
+        assert_eq!(PROJECTED_BOUNDS.with(std::cell::Cell::get), 1);
+    }
+
+    /// A batch storing its projected columns as the first batch did reuses
+    /// that batch's physical schema; one storing a column in another type
+    /// gets a schema of its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the schema is rebuilt for a matching batch or reused for
+    /// a differing one.
+    #[test]
+    fn physical_projection_reuses_a_matching_schema_only() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let projection = vec![(Arc::clone(schema.fields().first().expect("field")), Some(0))];
+        let batch = |data_type: DataType| {
+            let column =
+                arrow::compute::cast(&Int64Array::from(vec![1_i64]), &data_type).expect("casts");
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("stored", data_type, true)])),
+                vec![column],
+            )
+            .expect("batch")
+        };
+        let first = physical_projection(&batch(DataType::Int64), &schema, &projection, None);
+        let cached = first.schema();
+
+        let same =
+            physical_projection(&batch(DataType::Int64), &schema, &projection, Some(&cached));
+        let other =
+            physical_projection(&batch(DataType::Utf8), &schema, &projection, Some(&cached));
+
+        assert!(Arc::ptr_eq(&same.schema(), &cached));
+        assert!(!Arc::ptr_eq(&other.schema(), &cached));
+        assert_eq!(other.schema().field(0).name(), "id");
+        assert_eq!(other.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    /// Appends of one source and run join, and evaluate together as one
+    /// batch holding every row in the order given, examining each row once;
+    /// an append of another generation joins none of them, evaluates alone,
+    /// and is refused in a group with them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the joins differ, the joined rows differ from the appends'
+    /// rows, a row is examined other than once, the lone batch does not
+    /// evaluate, or the mixed group evaluates.
+    #[test]
+    fn appends_of_one_run_evaluate_joined_as_one_batch() {
+        use arrow::array::AsArray as _;
+
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let insert = |lsn: u64, ids: Vec<i64>| {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("insert");
+        };
+        insert(1, vec![0]);
+        memtable.freeze(&key).expect("older generation");
+        insert(2, vec![1, 2]);
+        insert(3, vec![3]);
+        insert(4, vec![4, 5]);
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let read = capture
+            .read(&partitions, schema.fields(), None, None, &unbounded_pool())
+            .expect("capture read");
+        let lsn = |batch: &LiveBatch| {
+            batch
+                .readable()
+                .expect("evaluates")
+                .expect("rows")
+                .wal_lsn_max
+                .as_u64()
+        };
+        let (older, current): (Vec<&LiveBatch>, Vec<&LiveBatch>) =
+            read.batches.iter().partition(|batch| lsn(batch) == 1);
+        let current: Vec<LiveBatch> = current.into_iter().cloned().collect();
+
+        assert!(current.iter().all(|batch| current[0].joins(batch)));
+        assert!(!current.iter().any(|batch| older[0].joins(batch)));
+        let before = live_scan_for_test().0;
+        let joined = LiveBatch::evaluate_joined(&current)
+            .expect("evaluates")
+            .expect("rows");
+        assert_eq!(live_scan_for_test().0 - before, 5);
+        assert_eq!(
+            joined
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .values(),
+            &[1, 2, 3, 4, 5]
+        );
+        let alone = LiveBatch::evaluate_joined(&[older[0].clone()])
+            .expect("a lone batch evaluates")
+            .expect("rows");
+        assert_eq!(alone.num_rows(), 1);
+        assert!(LiveBatch::evaluate_joined(&[current[0].clone(), older[0].clone()]).is_err());
+    }
+
+    /// Identity bounds are each column's byte-ordered extremes, skipping
+    /// nulls, and unknown for a column holding no value or an over-long one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bound differs from the expected extreme or is known
+    /// where it must be unknown.
+    #[test]
+    fn identity_bounds_skip_nulls_and_refuse_over_long_values() {
+        let text = arrow::array::StringArray::from(vec![Some("t2"), None, Some("t1"), Some("t3")]);
+        assert_eq!(
+            identity_bounds(&text),
+            Some((ScalarValue::from("t1"), ScalarValue::from("t3")))
+        );
+        let view = arrow::array::StringViewArray::from(vec!["b", "a"]);
+        assert_eq!(
+            identity_bounds(&view),
+            Some((
+                ScalarValue::Utf8View(Some("a".to_owned())),
+                ScalarValue::Utf8View(Some("b".to_owned()))
+            ))
+        );
+        let ids =
+            arrow::array::FixedSizeBinaryArray::try_from_iter([[2_u8; 8], [1; 8]].into_iter())
+                .expect("ids");
+        assert_eq!(
+            identity_bounds(&ids),
+            Some((
+                ScalarValue::FixedSizeBinary(8, Some(vec![1; 8])),
+                ScalarValue::FixedSizeBinary(8, Some(vec![2; 8]))
+            ))
+        );
+        let long = "m".repeat(IDENTITY_BOUND_BYTES + 1);
+        let body = arrow::array::StringArray::from(vec!["a", long.as_str(), "z"]);
+        assert_eq!(
+            identity_bounds(&body),
+            None,
+            "an over-long value leaves the column unknown"
+        );
+        let empty = arrow::array::StringArray::from(vec![None::<&str>]);
+        assert_eq!(
+            identity_bounds(&empty),
+            None,
+            "an all-null column has no extremes"
+        );
+    }
+
+    /// Catalog identity, time and child-match predicates prune memory
+    /// batches by their recorded bounds, and only where the bounds are known
+    /// to describe the column read.
+    ///
+    /// Columns carry field ids, as catalog tables do. An older generation
+    /// predates `parent_id`, so its unknown bounds keep it
+    /// for a parent lookup. `IS NULL` keeps exactly the batch holding nulls.
+    /// Reading `id` cast to `Utf8View` adapts the column, so its bounds are
+    /// unknown and nothing is pruned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a batch that can match is pruned, or one that cannot is
+    /// kept where its bounds are known.
+    #[test]
+    fn identity_time_and_child_predicates_prune_only_by_known_bounds() {
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::{BinaryExpr, IsNullExpr, col, lit};
+
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let with_id = |field: Field, id: &str| {
+            field.with_metadata([(PARQUET_FIELD_ID.to_owned(), id.to_owned())])
+        };
+        let id = with_id(Field::new("id", DataType::Utf8, true), "1");
+        let time = with_id(Field::new("time", DataType::Int64, false), "2");
+        let parent = with_id(
+            Field::new("parent_id", DataType::FixedSizeBinary(8), true),
+            "3",
+        );
+        let older = Arc::new(Schema::new(vec![id.clone(), time.clone()]));
+        let current = Arc::new(Schema::new(vec![id.clone(), time.clone(), parent.clone()]));
+        let row = |lsn: u64, id: Option<&str>, at: i64, parent_id: Option<u8>| {
+            let mut columns: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(arrow::array::StringArray::from(vec![id])),
+                Arc::new(Int64Array::from(vec![at])),
+            ];
+            let schema = match parent_id {
+                Some(byte) => {
+                    columns.push(Arc::new(
+                        arrow::array::FixedSizeBinaryArray::try_from_iter(std::iter::once(
+                            [byte; 8],
+                        ))
+                        .expect("parent ids"),
+                    ));
+                    Arc::clone(&current)
+                }
+                None => Arc::clone(&older),
+            };
+            let batch = RecordBatch::try_new(schema, columns).expect("row batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("insert");
+        };
+        row(1, Some("m1"), 40, None);
+        memtable.freeze(&key).expect("older generation");
+        row(2, Some("a1"), 10, Some(1));
+        row(3, Some("m1"), 20, Some(2));
+        row(4, None, 30, Some(3));
+
+        let partitions = key.partition.time()..=key.partition.time();
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let kept = |schema: &SchemaRef, predicate: Arc<dyn PhysicalExpr>| {
+            let pruning = crate::scan_sizing::BatchPruning::try_new(schema, predicate)
+                .expect("pruning plans");
+            let mut lsns = capture
+                .read(
+                    &partitions,
+                    schema.fields(),
+                    Some(&pruning),
+                    None,
+                    &unbounded_pool(),
+                )
+                .expect("capture read")
+                .evaluated()
+                .expect("batches evaluate")
+                .iter()
+                .map(|batch| batch.wal_lsn_max.as_u64())
+                .collect::<Vec<_>>();
+            lsns.sort_unstable();
+            lsns
+        };
+        let and = |left, right| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(left, Operator::And, right))
+        };
+        let compare = |schema: &SchemaRef, name: &str, operator, value: ScalarValue| {
+            Arc::new(BinaryExpr::new(
+                col(name, schema).expect("column"),
+                operator,
+                lit(value),
+            )) as Arc<dyn PhysicalExpr>
+        };
+
+        assert_eq!(
+            kept(
+                &current,
+                and(
+                    compare(&current, "id", Operator::Eq, ScalarValue::from("m1")),
+                    compare(
+                        &current,
+                        "time",
+                        Operator::GtEq,
+                        ScalarValue::Int64(Some(15))
+                    ),
+                ),
+            ),
+            vec![1, 3],
+            "an id and time lookup keeps only the batches that can match"
+        );
+        assert_eq!(
+            kept(
+                &current,
+                compare(
+                    &current,
+                    "parent_id",
+                    Operator::Eq,
+                    ScalarValue::FixedSizeBinary(8, Some(vec![1; 8])),
+                ),
+            ),
+            vec![1, 2],
+            "a child lookup keeps the match and the batch whose bounds are unknown"
+        );
+        assert_eq!(
+            kept(
+                &current,
+                Arc::new(IsNullExpr::new(col("id", &current).expect("id column"))),
+            ),
+            vec![4],
+            "IS NULL keeps exactly the batch holding a null id"
+        );
+        let adapted = Arc::new(Schema::new(vec![with_id(
+            Field::new("id", DataType::Utf8View, true),
+            "1",
+        )]));
+        assert_eq!(
+            kept(
+                &adapted,
+                compare(
+                    &adapted,
+                    "id",
+                    Operator::Eq,
+                    ScalarValue::Utf8View(Some("m1".to_owned())),
+                ),
+            ),
+            vec![1, 2, 3, 4],
+            "a cast column's bounds are unknown, so nothing is pruned"
+        );
+    }
+
+    /// A live read counts the rows and decoded bytes of exactly the captured
+    /// batches it examines: a batch its bounds prune adds nothing, and a kept
+    /// batch adds its rows before any row filter and the recorded Arrow bytes
+    /// of the columns it reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be read or the counted rows or bytes
+    /// differ from the examined batches'.
+    #[test]
+    fn capture_read_counts_the_rows_and_bytes_it_examines() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("unread", DataType::Int64, false),
+        ]));
+        let batch = |ids: Vec<i64>| {
+            let unread = Int64Array::from(vec![0_i64; ids.len()]);
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(ids)), Arc::new(unread)],
+            )
+            .expect("fixture batch")
+        };
+        memtable
+            .insert(&key, make_test_meta(1), batch(vec![1, 2]))
+            .expect("first insert");
+        memtable
+            .insert(&key, make_test_meta(2), batch(vec![50]))
+            .expect("second insert");
+        let required = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &required,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &required).expect("id column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(50_i64),
+            )),
+        )
+        .expect("pruning plans");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let examined = |pruning| {
+            let before = live_scan_for_test();
+            capture
+                .read(
+                    &partitions,
+                    required.fields(),
+                    pruning,
+                    None,
+                    &unbounded_pool(),
+                )
+                .expect("capture read")
+                .evaluated()
+                .expect("batches evaluate");
+            let after = live_scan_for_test();
+            (after.0 - before.0, after.1 - before.1)
+        };
+
+        assert_eq!(examined(Some(&pruning)), (1, 8), "only the kept batch");
+        assert_eq!(examined(None), (3, 24), "every batch, `id` alone");
     }
 
     /// A capture shares a bucket's sealed runs and a generation's batches by
@@ -3320,7 +4428,8 @@ pub(crate) mod tests {
                     &unbounded_pool(),
                 )
                 .expect("capture read")
-                .batches
+                .evaluated()
+                .expect("batches evaluate")
                 .iter()
                 .map(|readable| {
                     let lsn = readable.wal_lsn_max.as_u64();
@@ -3518,8 +4627,9 @@ pub(crate) mod tests {
     /// bytes to the Oracle holder alone, and the Scribe holder never moves. A
     /// bare `value` output shares the captured buffers, so it reserves less
     /// than one copy of them. Dropping the read returns every byte. Under a
-    /// ceiling that admits the first batch's output but not the second's, the
-    /// read fails and leaves neither pool nor root holding anything.
+    /// ceiling that admits the first batch's output but not the second's,
+    /// opening succeeds, evaluating fails, and neither pool nor root keeps
+    /// anything once the read drops.
     ///
     /// A partial `value % 2 = 0` filter copies each batch's survivors into a
     /// workspace the read charges while it holds them: a zero-column count
@@ -3607,7 +4717,8 @@ pub(crate) mod tests {
             .expect("a fitting computed read");
         let fresh = crate::scribe::memory::unshared_arrow_bytes(
             &computed
-                .batches
+                .evaluated()
+                .expect("batches evaluate")
                 .iter()
                 .map(|readable| readable.batch.clone())
                 .collect::<Vec<_>>(),
@@ -3650,8 +4761,10 @@ pub(crate) mod tests {
                     Some(&requirements("value + 1")),
                     tight.memory_pool(),
                 )
+                .expect("opening reserves nothing")
+                .evaluated()
                 .is_err(),
-            "growth beyond the ceiling refuses the read"
+            "growth beyond the ceiling refuses the evaluation"
         );
         assert_eq!(tight.memory_pool().reserved(), 0, "no residue in the pool");
         assert_eq!(held(), (0, scribe_before), "no residue at the root");
@@ -3680,7 +4793,8 @@ pub(crate) mod tests {
             .expect("a fitting filtered count");
         assert_eq!(
             counted
-                .batches
+                .evaluated()
+                .expect("batches evaluate")
                 .iter()
                 .map(|readable| (readable.batch.num_columns(), readable.batch.num_rows()))
                 .collect::<Vec<_>>(),
@@ -3707,7 +4821,8 @@ pub(crate) mod tests {
             .expect("a fitting filtered read");
         let retained = crate::scribe::memory::unshared_arrow_bytes(
             &survived
-                .batches
+                .evaluated()
+                .expect("batches evaluate")
                 .iter()
                 .map(|readable| readable.batch.clone())
                 .collect::<Vec<_>>(),
@@ -3736,6 +4851,8 @@ pub(crate) mod tests {
                     Some(&even(&[])),
                     starved.memory_pool(),
                 )
+                .expect("opening reserves nothing")
+                .evaluated()
                 .is_err(),
             "filter workspace beyond the ceiling refuses the count"
         );
@@ -3856,9 +4973,9 @@ pub(crate) mod tests {
         ScribeAppendMeta {
             batch_id: [0u8; 16],
             schema_fingerprint: [0; 32],
-            data_digest: [0; 32],
+            data_digest: [0; 16],
             data_len: 0,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_index: 0,
             slice_count: 1,
@@ -4097,7 +5214,7 @@ pub(crate) mod tests {
                     crate::scribe::wal::ScribeAppendPayloadIdentity {
                         batch_id: [8u8; 16],
                         schema_fingerprint: [0; 32],
-                        data_digest: [0; 32],
+                        data_digest: [0; 16],
                         data_len: 0,
                         slice_index: 0,
                         slice_count: 1,

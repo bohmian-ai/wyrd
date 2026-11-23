@@ -28,10 +28,14 @@ selected mounts so each journey asserts exactly what the tools returned.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import itertools
 import json
+import runpy
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -167,9 +171,15 @@ def policy_desk_key(policy_desk_bundle: Path) -> str:
 
 
 @pytest.fixture
-def desk(policy_desk_bundle: Path, policy_desk_key: str) -> Iterator[WyrdState]:
-    """The hydrated ``policy-desk`` Service acting as its own key, Bifrost started."""
+def desk(
+    request: pytest.FixtureRequest, policy_desk_bundle: Path, policy_desk_key: str
+) -> Iterator[WyrdState]:
+    """The hydrated ``policy-desk`` Service acting as its own key, Bifrost started.
+
+    Telemetry is installed only for a test that asks for fresh providers.
+    """
     state = WyrdState.from_path(policy_desk_bundle, WyrdClient(credential=policy_desk_key))
+    state.configure(telemetry="fresh_telemetry_providers" in request.fixturenames)
     state.start_bifrost()
     yield state
     state.shutdown()
@@ -228,7 +238,6 @@ def record_trace(
     Stored spans order by start time, so ``outer`` is the trace document's
     ``spans[0]`` and ``inner`` its ``spans[1]``.
     """
-    desk.start_telemetry()
     tracer = trace.get_tracer("journey.policy")
     with tracer.start_as_current_span(outer, attributes={"policy_id": policy_id}) as span:
         with tracer.start_as_current_span(inner):
@@ -244,7 +253,6 @@ def record_whole_trace(desk: WyrdState, server: WyrdTestServer, trace_id: str | 
 
     Given ``trace_id``, both spans join that trace.
     """
-    desk.start_telemetry()
     writer = TracerProvider()
     writer.add_span_processor(SimpleSpanProcessor(span_exporter(client_of(server))))
     parent = None
@@ -1834,3 +1842,68 @@ def test_artifact_workspace_refusals_preserve_authority(
         secret not in json.dumps(each.body) for each in receiver.to("/v1/chat/completions")[asked:]
     ), "no refused path hands the protected line to the model"
     assert tools_called(record)[:2] == ["fs.read", "fs.search"]
+
+
+REFUND_AGENT = FIXTURES.parent / "examples/refund-agent"
+"""The agent workflow guide's example: a refund agent whose remembered-order path skips its lookup."""
+
+
+@pytest.fixture
+def refund_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fresh_telemetry_providers: None
+) -> Iterator[WyrdTestServer]:
+    """An empty directory holding only the refund agent program, on a server of its own, as `wyrd init` leaves it."""
+    reader = tmp_path / "refund-agent"
+    reader.mkdir()
+    shutil.copy(REFUND_AGENT / "refund_agent.py", reader)
+    monkeypatch.chdir(reader)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
+        monkeypatch.setenv("WYRD_SERVER_URL", server.base_url)
+        monkeypatch.setenv("WYRD_GRPC_URL", server.grpc_url)
+        monkeypatch.setenv("WYRD_API_KEY", server.tenant_admin_key())
+        yield server
+
+
+def test_docsite_agent_workflow_example(refund_reader: WyrdTestServer) -> None:
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        program = runpy.run_path("refund_agent.py", run_name="__main__")
+    assert printed.getvalue() == (REFUND_AGENT / "output.txt").read_text()
+
+    # Both replies are the same text; only the traces the program exported differ.
+    complete, skipped = program["complete"], program["skipped"]
+    assert complete.reply == skipped.reply
+    assert [span["name"] for span in timeline(refund_reader, complete.trace)] == [
+        "answer-refund",
+        "look-up-order",
+        "draft-reply",
+    ]
+    assert [span["name"] for span in timeline(refund_reader, skipped.trace)] == [
+        "answer-refund",
+        "draft-reply",
+    ]
+
+
+def test_docsite_investigate_example(refund_reader: WyrdTestServer) -> None:
+    with contextlib.redirect_stdout(io.StringIO()):
+        runpy.run_path("refund_agent.py", run_name="__main__")
+    shutil.copy(REFUND_AGENT / "investigate.py", ".")
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        program = runpy.run_path("investigate.py", run_name="__main__")
+    assert printed.getvalue() == (REFUND_AGENT / "investigate-output.txt").read_text()
+
+    # The execution it found is the skipped run's, and reads refuse an unknown or foreign execution alike.
+    assert program["details"]["outcome"]["evidence"]["reply"]["value"].startswith("Order 1042")
+    with pytest.raises(WyrdError) as unknown:
+        verify.Execution.connect("01a1ec29-0000-7000-8000-000000000000").details()
+    assert unknown.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    foreign = WyrdClient(
+        credential=refund_reader.bootstrap_service_in_tenant(
+            refund_reader.seed_tenant("refund-foreigner"), ["admin"], name="refund-foreigner"
+        )
+    )
+    with pytest.raises(WyrdError) as refused:
+        verify.Execution.connect(program["execution_id"], client=foreign).details()
+    assert refused.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"

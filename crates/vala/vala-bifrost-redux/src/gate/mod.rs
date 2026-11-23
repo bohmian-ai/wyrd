@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::scribe::wal::ContentHasher;
 use arrow::record_batch::RecordBatch;
-use sha2::{Digest as _, Sha256};
 use tracing::Instrument;
 use uuid::Uuid;
 use wyrd_auth_verify::VerifiedToken;
@@ -41,6 +41,8 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
+use crate::tables::logs::LogInput;
+use crate::tables::traces::TraceInput;
 use crate::tables::{
     ApprovalsTable, CallsTable, DomainTable, EvidenceTable, ExecutionEventsTable,
     ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable, ResultsTable, SeriesTable,
@@ -52,6 +54,23 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
+
+/// One OTLP export authorized, attributed, and projected, owning its batch.
+///
+/// Returned by [`Gate::prepare_trace_input`] or [`Gate::prepare_log_input`]
+/// and consumed by [`Gate::dispatch_prepared`]; `O` is the signal's
+/// partial-success outcome.
+#[derive(Debug)]
+pub struct PreparedExport<O> {
+    /// The table the batch lands in.
+    table: TableRef,
+    /// The accepted records' canonical batch.
+    batch: RecordBatch,
+    /// The partial-success outcome.
+    outcome: O,
+    /// The Cards the export is attributed to.
+    attributed: Option<Vec<wyrd_spec::ids::CardUid>>,
+}
 
 /// Maps a canonical OTLP projection failure to its ingest refusal.
 ///
@@ -118,7 +137,7 @@ fn record_write_rejection(error: &IngestError) {
 ///
 /// OTLP is at-least-once and carries no request idempotency key, so a retried
 /// export must be recognized by what it accepted rather than by transport
-/// metadata. The identity is the SHA-256 of a domain separator, the
+/// metadata. The identity is the XXH3-128 of a domain separator, the
 /// authenticated tenant, the verified publisher's subject and current actor
 /// (the pair Scribe stamps on the rows), the logical table FQN,
 /// the accepted `context` — workload root and deployment environment — that
@@ -133,25 +152,22 @@ fn record_write_rejection(error: &IngestError) {
 /// publisher's attribution. Scoping by tenant and
 /// table keeps identity from correlating across either boundary.
 ///
-/// The first sixteen digest bytes are stamped with the RFC 4122 variant and
-/// UUID version 7 so the value satisfies the same `wyrd_batch_id` contract the
-/// native ingest path enforces. Scribe's WAL and Postgres commit fence then own
-/// the actual duplicate decision: a repeat returns `AlreadyCommitted` and a
-/// digest collision carrying a different durable identity stays fail-closed.
-///
-/// # Panics
-///
-/// Never panics: the sixteen-byte slice of a SHA-256 digest is infallible and
-/// its `expect` names that invariant.
+/// The XXH3-128 digest is stamped with the RFC 9562 variant and UUID version
+/// 8, the version for custom layouts: the id has no timestamp, and version 8
+/// marks it as content-derived. Native ingest accepts only version 7 client
+/// ids, so a version 8 id can only come from here, and Scribe recognises its
+/// retries by id alone ([`crate::scribe::preprocess::is_content_derived`]).
+/// Scribe's WAL and Postgres commit fence then own the duplicate decision: a
+/// repeat returns `AlreadyCommitted`.
 #[must_use]
 fn otlp_batch_id(
     tenant: DataTenantId,
     publisher: Attribution,
     context: [Option<&str>; 2],
     table: &TableRef,
-    logical_digest: &[u8; 32],
+    logical_digest: &crate::scribe::wal::ContentDigest,
 ) -> Uuid {
-    let mut digest = Sha256::new();
+    let mut digest = ContentHasher::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
     digest.update(publisher.sub_principal_id.as_uuid().as_bytes());
@@ -166,9 +182,8 @@ fn otlp_batch_id(
     }
     digest.update(table.fqn().as_bytes());
     digest.update(logical_digest);
-    let digest: [u8; 32] = digest.finalize().into();
-    let mut bytes: [u8; 16] = digest[..16].try_into().expect("sixteen digest bytes");
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    let mut bytes = digest.finish();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
 }
@@ -864,31 +879,98 @@ impl<A: GateAudit + 'static> Gate<A> {
         auth: &AuthContext,
         decoded: DecodedOtlp<ExportTraceServiceRequest>,
     ) -> Result<IngestOutcome, IngestError> {
+        let prepared = self
+            .prepare_trace_input(
+                auth,
+                &TraceInput::from_generated(&decoded.request.resource_spans),
+            )
+            .await?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
+        self.dispatch_export(auth, prepared, decoded.wire_bytes, decoded.owner)
+            .await
+    }
+
+    /// Authorize, attribute, and project one flattened trace export.
+    ///
+    /// This is the first half of trace ingest for a decoder whose input
+    /// borrows its transport buffer: the returned batch owns its data, so the
+    /// caller releases the input and buffer before
+    /// [`Self::dispatch_prepared`] hands the batch to Scribe. Card attribution
+    /// reads every span, including spans projection then rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, attribution, or projection errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
+    pub async fn prepare_trace_input(
+        &self,
+        auth: &AuthContext,
+        input: &TraceInput<'_>,
+    ) -> Result<PreparedExport<IngestOutcome>, IngestError> {
+        let table = TableRef::new(BifrostNamespace::Traces, "spans");
         self.ensure_open()?;
-        self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Traces, "spans"))
-            .await?;
+        self.authorize_record_write(auth, &table).await?;
         let attributed = self
-            .attributed_cards(auth, || attribution::span_card_uids(&decoded.request))
+            .attributed_cards(auth, || attribution::span_card_uids(input))
             .await?;
-        let (batch, outcome) = crate::tables::traces::project_resource_spans(
-            &decoded.request.resource_spans,
+        let (batch, outcome) = crate::tables::traces::project_trace_input(
+            input,
             attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
-        // The generated request is no longer read; free its backing before
-        // Scribe adopts the decode owner and charges the projected Arrow.
-        drop(decoded.request);
+        Ok(PreparedExport {
+            table,
+            batch,
+            outcome,
+            attributed,
+        })
+    }
+
+    /// Hand one prepared export and its decode owner to Scribe.
+    ///
+    /// `wire_bytes` is the export's encoded size. Returns the partial-success
+    /// outcome projection produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns request-limit or Scribe errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
+    pub async fn dispatch_prepared<O>(
+        &self,
+        auth: &AuthContext,
+        prepared: PreparedExport<O>,
+        wire_bytes: usize,
+        owner: OtlpDecodeOwner,
+    ) -> Result<O, IngestError> {
+        self.dispatch_export(auth, prepared, wire_bytes, Some(owner))
+            .await
+    }
+
+    /// Dispatch a prepared export with its optional decode owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns request-limit or Scribe errors.
+    async fn dispatch_export<O>(
+        &self,
+        auth: &AuthContext,
+        prepared: PreparedExport<O>,
+        wire_bytes: usize,
+        owner: Option<OtlpDecodeOwner>,
+    ) -> Result<O, IngestError> {
         self.dispatch_canonical(
             auth,
-            TableRef::new(BifrostNamespace::Traces, "spans"),
-            decoded.wire_bytes,
-            batch,
-            decoded.owner,
-            attributed,
+            prepared.table,
+            wire_bytes,
+            prepared.batch,
+            owner,
+            prepared.attributed,
         )
         .await?;
-        Ok(outcome)
+        Ok(prepared.outcome)
     }
 
     /// Routes one adapter-decoded metrics export and its move-only owner.
@@ -940,31 +1022,53 @@ impl<A: GateAudit + 'static> Gate<A> {
         auth: &AuthContext,
         decoded: DecodedOtlp<ExportLogsServiceRequest>,
     ) -> Result<LogsOutcome, IngestError> {
+        let prepared = self
+            .prepare_log_input(
+                auth,
+                &LogInput::from_generated(&decoded.request.resource_logs),
+            )
+            .await?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
+        self.dispatch_export(auth, prepared, decoded.wire_bytes, decoded.owner)
+            .await
+    }
+
+    /// Authorize, attribute, and project one flattened log export.
+    ///
+    /// The log counterpart of [`Self::prepare_trace_input`]: the returned
+    /// batch owns its data, so the caller releases the input and buffer before
+    /// [`Self::dispatch_prepared`]. Card attribution reads every record,
+    /// including records projection then rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, attribution, or projection errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
+    pub async fn prepare_log_input(
+        &self,
+        auth: &AuthContext,
+        input: &LogInput<'_>,
+    ) -> Result<PreparedExport<LogsOutcome>, IngestError> {
+        let table = TableRef::new(BifrostNamespace::Logs, "records");
         self.ensure_open()?;
-        self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Logs, "records"))
-            .await?;
+        self.authorize_record_write(auth, &table).await?;
         let attributed = self
-            .attributed_cards(auth, || attribution::log_card_uids(&decoded.request))
+            .attributed_cards(auth, || attribution::log_card_uids(input))
             .await?;
-        let (batch, outcome) = crate::tables::logs::project_resource_logs(
-            &decoded.request.resource_logs,
+        let (batch, outcome) = crate::tables::logs::project_log_input(
+            input,
             attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("log", &error))?;
-        // The generated request is no longer read; free its backing before
-        // Scribe adopts the decode owner and charges the projected Arrow.
-        drop(decoded.request);
-        self.dispatch_canonical(
-            auth,
-            TableRef::new(BifrostNamespace::Logs, "records"),
-            decoded.wire_bytes,
+        Ok(PreparedExport {
+            table,
             batch,
-            decoded.owner,
+            outcome,
             attributed,
-        )
-        .await?;
-        Ok(outcome)
+        })
     }
 
     /// Routes one projected canonical OTLP batch to Scribe under retry
@@ -3203,9 +3307,13 @@ mod otlp_batch_id_tests {
         );
         assert_eq!(
             baseline.get_version(),
-            Some(uuid::Version::SortRand),
-            "the derived identity satisfies the UUIDv7 batch contract"
+            Some(uuid::Version::Custom),
+            "the derived identity is marked UUIDv8, content-derived"
         );
+        assert!(crate::scribe::preprocess::is_content_derived(baseline));
+        assert!(!crate::scribe::preprocess::is_content_derived(
+            uuid::Uuid::now_v7()
+        ));
         for divergent in [
             id(other_tenant, principal, &spans, &[1, 2, 3], Some("run-a")),
             id(tenant, other_principal, &spans, &[1, 2, 3], Some("run-a")),

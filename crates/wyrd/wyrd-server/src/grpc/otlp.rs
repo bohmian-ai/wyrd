@@ -10,17 +10,17 @@ use std::task::{Context, Poll};
 
 use secrecy::SecretString;
 use tower::Service;
-use vala_bifrost_redux::contracts::DecodedOtlp;
+use vala_bifrost_redux::contracts::{DecodedOtlp, OtlpDecodeOwner};
 use vala_bifrost_redux::gate::auth::read_or_mint_request_id;
 use vala_bifrost_redux::gate::{AuthContext, IngestError};
 use wyrd_tonic::error::wyrd_error_to_status;
-use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
+use wyrd_tonic::otlp::logs_service::ExportLogsServiceResponse;
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceResponse;
 use wyrd_tonic::prost::Message;
-use wyrd_tonic::prost::bytes::Buf;
+use wyrd_tonic::prost::bytes::{Buf, Bytes};
 use wyrd_tonic::tonic::body::Body as TonicBody;
 use wyrd_tonic::tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use wyrd_tonic::tonic::codegen::http::{Request as HttpRequest, Response as HttpResponse};
@@ -35,8 +35,8 @@ use crate::components::auth::routes::TokenGrants;
 use crate::components::auth::token_extract::{
     WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER,
 };
-use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
-use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
+use crate::otlp_decode::{TracePoolCounts, decode_trace, preflight_trace_protobuf};
+use crate::otlp_logs_decode::{LogPoolCounts, decode_logs, preflight_logs_protobuf};
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
 use crate::state::Bifrost;
 
@@ -277,20 +277,41 @@ struct TraceExportUnary {
     auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
-impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
+impl UnaryService<OtlpWire<TracePoolCounts>> for TraceExportUnary {
     type Response = ExportTraceServiceResponse;
     type Future =
         Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
 
-    /// Consumes call-scoped authentication, routes the request, and returns partial success.
-    fn call(&mut self, request: Request<DecodedOtlp<ExportTraceServiceRequest>>) -> Self::Future {
+    /// Consumes call-scoped authentication, decodes and routes the export,
+    /// and returns partial success.
+    ///
+    /// The export is decoded while its wire is held and the wire is released
+    /// before Scribe adopts the decode owner.
+    fn call(&mut self, request: Request<OtlpWire<TracePoolCounts>>) -> Self::Future {
         let gate = Arc::clone(&self.gate);
         let auth = self.auth.take();
         Box::pin(async move {
             let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
+            let OtlpWire {
+                bytes,
+                counts,
+                owner,
+            } = request.into_inner();
+            let wire_bytes = bytes.len();
+            let prepared = {
+                record_codec_activity("decode");
+                let decoded = timed_decode("bifrost.otlp.traces.decode", || {
+                    decode_trace(&bytes, counts).map_err(ingest_status)
+                })?;
+                decoded
+                    .prepare(gate.gate(), &auth)
+                    .await
+                    .map_err(ingest_status)?
+            };
+            drop(bytes);
             let outcome = gate
                 .gate()
-                .ingest_decoded_resource_spans(&auth, request.into_inner())
+                .dispatch_prepared(&auth, prepared, wire_bytes, owner)
                 .await
                 .map_err(ingest_status)?;
             Ok(Response::new(ExportTraceServiceResponse {
@@ -377,7 +398,7 @@ struct TraceOtlpCodec {
 
 impl Codec for TraceOtlpCodec {
     type Encode = ExportTraceServiceResponse;
-    type Decode = DecodedOtlp<ExportTraceServiceRequest>;
+    type Decode = OtlpWire<TracePoolCounts>;
     type Encoder = OtlpResponseEncoder<ExportTraceServiceResponse>;
     type Decoder = TraceRequestDecoder;
 
@@ -427,6 +448,19 @@ where
     }
 }
 
+/// One preflighted export's wire and the capacity reserved for it.
+///
+/// The handler decodes it, so a borrowed decode can outlive the codec frame.
+/// `C` is the signal's preflight pool counts.
+struct OtlpWire<C> {
+    /// The export's encoded protobuf, split from tonic's frame without a copy.
+    bytes: Bytes,
+    /// The views and pooled values its borrowed decode holds.
+    counts: C,
+    /// Capacity reserved from the preflight plan.
+    owner: OtlpDecodeOwner,
+}
+
 /// Trace protobuf decoder that acquires capacity after wire preflight.
 struct TraceRequestDecoder {
     /// Gate used to acquire exactly the preflighted decode capacity.
@@ -434,10 +468,11 @@ struct TraceRequestDecoder {
 }
 
 impl Decoder for TraceRequestDecoder {
-    type Item = DecodedOtlp<ExportTraceServiceRequest>;
+    type Item = OtlpWire<TracePoolCounts>;
     type Error = Status;
 
-    /// Preflights a complete tonic message, reserves, then constructs prost types.
+    /// Preflights a complete tonic message, reserves, then hands its wire to
+    /// the handler for decode.
     ///
     /// The tonic decode buffer is contiguous for one unary frame. Refusing a
     /// fragmented view avoids a hidden consolidation allocation.
@@ -456,7 +491,7 @@ impl Decoder for TraceRequestDecoder {
             ));
         }
         record_codec_activity("preflight");
-        let plan = preflight_trace_protobuf(bytes, self.gate.gate().otlp_wire_limits())
+        let (plan, counts) = preflight_trace_protobuf(bytes, self.gate.gate().otlp_wire_limits())
             .map_err(ingest_status)?;
         record_codec_activity("reserve");
         let owner = self
@@ -464,12 +499,11 @@ impl Decoder for TraceRequestDecoder {
             .gate()
             .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(ingest_status)?;
-        record_codec_activity("decode");
-        let request = timed_decode("bifrost.otlp.traces.decode", || {
-            decode_trace_protobuf(bytes).map_err(ingest_status)
-        })?;
-        source.advance(plan.wire_bytes);
-        Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
+        Ok(Some(OtlpWire {
+            bytes: source.copy_to_bytes(plan.wire_bytes),
+            counts,
+            owner,
+        }))
     }
 }
 
@@ -740,20 +774,41 @@ struct LogsExportUnary {
     auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
-impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
+impl UnaryService<OtlpWire<LogPoolCounts>> for LogsExportUnary {
     type Response = ExportLogsServiceResponse;
     type Future =
         Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
 
-    /// Consumes call-scoped authentication and transfers the typed request to Scribe.
-    fn call(&mut self, request: Request<DecodedOtlp<ExportLogsServiceRequest>>) -> Self::Future {
+    /// Consumes call-scoped authentication, decodes and routes the export,
+    /// and returns partial success.
+    ///
+    /// The export is decoded while its wire is held and the wire is released
+    /// before Scribe adopts the decode owner.
+    fn call(&mut self, request: Request<OtlpWire<LogPoolCounts>>) -> Self::Future {
         let gate = Arc::clone(&self.gate);
         let auth = self.auth.take();
         Box::pin(async move {
             let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
+            let OtlpWire {
+                bytes,
+                counts,
+                owner,
+            } = request.into_inner();
+            let wire_bytes = bytes.len();
+            let prepared = {
+                record_codec_activity("decode");
+                let decoded = timed_decode("bifrost.otlp.logs.decode", || {
+                    decode_logs(&bytes, counts).map_err(ingest_status)
+                })?;
+                decoded
+                    .prepare(gate.gate(), &auth)
+                    .await
+                    .map_err(ingest_status)?
+            };
+            drop(bytes);
             let outcome = gate
                 .gate()
-                .ingest_decoded_resource_logs(&auth, request.into_inner())
+                .dispatch_prepared(&auth, prepared, wire_bytes, owner)
                 .await
                 .map_err(ingest_status)?;
             Ok(Response::new(ExportLogsServiceResponse {
@@ -771,7 +826,7 @@ struct LogsOtlpCodec {
 
 impl Codec for LogsOtlpCodec {
     type Encode = ExportLogsServiceResponse;
-    type Decode = DecodedOtlp<ExportLogsServiceRequest>;
+    type Decode = OtlpWire<LogPoolCounts>;
     type Encoder = OtlpResponseEncoder<ExportLogsServiceResponse>;
     type Decoder = LogsRequestDecoder;
 
@@ -795,10 +850,11 @@ struct LogsRequestDecoder {
 }
 
 impl Decoder for LogsRequestDecoder {
-    type Item = DecodedOtlp<ExportLogsServiceRequest>;
+    type Item = OtlpWire<LogPoolCounts>;
     type Error = Status;
 
-    /// Constructs one fixed-capacity typed logs request from a contiguous frame.
+    /// Preflights a complete tonic message, reserves, then hands its wire to
+    /// the handler for decode.
     ///
     /// # Errors
     ///
@@ -814,7 +870,7 @@ impl Decoder for LogsRequestDecoder {
             ));
         }
         record_codec_activity("preflight");
-        let plan = preflight_logs_protobuf(bytes, self.gate.gate().otlp_wire_limits())
+        let (plan, counts) = preflight_logs_protobuf(bytes, self.gate.gate().otlp_wire_limits())
             .map_err(ingest_status)?;
         record_codec_activity("reserve");
         let owner = self
@@ -822,12 +878,11 @@ impl Decoder for LogsRequestDecoder {
             .gate()
             .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(ingest_status)?;
-        record_codec_activity("decode");
-        let request = timed_decode("bifrost.otlp.logs.decode", || {
-            decode_logs_protobuf(bytes).map_err(ingest_status)
-        })?;
-        source.advance(plan.wire_bytes);
-        Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
+        Ok(Some(OtlpWire {
+            bytes: source.copy_to_bytes(plan.wire_bytes),
+            counts,
+            owner,
+        }))
     }
 }
 

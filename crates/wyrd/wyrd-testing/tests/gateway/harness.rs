@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use url::Url;
 use wiremock::{MockServer, Request};
 use wyrd_client::bifrost::BifrostOptions;
+use wyrd_kms::KmsConfig;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_testing::Bootstrap;
@@ -105,8 +106,22 @@ impl Journey {
     /// # Panics
     /// Panics when startup, role seeding, bootstrap, or token exchange fails.
     pub(crate) async fn start() -> Self {
+        Self::start_on(None).await
+    }
+
+    /// Boots like [`Self::start`], sealing stored secrets under `kms`
+    /// instead of the default generated file key when one is given.
+    /// Restarts keep the same `[kms]`.
+    ///
+    /// # Panics
+    /// Panics when startup, role seeding, bootstrap, or token exchange fails.
+    pub(crate) async fn start_on(kms: Option<KmsConfig>) -> Self {
         let upstream = MockServer::start().await;
-        let server = Box::pin(Self::builder(&upstream).start_bound())
+        let mut builder = Self::builder(&upstream);
+        if let Some(kms) = kms {
+            builder = builder.with_kms_for_test(kms);
+        }
+        let server = Box::pin(builder.start_bound())
             .await
             .expect("test server starts");
         let invoke: Vec<Permission> = INVOKED_DEPLOYMENTS
@@ -140,6 +155,43 @@ impl Journey {
             .await
             .expect("test server restarts");
         Self::connect(server, self.upstream, self.api_keys).await
+    }
+
+    /// Restarts like [`Self::restart`] with `kms` as the restarted
+    /// process's `[kms]`, as a redeploy that points it at another wrapping
+    /// endpoint does.
+    ///
+    /// # Panics
+    /// Panics when shutdown, restart, or token exchange fails.
+    pub(crate) async fn restart_on(self, kms: KmsConfig) -> Self {
+        let builder = Self::builder(&self.upstream).with_kms_for_test(kms);
+        let server = Box::pin(self.server.restart_bound(builder))
+            .await
+            .expect("test server restarts");
+        Self::connect(server, self.upstream, self.api_keys).await
+    }
+
+    /// Invalidation notifications the server's snapshot cache has received.
+    pub(crate) fn invalidations(&self) -> u64 {
+        self.server.state().gateway.snapshot_invalidations()
+    }
+
+    /// Waits until the server's snapshot cache has received `invalidations`
+    /// notifications in all and has no reload queued or running, so every
+    /// committed write has been loaded and prepared in the background.
+    ///
+    /// # Panics
+    /// Panics when the cache does not settle within ten seconds.
+    pub(crate) async fn settled(&self, invalidations: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let gateway = &self.server.state().gateway;
+        while gateway.snapshot_invalidations() < invalidations || !gateway.snapshots_settled() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the gateway snapshot cache never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Server builder whose built-in adapters target `upstream`.

@@ -6,17 +6,14 @@
 //! when the attempt finishes.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::gateway::{ProviderCredentialState, ProviderDeployment};
 use wyrd_spec::ids::SecretBackendName;
 use wyrd_spec::security::SecretRef;
 use wyrd_utils::secret::read_secret_ref;
 
-use crate::managed::ManagedSecretBinding;
 use crate::snapshot::{GatewayCredentialSource, GatewayTenantSnapshot};
 use crate::vault::VaultBackend;
 
@@ -61,29 +58,25 @@ pub enum CredentialError {
     /// The source exists but produced no usable value.
     #[error("provider credential source is unavailable")]
     Unavailable,
+    /// The managed secret could not be prepared because the key service was
+    /// unavailable; a background reload is retrying it.
+    #[error("provider credential is awaiting preparation")]
+    Pending,
 }
 
 /// Resolves deployment credentials from operator bindings, Vault backends,
-/// and the deployment sealing keyring protecting managed secrets.
+/// and the managed secrets the admitted snapshot already prepared.
 #[derive(Debug, Clone, Default)]
 pub struct CredentialResolver {
     /// Vault KV v2 backends keyed by operator-declared identity.
     backends: BTreeMap<SecretBackendName, VaultBackend>,
-    /// Deployment sealing keyring, the same one gateway administration seals
-    /// with; `None` on a keyless deployment, where managed secrets are
-    /// unconfigured.
-    keyring: Option<Arc<SealingKeyring>>,
 }
 
 impl CredentialResolver {
-    /// Builds a resolver over the configured Vault backends and the
-    /// deployment sealing keyring.
+    /// Builds a resolver over the configured Vault backends.
     #[must_use]
-    pub fn new(
-        backends: BTreeMap<SecretBackendName, VaultBackend>,
-        keyring: Option<Arc<SealingKeyring>>,
-    ) -> Self {
-        Self { backends, keyring }
+    pub fn new(backends: BTreeMap<SecretBackendName, VaultBackend>) -> Self {
+        Self { backends }
     }
 
     /// Resolves the plaintext `deployment` authenticates with for `tenant`,
@@ -95,10 +88,10 @@ impl CredentialResolver {
     /// and — for `OpenAiCompatible` — the deployment's exact endpoint host.
     /// Environment bindings read the operator's environment variable or
     /// restrictive mounted file; Vault sources read the latest version afresh;
-    /// a managed secret is opened locally with the deployment sealing keyring
-    /// and must be bound to `tenant`, with no Postgres round trip beyond the
-    /// admission snapshot. Surrounding
-    /// whitespace is trimmed and an empty value fails closed.
+    /// a managed secret is the value the snapshot loader opened for `tenant`,
+    /// read from memory with no key-service or Postgres wait, and one whose
+    /// preparation hit a key-service outage is [`CredentialError::Pending`].
+    /// Surrounding whitespace is trimmed and an empty value fails closed.
     ///
     /// # Errors
     ///
@@ -123,8 +116,8 @@ impl CredentialResolver {
             return Err(CredentialError::ProviderMismatch);
         }
         // A managed secret carries no operator binding: the submitting tenant
-        // is its authority, and the sealed payload binds the identity an
-        // operator assignment would otherwise cover.
+        // is its authority, and its envelope binds the identity an operator
+        // assignment would otherwise cover.
         let managed = matches!(
             credential.source,
             GatewayCredentialSource::ManagedSecret { .. }
@@ -147,17 +140,13 @@ impl CredentialResolver {
                     .fetch(reference)
                     .await?
             }
-            GatewayCredentialSource::ManagedSecret { sealed } => ManagedSecretBinding {
-                tenant,
-                name: &credential.name,
-                provider: &credential.provider,
+            GatewayCredentialSource::ManagedSecret { secret, pending } => {
+                secret.clone().ok_or(if *pending {
+                    CredentialError::Pending
+                } else {
+                    CredentialError::Unavailable
+                })?
             }
-            .open(
-                self.keyring
-                    .as_deref()
-                    .ok_or(CredentialError::Unconfigured)?,
-                sealed,
-            )?,
         };
         let trimmed = raw.expose_secret().trim();
         if trimmed.is_empty() {
@@ -301,7 +290,6 @@ mod tests {
                     (SecretBackendName::new(*name).expect("backend"), backend)
                 })
                 .collect(),
-            None,
         )
     }
 

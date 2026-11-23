@@ -3017,7 +3017,7 @@ impl Oracle {
         let physical_planning = planned.profile.physical_planning.timer();
         // Planning reads manifests and Parquet footers, so it runs under the
         // query deadline like every other read.
-        let root = Self::before_deadline(deadline, planning.state().create_physical_plan(&logical))
+        let root = Self::before_deadline(deadline, Self::plan_physical(&planning, &logical))
             .await?
             .map_err(|error| map_query_planning_error(&error))?;
         physical_planning.done();
@@ -3294,6 +3294,29 @@ impl Oracle {
             .map_err(|error| map_sql_planning_error(&error))?;
         authorize_payload_columns(context, &plan)?;
         Ok(plan)
+    }
+
+    /// Builds the physical root of `logical`, a plan [`Self::plan_logical`]
+    /// already optimized and authorized, through `session`'s registered
+    /// query planner.
+    ///
+    /// `SessionState::create_physical_plan` would optimize the plan again; the
+    /// planner is called directly so the logical optimizer runs once per query
+    /// and the plan the payload gate inspected is the plan that executes. The
+    /// physical optimizer still runs inside the planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the planner's `DataFusion` error unchanged.
+    async fn plan_physical(
+        session: &SessionContext,
+        logical: &datafusion::logical_expr::LogicalPlan,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let state = session.state();
+        state
+            .query_planner()
+            .create_physical_plan(logical, &state)
+            .await
     }
 }
 
@@ -4924,6 +4947,71 @@ mod tests {
     /// Panics when the query is not one valid Bifrost `SELECT`.
     pub(super) fn statement(sql: &str) -> DfStatement {
         parse_select(sql).expect("test query validates").0
+    }
+
+    /// A planned query runs the logical optimizer once: building its physical
+    /// root from the optimized, authorized plan applies no further logical
+    /// optimizer pass, and the root still reads the query's table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the statement cannot be planned, the physical build runs
+    /// another logical optimizer pass, or the root reads no table.
+    #[tokio::test]
+    async fn physical_planning_reuses_the_optimized_logical_plan() {
+        use datafusion::common::tree_node::Transformed;
+        use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
+
+        /// Counts each logical optimizer pass over a whole plan.
+        #[derive(Debug, Default)]
+        struct Passes(std::sync::atomic::AtomicUsize);
+        impl OptimizerRule for Passes {
+            fn name(&self) -> &'static str {
+                "count_passes"
+            }
+            fn rewrite(
+                &self,
+                plan: datafusion::logical_expr::LogicalPlan,
+                _config: &dyn OptimizerConfig,
+            ) -> datafusion::error::Result<Transformed<datafusion::logical_expr::LogicalPlan>>
+            {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Transformed::no(plan))
+            }
+        }
+
+        let passes = Arc::new(Passes::default());
+        let session = SessionContext::new_with_state(
+            datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                payload_session().state(),
+            )
+            .with_optimizer_rule(Arc::clone(&passes) as _)
+            .build(),
+        );
+        let metadata = payload_context(&[Permission::bifrost_query_read()]);
+        let logical = Oracle::plan_logical(
+            &session,
+            &metadata,
+            &statement("SELECT severity_text FROM bifrost.logs.records WHERE severity_number = $1"),
+            &[QueryParam::Int(9)],
+        )
+        .await
+        .expect("plans");
+        let optimized = passes.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(optimized > 0, "the logical plan was optimized");
+
+        let root = Oracle::plan_physical(&session, &logical)
+            .await
+            .expect("physical root");
+
+        assert_eq!(
+            passes.0.load(std::sync::atomic::Ordering::Relaxed),
+            optimized
+        );
+        let shown = datafusion::physical_plan::displayable(root.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(shown.contains("DataSourceExec"), "{shown}");
     }
 
     /// One validated statement plans afresh for every request binding: its

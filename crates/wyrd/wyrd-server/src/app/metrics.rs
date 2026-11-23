@@ -200,6 +200,12 @@ pub const GATEWAY_QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds"
 /// benchmarking: its execution task's dispatch, the caller's resumption on
 /// its answer, or its provider header wait and body receipt.
 pub const GATEWAY_WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
+/// One stage of a Scribe outbox write, by `stage`, recorded only while
+/// benchmarking: the write's row projection into frames (`frames`), and per
+/// chunk its delivery-permit wait (`permit`), blocking-pool start delay
+/// (`encode_queue`), encoding (`encode`), and each stream's submission until
+/// Scribe answers it (`submit`).
+pub const SCRIBE_OUTBOX_STAGE_SECONDS: &str = "wyrd_scribe_outbox_stage_seconds";
 
 /// Gateway latency families sharing [`VERIFICATION_DURATION_BUCKETS`], so a
 /// sub-millisecond overhead p99 is resolvable.

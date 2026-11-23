@@ -783,17 +783,23 @@ the result and inputs rows. Nothing else reads it.
 
 Telemetry supports two setup paths:
 
-- **Wyrd-managed telemetry.** Configure the loaded state once, then call
-  `state.start_telemetry()` (or its language-native equivalent). Wyrd supplies
-  `service.name`, `service.version` and optional `deployment.environment.name`
-  from the frozen state context to its managed OpenTelemetry setup, and exports
-  with the state's validated workload context and existing authentication.
+- **Wyrd-managed telemetry.** Configure the loaded state once:
+  `state.configure()` fixes its context and, by default, installs Wyrd's
+  managed OpenTelemetry setup; `telemetry=False` (`{ telemetry: false }` in
+  TypeScript) fixes the context only. When the optional OpenTelemetry packages
+  are absent, a default `configure()` fails naming them. Rust configures
+  through `WyrdState::configure` and installs with
+  `wyrd_ai::otel::start_telemetry(&state)`, whose returned handle owns the
+  pipeline. Wyrd supplies `service.name`, `service.version` and optional
+  `deployment.environment.name` from the frozen state context to its managed
+  OpenTelemetry setup, and exports with the state's validated workload context
+  and existing authentication.
 - **Application-managed telemetry.** The application owns its OpenTelemetry
   providers, resources and lifecycle. It supplies `service.name`,
   `service.version` and optional `deployment.environment.name` on its resources,
   and sends spans, logs and metrics through standard OTLP exporters to Wyrd's
   supported endpoints with supported authentication. This path does not require
-  WyrdState, `state.start_telemetry()`, or an exporter accepting a state. Wyrd
+  WyrdState, Wyrd's managed setup, or an exporter accepting a state. Wyrd
   does not copy private state configuration into an application-owned provider.
 
 Both paths use the same ingest validation and table projection. An application
@@ -889,11 +895,12 @@ reuse that client's credential resolution and refresh rather than introducing
 another authentication implementation. Applications may attach those exporters
 to their own OpenTelemetry providers. Framework instrumentation remains owned
 by the application and framework; Wyrd never discovers or patches frameworks.
-A state's `start_telemetry` installs one managed global provider; that state's
+A state's managed setup installs one managed global provider; that state's
 `flush` and `shutdown` force-flush it before draining the writer, still drain
 when it fails, and report the failure as `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`
-or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. An application-owned provider is
-never flushed by a state.
+or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. A state that never started Bifrost
+has no writer to drain, so a telemetry-only program flushes without starting
+it. An application-owned provider is never flushed by a state.
 
 Env vars in deployed services:
 
@@ -1210,8 +1217,8 @@ introduce a competing request identity.
 #### Trace context — W3C `traceparent` and `tracestate`
 
 Every Wyrd SDK sends the caller's active OpenTelemetry span as W3C
-`traceparent`/`tracestate` on each HTTP and gRPC request, and its
-`start_telemetry` installs the W3C trace-context propagator, so standard
+`traceparent`/`tracestate` on each HTTP and gRPC request, and its managed
+telemetry setup installs the W3C trace-context propagator, so standard
 instrumentation carries the same trace to the next service. A queued Bifrost
 write records a `bifrost.enqueue` PRODUCER span in the caller's own tracer;
 the server's `bifrost.gate.write` CONSUMER span links each batch's producers.
@@ -2216,7 +2223,7 @@ prepares a live in-memory `RunState` for recovery checkpoints; direct verify
 runs the same engine without that state or the checkpoint adapter.
 Preparation (input validation, authorization, exact target
 resolution including cold loads, and for queued work the batched claim, pinned
-input/source/policy, accepted authority, original deadline and exact accepted
+input/source/policy, original deadline and newest readable compatible
 recovery) completes before the engine starts. Engine transitions (begin, forget,
 settle, control, publication acceptance and replay, terminal selection and
 failure) validate and mutate live memory and return at once; they never wait for
@@ -2268,13 +2275,15 @@ finalizer or owed-delivery queue exists. Scheduled/group activation retains the
 same queue path.
 
 A crash loses live and unaccepted progress, including an unaccepted terminal
-decision. Direct work never resumes. Queued redelivery recovers the exact
-accepted revision (the fenced prefix) with the same execution ID, input, source,
+decision. Direct work never resumes. Queued redelivery recovers the newest
+readable compatible revision from Bifrost with the same execution ID, input, source,
 policy and original deadline, and may repeat later work, effects and spend; lost
-spend is not reconstructed. A recovered accepted terminal decision is delivered
-without recomputation. Recovery returns the exact accepted compatible state,
-authoritative absence, or explicit unavailability; unavailability defers
-preparation and is never treated as absence. A snapshot that does not decode
+spend is not reconstructed. A recovered terminal decision is delivered without
+recomputation. If no checkpoint is readable, recovery starts from fresh state.
+A newer accepted revision can temporarily be unreadable. Fixed revision batch
+identities prevent overwriting it: a conflicting save makes the writer stale and
+retries recovery, and settlement waits for its own saves to be acknowledged.
+A failed recovery query defers preparation as unavailable. A snapshot that does not decode
 as a supported `ExecutionState` format defers with `execution_state_incompatible`.
 A revision the old owner froze just before takeover may still be accepted ahead
 of the replacement's and is then inherited; this rare interval is accepted and no
@@ -2934,20 +2943,17 @@ protocol-versioned additions):
 tenant connection by provider and name. Tenant administrators manage
 connections through `/v1/operator-connections` (`operators:read` /
 `operators:write`) and every SDK, CLI, and MCP projection. Wyrd stores each
-secret itself in Postgres, envelope-encrypted: a per-row data key sealed with
-AAD binding tenant, connection, provider, name, and secret version, wrapped by
-a versioned key-encryption key from an environment variable, owner-only
-files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault over
-HTTPS so each tenant has its own key, and fails startup if the provider or any
-active tenant's active 32-byte key is unavailable; environment keys are
-development-only, and owner-only key files may serve an explicitly
-single-tenant deployment. Without a readable key only connection
-create/update refuses; other surfaces keep working and delivery retries with
-`credential_store_unavailable`. Vault reads use the shared screened and
-pinned `wyrd-vault` KV v2 reader that Gateway also uses for provider
-credentials; only the Operator owner interprets and validates the KEK, and no
-general secret resolver backs Operator keys. Rewrap onto a new active version
-runs beside delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
+secret itself in Postgres as one common `WyrdKms` envelope in
+`secret_ciphertext`: a fresh data key per secret version, authenticated with
+tenant, connection, provider, name, and secret version, wrapped by the
+deployment's configured stored-secret backend (file, development memory, GCP
+KMS, AWS KMS, or Vault Transit). The Operator owner keeps connection
+authorization, persistence, reversible disable, and delivery checks; it owns no
+key source, cipher, or provider client of its own. When the wrapping backend
+cannot serve, connection create/update refuses; other surfaces keep working
+and delivery retries with `credential_store_unavailable`. Delivery never
+moves an envelope between wrapping keys; the platform stored-secret
+maintenance pass does, fenced on the observed envelope. Responses, errors,
 logs, and audit carry only redacted metadata, never key locations. Declaration
 and every delivery attempt require an active connection whose provider — and,
 for HTTP, auth scheme, header name, and origin of every effective URL —
@@ -3244,8 +3250,13 @@ values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
 canonical `inputs` maps and whole-map setters retain their names. Rust accepts
 bare JSON Schemas and Python accepts schema dictionaries or supported model
 classes without a mandatory JSON-slot wrapper; a Python Verifier's `inputs`
-may also be one Pydantic model class whose fields are its named slots,
-and a Python Service `Table`'s `schema` may be a model class whose field
+may also be one Pydantic model class whose fields are its named slots.
+A field typed with the SDK's trace marker (`wyrd.verify.Trace` in Python,
+`verify.Trace(z.string())` in TypeScript, `wyrd_ai::verify::Trace` in Rust) declares a `trace`
+slot, whether it is a model field or a mapping value, and carries the trace ID
+string; every other field declares a `json` slot. The marker compiles to the
+canonical `trace` slot, so the stored Card is unchanged. A Python Service
+`Table`'s `schema` may be a model class whose field
 order is the column order. Pydantic is the optional `wyrd-ai[pydantic]` extra.
 Explicit canonical slot forms and distinct non-JSON slot constructors remain
 available. Execution references stay strings such as `inputs.report.text`.

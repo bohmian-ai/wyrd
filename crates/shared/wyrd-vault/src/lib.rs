@@ -1,13 +1,14 @@
-//! The one Vault KV v2 reader Wyrd uses.
+//! The one HashiCorp Vault client Wyrd uses.
 //!
-//! The gateway reads provider credentials and the server reads Operator
-//! key-encryption keys through [`VaultKv2`]. Each caller keeps its own
-//! configuration, token source, and interpretation of the value it reads;
-//! this crate owns only the network read: TLS trust, bounded connect and total
-//! time, a bounded response body, the token and namespace headers, and egress
-//! screening. Every read issues exactly one latest-version request and caches
-//! nothing, so rotation and revocation apply to the next read. Neither the
-//! token nor the value ever enters a URL, log, or error.
+//! The gateway reads provider credentials through [`VaultKv2`], and the
+//! stored-secret facade (`wyrd-kms`) wraps and unwraps data keys through
+//! [`VaultTransit`]. Each caller keeps its own configuration, token source,
+//! and interpretation of the value; this crate owns only the network call:
+//! TLS trust, bounded connect and total time, a bounded response body, the
+//! token and namespace headers, and egress screening. Every call issues
+//! exactly one request and caches nothing, so rotation and revocation apply
+//! to the next call. Neither the token nor a value ever enters a URL, log, or
+//! error.
 //!
 //! Egress screening refuses a literal metadata, link-local, broadcast, or
 //! documentation address before any request, and resolves a hostname through a
@@ -20,13 +21,18 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::HeaderValue;
 use reqwest::redirect::Policy;
-use reqwest::{Certificate, Client, StatusCode};
+use reqwest::{Certificate, Client, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use url::{Host, Url};
+use wyrd_crypt::SecretBytes;
+use zeroize::Zeroizing;
 
 /// Total time one Vault read may take.
 const VAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,17 +73,8 @@ pub enum VaultError {
 /// current token on every read, so the derived `Debug` prints nothing secret.
 #[derive(Debug, Clone)]
 pub struct VaultKv2 {
-    /// Vault server base address.
-    address: Url,
-    /// KV v2 mount path, possibly several segments, without surrounding `/`.
-    mount: String,
-    /// Optional Vault Enterprise namespace.
-    namespace: Option<String>,
-    /// Egress screening of the address literal and every resolved answer.
-    egress: Egress,
-    /// Redirect-free, proxy-free, time-bounded client using the configured
-    /// trust and the screening resolver.
-    client: Client,
+    /// The screened, bounded client for the KV v2 mount.
+    endpoint: Endpoint,
 }
 
 impl VaultKv2 {
@@ -125,22 +122,8 @@ impl VaultKv2 {
         ca_cert: Option<&[u8]>,
         egress: Egress,
     ) -> Result<Self, reqwest::Error> {
-        wyrd_tls::install_crypto_provider().ok();
-        let mut builder = Client::builder()
-            .timeout(VAULT_TIMEOUT)
-            .connect_timeout(VAULT_CONNECT_TIMEOUT)
-            .dns_resolver(Arc::new(ScreeningResolver { egress }))
-            .redirect(Policy::none())
-            .no_proxy();
-        if let Some(pem) = ca_cert {
-            builder = builder.tls_certs_only(Certificate::from_pem_bundle(pem)?);
-        }
         Ok(Self {
-            address,
-            mount: mount.trim_matches('/').to_owned(),
-            namespace,
-            egress,
-            client: builder.build()?,
+            endpoint: Endpoint::new(address, mount, namespace, ca_cert, egress)?,
         })
     }
 
@@ -167,44 +150,11 @@ impl VaultKv2 {
         path: &str,
         field: &str,
     ) -> Result<SecretString, VaultError> {
-        if !self.egress.permits_host(&self.address) {
-            return Err(VaultError::Refused);
-        }
-        let mut token =
-            HeaderValue::from_str(token.expose_secret().trim()).map_err(|_| VaultError::Refused)?;
-        token.set_sensitive(true);
-        let mut url = self.address.clone();
-        url.path_segments_mut()
-            .map_err(|()| VaultError::Refused)?
-            .pop_if_empty()
-            .push("v1")
-            .extend(self.mount.split('/'))
-            .push("data")
-            .extend(path.split('/'));
-        let mut request = self.client.get(url).header("X-Vault-Token", token);
-        if let Some(namespace) = &self.namespace {
-            request = request.header("X-Vault-Namespace", namespace);
-        }
-        let mut response = request.send().await.map_err(|_| VaultError::Unavailable)?;
-        match response.status() {
-            StatusCode::OK => {}
-            StatusCode::NOT_FOUND => return Err(VaultError::Missing),
-            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::METHOD_NOT_ALLOWED => {
-                return Err(VaultError::Refused);
-            }
-            _ => return Err(VaultError::Unavailable),
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| VaultError::Unavailable)?
-        {
-            if body.len() + chunk.len() > MAX_VAULT_RESPONSE_BYTES {
-                return Err(VaultError::Unavailable);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let url = self.endpoint.url(&["data"], path.split('/'))?;
+        let body = self
+            .endpoint
+            .send(self.endpoint.client.get(url), token)
+            .await?;
         let envelope: Value = serde_json::from_slice(&body).map_err(|_| VaultError::Unavailable)?;
         let metadata = &envelope["data"]["metadata"];
         let deleted = metadata["deletion_time"]
@@ -217,6 +167,278 @@ impl VaultKv2 {
             .as_str()
             .map(SecretString::from)
             .ok_or(VaultError::Missing)
+    }
+}
+
+/// A bounded, screened, and pinned client for one Vault Transit mount.
+///
+/// Transit holds the wrapping key; Wyrd sends a data key and its
+/// authenticated associated data and receives Transit's opaque ciphertext,
+/// or the reverse. The key must be an AEAD key type such as `aes256-gcm96`,
+/// which authenticates `associated_data`. The client holds no token, so the
+/// derived `Debug` prints nothing secret.
+#[derive(Debug, Clone)]
+pub struct VaultTransit {
+    /// The screened, bounded client for the Transit mount.
+    endpoint: Endpoint,
+}
+
+impl VaultTransit {
+    /// Builds a Transit client for `mount` at `address`, under the same
+    /// trust, bounds, and egress screening as [`VaultKv2::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the CA bundle does not parse or the
+    /// client cannot be built.
+    pub fn new(
+        address: Url,
+        mount: &str,
+        namespace: Option<String>,
+        ca_cert: Option<&[u8]>,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            endpoint: Endpoint::new(
+                address,
+                mount,
+                namespace,
+                ca_cert,
+                Egress {
+                    block_internal: false,
+                },
+            )?,
+        })
+    }
+
+    /// Encrypts `plaintext` under the named Transit `key`, authenticating
+    /// `associated_data`, and returns Transit's opaque `vault:v<n>:` string.
+    ///
+    /// Sends one `POST {address}/v1/{mount}/encrypt/{key}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Missing`] for an unknown key (HTTP 404) or an
+    /// answer without a ciphertext string, [`VaultError::Refused`] for a
+    /// blocked address, an invalid token, or HTTP 400, 403, or 405, and
+    /// [`VaultError::Unavailable`] for transport failures, timeouts, other
+    /// statuses, and oversized or undecodable bodies.
+    pub async fn encrypt(
+        &self,
+        token: &SecretString,
+        key: &str,
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<String, VaultError> {
+        let url = self.endpoint.url(&["encrypt", key], std::iter::empty())?;
+        let encoded = Zeroizing::new(STANDARD.encode(plaintext));
+        let mut body = SecretBytes::default();
+        serde_json::to_writer(
+            &mut body,
+            &EncryptRequest {
+                plaintext: &encoded,
+                associated_data: &STANDARD.encode(associated_data),
+            },
+        )
+        .map_err(|_| VaultError::Unavailable)?;
+        let request = self
+            .endpoint
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes::Bytes::from_owner(body));
+        let answer = self.endpoint.send(request, token).await?;
+        let answer: Value = serde_json::from_slice(&answer).map_err(|_| VaultError::Unavailable)?;
+        answer["data"]["ciphertext"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or(VaultError::Missing)
+    }
+
+    /// Decrypts Transit `ciphertext` under the named `key`, requiring the
+    /// same `associated_data` it was encrypted with.
+    ///
+    /// Sends one `POST {address}/v1/{mount}/decrypt/{key}`. The returned
+    /// plaintext is zeroized on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Refused`] for a different `associated_data`,
+    /// tampered ciphertext, or any other HTTP 400, 403, or 405, and otherwise
+    /// the classes [`VaultTransit::encrypt`] documents; an answer whose
+    /// plaintext is absent or not base64 is [`VaultError::Unavailable`].
+    pub async fn decrypt(
+        &self,
+        token: &SecretString,
+        key: &str,
+        ciphertext: &str,
+        associated_data: &[u8],
+    ) -> Result<SecretBytes, VaultError> {
+        let url = self.endpoint.url(&["decrypt", key], std::iter::empty())?;
+        let body = json!({
+            "ciphertext": ciphertext,
+            "associated_data": STANDARD.encode(associated_data),
+        });
+        let answer = self
+            .endpoint
+            .send(self.endpoint.client.post(url).json(&body), token)
+            .await?;
+        let answer: DecryptAnswer<'_> =
+            serde_json::from_slice(&answer).map_err(|_| VaultError::Unavailable)?;
+        STANDARD
+            .decode(answer.data.plaintext)
+            .map(|plaintext| SecretBytes::from(Zeroizing::new(plaintext)))
+            .map_err(|_| VaultError::Unavailable)
+    }
+}
+
+/// A Transit encrypt body borrowing its base64 plaintext, so serializing it
+/// into [`SecretBytes`] makes no unprotected copy of the key.
+#[derive(Serialize)]
+struct EncryptRequest<'a> {
+    /// Base64 plaintext.
+    plaintext: &'a str,
+    /// Base64 associated data.
+    associated_data: &'a str,
+}
+
+/// A Transit decrypt answer read in place from the protected response body.
+///
+/// The plaintext borrows the body, so an answer that would need unescaping
+/// into a fresh string fails to parse and is refused instead; Vault's base64
+/// output never contains an escape.
+#[derive(Deserialize)]
+struct DecryptAnswer<'a> {
+    /// The `data` object.
+    #[serde(borrow)]
+    data: DecryptData<'a>,
+}
+
+/// The `data` object of a Transit decrypt answer.
+#[derive(Deserialize)]
+struct DecryptData<'a> {
+    /// Base64 plaintext, borrowed from the protected body.
+    plaintext: &'a str,
+}
+
+/// One Vault mount behind the screened, bounded HTTP client.
+#[derive(Debug, Clone)]
+struct Endpoint {
+    /// Vault server base address.
+    address: Url,
+    /// Mount path, possibly several segments, without surrounding `/`.
+    mount: String,
+    /// Optional Vault Enterprise namespace.
+    namespace: Option<String>,
+    /// Egress screening of the address literal and every resolved answer.
+    egress: Egress,
+    /// Redirect-free, proxy-free, time-bounded client using the configured
+    /// trust and the screening resolver.
+    client: Client,
+}
+
+impl Endpoint {
+    /// Builds the client: no redirects, no proxy, bounded connect and total
+    /// time, the screening resolver, and `ca_cert` replacing platform roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the CA bundle does not parse or the
+    /// client cannot be built.
+    fn new(
+        address: Url,
+        mount: &str,
+        namespace: Option<String>,
+        ca_cert: Option<&[u8]>,
+        egress: Egress,
+    ) -> Result<Self, reqwest::Error> {
+        wyrd_tls::install_crypto_provider().ok();
+        let mut builder = Client::builder()
+            .timeout(VAULT_TIMEOUT)
+            .connect_timeout(VAULT_CONNECT_TIMEOUT)
+            .dns_resolver(Arc::new(ScreeningResolver { egress }))
+            .redirect(Policy::none())
+            .no_proxy();
+        if let Some(pem) = ca_cert {
+            builder = builder.tls_certs_only(Certificate::from_pem_bundle(pem)?);
+        }
+        Ok(Self {
+            address,
+            mount: mount.trim_matches('/').to_owned(),
+            namespace,
+            egress,
+            client: builder.build()?,
+        })
+    }
+
+    /// `{address}/v1/{mount}/{route…}/{rest…}` with every segment
+    /// percent-encoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Refused`] when the address is a blocked literal
+    /// or cannot carry a path.
+    fn url<'a>(
+        &self,
+        route: &[&str],
+        rest: impl Iterator<Item = &'a str>,
+    ) -> Result<Url, VaultError> {
+        if !self.egress.permits_host(&self.address) {
+            return Err(VaultError::Refused);
+        }
+        let mut url = self.address.clone();
+        url.path_segments_mut()
+            .map_err(|()| VaultError::Refused)?
+            .pop_if_empty()
+            .push("v1")
+            .extend(self.mount.split('/'))
+            .extend(route)
+            .extend(rest);
+        Ok(url)
+    }
+
+    /// Sends `request` with the trimmed, sensitive token and the namespace,
+    /// and returns the bounded body of a `200`, kept in [`SecretBytes`]
+    /// because a KV value or a Transit decrypt answer is secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Refused`] for an invalid token header or HTTP
+    /// 400, 403, or 405, [`VaultError::Missing`] for HTTP 404, and
+    /// [`VaultError::Unavailable`] for transport failures, timeouts, other
+    /// statuses, and oversized or undecodable bodies.
+    async fn send(
+        &self,
+        request: RequestBuilder,
+        token: &SecretString,
+    ) -> Result<SecretBytes, VaultError> {
+        let mut token =
+            HeaderValue::from_str(token.expose_secret().trim()).map_err(|_| VaultError::Refused)?;
+        token.set_sensitive(true);
+        let mut request = request.header("X-Vault-Token", token);
+        if let Some(namespace) = &self.namespace {
+            request = request.header("X-Vault-Namespace", namespace);
+        }
+        let mut response = request.send().await.map_err(|_| VaultError::Unavailable)?;
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::NOT_FOUND => return Err(VaultError::Missing),
+            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::METHOD_NOT_ALLOWED => {
+                return Err(VaultError::Refused);
+            }
+            _ => return Err(VaultError::Unavailable),
+        }
+        let mut body = SecretBytes::default();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| VaultError::Unavailable)?
+        {
+            if body.len() + chunk.len() > MAX_VAULT_RESPONSE_BYTES {
+                return Err(VaultError::Unavailable);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -553,5 +775,75 @@ mod tests {
             .await
             .expect("internal Vault resolves");
         assert_eq!(internal.expose_secret(), "sk-internal");
+    }
+
+    /// Transit encrypt and decrypt each send one POST to the named key with
+    /// base64 plaintext or ciphertext and associated data, the token and
+    /// namespace headers, and map Transit's answers onto the closed classes.
+    #[tokio::test]
+    async fn transit_wraps_and_unwraps_through_the_named_key() {
+        use wiremock::matchers::body_json;
+        let server = MockServer::start().await;
+        let transit = VaultTransit::new(
+            Url::parse(&server.uri()).expect("address"),
+            "transit/wyrd",
+            Some("ns1".to_owned()),
+            None,
+        )
+        .expect("client builds");
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/wyrd/encrypt/wyrd-secrets"))
+            .and(header("x-vault-token", TOKEN))
+            .and(header("x-vault-namespace", "ns1"))
+            .and(body_json(
+                json!({"plaintext": "ZGVr", "associated_data": "YWFk"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": {"ciphertext": "vault:v1:opaque"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/wyrd/decrypt/wyrd-secrets"))
+            .and(body_json(
+                json!({"ciphertext": "vault:v1:opaque", "associated_data": "YWFk"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"plaintext": "ZGVr"}})),
+            )
+            .mount(&server)
+            .await;
+        let wrapped = transit
+            .encrypt(&token(), "wyrd-secrets", b"dek", b"aad")
+            .await
+            .expect("encrypts");
+        assert_eq!(wrapped, "vault:v1:opaque");
+        let plaintext = transit
+            .decrypt(&token(), "wyrd-secrets", &wrapped, b"aad")
+            .await
+            .expect("decrypts");
+        assert_eq!(&plaintext[..], b"dek");
+
+        for (status, expected) in [
+            (400, VaultError::Refused),
+            (403, VaultError::Refused),
+            (404, VaultError::Missing),
+            (500, VaultError::Unavailable),
+        ] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({"errors": ["x"]})))
+                .mount(&server)
+                .await;
+            assert_eq!(
+                transit
+                    .decrypt(&token(), "wyrd-secrets", &wrapped, b"other")
+                    .await
+                    .map(|_| ()),
+                Err(expected),
+                "{status}"
+            );
+        }
     }
 }

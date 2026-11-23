@@ -2362,6 +2362,78 @@ deferred('TASK-005: a pull request follows its newest review set while a pinned 
   expect([missing.current, missing.selected]).toEqual([newest.generation, undefined]);
 });
 
+deferred('TASK-005: a member whose Repository policy and Verifier Card were deleted still opens with what it recorded', async ({ server }) => {
+  // Setup: one review of pull request 7 admits both Verifiers of the declared policy.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  const policy = await declarePolicy(cards, github.host, 'acme/api', 'gated-review');
+  github.setPullRequest(1, 7, 'b1'.repeat(20), REVIEW_HEAD);
+  const accepted = await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, 'task-005-deleted');
+  const executor = nodeExecutor(admin);
+  const before = await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      const loaded = await loadReviewSets({ repository: policy.name, number: 7 }, { executor });
+      expect(loaded.result.state === 'populated' && loaded.result.data.selected?.members.every((member) => member.retained)).toBe(true);
+      return loaded.result.state === 'populated' ? loaded.result.data.selected! : undefined;
+    },
+    { timeout: 30_000, interval: 500 }
+  );
+  // The `code-review` member: only this policy references its Verifier, so deleting the policy frees it.
+  const verifier = (await cards.list({ kind: 'Verifier' })).items.find((card) => card.name === 'code-review');
+  const deleted = before!.members.find((member) => member.verifier_card_uid === verifier?.card_uid);
+  if (!verifier || !deleted) throw new Error('no member runs code-review');
+
+  // Action: the administrator deletes the Repository policy version that bound it, then that member's Verifier Card.
+  await cards.delete(policy);
+  await cards.delete({ kind: 'Verifier', name: verifier.name, version: verifier.version });
+  await expect(cards.get({ kind: 'Verifier', name: verifier.name, version: verifier.version })).rejects.toMatchObject({ code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' });
+
+  // The review set still lists every member, each with its own status and verdict.
+  const after = await loadReviewSets({ repository: policy.name, number: 7 }, { executor });
+  expect(after.result.state === 'populated' && after.result.data.selected?.members.map(({ execution_id, retained, verifier_card_uid }) => ({ execution_id, retained, verifier_card_uid }))).toEqual(
+    before!.members.map(({ execution_id, verifier_card_uid }) => ({ execution_id, retained: true, verifier_card_uid }))
+  );
+  // The member opens with its recorded progress; its definition is reported missing, never drawn.
+  const member = data(await loadExecution({ executionId: deleted.execution_id, node: 'none' }, { executor }), 'deleted Verifier');
+  expect([member.repository, member.definition.state, member.invocations?.state]).toEqual([policy.name, 'error', 'populated']);
+  expect(member.definition.state === 'error' && member.definition.problem.code).toBe('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  expect(member.status.status).toBe(deleted.status);
+});
+
+test('a reader of the subject but not the Verifier previews and downloads a recorded step output', async ({ server }) => {
+  // Setup: an execution of `ui-blind` that retained a file and a directory from its `draft` step.
+  const { executionId } = server.holdPublications('ui-blind');
+  server.flushBifrost();
+  const principals = await Principals.connect({ client: WyrdClient.connect() });
+  const { credential } = await principals.createServicePrincipal({
+    name: 'ui-blind-subject-reader',
+    assignments: [{ role: 'viewer', scope: { card: { family: { kind: 'Service', name: 'ui-blind-subject' } } } }]
+  } as never);
+  const report = { executionId, node: 'step:draft', producer: { item_index: null, iteration_index: null, attempt: 1 }, output: 'report' };
+
+  // The member opens with its recorded output; the definition is refused, never drawn.
+  const opened = data(await loadExecution(report, { executor: nodeExecutor(WyrdClient.connect({ credential })) }), 'subject reader');
+  expect([opened.definition.state === 'error' && opened.definition.problem.code, opened.invocations?.state]).toEqual(['WYRD_REGISTRY_404_CARD_NOT_FOUND', 'populated']);
+  expect(opened.publication).toMatchObject({ state: 'populated', data: { kind: 'file', producer: { step_id: 'draft', attempt: 1 } } });
+  expect(opened.text).toEqual({ state: 'populated', data: { text: '# Report\n', truncated: false } });
+
+  // The host download serves the same file to that reader's browser session.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const url = new URL('http://ui.test/t/test-tenant-1/ui/load');
+  const cookies = jar();
+  await browserSessions.signInWithApiKey('test-tenant-1', credential, url, cookies);
+  const browserSession = await browserSessions.read('test-tenant-1', url, cookies);
+  const file = await downloadPublication({
+    locals: { browserSession },
+    params: { tenantKey: 'test-tenant-1', executionId },
+    url: new URL('http://ui.test/x/download?step=draft&name=tree&attempt=1&path=nested/b.md')
+  } as never);
+  expect([file.status, await file.text()]).toEqual([200, 'beta']);
+});
+
 deferred('TASK-005: a Repository grant reads that Repository\'s review sets and nothing of another Repository', async ({ server }) => {
   // Setup: Repositories `api` and `web` both run the `ci-gate` Verifier. `api` is reviewed under two policy versions, `web` once.
   const github = server.githubApp;

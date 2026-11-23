@@ -293,11 +293,22 @@ proof, not manufactured failures.
      progress populated, Repository name present. The Alice journey [D2]
      selects `Requirement green`, reloads with it still selected, and finds
      no graph node.
-   - FAIL (not proven): work retained after its source Card is deleted; a
-     step output preview and download without the definition against a real
-     server (the `ci-gate` member has no steps; the component test covers
-     the preview with fixtures).
-   - Status: selection PASS; the two cases above remain open.
+   - Proof (real server, [U1]): "TASK-005: a member whose Repository policy
+     and Verifier Card were deleted still opens with what it recorded"
+     deletes the policy version and then the `code-review` Verifier (the
+     registry refuses deleting a Verifier a live policy references). The set
+     still lists every member with its status and verdict; the member opens
+     with recorded progress and status; its definition reads
+     `WYRD_REGISTRY_404_CARD_NOT_FOUND`. "a reader of the subject but not the
+     Verifier previews and downloads a recorded step output" grants viewer on
+     the subject Service family only: definition
+     `WYRD_REGISTRY_404_CARD_NOT_FOUND`, progress populated, the `draft`
+     report previews as `# Report\n`, and the BFF download returns
+     `nested/b.md` (200, `beta`). Each passed on its first run: the behavior
+     already existed (scenario 4 change above and the server's trusted-parent
+     read), so no RED was possible. The PR `ci-gate` member has no steps, so
+     the step-output case uses the existing held-publication execution.
+   - Status: PASS.
 
 5. **Connect navigation and hosts.** Through the production browser follow
    Repository → PR → older set → member → output → Back. Copy/reload links and

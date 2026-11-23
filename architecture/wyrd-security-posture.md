@@ -387,9 +387,13 @@ credential.
   the one exception to `WyrdError` problem+json: a refusal converted from a
   `WyrdError` is logged under its Wyrd code, while a malformed form or
   client-identification refusal is answered directly with no Wyrd code.
-- Interactive CLI login rate limiting is an ingress concern: deployments
-  rate-limit `POST /auth/device`, the user-code entry form, per client address
-  (RFC 8628 §5.1).
+- Sign-in start rate limiting is an ingress concern. Each unauthenticated
+  start below records one short-lived pending-login row before any proof, so
+  deployments rate-limit them per client address with an aggregate ceiling,
+  and the server is not reachable around the ingress: `POST /auth/device`,
+  the user-code entry form (RFC 8628 §5.1); `POST /auth/browser/login`, for
+  company SSO, social and invitation sign-in; and `/auth/platform/login`,
+  the platform OIDC sign-in start. Signup and password sign-in carry their own admission windows.
 - Recoverable auth-provider and workload-issuer client secrets, shared
   social-provider client secrets, application SMTP credentials and the signup
   challenge secret follow [stored secrets](#stored-secrets). Signup and sign-in

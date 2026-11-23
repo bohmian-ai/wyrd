@@ -6,11 +6,11 @@ authority, network boundaries, database lifecycle, and safe release contract.
 ## Supported topologies
 
 `wyrd-server` is the only external serving surface. One logical Wyrd server may
-contain multiple replicas and role-targeted pods behind one gateway.
+contain multiple replicas and role-targeted pods behind one ingress.
 
 | Topology | Tenant model | Required properties |
 |---|---|---|
-| Self-hosted | One or more tenants selected by the operator | One logical gateway, durable Postgres, durable object storage, persistent Scribe and Oracle audit volumes, explicit backup and recovery objectives |
+| Self-hosted | One or more tenants selected by the operator | One logical ingress, durable Postgres, durable object storage, persistent Scribe and Oracle audit volumes, explicit backup and recovery objectives |
 | Cloud SaaS | Multi-tenant | Shared serving fleet with full tenant separation in identity, RLS, object paths, encryption, resource admission, audit, telemetry, and generated artifacts |
 | Enterprise cloud | One tenant per deployment | The same server and protocol contracts, isolated storage and keys, and no in-tree commercial feature or compatibility fork |
 
@@ -22,8 +22,8 @@ Replicas may enable a subset of server roles through the canonical target
 configuration. Targeting changes activated subsystems and resource ownership;
 it does not create another public service, protocol, or durable contract.
 
-The gateway owns public addressability, request-size and connection bounds,
-rate-limit integration, and external TLS termination when TLS is not terminated
+The ingress (the load balancer or reverse proxy in front of `wyrd-server`)
+owns public addressability, request-size and connection bounds, rate limiting, and external TLS termination when TLS is not terminated
 by `wyrd-server`. It does not establish tenant identity, reinterpret Wyrd
 errors, retry non-idempotent writes, or buffer an unbounded query stream.
 
@@ -32,7 +32,7 @@ errors, retry non-idempotent writes, or buffer an unbounded query stream.
 - Every external connection uses TLS. Plaintext listeners are confined to
   loopback development or a mutually authenticated, policy-enforced local
   transport boundary.
-- Gateway-to-server transport is authenticated and encrypted. Forwarded client
+- Ingress-to-server transport is authenticated and encrypted. Forwarded client
   identity metadata is advisory; the Wyrd token remains authoritative.
 - Replica-to-replica Bifrost traffic uses mutual TLS from one dedicated
   cluster CA with the fixed `wyrd-peer` identity, and every private operation
@@ -342,7 +342,7 @@ the reviewed commit and pins that exact build by its immutable local image ID,
 recording the ID and source commit. The first release repeats the same image
 journeys against the published registry digest named in its manifest.
 
-- The gateway and peers reject protocol versions outside their declared
+- The ingress and peers reject protocol versions outside their declared
   compatibility set before payload decoding.
 - Adjacent application versions may overlap only when the release manifest
   proves compatible database, object, wire, and peer contracts.

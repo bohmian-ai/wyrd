@@ -2286,6 +2286,20 @@ pub struct ScribeWalIoPool {
     /// Record write operations submitted through the production lane in unit tests.
     #[cfg(test)]
     write_submissions: Arc<AtomicU64>,
+    /// One armed hold on the next sync: the worker reports the completed sync
+    /// and keeps its result until the holder releases it.
+    #[cfg(test)]
+    sync_hold: Arc<std::sync::Mutex<Option<WalSyncHold>>>,
+}
+
+/// A test hold placed on one WAL sync after it is durable.
+#[cfg(test)]
+#[derive(Debug)]
+struct WalSyncHold {
+    /// Fired by the worker once the held sync has completed.
+    reached: oneshot::Sender<()>,
+    /// Ends the hold; a dropped sender also releases it.
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl ScribeWalIoPool {
@@ -2350,6 +2364,8 @@ impl ScribeWalIoPool {
             sync_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             write_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            sync_hold: Arc::default(),
         })
     }
 
@@ -2401,6 +2417,15 @@ impl ScribeWalIoPool {
         let failed = Arc::clone(&self.failed);
         let delay = self.sync_delay;
         let (sender, receiver) = oneshot::channel();
+        #[cfg(test)]
+        let hold = matches!(&operation, ScribeWalIoOp::SyncWal { .. })
+            .then(|| {
+                self.sync_hold
+                    .lock()
+                    .expect("WAL sync hold lock must not be poisoned")
+                    .take()
+            })
+            .flatten();
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("wal_io");
         let active = Arc::clone(&self.active);
@@ -2411,6 +2436,11 @@ impl ScribeWalIoPool {
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("wal_io");
             let result = catch_unwind(AssertUnwindSafe(|| execute_wal_io(operation, delay)));
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold.reached.send(());
+                let _ = hold.release.recv();
+            }
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
             record_lane_finished("wal_io");
@@ -2489,6 +2519,30 @@ impl ScribeWalIoPool {
     #[cfg(test)]
     pub(crate) fn write_submissions_for_test(&self) -> u64 {
         self.write_submissions.load(Ordering::Acquire)
+    }
+
+    /// Holds the next submitted sync after it is durable.
+    ///
+    /// The returned receiver fires once that sync has completed on its worker;
+    /// the worker keeps the result from its submitter until the returned
+    /// sender sends or is dropped, so a test can observe a durable group while
+    /// its IO completion is still outstanding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hold lock is poisoned.
+    #[cfg(test)]
+    pub(crate) fn hold_next_sync_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = oneshot::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self
+            .sync_hold
+            .lock()
+            .expect("WAL sync hold lock must not be poisoned") =
+            Some(WalSyncHold { reached, release });
+        (reached_rx, release_tx)
     }
 }
 

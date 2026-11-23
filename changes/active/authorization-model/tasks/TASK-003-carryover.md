@@ -861,6 +861,28 @@ directory-update owner once here; recovery below consumes its output.
   - `mise run check:tenant-isolation`.
   All are clean.
 - TDD: PASS for scenario 1.
+- Scenario 2, every stale or foreign use refuses and the offline paths stay usable:
+  `platform_admin_e2e::contacts::a_reset_code_refuses_every_stale_or_foreign_use` (same file).
+  It covers these cases:
+  - a mailed code replaced by a newer request, then the newer one once expired (both aged
+    16 minutes in SQL), each get `401 ONE_TIME_CODE_INVALID`;
+  - a contact proof used as a reset code (wrong purpose), and a code mailed before the contact was
+    replaced (old contact), each get `401`; the password is unchanged afterwards;
+  - with company SSO required (policy row set in SQL), a request gets `403 METHOD_UNAVAILABLE` and
+    a live mailed code gets `403` at redemption;
+  - an operator reset for a social-only User (inserted in SQL) gets `404`, so no reset adds a password;
+  - with the relay removed (SQL, as no relay-removal surface exists), a request gets
+    `403 METHOD_UNAVAILABLE`, while a code mailed before and an operator-issued code both reset
+    (`204`) and their new passwords sign in.
+  - RED: none. The first run failed only in setup (the test's social-only insert used a retired
+    `auth_type`; fixed to `oidc`). Every assertion before it already passed.
+  - GREEN: 1 passed.
+  - Mutation check: without the mailed-code supersession, or without the contact-revision check, the
+    test fails with `204` where `401` is expected.
+  - TDD VIOLATED for the replaced and old-contact cases: their production code (supersession in
+    `insert_password_reset`, the contact-revision check in `password_reset`) went in with
+    scenario 1, before this test. Expired, wrong-purpose, SSO, relay removal, operator offline reset
+    and social-only are existing redemption behavior, proved here as regressions.
 
 ### 13. Verified contacts support private self-service reset
 

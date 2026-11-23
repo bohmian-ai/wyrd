@@ -808,3 +808,186 @@ async fn a_verified_contact_resets_a_forgotten_password() {
         "{body}"
     );
 }
+
+/// Every stale or foreign use of a reset code refuses, and the offline paths
+/// stay usable:
+///   1. a mailed code replaced by a newer request, then the newer one once
+///      expired, both refuse;
+///   2. a contact proof is not a reset code, and a code mailed to a contact
+///      that has since been replaced refuses;
+///   3. while company SSO is required, reset is neither requested nor
+///      redeemed; a social-only User gets no reset code from an operator;
+///   4. without a mail relay reset is no longer requested, but a code
+///      already mailed and an operator-issued code both still reset.
+///
+/// # Panics
+/// Panics when a code resets, or a request answers, differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_code_refuses_every_stale_or_foreign_use() {
+    let (srv, operator) = contact_server("pier").await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let old = "ada.stale@example.test";
+    let new = "ada.renewed@example.test";
+    let dee = "dee.offline@example.test";
+    let fresh = "quiet harbor lanterns";
+    let session = sign_in(&srv, "pier").await;
+    verify_contact(&srv, &api, "pier", &session, old).await;
+    let mut users = std::collections::BTreeMap::new();
+    for name in ["bea", "dee"] {
+        let (status, _, body) = browser(
+            &srv,
+            "/v1/principals/users",
+            &[&session],
+            "-",
+            &json!({
+                "username": name,
+                "password": PASSWORD,
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        users.insert(name, body["principal_id"].as_str().expect("id").to_owned());
+    }
+    let dee_session = sign_in_as(&srv, "pier", "dee", PASSWORD)
+        .await
+        .expect("dee signs in");
+    verify_contact(&srv, &api, "pier", &dee_session, dee).await;
+    let refused = |status: StatusCode, body: &Value, case: &str| {
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}: {body}");
+        assert_eq!(body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID", "{case}: {body}");
+    };
+
+    // 1. A newer request replaces a code; a code expires.
+    for _ in 0..2 {
+        assert_eq!(request_reset(&srv, "pier", "admin", VISITOR).await.0, StatusCode::ACCEPTED);
+    }
+    let texts = await_mail(&api, old, RESET_SUBJECT, 2).await;
+    let (newer, older) = (reset_code(&texts[0]), reset_code(&texts[1]));
+    let (status, _, body) = redeem(&srv, "pier", &older, fresh).await;
+    refused(status, &body, "replaced");
+    sqlx::query(
+        "UPDATE wyrd.auth_password_resets
+            SET created_at = created_at - interval '16 minutes',
+                expires_at = expires_at - interval '16 minutes'
+          WHERE consumed_at IS NULL",
+    )
+    .execute(&superuser)
+    .await
+    .expect("codes age");
+    let (status, _, body) = redeem(&srv, "pier", &newer, fresh).await;
+    refused(status, &body, "expired");
+
+    // 2. A contact proof is no reset code; replacing the contact voids its codes.
+    assert_eq!(request_reset(&srv, "pier", "admin", VISITOR).await.0, StatusCode::ACCEPTED);
+    let bound = reset_code(&await_mail(&api, old, RESET_SUBJECT, 3).await[0]);
+    let (status, flow, body) = browser(
+        &srv,
+        "/auth/browser/email/request",
+        &[&session],
+        "wyrd_contact",
+        &json!({ "tenant": "pier", "email": new }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (proof, _) = mailed_proof(&api, new).await;
+    let (status, _, body) = redeem(&srv, "pier", &proof, fresh).await;
+    refused(status, &body, "contact proof");
+    let (status, _, body) = browser(
+        &srv,
+        "/auth/browser/email/verify",
+        &[&session, &flow.expect("a flow cookie")],
+        "wyrd_contact",
+        &json!({ "tenant": "pier", "proof": proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _, body) = redeem(&srv, "pier", &bound, fresh).await;
+    refused(status, &body, "old contact");
+    sign_in_as(&srv, "pier", "admin", PASSWORD)
+        .await
+        .expect("no refused code changed the password");
+
+    // 3. Required company SSO leaves no reset path; social-only Users get no code.
+    assert_eq!(request_reset(&srv, "pier", "dee", VISITOR).await.0, StatusCode::ACCEPTED);
+    let mailed = reset_code(&await_mail(&api, dee, RESET_SUBJECT, 1).await[0]);
+    let require_sso = |required: bool| {
+        sqlx::query(
+            "INSERT INTO wyrd.auth_login_policies (data_tenant_id, require_company_sso)
+             SELECT data_tenant_id, $1 FROM platform.tenants WHERE slug = 'pier'
+             ON CONFLICT (data_tenant_id) DO UPDATE
+                SET require_company_sso = EXCLUDED.require_company_sso,
+                    revision = wyrd.auth_login_policies.revision + 1",
+        )
+        .bind(required)
+        .execute(&superuser)
+    };
+    require_sso(true).await.expect("SSO required");
+    let (status, body, _) = request_reset(&srv, "pier", "dee", VISITOR).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{body}");
+    let (status, _, body) = redeem(&srv, "pier", &mailed, fresh).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    require_sso(false).await.expect("SSO no longer required");
+    let eve = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
+         SELECT $1, data_tenant_id, 'eve@example.test', 'oidc', 'active'
+           FROM platform.tenants WHERE slug = 'pier'",
+    )
+    .bind(eve)
+    .execute(&superuser)
+    .await
+    .expect("a social-only User");
+    let admin_session = sign_in(&srv, "pier").await;
+    let (status, _, body) = browser(
+        &srv,
+        &format!("/v1/principals/users/{eve}/password-reset"),
+        &[&admin_session],
+        "-",
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // 4. Without a relay nothing is requested, but issued codes still reset.
+    let (status, _, issued) = browser(
+        &srv,
+        &format!("/v1/principals/users/{}/password-reset", users["bea"]),
+        &[&admin_session],
+        "-",
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    sqlx::query(
+        "UPDATE platform.login_settings
+            SET smtp_host = NULL, smtp_port = NULL, smtp_tls = NULL, smtp_username = NULL,
+                smtp_password_enc = NULL, smtp_sender = NULL",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the relay is removed");
+    let (status, body, _) = request_reset(&srv, "pier", "dee", VISITOR).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{body}");
+    let (status, _, body) = redeem(&srv, "pier", &mailed, fresh).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the mailed code survives: {body}");
+    let (status, _, body) = redeem(
+        &srv,
+        "pier",
+        issued["reset_code"].as_str().expect("code"),
+        fresh,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the operator code works offline: {body}");
+    for name in ["dee", "bea"] {
+        sign_in_as(&srv, "pier", name, fresh)
+            .await
+            .expect("the reset password signs in");
+    }
+}

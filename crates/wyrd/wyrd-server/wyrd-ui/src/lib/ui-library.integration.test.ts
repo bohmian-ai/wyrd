@@ -280,7 +280,8 @@ test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) =
   expect(app.document.querySelector('h2')?.textContent).toBe('Ranker');
   expect(app.document.querySelector('[data-panel="header"]')?.textContent).toContain(registered.metadata.name);
   expect(app.document.querySelector('[data-panel="invalid"]')?.textContent).toContain('WYRD_SPEC_400_VALIDATION');
-  expect(app.calls.map((call) => call.name).sort()).toEqual(['bifrost.query', 'cards.get', 'cards.list']);
+  // The header's version list may settle after the chart draws.
+  await vi.waitFor(() => expect(app.calls.map((call) => call.name).sort()).toEqual(['bifrost.query', 'cards.get', 'cards.list']));
   expect(app.calls.find((call) => call.name === 'bifrost.query')?.arguments).toEqual({
     sql: timeseries.sql,
     params: ['2026-10-19T00:00:00Z', '2026-10-19T12:00:00Z']

@@ -5,11 +5,13 @@ import type { LayoutServerLoad } from './$types';
 
 /**
  * The name block's person: display name, else username, else email, with the
- * email as the second line. Read from the caller's own `/me`; a principal
- * without a User profile keeps the session's name, never its id.
+ * email as the second line. Read from the caller's own `/me`, which refuses a
+ * principal that is not a User: one signed in with its API key shows as that,
+ * never as its id.
  */
 async function identity(api: (method: string, path: string) => Promise<Response>) {
   const response = await api('GET', '/principals/me');
+  if (response.status === 403) return { name: 'API key', email: null };
   if (!response.ok) return null;
   const me = (await response.json()) as CurrentUserProfile;
   const name = me.display_name ?? me.username ?? me.email;

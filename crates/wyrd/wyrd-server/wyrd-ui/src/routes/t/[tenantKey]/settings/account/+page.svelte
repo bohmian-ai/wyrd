@@ -29,7 +29,7 @@
 
 <svelte:head><title>Your account · {data.tenant.name} · Wyrd</title></svelte:head>
 <div class="ui-admin">
-<div class="work account">
+<div class="work narrow">
   <header class="pagehead"><div><h1>Your account</h1><p>How you sign in to {data.tenant.name}.</p></div></header>
 
   {#if problem}
@@ -178,9 +178,6 @@
 </div>
 
 <style>
-  .account {
-    max-width: 820px;
-  }
   .grow {
     flex: 1;
     max-width: 480px;

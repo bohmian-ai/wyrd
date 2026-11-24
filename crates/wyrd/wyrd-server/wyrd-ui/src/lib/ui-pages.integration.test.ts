@@ -921,17 +921,18 @@ async function captureLifecycle(page: Page, name: string) {
   await page.evaluate(() => delete (document.querySelector('.app-root') as HTMLElement).dataset.mode);
 }
 
-/** The admin console states compared with the approved mock, as `admin-<state>-<mode>-<width>.png`, when `WYRD_UI_CAPTURE_DIR` is set. */
-async function captureAdmin(page: Page, base: string, states: readonly string[], prefix = 'admin') {
+/** The console pages under `root` compared with the approved mock, as `<prefix>-<state>-<mode>-<width>.png`, when `WYRD_UI_CAPTURE_DIR` is set. */
+async function captureAdmin(page: Page, root: string, states: readonly string[], prefix = 'admin') {
   const shots = process.env.WYRD_UI_CAPTURE_DIR;
   if (!shots) return;
   for (const width of [1280, 390]) {
     await page.setViewportSize({ width, height: 900 });
     for (const state of states) {
-      await page.goto(`${base}/settings/${state}`);
       for (const mode of ['light', 'dark'] as const) {
-        await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
-        await page.screenshot({ path: join(shots, `${prefix}-${state.replace(/[^a-z0-9]+/g, '-')}-${mode}-${width}.png`), fullPage: true });
+        // The mode is the reader's stored choice, so a hydrated page keeps it.
+        await page.context().addCookies([{ name: 'wyrd-mode', value: mode, url: root }]);
+        await page.goto(state ? `${root}/${state}` : root, { waitUntil: 'networkidle' });
+        await page.screenshot({ path: join(shots, `${[prefix, state.replace(/[^a-z0-9]+/g, '-')].filter(Boolean).join('-')}-${mode}-${width}.png`), fullPage: true });
       }
     }
   }
@@ -2301,7 +2302,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
   const browser = await chromium.launch();
   try {
     // The UI's sign-in is reported ready before the example app is set up or its batch sent.
-    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login (sign in as development / development)'), { timeout: 1_500_000, interval: 1_000 });
+    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login (sign in as development / development-password)'), { timeout: 1_500_000, interval: 1_000 });
     expect(output()).not.toMatch(/batch {8}/);
     expect(statSync(join(config, 'credentials.toml')).mode & 0o777).toBe(0o600);
 
@@ -2309,7 +2310,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     const page = await (await browser.newContext()).newPage();
     await page.goto('http://127.0.0.1:3000/t/dev/login');
     await page.getByLabel('Username').fill('development');
-    await page.getByLabel('Password').fill('development');
+    await page.getByLabel('Password').fill('development-password');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await page.waitForURL('http://127.0.0.1:3000/t/dev');
     await page.goto('http://127.0.0.1:3000/t/dev/settings/account');
@@ -2320,7 +2321,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     expect(output(), log).toContain('batch        passed');
     // Pull request review registration runs beside the app and batch without holding either up.
     expect(output()).toContain('review       registers bohmian-ai/wyrd-example-py once GitHub is connected');
-    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as development / development)');
+    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as development / development-password)');
     expect(output()).not.toContain('/login/api-key');
     for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);
 
@@ -2980,8 +2981,10 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
 
     // Her browser holds no credential a script can read.
     expect(await her.evaluate(() => `${document.cookie} ${JSON.stringify(localStorage)} ${JSON.stringify(sessionStorage)}`)).not.toMatch(/wyrd_session|eyJ|wyrd_[a-z]+_[A-Za-z0-9]{16}/);
-    await captureAdmin(page, base, ['people', 'people?filter=invited', 'people?drawer=invite', 'service-accounts', 'roles', 'roles?open=viewer', 'sign-in', 'sign-in?setup=1', 'secrets', 'integrations']);
-    await captureAdmin(her, base, ['account'], 'user');
+    // An administrator signed in with the tenant's API key is named as that, never by its principal id.
+    expect(await page.locator('.me .who b').textContent()).toBe('API key');
+    await captureAdmin(page, `${base}/settings`, ['people', 'people?filter=invited', 'people?drawer=invite', 'service-accounts', 'roles', 'roles?open=viewer', 'sign-in', 'sign-in?setup=1', 'secrets', 'integrations']);
+    await captureAdmin(her, `${base}/settings`, ['account'], 'user');
   } finally {
     vi.unstubAllEnvs();
     await browser.close();
@@ -3227,6 +3230,7 @@ test('an administrator creates a runtime Service account in Settings, and its on
     await page.goto(`${base}/settings/service-accounts`);
     await page.getByRole('link', { name: 'New service account' }).click();
     const create = page.getByRole('form', { name: 'Create a Service account' });
+    await create.waitFor();
     expect(await create.getByRole('textbox').evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).name))).toEqual(['name', 'description', 'family']);
     await create.getByLabel('Name').fill('checkout-runtime');
     await create.getByLabel('Runtime family').fill('observed-service');
@@ -3234,6 +3238,9 @@ test('an administrator creates a runtime Service account in Settings, and its on
     const secret = page.locator('[data-secret]');
     await expect.poll(() => secret.count()).toBe(1);
     const key = (await secret.textContent()) ?? '';
+    // The drawer keeps the one-time key until the administrator closes it.
+    await page.keyboard.press('Escape');
+    await page.getByRole('dialog', { name: 'New service account' }).waitFor({ state: 'detached' });
 
     // The server holds one account restricted to the family and granting nothing yet.
     const [account] = (await principals.list({ kind: 'service', name: 'checkout-runtime' })).principals;
@@ -3705,7 +3712,7 @@ withConsole('a platform operator signs in to the console with a password', async
     expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Overview');
     expect(await page.locator('.me .who').textContent()).toContain('Platform admin');
     expect(await page.locator('.me .who b').textContent()).toBe('ops-oncall');
-    expect(await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link').allTextContents()).toEqual(['Overview', 'Workspaces', 'Sign-in providers', 'Mail', 'Admins', 'Stored secrets']);
+    expect((await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link').allTextContents()).map((label) => label.trim())).toEqual(['Overview', 'Workspaces', 'Sign-in providers', 'Mail', 'Admins', 'Stored secrets']);
     await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Workspaces' }).click();
     await page.waitForURL(`${bff.url}/platform/ui/workspaces`);
     expect(await page.getByRole('table').textContent()).toContain(server.tenantSlug);
@@ -4128,6 +4135,7 @@ withConsole('the console saves signup settings and keeps the challenge secret', 
     await page.getByLabel('Human challenge').uncheck();
     await page.getByRole('button', { name: 'Save settings' }).click();
     await expect.poll(async () => (await settings()).signup_challenge ?? null).toBeNull();
+    await captureAdmin(page, `${bff.url}/platform/ui`, ['', 'workspaces', 'providers', 'mail', 'admins', 'secrets'], 'platform');
   } finally {
     await browser.close();
     bff.stop();

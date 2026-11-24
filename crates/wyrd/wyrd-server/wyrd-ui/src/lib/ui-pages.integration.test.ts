@@ -1195,14 +1195,13 @@ test('local signup and personal settings', async ({ server, ui }) => {
     await page.waitForURL(`${ui.base}/t/${tenantKey}`);
     expect(page.url()).not.toContain(code);
 
-    // The sidebar names the person by username, and the identity menu leads to personal Settings, which an editor without SSO administration may open.
-    expect(await page.locator('details.identity .who > span').first().textContent()).toBe('ui-person');
-    await page.locator('details.identity summary').click();
-    await page.getByRole('link', { name: 'Account' }).click();
+    // The sidebar names the person by username, and the name block leads to their own account page, which an editor without SSO administration may open.
+    expect(await page.locator('.me .who b').textContent()).toBe('ui-person');
+    await page.locator('.me .who').click();
     const account = `${ui.base}/t/${tenantKey}/settings/account`;
     await page.waitForURL(account);
-    await expect.poll(() => page.locator('dl').textContent()).toContain('ui-person');
-    expect(await page.locator('dl').textContent()).toContain('Username and password');
+    await expect.poll(() => page.getByTestId('profile').textContent()).toContain('ui-person');
+    expect(await page.getByTestId('profile').textContent()).toContain('Password');
     await expect.poll(() => page.getByText('No keys yet').count()).toBe(1);
     expect(await page.getByLabel('Expires after (days)').inputValue()).toBe('30');
     expect(await page.locator('input[name=permission]:checked').count()).toBe(0);
@@ -1226,13 +1225,13 @@ test('local signup and personal settings', async ({ server, ui }) => {
     expect(await page.content()).not.toContain(secret);
     expect(await serverHtml(page, account)).not.toContain(secret);
     const row = page.locator('tbody tr', { hasText: 'laptop' });
-    expect(await row.textContent()).toContain('✓ active');
+    expect(await row.textContent()).toContain('Active');
     expect(await row.textContent()).toContain('cards:read');
 
     // Revoke reports success and the key stops working.
     await row.getByRole('button', { name: 'Revoke laptop' }).click();
     await expect.poll(() => page.getByText('Key revoked.').count()).toBe(1);
-    expect(await page.locator('tbody tr', { hasText: 'laptop' }).textContent()).toContain('⊘ revoked');
+    expect(await page.locator('tbody tr', { hasText: 'laptop' }).textContent()).toContain('Revoked');
     await expect(meWith(ui.serverUrl, secret)).rejects.toMatchObject({ code: 'WYRD_AUTH_401_API_KEY_INVALID' });
 
     // A password change ends the session; only the new password signs in.
@@ -2298,7 +2297,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await page.waitForURL('http://127.0.0.1:3000/t/dev');
     await page.goto('http://127.0.0.1:3000/t/dev/settings/account');
-    await expect.poll(() => page.locator('dl').textContent()).toContain('Username and password');
+    await expect.poll(() => page.getByTestId('profile').textContent()).toContain('Password');
 
     // One command runs the batch to terminal evidence and reports usable URLs.
     await vi.waitFor(() => expect(output()).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
@@ -2362,7 +2361,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await expect.poll(() => page.getByRole('region', { name: 'Graph', exact: true }).locator('[data-node]').count()).toBeGreaterThan(0);
 
     // Sign-out ends the session.
-    await page.locator('details.identity summary').click();
+    await page.locator('.me .who').click();
     await page.getByRole('button', { name: 'Sign out' }).click();
     await page.waitForURL(/\/login$/);
   } finally {
@@ -3542,7 +3541,7 @@ withGoogle('an invited person joins with Google and returns with Google', async 
     ]);
 
     // She signs out and continues with Google to the same account.
-    await ana.locator('details.identity summary').click();
+    await ana.locator('.me .who').click();
     await ana.getByRole('button', { name: 'Sign out' }).click();
     await ana.waitForURL(/\/login$/);
     await ana.getByRole('button', { name: 'Continue with Google' }).click();
@@ -3683,15 +3682,18 @@ withConsole('a platform operator signs in to the console with a password', async
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await page.waitForURL(`${bff.url}/platform/ui`);
     expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Overview');
-    const header = page.locator('header');
-    expect(await header.textContent()).toContain('Platform admin');
-    expect(await page.getByTestId('operator').textContent()).toBe('ops-oncall');
-    const facts = page.getByRole('region', { name: 'This session' });
-    expect(await facts.textContent()).toContain('Platform password');
-    expect(await page.getByTestId('recent').textContent()).toContain('yes');
+    expect(await page.locator('.me .who').textContent()).toContain('Platform admin');
+    expect(await page.locator('.me .who b').textContent()).toBe('ops-oncall');
+    expect(await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link').allTextContents()).toEqual(['Overview', 'Workspaces', 'Sign-in providers', 'Mail', 'Admins', 'Stored secrets']);
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Workspaces' }).click();
+    await page.waitForURL(`${bff.url}/platform/ui/workspaces`);
     expect(await page.getByRole('table').textContent()).toContain(server.tenantSlug);
-    expect(await page.getByTestId(`status-${server.tenantSlug}`).textContent()).toContain('active');
-    expect(await page.getByRole('navigation', { name: 'Console' }).getByRole('link').allTextContents()).toEqual(['Overview', 'Social sign-in', 'Mail relay', 'Signup']);
+    expect(await page.getByTestId(`status-${server.tenantSlug}`).textContent()).toContain('Active');
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Admins' }).click();
+    await page.waitForURL(`${bff.url}/platform/ui/admins`);
+    const you = page.getByRole('row').filter({ hasText: '(you)' });
+    expect(await you.getByTestId('operator').textContent()).toBe('ops-oncall');
+    expect(await you.textContent()).toContain('Password');
 
     // Rust's cookie is host-only on /platform, HttpOnly and SameSite=Lax; no page carries it, a token or the root key.
     const cookie = (await page.context().cookies()).find((each) => each.name === 'wyrd_platform_session');
@@ -3705,8 +3707,8 @@ withConsole('a platform operator signs in to the console with a password', async
     expect(platformCalls.length).toBeGreaterThan(0);
     for (const call of platformCalls) for (const name of call.cookies) expect(['wyrd_platform_session', 'wyrd_platform_login']).toContain(name);
 
-    // Signing out ends the session at Rust: the old cookie opens nothing again.
-    await page.getByRole('button', { name: 'Sign out' }).click();
+    // Signing out from the operator's own Admins row ends the session at Rust: the old cookie opens nothing again.
+    await you.getByRole('button', { name: 'Sign out' }).click();
     await page.waitForURL(`${bff.url}/platform?ended=1`);
     expect(await page.getByRole('status').textContent()).toContain('Your console session ended. Sign in again.');
     await page.context().addCookies([{ ...cookie!, expires: -1 }]);
@@ -3749,8 +3751,7 @@ withConsole('a stale console session confirms the operator before suspending a w
     const page = await browser.newPage();
     await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
     server.staleConsoleProof();
-    await page.reload();
-    expect(await page.getByTestId('recent').textContent()).toContain('no');
+    await page.goto(`${bff.url}/platform/ui/workspaces`);
 
     const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
     // The platform's own wyrd-system workspace is listed but offers no Suspend.
@@ -3793,7 +3794,7 @@ withConsole('a stale console session confirms the operator before suspending a w
     await page.waitForLoadState('networkidle');
     expect(await status()).toBe('active');
     expect(await dialog.count()).toBe(0);
-    expect(await page.getByTestId(`status-${slug}`).textContent()).toContain('active');
+    expect(await page.getByTestId(`status-${slug}`).textContent()).toContain('Active');
     await page.unroute('**/platform/ui/reauth');
 
     // The operator's own password applies the suspension it was asked for.
@@ -3801,14 +3802,13 @@ withConsole('a stale console session confirms the operator before suspending a w
     await row.getByRole('button', { name: 'Suspend' }).click();
     await dialog.getByLabel('Your password').fill(OPERATOR_PASSWORD);
     await dialog.getByRole('button', { name: 'Confirm' }).click();
-    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('suspended');
+    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('Suspended');
     expect(await status()).toBe('suspended');
     expect(await page.getByRole('status').textContent()).toContain(`${slug} is suspended.`);
-    expect(await page.getByTestId('recent').textContent()).toContain('yes');
 
     // Fresh proof applies Resume at once, without asking again.
     await row.getByRole('button', { name: 'Resume' }).click();
-    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('active');
+    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('Active');
     expect(await dialog.count()).toBe(0);
     expect(await status()).toBe('active');
   } finally {
@@ -3848,12 +3848,13 @@ withConsole('a platform SSO operator confirms a suspension at the identity provi
     await page.reload();
     await sso.click();
     await page.waitForURL(`${bff.url}/platform/ui`);
-    expect(await page.getByTestId('operator').textContent()).toBe('ops-lead');
-    expect(await page.getByRole('region', { name: 'This session' }).textContent()).toContain('Platform SSO');
+    expect(await page.locator('.me .who b').textContent()).toBe('ops-lead');
+    await page.goto(`${bff.url}/platform/ui/admins`);
+    expect(await page.getByRole('row').filter({ hasText: '(you)' }).textContent()).toContain('Platform SSO');
     expect((await page.context().cookies()).find((cookie) => cookie.name === 'wyrd_platform_session')).toMatchObject({ path: '/platform', httpOnly: true });
 
     server.staleConsoleProof();
-    await page.reload();
+    await page.goto(`${bff.url}/platform/ui/workspaces`);
     const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
     const row = page.getByRole('row').filter({ hasText: slug });
     await row.getByRole('button', { name: 'Suspend' }).click();
@@ -3867,17 +3868,20 @@ withConsole('a platform SSO operator confirms a suspension at the identity provi
     await (await refused).waitForEvent('close');
     await expect.poll(() => dialog.getByRole('alert').textContent()).toContain('WYRD_AUTH_401_UNAUTHENTICATED');
     expect(await status()).toBe('active');
-    expect(await page.getByTestId('operator').textContent()).toBe('ops-lead');
+    expect(await page.locator('.me .who b').textContent()).toBe('ops-lead');
 
     // The same operator's fresh IdP sign-in applies the suspension.
     google.account = { sub: 'idp-lead', email: 'lead@ops.test' };
     const confirmed = page.waitForEvent('popup');
     await dialog.getByRole('button', { name: 'Continue with platform SSO' }).click();
     await (await confirmed).waitForEvent('close');
-    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('suspended');
+    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('Suspended');
     expect(await status()).toBe('suspended');
     expect(await dialog.count()).toBe(0);
-    expect(await page.getByTestId('recent').textContent()).toContain('yes');
+    // The proof is fresh now, so Resume applies without asking again.
+    await row.getByRole('button', { name: 'Resume' }).click();
+    await expect.poll(status).toBe('active');
+    expect(await dialog.count()).toBe(0);
   } finally {
     await browser.close();
     bff.stop();
@@ -3903,26 +3907,30 @@ withConsole('the console tests a provider revision before enabling it', async ({
     const context = await browser.newContext();
     const page = await context.newPage();
     await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
-    await page.getByRole('navigation', { name: 'Console' }).getByRole('link', { name: 'Social sign-in' }).click();
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Sign-in providers' }).click();
     await page.waitForURL(`${bff.url}/platform/ui/providers`);
-    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Social sign-in');
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Sign-in providers');
     const googleCard = page.getByTestId('provider-google');
     const state = page.getByTestId('state-google');
-    expect(await state.textContent()).toBe('– not configured');
+    expect(await state.textContent()).toContain('Not set up');
     expect(await googleCard.textContent()).toContain('/auth/social/google/callback');
     const notice = page.getByRole('status');
     const save = async (clientId: string, secret: string) => {
+      if (await googleCard.getByRole('button', { name: 'Replace' }).count()) await googleCard.getByRole('button', { name: 'Replace' }).click();
       await googleCard.getByLabel('Client ID').fill(clientId);
       await googleCard.getByLabel('Client secret').fill(secret);
       await googleCard.getByRole('button', { name: 'Save client' }).click();
     };
 
     await save('wyrd-google', 'google-secret-one');
-    await expect.poll(() => state.textContent()).toBe('◌ untested · not offered');
+    await expect.poll(() => state.textContent()).toContain('Untested');
     expect(await notice.textContent()).toContain('Google revision 1 saved. It is untested and not offered.');
-    expect(await googleCard.getByRole('button', { name: 'Enable' }).isDisabled()).toBe(true);
-    expect(await googleCard.textContent()).toContain('Test revision 1 before enabling it.');
+    expect(await googleCard.getByRole('button', { name: 'Turn on' }).isDisabled()).toBe(true);
+    expect(await googleCard.textContent()).toContain('Test revision 1 before turning it on.');
+    // A saved client shows its id; Replace opens an empty form for the next one.
+    await googleCard.getByRole('button', { name: 'Replace' }).click();
     expect(await googleCard.getByLabel('Client secret').inputValue()).toBe('');
+    await googleCard.getByRole('button', { name: 'Cancel' }).click();
     expect(await serverHtml(page, `${bff.url}/platform/ui/providers`)).not.toContain('google-secret-one');
 
     // A test of revision 1 that finishes after revision 2 is saved proves nothing about revision 2.
@@ -3939,12 +3947,12 @@ withConsole('the console tests a provider revision before enabling it', async ({
     await googleCard.getByRole('button', { name: 'Test sign-in' }).click();
     await atProvider;
     await save('wyrd-google-2', 'google-secret-two');
-    await expect.poll(() => googleCard.textContent()).toContain('Test revision 2 before enabling it.');
+    await expect.poll(() => googleCard.textContent()).toContain('Test revision 2 before turning it on.');
     release();
     await (await stale).waitForEvent('close');
     // The console has finished with that test once its button reads Test sign-in again.
     await googleCard.getByRole('button', { name: 'Test sign-in' }).waitFor();
-    expect(await state.textContent()).toBe('◌ untested · not offered');
+    expect(await state.textContent()).toContain('Untested');
     expect(await notice.textContent()).not.toContain('is tested');
     await context.unroute(`${google.issuer}/authorize**`);
 
@@ -3952,23 +3960,23 @@ withConsole('the console tests a provider revision before enabling it', async ({
     const current = page.waitForEvent('popup');
     await googleCard.getByRole('button', { name: 'Test sign-in' }).click();
     await (await current).waitForEvent('close');
-    await expect.poll(() => state.textContent()).toBe('◐ tested · not offered');
+    await expect.poll(() => state.textContent()).toContain('Tested · off');
     expect(await notice.textContent()).toContain('Signed in at Google. Revision 2 is tested; enable it to offer it.');
 
     // A revision saved behind the page makes Enable refuse as a changed provider.
     expect((await api('PUT', '/platform/social/providers/google', { client_id: 'wyrd-google-3', client_secret: 'google-secret-three' })).status).toBe(200);
-    await googleCard.getByRole('button', { name: 'Enable' }).click();
+    await googleCard.getByRole('button', { name: 'Turn on' }).click();
     await expect.poll(() => page.getByRole('alert').textContent()).toContain('This provider changed');
     expect(await page.getByRole('alert').textContent()).toContain('WYRD_SPEC_409_CONFLICT');
     await page.reload();
-    expect(await state.textContent()).toBe('◌ untested · not offered');
+    expect(await state.textContent()).toContain('Untested');
 
     const third = page.waitForEvent('popup');
     await googleCard.getByRole('button', { name: 'Test sign-in' }).click();
     await (await third).waitForEvent('close');
-    await expect.poll(() => state.textContent()).toBe('◐ tested · not offered');
-    await googleCard.getByRole('button', { name: 'Enable' }).click();
-    await expect.poll(() => state.textContent()).toBe('✓ enabled · offered');
+    await expect.poll(() => state.textContent()).toContain('Tested · off');
+    await googleCard.getByRole('button', { name: 'Turn on' }).click();
+    await expect.poll(() => state.textContent()).toContain('On');
     expect(await notice.textContent()).toContain('Google is offered on sign-in and signup pages.');
     const html = await serverHtml(page, `${bff.url}/platform/ui/providers`);
     for (const secret of ['google-secret-one', 'google-secret-two', 'google-secret-three']) expect(html).not.toContain(secret);
@@ -3996,9 +4004,9 @@ withConsole('the console keeps a relay password unless the operator removes it',
   try {
     const page = await browser.newPage();
     await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
-    await page.getByRole('navigation', { name: 'Console' }).getByRole('link', { name: 'Mail relay' }).click();
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Mail' }).click();
     await page.waitForURL(`${bff.url}/platform/ui/mail`);
-    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Mail relay');
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Mail');
     expect(await page.getByTestId('no-relay').textContent()).toContain('– No relay. Wyrd emails nothing');
     expect(await page.getByRole('button', { name: 'Send test' }).count()).toBe(0);
     const relay = page.getByTestId('relay');
@@ -4064,29 +4072,28 @@ withConsole('the console saves signup settings and keeps the challenge secret', 
   try {
     const page = await browser.newPage();
     await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
-    await page.getByRole('navigation', { name: 'Console' }).getByRole('link', { name: 'Signup' }).click();
-    await page.waitForURL(`${bff.url}/platform/ui/signup`);
-    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Signup');
-    expect(await page.getByLabel('Password sign-in for workspaces').isChecked()).toBe(true);
-    expect(await page.getByLabel('Public workspace signup').isChecked()).toBe(false);
-    expect(await page.getByLabel('Workspaces one identity may create').inputValue()).toBe('3');
+    // Sign-up settings live on the overview.
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Overview');
+    expect(await page.getByLabel('Password sign-in').isChecked()).toBe(true);
+    expect(await page.getByLabel('Allow new workspaces').isChecked()).toBe(false);
+    expect(await page.getByLabel('Workspaces per person').inputValue()).toBe('3');
     const notice = page.getByRole('status');
 
-    await page.getByLabel('Public workspace signup').check();
-    await page.getByLabel('Workspaces one identity may create').fill('2');
-    await page.getByLabel('Require a challenge for browser workspace creation').check();
+    await page.getByLabel('Allow new workspaces').check();
+    await page.getByLabel('Workspaces per person').fill('2');
+    await page.getByLabel('Human challenge').check();
     await page.getByLabel('Site key').fill('turnstile-site-key');
     await page.getByLabel('Secret key').fill('turnstile-secret-value');
     await page.getByRole('button', { name: 'Save settings' }).click();
     await expect.poll(() => notice.textContent()).toContain('Login and signup settings saved.');
     expect(await settings()).toMatchObject({ password_enabled: true, signup_enabled: true, signup_workspace_cap: 2, signup_challenge: { site_key: 'turnstile-site-key' } });
     expect(await page.getByLabel('Secret key').inputValue()).toBe('');
-    expect(await serverHtml(page, `${bff.url}/platform/ui/signup`)).not.toContain('turnstile-secret-value');
+    expect(await serverHtml(page, `${bff.url}/platform/ui`)).not.toContain('turnstile-secret-value');
 
     // A stale session confirms first; a blank secret keeps the stored one.
     server.staleConsoleProof();
     await page.reload();
-    await page.getByLabel('Workspaces one identity may create').fill('4');
+    await page.getByLabel('Workspaces per person').fill('4');
     await page.getByRole('button', { name: 'Save settings' }).click();
     const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
     expect(await dialog.textContent()).toContain('Changing login and signup settings is a destructive platform change.');
@@ -4097,7 +4104,7 @@ withConsole('the console saves signup settings and keeps the challenge secret', 
     expect((await settings()).signup_challenge).toEqual({ site_key: 'turnstile-site-key' });
 
     // Turning the challenge off removes it.
-    await page.getByLabel('Require a challenge for browser workspace creation').uncheck();
+    await page.getByLabel('Human challenge').uncheck();
     await page.getByRole('button', { name: 'Save settings' }).click();
     await expect.poll(async () => (await settings()).signup_challenge ?? null).toBeNull();
   } finally {

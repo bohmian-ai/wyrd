@@ -4,6 +4,7 @@ import { expect, test } from 'vitest';
 import * as development from '$lib/server/development';
 import TenantLayout from '../routes/t/[tenantKey]/+layout.svelte';
 import SignedIn from '../routes/t/[tenantKey]/+page.svelte';
+import Account from '../routes/t/[tenantKey]/settings/account/+page.svelte';
 
 const tenant = { key: 'acme', name: 'Acme' };
 const session = {
@@ -32,15 +33,21 @@ test('TASK-002: Retained pages without mocks', () => {
   expect(page.container.textContent).not.toMatch(/Recent changes|Recently viewed Cards/);
   page.unmount();
 
-  // The tenant layout keeps tenant switching and sign-out for the current tenant.
+  // The tenant layout's name block opens the person's own account page and carries the mode control.
   const children = createRawSnippet(() => ({ render: () => '<p>child</p>' }));
-  const layout = render(TenantLayout, { data: { tenant, session }, children } as never);
-  const switches = layout.container.querySelectorAll('form[action="/?/switch"] button[name="tenantKey"]');
+  const layout = render(TenantLayout, { data: { tenant, session, me: null }, children } as never);
+  expect(layout.getByRole('link', { name: /Jordan Reyes/ })).toHaveAttribute('href', '/t/acme/settings/account');
+  expect(layout.getByRole('button', { name: /Switch to (light|dark) mode/ })).toBeInTheDocument();
+  expect(layout.getByText('child')).toBeInTheDocument();
+  layout.unmount();
+
+  // The account page keeps workspace switching and sign-out for the current workspace.
+  const account = render(Account, { data: { tenant, session, me: null, profile: null, keys: null, recovery: false, problem: null }, form: null } as never);
+  const switches = account.container.querySelectorAll('form[action="/?/switch"] button[name="tenantKey"]');
   expect([...switches].map((button) => button.getAttribute('value'))).toEqual(['acme', 'research']);
-  const signOut = layout.getByRole('button', { name: 'Sign out' });
+  const signOut = account.getByRole('button', { name: 'Sign out' });
   expect(signOut.closest('form')).toHaveAttribute('action', '/?/logout');
   expect(signOut.closest('form')?.querySelector('input[name="tenantKey"]')).toHaveValue('acme');
-  expect(layout.getByText('child')).toBeInTheDocument();
 });
 
 import { fireEvent, waitFor, within } from '@testing-library/svelte';

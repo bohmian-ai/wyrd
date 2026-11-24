@@ -805,7 +805,7 @@ test('production SSO account settings', async () => {
     const page = await context.newPage();
     const account = `${journey.origin}/t/${sso}/settings/account`;
     await page.goto(account);
-    await expect.poll(() => page.locator('dl').textContent()).toContain('Single sign-on');
+    await expect.poll(() => page.getByTestId('profile').textContent()).toContain('Single sign-on');
     expect(await page.getByLabel('Current password').count()).toBe(0);
     expect(await page.getByLabel('Expires after (days)').inputValue()).toBe('30');
     expect(await page.locator('input[name=permission]:checked').count()).toBe(0);
@@ -822,7 +822,7 @@ test('production SSO account settings', async () => {
     expect(((await used.json()) as { permissions: string[] }).permissions).toEqual(['cards:read']);
     await page.goto(account);
     expect(await page.content()).not.toContain(secret);
-    expect(await page.locator('tbody tr', { hasText: 'sso-laptop' }).textContent()).toContain('✓ active');
+    expect(await page.locator('tbody tr', { hasText: 'sso-laptop' }).textContent()).toContain('Active');
     expect(await page.content()).not.toContain(session);
   } finally {
     await chrome.close();

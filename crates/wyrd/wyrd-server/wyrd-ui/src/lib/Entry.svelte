@@ -101,6 +101,11 @@
     width: 100%;
     padding: 12px 16px;
   }
+  /* A provider button: its fixed mark, then the words. */
+  .card :global(.provider) {
+    gap: 10px;
+    font-weight: var(--weight-strong);
+  }
   .card :global(.links) {
     display: flex;
     flex-wrap: wrap;

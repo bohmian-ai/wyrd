@@ -1,5 +1,6 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
+  import Mark from '$lib/Mark.svelte';
   import PasswordInput from '$lib/PasswordInput.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
@@ -22,12 +23,12 @@
     </form>
   {/if}
   {#if data.companySso}
-    <form method="POST" action="?/sso"><button class="app-control wide" type="submit">Sign in with SSO</button></form>
+    <form method="POST" action="?/sso"><button class="app-control wide provider" type="submit"><Mark method="sso" size={18} />Sign in with SSO</button></form>
   {/if}
   {#each data.providers as provider (provider)}
     <form method="POST" action="?/social">
       <input type="hidden" name="provider" value={provider} />
-      <button class="app-control wide" type="submit">Continue with {names[provider]}</button>
+      <button class="app-control wide provider" type="submit"><Mark method={provider} size={18} />Continue with {names[provider]}</button>
     </form>
   {/each}
   <nav class="links" aria-label="Other sign-in">

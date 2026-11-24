@@ -1,5 +1,6 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
+  import Mark from '$lib/Mark.svelte';
   import CheckEmail from '$lib/CheckEmail.svelte';
   import { PROBLEMS, PROVIDERS, auth, emailError, openProof, refusal } from '$lib/onboarding';
   import type { WyrdProblem } from '$lib/server/problem';
@@ -60,7 +61,7 @@
     {/if}
     {#each data.providers as provider (provider)}
       <form onsubmit={(event) => byProvider(event, provider)}>
-        <button class="app-control wide" type="submit" disabled={busy}>Continue with {PROVIDERS[provider]}</button>
+        <button class="app-control wide provider" type="submit" disabled={busy}><Mark method={provider} size={18} />Continue with {PROVIDERS[provider]}</button>
       </form>
     {/each}
     <nav class="links" aria-label="Existing workspace"><a href="/">Already have a workspace? Sign in</a></nav>

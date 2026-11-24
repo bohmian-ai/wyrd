@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Entry from '$lib/Entry.svelte';
+  import Mark from '$lib/Mark.svelte';
   import PasswordInput from '$lib/PasswordInput.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
@@ -31,7 +32,7 @@
     <form method="POST" action="/t/{encodeURIComponent(data.tenant.key)}/login?/social">
       <input type="hidden" name="provider" value={provider} />
       <input type="hidden" name="invitationCode" value={code} />
-      <button class="app-control wide" type="submit" disabled={!code}>Join with {names[provider]}</button>
+      <button class="app-control wide provider" type="submit" disabled={!code}><Mark method={provider} size={18} />Join with {names[provider]}</button>
     </form>
   {/each}
   <nav class="links"><a href="/t/{encodeURIComponent(data.tenant.key)}/login">Back to sign-in</a></nav>

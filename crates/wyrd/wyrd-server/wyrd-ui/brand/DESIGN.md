@@ -32,6 +32,8 @@ designed but not yet built.
 - Every color and geometry value is a token in `palette.json`. Never hardcode a hex in a
   consumer — use `var(--token)` (or the workbench's Tailwind `bg-*`/`text-*`/`border-*`
   utilities, which resolve per mode). No consumer owns a second palette.
+- The one exception is a fixed provider mark (`$lib/Mark.svelte`): Google's "G" keeps its
+  official colours and the GitHub mark follows `currentColor`.
 - Regenerate after any token edit: `node brand/gen-theme.mjs` (from
   `crates/wyrd/wyrd-server/wyrd-ui`). `mise run codegen:check` runs the generator tests and
   fails on any projection drift. Never hand-edit a generated file.

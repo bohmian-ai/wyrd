@@ -921,6 +921,22 @@ async function captureLifecycle(page: Page, name: string) {
   await page.evaluate(() => delete (document.querySelector('.app-root') as HTMLElement).dataset.mode);
 }
 
+/** The admin console states compared with the approved mock, as `admin-<state>-<mode>-<width>.png`, when `WYRD_UI_CAPTURE_DIR` is set. */
+async function captureAdmin(page: Page, base: string, states: readonly string[], prefix = 'admin') {
+  const shots = process.env.WYRD_UI_CAPTURE_DIR;
+  if (!shots) return;
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const state of states) {
+      await page.goto(`${base}/settings/${state}`);
+      for (const mode of ['light', 'dark'] as const) {
+        await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+        await page.screenshot({ path: join(shots, `${prefix}-${state.replace(/[^a-z0-9]+/g, '-')}-${mode}-${width}.png`), fullPage: true });
+      }
+    }
+  }
+}
+
 /**
  * Live on `board` (`observe` or `verify`) at `search`, in a new page of
  * `page`'s session on a fake clock. Its support is held through two more tick
@@ -2703,7 +2719,7 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
 
     // Settings leads to People. The administrator invites a user with viewer at the payments family: no IdP, no tenant-wide default.
     await page.goto(`${base}/settings`);
-    await page.getByRole('link', { name: 'People', exact: true }).click();
+    await page.getByRole('link', { name: /^People\b/ }).click();
     await page.waitForURL(`${base}/settings/people`);
     const invite = await openInvite(page);
     await invite.getByLabel('Email addresses').fill('alice@example.test\ncarol@example.test');
@@ -2714,6 +2730,9 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await expect.poll(() => page.getByText('Wyrd does not email invitations until an operator configures a mail relay.').count()).toBe(1);
     const aliceLink = (await links.first().textContent()) ?? '';
     expect(aliceLink.startsWith(`${base}/signup#invitation=`)).toBe(true);
+    // The drawer keeps the links until the administrator closes it.
+    await page.keyboard.press('Escape');
+    await page.getByRole('dialog', { name: 'Invite people' }).waitFor({ state: 'detached' });
     await page.getByRole('group', { name: 'Filter' }).getByRole('link', { name: /^Invited/ }).click();
     const pending = page.getByRole('region', { name: 'Pending invitations' });
     await expect.poll(() => pending.getByRole('row', { name: /carol@example\.test/ }).textContent()).toContain('Not emailed');
@@ -2961,6 +2980,8 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
 
     // Her browser holds no credential a script can read.
     expect(await her.evaluate(() => `${document.cookie} ${JSON.stringify(localStorage)} ${JSON.stringify(sessionStorage)}`)).not.toMatch(/wyrd_session|eyJ|wyrd_[a-z]+_[A-Za-z0-9]{16}/);
+    await captureAdmin(page, base, ['people', 'people?filter=invited', 'people?drawer=invite', 'service-accounts', 'roles', 'roles?open=viewer', 'sign-in', 'sign-in?setup=1', 'secrets', 'integrations']);
+    await captureAdmin(her, base, ['account'], 'user');
   } finally {
     vi.unstubAllEnvs();
     await browser.close();
@@ -3370,7 +3391,7 @@ test('People and Service accounts work from the keyboard and fit a phone and a d
     }
 
     // The keyboard alone opens another section, and the control it lands on next shows a focus ring.
-    await page.getByRole('link', { name: 'Service accounts', exact: true }).focus();
+    await page.getByRole('link', { name: /^Service accounts\b/ }).focus();
     await page.keyboard.press('Enter');
     await page.waitForURL(/\/settings\/service-accounts/);
     await page.getByRole('link', { name: 'New service account' }).focus();

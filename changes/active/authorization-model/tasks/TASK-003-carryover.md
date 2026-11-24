@@ -1275,6 +1275,25 @@ Focused runner: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db
 
 **Maintainer decisions (2026-11-23, cycle 16 part A):** approved — a relay save that changes the username without a password is refused with 400 rather than dropping the stored password; `oidc: true` means a platform OIDC connection row exists (no secret decryption on the anonymous read).
 
+#### Cycle 16 evidence (Part C: platform console)
+
+Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
+(production BFF build → native `WyrdTestServer` → repository Postgres), via
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd crates/wyrd/wyrd-server/wyrd-ui && WYRD_UI_INTEGRATION=1 pnpm exec vitest run src/lib/ui-pages.integration.test.ts -t "<name>"'`.
+
+- **S1 password sign-in, overview, cookie isolation**
+  (`a platform operator signs in to the console with a password`).
+  RED: `page.waitForURL(/platform)` timed out; `/platform/ui` had no
+  production page. GREEN: 1 passed. Proves the **Platform admin** entry; an
+  unknown name, a wrong password and the root key each refuse with
+  `WYRD_AUTH_401_UNAUTHENTICATED` and set no cookie; the overview shows only
+  Rust's safe session metadata and the workspaces; the cookie is host-only on
+  `/platform`, HttpOnly, SameSite=Lax; no page carries it, a token or a key;
+  a recording hop shows every BFF call to Rust's `/platform/*` carried only
+  `wyrd_platform_*` cookies although the browser held a tenant session; a
+  tenant session alone opens no console page; sign-out ends the session at
+  Rust.
+
 ### 17. An existing User explicitly connects another sign-in method
 
 **Reuses:** Cycles 4–5 password/method owners, cycle 16 approved account pages and existing bound identity linking; preserve the same User/grants.

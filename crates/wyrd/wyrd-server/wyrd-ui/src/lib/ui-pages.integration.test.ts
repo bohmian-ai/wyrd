@@ -3561,3 +3561,145 @@ withGoogle('an invited person joins with Google and returns with Google', async 
     bff.stop();
   }
 });
+
+/** The platform operator's console password: fifteen characters, not blocklisted. */
+const OPERATOR_PASSWORD = 'quartz heron 15';
+
+/**
+ * The platform API as the deployment's root credential, the CLI/API break-glass
+ * channel: a token exchange, then JSON calls that answer status and body.
+ */
+async function platformApi(serverUrl: string, rootCredential: string) {
+  const exchanged = await fetch(`${serverUrl}/auth/platform/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+      subject_token: rootCredential,
+      subject_token_type: 'urn:wyrd:oauth:token-type:api_key'
+    })
+  });
+  expect(exchanged.status).toBe(200);
+  const { access_token: token } = (await exchanged.json()) as { access_token: string };
+  return async (method: string, path: string, body?: unknown) => {
+    const response = await fetch(`${serverUrl}${path}`, {
+      method,
+      headers: { 'x-wyrd-access-token': `Bearer ${token}`, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    const text = await response.text();
+    return { status: response.status, body: (text ? JSON.parse(text) : null) as Record<string, unknown> };
+  };
+}
+
+/** Register platform user `name` through `api`, with a console password unless `password` is null. */
+async function registerOperator(api: Awaited<ReturnType<typeof platformApi>>, name: string, password: string | null, matchClaim?: string): Promise<string> {
+  const registered = await api('POST', '/platform/admins', matchClaim ? { name, match_claim: matchClaim } : { name });
+  expect(registered.status, JSON.stringify(registered.body)).toBe(200);
+  const id = String(registered.body.principal_id);
+  if (password) expect((await api('PUT', `/platform/admins/${id}/password`, { password })).status).toBe(204);
+  return id;
+}
+
+/**
+ * A loopback hop between the BFF and the server that records the cookie
+ * names each request carried, by path, and forwards everything untouched.
+ */
+async function cookieHop(target: string) {
+  const seen: { path: string; cookies: string[] }[] = [];
+  const server = createHttpServer((req, res) => {
+    const names = (req.headers.cookie ?? '').split(';').map((pair) => pair.trim().split('=')[0]).filter(Boolean);
+    seen.push({ path: new URL(req.url ?? '/', target).pathname, cookies: names });
+    const upstream = httpRequest(new URL(req.url ?? '/', target), { method: req.method, headers: req.headers }, (answer) => {
+      res.writeHead(answer.statusCode ?? 502, answer.headers);
+      answer.pipe(res);
+    });
+    upstream.on('error', () => res.destroy());
+    req.pipe(upstream);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  return { url: `http://127.0.0.1:${port}`, seen, stop: () => server.close() };
+}
+
+/** A deployment with a platform console: its shared Google is the fake Google, so a provider test signs in there. */
+const withConsole = serverTest({ googleIssuer: google.issuer, perTest: true });
+
+/**
+ * A registered platform operator signs in to the console headed Platform
+ * admin with a platform-user password: an unknown name, a wrong password and
+ * the root key refuse without a session; the console renders only Rust's
+ * safe session metadata and its workspaces; the Rust cookie stays on
+ * `/platform`, HttpOnly and SameSite=Lax; the BFF forwards Rust only the
+ * platform cookie although this browser also holds a tenant session; a
+ * tenant session alone opens no console page; and signing out ends the
+ * session at Rust.
+ */
+withConsole('a platform operator signs in to the console with a password', async ({ server }) => {
+  const root = server.initializePlatformRoot();
+  const api = await platformApi(server.baseUrl, root);
+  await registerOperator(api, 'ops-oncall', OPERATOR_PASSWORD);
+  const tenantKey = server.bootstrapService(['admin'], 'console_tenant_admin');
+  buildUi();
+  const hop = await cookieHop(server.baseUrl);
+  const bff = await startBff(hop.url);
+  const browser = await chromium.launch();
+  try {
+    // This browser already holds a tenant session; it opens no console page.
+    const page = await signIn(browser, bff.url, server.tenantSlug, tenantKey);
+    await page.goto(`${bff.url}/platform/ui`);
+    await page.waitForURL(`${bff.url}/platform`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Platform admin');
+    expect(await page.getByText('For operators of this Wyrd deployment.', { exact: false }).count()).toBe(1);
+
+    // An unknown name, a wrong password and the root key each refuse alike and set no cookie.
+    for (const [username, password] of [['nobody', OPERATOR_PASSWORD], ['ops-oncall', 'not the password'], ['ops-oncall', root]]) {
+      await page.getByLabel('Username').fill(username);
+      await page.getByLabel('Password').fill(password);
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      await expect.poll(() => page.getByRole('alert').textContent()).toContain('WYRD_AUTH_401_UNAUTHENTICATED');
+      expect(await page.getByRole('alert').textContent()).toContain('Sign-in not accepted');
+      expect((await page.context().cookies()).some((cookie) => cookie.name === 'wyrd_platform_session')).toBe(false);
+    }
+
+    // The operator's own password opens the console overview with Rust's session metadata.
+    await page.getByLabel('Username').fill('ops-oncall');
+    await page.getByLabel('Password').fill(OPERATOR_PASSWORD);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await page.waitForURL(`${bff.url}/platform/ui`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Overview');
+    const header = page.locator('header');
+    expect(await header.textContent()).toContain('Platform admin');
+    expect(await page.getByTestId('operator').textContent()).toBe('ops-oncall');
+    const facts = page.getByRole('region', { name: 'This session' });
+    expect(await facts.textContent()).toContain('Platform password');
+    expect(await page.getByTestId('recent').textContent()).toContain('yes');
+    expect(await page.getByRole('table').textContent()).toContain(server.tenantSlug);
+    expect(await page.getByTestId(`status-${server.tenantSlug}`).textContent()).toContain('active');
+    expect(await page.getByRole('navigation', { name: 'Console' }).getByRole('link').allTextContents()).toEqual(['Overview', 'Social sign-in', 'Mail relay', 'Signup']);
+
+    // Rust's cookie is host-only on /platform, HttpOnly and SameSite=Lax; no page carries it, a token or the root key.
+    const cookie = (await page.context().cookies()).find((each) => each.name === 'wyrd_platform_session');
+    expect(cookie).toMatchObject({ path: '/platform', httpOnly: true, sameSite: 'Lax', domain: '127.0.0.1' });
+    const html = await serverHtml(page, `${bff.url}/platform/ui`);
+    for (const secret of [cookie?.value ?? '', root, tenantKey]) expect(html).not.toContain(secret);
+    expect(html).not.toMatch(/eyJ[\w-]+\.[\w-]+\./);
+
+    // Every request the BFF made to Rust for the console carried only platform cookies.
+    const platformCalls = hop.seen.filter((call) => call.path.startsWith('/platform'));
+    expect(platformCalls.length).toBeGreaterThan(0);
+    for (const call of platformCalls) for (const name of call.cookies) expect(['wyrd_platform_session', 'wyrd_platform_login']).toContain(name);
+
+    // Signing out ends the session at Rust: the old cookie opens nothing again.
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.waitForURL(`${bff.url}/platform?ended=1`);
+    expect(await page.getByRole('status').textContent()).toContain('Your console session ended. Sign in again.');
+    await page.context().addCookies([{ ...cookie!, expires: -1 }]);
+    await page.goto(`${bff.url}/platform/ui/providers`);
+    await page.waitForURL(`${bff.url}/platform`);
+  } finally {
+    await browser.close();
+    bff.stop();
+    hop.stop();
+  }
+});

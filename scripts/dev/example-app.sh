@@ -11,16 +11,15 @@
 #   example-app.sh test ARGS    the app's pytest suite with the testing-enabled wheel,
 #                               in an environment kept apart from the development one
 #
-# The checkout at target/dev/wyrd-example-py is the pinned upstream commit
-# (wyrd-example-py's dev-workload branch). A checkout holding uncommitted
-# changes is refused, never overwritten. The wheel is built from this repository
+# The checkout at target/dev/wyrd-example-py is the pinned upstream commit.
+# A checkout holding uncommitted changes is refused, never overwritten. The wheel is built from this repository
 # without the testing feature, is the only file in the app's vendor index, and
 # the installed native module must match its digest.
 set -Eeuo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo=https://github.com/bohmian-ai/wyrd-example-py
-readonly base=90fb879c4d02fb170efa4106a00be925648cc0e3
+readonly base=3222cf1359f4a2e43081127e6d8b1089eaeebd67
 readonly app="$root/target/dev/wyrd-example-py"
 readonly port=${WYRD_EXAMPLE_PORT:-8000}
 
@@ -64,7 +63,7 @@ wheel() {
     && uv pip install --quiet --no-deps --reinstall "$built")
   local installed
   installed=$(cd "$app" && uv run --no-sync python -c 'import wyrd._wyrd as m; print(m.__file__)')
-  if [[ $(unzip -p "$built" "wyrd/$(basename "$installed")" | sha256sum | cut -d' ' -f1) != $(sha256sum "$installed" | cut -d' ' -f1) ]]; then
+  if [[ $(unzip -p "$built" "wyrd/$(basename "$installed")" | shasum -a 256 | cut -d' ' -f1) != $(shasum -a 256 "$installed" | cut -d' ' -f1) ]]; then
     echo "the app imports $installed, not the native module of $built" >&2
     exit 1
   fi
@@ -74,7 +73,7 @@ wheel() {
   fi
   printf 'wyrd-example-py %s, source tree %s, wheel %s (sha256 %s)\n' \
     "$base" "$(worktree_tree)" \
-    "$(basename "$built")" "$(sha256sum "$built" | cut -c1-12)"
+    "$(basename "$built")" "$(shasum -a 256 "$built" | cut -c1-12)"
 }
 
 # Point the tenant's `openai` deployment at MockServer with a placeholder key,

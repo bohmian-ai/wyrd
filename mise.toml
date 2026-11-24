@@ -1351,18 +1351,24 @@ started=$(mktemp)
 WYRD_CONFIG_PATH="$PWD/tests/fixtures/mockserver/server.toml" WYRD_KMS_BACKEND=memory WYRD_KMS_ACTIVE_KEY=dev scripts/postgres/dev-server.sh &
 server=$!
 pids+=($server)
+# The server is ready once it serves and holds this start's new tenant key, written once the tenant and User exist.
+# A first run pulls the Postgres and MockServer images first, which can take minutes.
+echo "Waiting for wyrd-server; the UI starts once it is ready"
+until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $credentials -nt $started ]]; do
+  kill -0 "$server" 2>/dev/null || { echo "wyrd-server exited before it was ready" >&2; exit 1; }
+  sleep 1
+done
+# The UI starts only now, so :3000 never serves a sign-in page with no server behind it.
 # Sign-in is the real local User login, never the UI's fixture identity.
 (cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && WYRD_UI_LOCAL_AUTH=false exec pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}) &
 ui_pid=$!
 pids+=($ui_pid)
-# Ready means serving, holding this start's new tenant key, written once the tenant and User exist, and the UI's sign-in page answering.
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $credentials -nt $started ]] && curl -sf -o /dev/null "$ui/t/dev/login"; do
-  kill -0 "$server" 2>/dev/null || { echo "wyrd-server exited before it was ready" >&2; exit 1; }
+until curl -sf -o /dev/null "$ui/t/dev/login"; do
   kill -0 "$ui_pid" 2>/dev/null || { echo "the UI exited before it was ready" >&2; exit 1; }
   sleep 1
 done
 rm -f "$started"
-printf '\nUI ready     %s/t/dev/login (sign in as development / development-password)\n\n' "$ui"
+printf '\nUI ready     %s/t/dev/login (sign in as development / development-local)\n\n' "$ui"
 until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
   kill -0 "${pids[0]}" 2>/dev/null || { echo "MockServer exited before it was ready" >&2; exit 1; }
   sleep 1
@@ -1394,13 +1400,13 @@ else
   reviews="not started: setup FAILED"
 fi
 printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
-printf 'UI           %s/t/dev/login (sign in as development / development-password)\n' "$ui"
+printf 'UI           %s/t/dev/login (sign in as development / development-local)\n' "$ui"
 printf 'example app  %s\n' "$example"
 printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
 printf 'batch        %s\n' "$batch"
 printf 'review       %s\n\n' "$reviews"
-# macOS ships bash 3.2, which has no `wait -n`: return once any service exits.
-alive() { for pid in "$@"; do kill -0 "$pid" 2>/dev/null || return 1; done; }
+# Run until any service exits. Polled, not `wait -n`: macOS ships bash 3.2, which lacks it.
+alive() { local pid; for pid in "$@"; do kill -0 "$pid" 2>/dev/null || return 1; done; }
 while alive "${pids[@]}" ${app:+"$app"}; do sleep 1; done
 """
 

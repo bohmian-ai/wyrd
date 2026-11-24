@@ -5,8 +5,10 @@
 # tenant login, as a DBA would; `wyrd-server migrate` then runs as the platform
 # login exactly as a deployment does, and the server serves with both URLs.
 # Once it is ready, `wyrd-server setup` creates the `dev` tenant, its admin
-# key and its admin User `development` with password `development-password`, as
-# `wyrd init` does. The key then replaces the Wyrd config directory's `credentials.toml`, where every SDK
+# key, and its first human administrator, the User `development` with password
+# `development-local` (setup requires 15 to 128 characters) bound to the tenant
+# `admin` role. The key
+# then replaces the Wyrd config directory's `credentials.toml`, where every SDK
 # and CLI process finds it; the client's default URLs reach this server. It is
 # written last, so a fresh file means the tenant and User both exist.
 # The database is discarded on exit, and the server's `.wyrd` data is removed
@@ -26,13 +28,14 @@ exec "$root/scripts/postgres/with-test-postgres.sh" -- bash -c '
     kill -0 "$server" 2>/dev/null || exit 1
     sleep 1
   done
-  key=$(printf "development-password\n" | ./target/debug/wyrd-server setup --tenant dev --admin-username development --admin-password-stdin --server http://127.0.0.1:8080 | sed -n "s/^admin_credential: //p")
+  key=$(printf "development-local\n" | ./target/debug/wyrd-server setup --tenant dev --admin-username development --admin-password-stdin --server http://127.0.0.1:8080 | sed -n "s/^admin_credential: //p")
+  [[ -n $key ]] || { echo "wyrd-server setup printed no tenant credential" >&2; exit 1; }
   # SDKs and the CLI refuse a saved credential others can read.
   mkdir -p "$config"
   chmod 700 "$config"
   printf "[default]\napi_key = \"%s\"\n" "$key" > "$config/credentials.toml"
   chmod 600 "$config/credentials.toml"
   printf "\nwyrd-server ready on http://127.0.0.1:8080; tenant dev key saved to %s\n" "$config/credentials.toml"
-  printf "Sign in to tenant dev as development / development-password.\n\n"
+  printf "Sign in to tenant dev as development / development-local.\n\n"
   wait "$server"
 ' _ "$@"

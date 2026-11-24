@@ -483,6 +483,9 @@
     font: 700 11px var(--font-mono);
     color: var(--muted);
   }
+  p.done {
+    color: var(--text);
+  }
   .bad {
     color: var(--danger);
   }

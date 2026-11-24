@@ -133,12 +133,13 @@
       padding: 28px 20px;
     }
   }
-  .card :global(b) {
+  /* Zero-specificity base styles, as the mock's global rules: a page's own rule wins. */
+  :where(.card) :global(b) {
     color: var(--text);
     font-weight: var(--weight-strong);
     overflow-wrap: anywhere;
   }
-  .card :global(:not(.app-problem) > code) {
+  :where(.card) :global(code) {
     font: 11px var(--font-mono);
     color: var(--text);
     overflow-wrap: anywhere;

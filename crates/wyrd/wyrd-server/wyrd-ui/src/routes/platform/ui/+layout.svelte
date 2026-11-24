@@ -208,6 +208,17 @@
   .body :global(.app-problem code) {
     margin: 6px 0 0;
   }
+  /* Zero-specificity base styles, as the mock's global rules: a page's own rule wins. */
+  :where(.body) :global(code) {
+    font: 11px var(--font-mono);
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+  :where(.body) :global(b) {
+    color: var(--text);
+    font-weight: var(--weight-strong);
+    overflow-wrap: anywhere;
+  }
   .body :global(p.done) {
     color: var(--text);
   }

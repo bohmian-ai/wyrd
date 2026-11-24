@@ -119,8 +119,11 @@ Wyrd limits sign-in and signup starts per visitor address. The `bohmian/wyrd` im
 With the server running, from a machine that has the same two database URLs exported:
 
 ```bash
-wyrd-server setup --tenant acme --server http://<server-host>:8080
+wyrd-server setup --tenant acme --server http://<server-host>:8080 \
+  --admin-username alice --admin-password-stdin < alice-password.txt
 ```
+
+`--admin-username` names the tenant's first person, who signs in with a password and needs neither a mail relay nor an identity provider. The password is read from the first line of standard input, so it never enters the command line or your shell history; without `--admin-password-stdin`, `setup` asks for it at a hidden prompt. It must be 15 to 128 characters; a passphrase works well.
 
 On a fresh database this creates the platform root and prints its `wyrd_global_...` credential, then creates the tenant and prints:
 
@@ -130,9 +133,29 @@ slug: acme
 admin_principal_id: <uuid>
 admin_credential: <key>
 This is the only time the tenant credential is shown. Store it now.
+admin_username: alice
+login_url: https://wyrd.example.com/t/acme/login
 ```
 
-Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Rerunning `setup` for an active tenant prints `is already set up; nothing to do.` To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Give `login_url` and the password to the person named by `--admin-username`.
+
+`setup` is safe to rerun. For an active tenant it prints `is already set up; nothing to do.` and discloses nothing. If a run was interrupted, rerun the same command: it finishes the tenant and keeps the administrator the first run created. To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+
+## 5. Decide who can create a workspace
+
+A new deployment is private. Nobody can create a workspace from the sign-in page, and the root page offers only sign-in to a workspace someone already knows. People join a workspace with an invitation from its administrator, which is a different step from creating one: [Add people](/operate/add-people/) covers joining.
+
+To let visitors create their own workspaces, a platform administrator turns signup on:
+
+```bash
+curl -X PUT https://wyrd.example.com/platform/login-settings \
+  -H "X-Wyrd-Access-Token: Bearer $PLATFORM_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"password_enabled":true,"signup_enabled":true,"signup_workspace_cap":1}'
+```
+
+The root page then shows **Create a workspace**. A visitor proves an email address or a Google or GitHub account, names the workspace and its URL, and becomes its administrator. `signup_workspace_cap` limits how many workspaces one proven identity may create; the page says so when it is reached.
+
+Email signup, **Find my workspaces**, recovery email and mailed password reset codes need a mail relay ([Email invitations](/operate/add-people/#email-invitations)). Without one, Wyrd sends no mail and the pages say so instead of offering those steps: invitations are copied links, and an administrator issues password reset codes.
 
 Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/get-started/use-with-your-coding-agent/), and grant roles to others; [Identity and access](/understand/identity-and-authorization/) explains the model.
 

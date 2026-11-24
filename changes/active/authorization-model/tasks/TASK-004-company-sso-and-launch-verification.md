@@ -120,8 +120,11 @@ production UI journey owners; tier 2 pins tenant isolation/count semantics.
 
 Evidence (Rust/HTTP):
 
-- Runner: `t.sh` = repository test Postgres + Mailpit + Keycloak/Dex env, then
-  `mise exec -- cargo nextest run --locked "$@"`. Selector:
+- Runner: inside `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run
+  db:migrate:inner && scripts/identity/with-identity-providers.sh -- …'`
+  (the `test:identity:ui` lifecycle), run
+  `mise exec -- cargo nextest run --locked <selector>`. UI journeys run the
+  same lifecycle's `pnpm build` then `production_ui_bff_journey`. Selector:
   `-p wyrd-server --features test-support --test integration -E
   'test(=platform_admin_e2e::company_sso::a_company_administrator_reads_the_policy_and_its_account_warning)'`.
 - RED: `GET /v1/identity/login-policy` from the company admin's browser
@@ -464,6 +467,17 @@ Rust SDK, Python `tests/integration/` and TypeScript `wyrd/tests/integration/`
 identity consumers; existing `wyrd-mcp` scoped journey owners. Keep tests requiring
 services in their existing pg/provider lanes. Do not invent new test selectors in
 planning; implementation records the exact focused selector before each RED.
+
+Task verification (2026-11-24):
+- Passed: `mise run fmt`, `mise run lints`, `mise run ui:check` (105),
+  `mise run codegen:check`, `mise run check:tenant-isolation`,
+  `mise run check:deps`, `mise run docs:check`, and `git diff --check`.
+- `test:sql`'s suites, run inside the same lifecycle, passed 242 + 7 + 92 + 3.
+- Also passed: `-p wyrd-auth` (142);
+  `platform_admin_e2e::` | `pg_browser_sessions::` (113); and the full
+  production UI file (6/6).
+- `test:identity:journey`, `test:platform:journey` and the Python/TS identity
+  consumers were not run; they are left for change review.
 
 Existing runner families inspected in `mise.toml`:
 

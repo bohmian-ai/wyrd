@@ -264,7 +264,8 @@ test('the tenant layout enumerates sessions without depending on the URL, so cli
   const data = await loadTenantLayout({ locals: { session: null, browserSession, tenant: browserSession.context() }, cookies: browser.cookies, url: watched, untrack } as never);
 
   expect(data).toMatchObject({ tenant: { key: 'acme', name: 'Acme' }, session: { tenants: [{ key: 'acme', name: 'Acme' }] } });
-  expect(requests).toHaveLength(1);
+  // The name block's `/me` read is separate; the session enumeration happens once.
+  expect(requests.filter((request) => new URL(request.url).pathname === '/auth/browser/session')).toHaveLength(1);
   expect(tracked).toEqual([]);
 });
 

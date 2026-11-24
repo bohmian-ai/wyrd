@@ -323,7 +323,7 @@ async function expectSessionEnded(browser: Browser, replica: 0 | 1, tenant: stri
 
 /** The page and its data channel carry neither the session cookie nor any token. */
 async function expectNoSecrets(browser: Browser, tenant: string, session: string) {
-  for (const path of [`/t/${tenant}`, `/t/${tenant}/__data.json`, `/t/${tenant}/settings`]) {
+  for (const path of [`/t/${tenant}`, `/t/${tenant}/__data.json`, `/t/${tenant}/settings/account`]) {
     for (const replica of [0, 1] as const) {
       const response = await browser.go(replica, path);
       // Served to the session (a reader may be denied a page), never sent to sign-in.
@@ -435,7 +435,7 @@ test('production SSO crosses replicas', async () => {
   }
   const crossed = new Browser();
   crossed.cookies.set(sessionCookie(journey.apiKeyTenant), session);
-  expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings`)).headers.get('location')).toBe(
+  expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings/account`)).headers.get('location')).toBe(
     `/t/${journey.apiKeyTenant}/login`
   );
   expect(crossed.cookies.has(sessionCookie(journey.apiKeyTenant))).toBe(false);
@@ -599,14 +599,14 @@ test('production multi-provider tenant switch', async () => {
   expect(browser.cookies.get(sessionCookie(keycloak))).toBe(keycloakSession);
 
   // Both replicas render a chooser of exactly this browser's sessions; a forged
-  // session-cookie hint never renders and is cleared. (Settings render for every
+  // session-cookie hint never renders and is cleared. (Your account renders for every
   // member; the Dex tenant's role-less user is denied the home page.)
   browser.cookies.set(sessionCookie('ui-ghost'), 'd'.repeat(64));
   for (const [replica, tenant] of [
     [0, keycloak],
     [1, second]
   ] as const) {
-    const page = await browser.go(replica, `/t/${tenant}/settings`);
+    const page = await browser.go(replica, `/t/${tenant}/settings/account`);
     expect(page.status).toBe(200);
     expect(chooserTenants(await page.text())).toEqual([second, keycloak].sort());
   }
@@ -616,7 +616,7 @@ test('production multi-provider tenant switch', async () => {
   const toSecond = await browser.go(1, '/?/switch', { form: { tenantKey: second } });
   expect(toSecond.status).toBe(303);
   expect(toSecond.headers.get('location')).toBe(`/t/${second}`);
-  expect((await browser.go(1, `/t/${second}/settings`)).status).toBe(200);
+  expect((await browser.go(1, `/t/${second}/settings/account`)).status).toBe(200);
   const toKeycloak = await browser.go(0, '/?/switch', { form: { tenantKey: keycloak } });
   expect(toKeycloak.headers.get('location')).toBe(`/t/${keycloak}`);
 
@@ -642,7 +642,7 @@ test('production multi-provider tenant switch', async () => {
   // The same provider user signed in to the peer is a different tenant's
   // session: it joins this browser's chooser, but never opens the other tenant.
   const peerSession = await ssoLogin(browser, journey.users.admin, 1, 0, peer);
-  expect(chooserTenants(await (await browser.go(1, `/t/${keycloak}/settings`)).text())).toEqual(
+  expect(chooserTenants(await (await browser.go(1, `/t/${keycloak}/settings/account`)).text())).toEqual(
     [second, keycloak, peer].sort()
   );
   const crossed = new Browser();
@@ -651,12 +651,12 @@ test('production multi-provider tenant switch', async () => {
     `/t/${keycloak}/login`
   );
   expect(crossed.cookies.has(sessionCookie(keycloak))).toBe(false);
-  expect((await browser.go(0, `/t/${peer}/settings`)).status).toBe(200);
+  expect((await browser.go(0, `/t/${peer}/settings/account`)).status).toBe(200);
 
   // Signing out of one tenant leaves the others signed in.
   await browser.go(1, '/?/logout', { form: { tenantKey: peer } });
   expect(browser.cookies.has(sessionCookie(peer))).toBe(false);
-  expect(chooserTenants(await (await browser.go(0, `/t/${keycloak}/settings`)).text())).toEqual(
+  expect(chooserTenants(await (await browser.go(0, `/t/${keycloak}/settings/account`)).text())).toEqual(
     [second, keycloak].sort()
   );
 

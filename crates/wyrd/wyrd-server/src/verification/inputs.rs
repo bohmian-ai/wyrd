@@ -31,7 +31,7 @@ use wyrd_spec::ids::{
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::{
-    ApprovalReceipt, ApprovalStatus, GithubDelivery, InputDeclaration,
+    ApprovalReceipt, ApprovalStatus, GithubDelivery, InputDeclaration, PullRequestActivation,
 };
 use wyrd_spec::verification::{DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId};
 
@@ -215,6 +215,18 @@ impl InputRow {
     pub fn group(&self) -> Result<Option<GroupSelector>, WyrdError> {
         match self.origin {
             InputOrigin::Group => decode(self.inputs.clone()).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// A pull-request record's frozen PR source, generation and members,
+    /// `None` for any other origin.
+    ///
+    /// # Errors
+    /// Returns an internal error when the stored pins are malformed.
+    pub fn pull_request(&self) -> Result<Option<PullRequestActivation>, WyrdError> {
+        match self.origin {
+            InputOrigin::PullRequest => decode(self.inputs.clone()).map(Some),
             _ => Ok(None),
         }
     }

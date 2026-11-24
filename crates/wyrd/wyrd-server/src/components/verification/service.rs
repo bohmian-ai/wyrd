@@ -263,14 +263,19 @@ impl<'a> VerificationControl<'a> {
     /// answers the queue's status until its queue row commits completion
     /// with the dispatches; otherwise only unfinished work answers the
     /// queue's status. Dispatches and a group execution's source
-    /// selection are read from the queue row and the input record. A result
+    /// selection are read from the queue row and the input record. Once the
+    /// queue row is gone, a `pull_request` execution's PR source, generation
+    /// and members are read from its input record, so its recorded GitHub
+    /// delivery is still read for its accepted revision. A result
     /// Scribe has not yet published leaves `result` absent, so the caller
     /// polls again. The result is the compact decision: its stored checks
     /// are skipped, never decoded or compiled.
     ///
     /// # Errors
-    /// The errors of [`Self::retained`](VerificationControl::retained), and
-    /// the query error when a record read fails.
+    /// The errors of [`Self::retained`](VerificationControl::retained), the
+    /// query error when a record read fails, and
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when an execution with no
+    /// queue row has no visible input record.
     pub(crate) async fn get_execution(
         &self,
         caller: &Caller,
@@ -303,6 +308,21 @@ impl<'a> VerificationControl<'a> {
         state.waiting = retained.waiting();
         state.approvals = retained.approvals();
         state.input_waits = retained.input_waits();
+        let grouped = state.group_id.is_some() && state.owner_card_uid.is_some();
+        let queue_free = retained.queued.is_none() && retained.direct.is_none();
+        let record = if grouped || queue_free {
+            records.record(execution_id).await?
+        } else {
+            None
+        };
+        if queue_free {
+            // With no queue row, the input record Scribe acknowledged before
+            // queueing is the one retained source of the PR association.
+            let record = record
+                .as_ref()
+                .ok_or(BifrostError::QueryVisibilityUnavailable)?;
+            state.pull_request = record.pull_request()?;
+        }
         if state.pull_request.is_some() {
             let recorded = GithubDeliveries::new(self.state, caller.data_tenant_id)
                 .recorded(&records, execution_id, retained.revision, state.status)
@@ -316,8 +336,8 @@ impl<'a> VerificationControl<'a> {
         if let Some(failure) = &retained.state.failure {
             state.error = Some(failure.error.clone());
         }
-        if state.group_id.is_some() && state.owner_card_uid.is_some() {
-            state.group = match records.record(execution_id).await? {
+        if grouped {
+            state.group = match &record {
                 Some(record) => record.group()?.map(|selector| selector.snapshot()),
                 None => None,
             };

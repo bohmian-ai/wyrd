@@ -601,6 +601,72 @@ fn sent(deployment: &Deployment, request: &str) -> usize {
         .count()
 }
 
+/// `execution`'s status read once retention cleanup removed its terminal
+/// scheduling row, asserting the PR association, status, selected result
+/// and recorded delivery are unchanged from `before`, that no execution or
+/// scheduling row is created, and that GitHub receives nothing.
+///
+/// # Panics
+/// Panics when the row is not removed or the retained read differs.
+async fn after_queue_cleanup(deployment: &Deployment, execution: Uuid, before: &Value) -> Value {
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let deleted = sqlx::query("DELETE FROM wyrd.verifier_executions WHERE execution_id = $1")
+        .bind(execution)
+        .execute(&pool)
+        .await
+        .expect("the queue row deletes")
+        .rows_affected();
+    assert_eq!(deleted, 1, "the terminal scheduling row is removed");
+    let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM wyrd.verifier_executions")
+        .fetch_one(&pool)
+        .await
+        .expect("executions count");
+    let requests = deployment.mock.delivery_requests().len();
+
+    let served = deployment
+        .get(&format!("/v1/verification/executions/{execution}"))
+        .await;
+    for field in ["status", "pull_request", "result", "github_delivery"] {
+        assert_eq!(
+            served[field], before[field],
+            "{field} is retained: {served}"
+        );
+    }
+    assert!(served["pull_request"]["generation"].is_string(), "{served}");
+    let (after,): (i64,) = sqlx::query_as("SELECT count(*) FROM wyrd.verifier_executions")
+        .fetch_one(&pool)
+        .await
+        .expect("executions count");
+    assert_eq!(after, rows, "inspection creates no execution or queue row");
+    assert_eq!(
+        deployment.mock.delivery_requests().len(),
+        requests,
+        "inspection sends GitHub nothing"
+    );
+    served
+}
+
+/// A delivered PR execution reads the same after its terminal scheduling
+/// row is removed: its PR source, generation and members, completed status,
+/// selected result and delivered outcome all come from its retained records.
+///
+/// # Panics
+/// Panics when the retained read loses or changes any of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivered_execution_reads_the_same_after_queue_cleanup() {
+    let deployment = bound(&[("review", located())], &[]).await;
+    let execution = deployment.admit(&sha('a'), "opened").await;
+    let before = outcome(&deployment, execution).await;
+    assert_eq!(before["github_delivery"], json!({"status": "delivered"}));
+    assert_eq!(before["pull_request"]["members"], json!([execution]));
+
+    after_queue_cleanup(&deployment, execution, &before).await;
+}
+
 /// GitHub commits the Check create and a review create but loses both
 /// answers; a review create is first rate-limited. Delivery looks each up
 /// again before writing: the Check is updated in place and the review is
@@ -784,7 +850,8 @@ async fn a_recorded_outcome_outlives_its_retry_receipts() {
 /// A new head pushed while the Check create is in flight supersedes the
 /// execution: GitHub fails that create, and delivery writes nothing more
 /// for it, recording it skipped as superseded while the new head's
-/// execution is delivered.
+/// execution is delivered. Once its scheduling row is removed, the skipped
+/// execution still reads as skipped, never pending.
 ///
 /// # Panics
 /// Panics when the superseded execution writes again or is not skipped.
@@ -814,6 +881,9 @@ async fn a_new_head_during_delivery_skips_every_later_write() {
     let reviews = deployment.mock.reviews(REPOSITORY, PR);
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0]["commit_id"], sha('b'));
+
+    let skipped = outcome(&deployment, first).await;
+    after_queue_cleanup(&deployment, first, &skipped).await;
 }
 
 /// The App is uninstalled while the Check create is in flight: GitHub fails
@@ -860,7 +930,8 @@ async fn removed_access_during_delivery_skips_every_later_write() {
 }
 
 /// GitHub refuses the Check create permanently: delivery stops, records a
-/// failed outcome GitHub refused, and leaves the verdict alone.
+/// failed outcome GitHub refused, and leaves the verdict alone. Once its
+/// scheduling row is removed, it still reads as failed, never pending.
 ///
 /// # Panics
 /// Panics when delivery retries the refusal, writes the review, or hides
@@ -883,6 +954,8 @@ async fn a_permanent_refusal_is_a_visible_failed_outcome() {
     assert_eq!(sent(&deployment, "POST "), 1, "a refusal is not retried");
     assert!(deployment.mock.check_runs(REPOSITORY).is_empty());
     assert!(deployment.mock.reviews(REPOSITORY, PR).is_empty());
+
+    after_queue_cleanup(&deployment, execution, &served).await;
 }
 
 /// The citations the public `examples/review-a-pull-request` requirement

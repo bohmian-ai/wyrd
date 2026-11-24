@@ -386,6 +386,36 @@ async fn complete_from(
     (status, headers, body_json(resp).await)
 }
 
+/// A self-service signup cannot claim a reserved workspace slug such as
+/// `admin`, `platform` or `support`: completion answers the same `409` as
+/// a taken slug and no tenant row is written, so nobody can pose as the
+/// service operator.
+///
+/// # Panics
+/// Panics when a reserved slug is claimed or refused differently from a
+/// taken one.
+#[tokio::test(flavor = "multi_thread")]
+async fn signup_cannot_claim_a_reserved_slug() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, _session) = signup_server(&google).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let proof = prove_signup(&srv, &google, "google-squatter").await;
+
+    for slug in ["admin", "platform", "support"] {
+        let body = json!({ "slug": slug, "display_name": "Official" });
+        let (status, session, body) = complete_with(&srv, &proof, "198.51.100.140", &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{slug} is reserved: {body}");
+        assert!(session.is_none(), "{slug}: no session is issued");
+        assert!(
+            statuses(&superuser, slug).await.is_empty(),
+            "{slug}: no tenant row"
+        );
+    }
+}
+
 /// Every signup throttle answers `429` with a whole-second `Retry-After`
 /// equal to `details.retry_after_seconds`:
 ///   1. the start source window;

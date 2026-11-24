@@ -1041,6 +1041,10 @@ explicitly included; neither creates a global identity account.
 Email invitations do not add delivery/notifications to REQ-009's access-request
 copy flow.
 
+### Revision 10 addendum: reserved signup slugs
+
+Maintainer-approved 2026-11-23. A self-service signup completion cannot claim a reserved slug (`admin`, `administrator`, `api`, `app`, `auth`, `billing`, `help`, `login`, `mail`, `platform`, `root`, `security`, `signup`, `status`, `support`, `system`, `www`, `wyrd`). It is refused with the same `409` as a taken slug and creates nothing. Operator creation through the platform API is unrestricted. No migration. Extends REQ-011/AC-005.
+
 ## Revision history
 
 Revision 2 makes local device-login anchors and scoped invitation consumption

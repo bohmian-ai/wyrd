@@ -1217,6 +1217,8 @@ neither changes the mock nor claims that future visual approval has occurred.
 
 **Cycle 15 status: APPROVED (2026-11-23).** The maintainer approved the extended mock (commits 2d2cdbe26, 1c8773557) and all seven contract readings in the mock README: (1) the proof step reports its method, so the completion page does not infer it; (2) recovery-contact entry appears only when `email_discovery` is offered; (3) no current recovery address is shown; (4) a read exposes whether platform OIDC exists so its button appears only when usable; (5) sign-in on `/platform`, console under `/platform/ui`; (6) retirement is Suspend/Resume; (7) a blank relay password keeps the stored one, with explicit removal.
 
+**Reserved signup slugs (spec revision 10 addendum).** RED: `platform_admin_e2e::signup::signup_cannot_claim_a_reserved_slug` failed with `admin is reserved: {"tenant":"admin"}` (200, expected 409). GREEN: `ProvisionOwner::claim_for_signup` refuses a reserved slug as `SlugTaken` before any write; all 12 signup journeys pass. TDD: PASS.
+
 ### 16. Deliver approved onboarding and platform console pages
 
 **Reuses:** Cycles 1–14 final Rust outputs and cycle 15 approved mock; render the complete onboarding and platform surfaces once.

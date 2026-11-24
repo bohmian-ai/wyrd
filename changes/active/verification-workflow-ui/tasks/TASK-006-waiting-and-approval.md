@@ -89,6 +89,26 @@ behavior remains test-first.
    **Map:** REQ-005/008/014, AC-004/008. **Tier/owner:** existing shared component,
    real-server library and BFF/browser integration owners. Missing occurrence
    rendering/selection should produce RED.
+   - Evidence. [I1] `ui-library.integration.test.ts:2485` "TASK-006: each reached approval occurrence is read without the Verifier…" (fixture `fixtures/cards/approvals/repeated.yaml`, `repeated-repository.yaml`): a real pull-request execution parks on a repeated
+     `review` approval and a `release` approval while `ci` is deferred
+     (`status: waiting`, `waiting: ['ci']`, no `result`). A Repository viewer
+     with no Verifier read loads it through Node and MCP: `definition` is not
+     populated, and `approvals` lists `[review, 0, 'Reviewed?', pending]` and
+     `[release, null, 'Release?', pending]`. Rendered, the "Recorded without
+     the definition" group shows `Step release` as waiting, and
+     `[data-approval=<id>]` reads `<execution> · step review · iteration 0`.
+     [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…" (definition refused through `fixtureRecording`): the summary fact
+     "Waiting for input" names `eval_report` apart from the approvals. Recorded
+     steps read `gather succeeded`, `audit started`, `release ◷waiting`,
+     `review ◷waiting`. Each occurrence shows its status, message, exact
+     occurrence/step/item/iteration and lifecycle wording. Status stays
+     `waiting` with no verdict. [B1] `ui-pages.integration.test.ts:2643` "TASK-006: an approver reads each waiting approval in the execution page…": the page reads "no verdict recorded" and
+     "Waiting for input".
+   - RED: [U1] failed on the missing "Waiting for input" label (missing
+     behavior). GREEN: [U1], [I1], [B1] pass.
+   - Limit: the running peer is covered by the [U1] fixture (`audit started`);
+     the real Verifier in [I1] has approvals and a deferred input but no
+     long-running peer step.
 
 2. **Submit one exact decision and consume its receipt.** As a reader with
    exact-Verifier approve plus parent read, approve one occurrence with a reason
@@ -101,6 +121,35 @@ behavior remains test-first.
    and real public backend → Node/MCP/custom/built host action → browser journey
    using existing UI test owners. Missing decision emit/BFF dispatch should
    produce RED; backend resumption/durability is reused.
+   - Evidence. [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…": Approve emits exactly `{name: 'approval.decide', input:
+     {execution_id, approval_id, decision, reason?}}`. `validateIntent` accepts
+     it, the catalog says `completion: 'host-action'`, and `decision: 'expired'`
+     is refused. While the action is pending, every decide control is disabled
+     (one decision in flight per page) and a second click emits nothing. The
+     host's answer shows only under the occurrence last sent (`decidedFor`).
+     Reject with no reason sends no `reason`. Without `onaction`, Approve is
+     disabled, so the MCP App artifact and `examples/ui-app` issue no write.
+     [P1] `ui-pages.test.ts:739` "TASK-006: an execution page decides one exact approval occurrence once…": one `fetch(here + '/approvals/apo_release_0', {method: 'POST',
+     body: {decision: 'approved', reason: 'metrics hold'}})`. A second click
+     sends nothing. The receipt shows "Recorded approved by pr_me at … The same
+     execution continues from this decision; its status is read again.", then
+     `invalidateAll` runs once. [I1] `ui-library.integration.test.ts:2485` "TASK-006: each reached approval occurrence is read without the Verifier…" (fixture `fixtures/cards/approvals/repeated.yaml`, `repeated-repository.yaml`): with both grants, rejecting
+     `review` iteration 0 without a reason returns `200 {status: 'rejected',
+     reason: null, actor_id}`. The same execution then asks again as a new
+     occurrence, iteration 1. Approving that occurrence with a reason records
+     it, its `reviewed` requirement is judged `passed`, and status stays
+     `waiting` on `ci` with `release` pending under the same
+     `execution_id`. [B1] `ui-pages.integration.test.ts:2643` "TASK-006: an approver reads each waiting approval in the execution page…": a real browser types a reason, clicks Approve on
+     `review` and sees the receipt line and `approved`. It then rejects
+     `release` from the keyboard (focus plus Enter). The server holds exactly
+     `[review approved 'reviewed the diff'], [release rejected null]`.
+   - Host route: `approvals/[approvalId]/+server.ts` validates the body
+     (strict `decision` enum, `reason` 1–4096) and forwards it unchanged
+     through the session to `POST /v1/verification/executions/{id}/approvals/
+     {approval_id}`. Cancel and decide share `relayAnswer` in
+     `server/problem.ts`.
+   - RED: [U1] (missing emit) and [P1] (`approve()` never became disabled:
+     no host dispatch). GREEN: all four.
 
 3. **Refuse insufficient or changed authority.** Exercise a parent reader
    without approve, exact-Verifier approver without parent read, wrong-Verifier
@@ -113,6 +162,26 @@ behavior remains test-first.
    **Tier/owner:** actual scoped-grant server/HTTP inputs through existing
    library/host and production-browser integration owners. New UI refusal/
    availability wiring should produce RED; unchanged server checks may pass.
+   - Evidence. [I1] `ui-library.integration.test.ts:2485` "TASK-006: each reached approval occurrence is read without the Verifier…" (fixture `fixtures/cards/approvals/repeated.yaml`, `repeated-repository.yaml`), through the host route as each principal's browser
+     session: Repository viewer without approve gets 403
+     `WYRD_PERMISSION_403_DENIED_RBAC`. Exact-Verifier `approver` without
+     Repository read gets 403. `approver` on another Verifier plus Repository
+     viewer gets 403. Another tenant's admin gets 404
+     `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`. An invalid body gets 400
+     `WYRD_SPEC_400_VALIDATION` from the host and is never forwarded. The
+     occurrence stays `pending` after each refusal. A custom role
+     `verifier_approver` (`verifier:approve`) on the exact Verifier plus
+     Repository viewer may decide. After the page loaded, unbinding that
+     principal's Repository viewer refuses its next decision with 403 in the
+     same session, and `release` stays pending. [P1] `ui-pages.test.ts:739` "TASK-006: an execution page decides one exact approval occurrence once…": a 403 shows the stable
+     code under the occurrence, which stays readable and `pending`. [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…": a
+     denied note appears only under the occurrence that was sent.
+   - Decision: no permission hint. The session's permission strings are not a
+     verified contract, so the UI infers no authority. A supported host submits,
+     and the server's refusal is the answer, as REQ-008 allows. Hosts without
+     `onaction` keep the controls disabled.
+   - RED: the refusal wiring is in the [P1] RED above. The server checks
+     already existed and passed on first run.
 
 4. **Read back ambiguous, stale and conflicting answers.** Let the real backend
    commit a decision while its response is lost. The host reads that exact
@@ -124,6 +193,27 @@ behavior remains test-first.
    **Map:** REQ-008/014, AC-004/008. **Tier/owner:** controlled transport around
    real backend decisions plus component/host/browser tests. Missing ambiguous
    response and exact-selection handling should produce RED.
+   - Evidence. [P1] `ui-pages.test.ts:739` "TASK-006: an execution page decides one exact approval occurrence once…": on 409 the server's problem is shown and the status is
+     read again. On a lost answer (fetch rejects), the reread finds the
+     occurrence still pending: "No decision is recorded for apo_release_0;
+     submit it again to retry." Nothing is resent. If the reread itself fails,
+     the result is "Whether apo_release_0 was decided is unknown … Refresh
+     before deciding again." and the control is released. An explicit retry
+     sends the same decision and reason. On 503, the reread shows the server
+     already recorded it: "The answer was lost; the server records approved by
+     pr_me at …". Approve disappears, and there are 6 fetches in total, none
+     automatic. [I1] `ui-library.integration.test.ts:2485` "TASK-006: each reached approval occurrence is read without the Verifier…" (fixture `fixtures/cards/approvals/repeated.yaml`, `repeated-repository.yaml`): a decision is committed and its answer discarded. The
+     reader's reread shows it approved with the reason, and an explicit retry of
+     the same decision and reason returns the identical receipt
+     (`actor_id`, `decided_at`). Replaying the same rejection gives an equal
+     response. A different decision gets 409. [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…": while one decision is
+     pending, the other step's controls are disabled, and its answer never
+     appears under another occurrence.
+   - RED: [P1] (no dispatch or readback). The Wyrd Factory hook found two
+     defects, both fixed before commit. A rejected `invalidateAll` left the
+     action pending (the reread now settles, and cancel shares the fix). An
+     unreadable status was reported as pending (it is now reported as unknown).
+     GREEN: [P1] 23/23 in the file.
 
 5. **Cancel or finish parked work and retain evidence.** Cancel actual parked
    work, race continuation/completion and reopen retained outputs. Server-owned
@@ -138,6 +228,41 @@ behavior remains test-first.
    timestamps. Record AC-009 comparison evidence and get the maintainer's ruling
    on remaining mock differences under
    [wyrd-ui](../../../../.agents/skills/wyrd-ui/SKILL.md#matching-an-approved-mock).
+   - Evidence. [I1] `ui-library.integration.test.ts:2485` "TASK-006: each reached approval occurrence is read without the Verifier…" (fixture `fixtures/cards/approvals/repeated.yaml`, `repeated-repository.yaml`): cancelling the parked execution through the cancel host
+     route returns `cancelled`. `release` becomes `expired`, deciding it gets
+     409, the invocations stay populated, and the rendered occurrence reads
+     `expired` with no Approve. [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…": after `timed_out`, the occurrence reads
+     expired with "The execution ended before anyone decided." Prerequisites:
+     `pg_approvals::a_pending_approval_is_decided_once_and_resumes_the_same_execution`
+     and `pg_approvals::an_approval_expires_with_its_execution` 2 passed (command
+     under Verification).
+   - AC-009 comparison: the mock's `selfcheck.mjs --shots` (`exec-approval`
+     light, dark, mobile) beside [B1]'s `captureRepositories` of the pending and
+     decided page at 1440 and 390, light and dark, with no sideways scroll.
+     Matching: the orange-ruled "HUMAN APPROVAL" box, message, Occurrence/For,
+     optional reason textarea, primary Approve and secondary Reject, ◷ pending
+     mark, and APPROVAL kind badge. At 390 the graph scrolls inside its region.
+   - Differences awaiting the maintainer's ruling:
+     1. The mock's Requested/Expires timestamps are replaced by lifecycle wording
+        (the wire carries no deadline per occurrence; spec-sanctioned).
+     2. The graph mark reads "◷ waiting" for an approval step. The mock reads
+        "waiting for approval" or "waiting for input". Production keeps input
+        and approval apart through the "Waiting for input" fact and the
+        APPROVAL badge.
+     3. The header status reads `waiting`. The mock shows pills "running ·
+        waiting for input · waiting for approval" (owned by the existing status
+        mapping).
+     4. "For" shows `iteration N` or `item N`. The mock shows `attempt 1`
+        (occurrences carry no attempt on the wire).
+     5. Facts use the inspector's stacked uppercase labels. The mock uses
+        side-by-side rows. The pending mark is unboxed.
+     6. No viewer note. Authority is not inferred (see 3).
+     7. Found in the decided capture: right after `release` is rejected, its
+        graph node reads "○ not started" until the engine records the
+        approval step's invocation. The occurrence already reads `rejected`,
+        and the next refresh shows the step's recorded state.
+   - Limits: long messages and the touch layout are checked only at 390 in the
+     captures, with no separate long-message fixture.
 
 ## Verification and handoff
 
@@ -158,6 +283,13 @@ build before focused UI integration under the managed Postgres wrapper with
 and `mise run codegen:check` for changed schemas/catalog, plus affected BFF/
 session owner checks including `mise run test:identity:ui` for new forwarding.
 Do not add benchmarks or unrelated broad gates.
+
+Run (2026-11-24): `mise run ui:check` exit 0 (117 passed); `mise run
+codegen:check` exit 0; `mise run test:identity:ui` exit 0; `git diff --check`
+clean; backend prerequisites 2 passed. Focused integration under
+`scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm exec
+vitest run <file> -t "TASK-006"`: [I1] and the cancel journeys 2 passed; [B1]
+1 passed with `WYRD_UI_CAPTURE_DIR` set.
 
 Planning runs no implementation or runtime verification. Backend approval/
 recovery is consumed, not reimplemented; integrated change review owns complete

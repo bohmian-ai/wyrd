@@ -135,7 +135,7 @@ import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as exampleLoad } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
-import { Bifrost, GithubConnection, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
+import { Bifrost, GithubConnection, WyrdError, verify, type CardTypes, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
 import { STATE_ROOM, layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
@@ -164,6 +164,7 @@ import {
   executionDetails,
   executionStatus,
   EXECUTIONS,
+  invocations,
   facet,
   executions,
   executionsByVerdict,
@@ -4034,4 +4035,74 @@ test('an execution whose Verifier definition is refused still lets a reader sele
   expect(step.container).toHaveTextContent('attempt 2');
   expect(within(step.container).getByRole('button', { name: 'Preview' })).toBeInTheDocument();
   expect(within(within(step.container).getByRole('group', { name: 'Recorded without the definition' })).getByRole('button', { name: /Step score/ })).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('a requirement judged once per item stays one selectable entry with every judgment when the definition is refused', async () => {
+  // Setup: a settled execution that judged `classified` for two items, and a Verifier Card the reader may not read.
+  const refusal = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };
+  const settled = executionStatus[EXECUTIONS.settled];
+  const outcome = settled.result!.outcome;
+  const repeated = {
+    ...settled,
+    result: { ...settled.result!, outcome: { ...outcome, requirements: [{ ...outcome.requirements[0], item_index: 0 }, { ...outcome.requirements[0], item_index: 1, outcome: 'failed' as const, reason: 'item 1 has two labels' }] } }
+  };
+  const reads = fixtureRecording((request) =>
+    request.op === 'cards.get_by_ref' ? { ok: false, problem: refusal } : request.op === 'verification.get_execution' ? { ok: true, value: repeated } : undefined
+  );
+  const onaction = vi.fn();
+
+  // Action: open it with nothing selected, then select the requirement.
+  const view = render(VerificationExecution, { ...(await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: reads.executor })), onaction });
+  const recorded = () => within(view.container).getByRole('group', { name: 'Recorded without the definition' });
+  const entries = within(recorded()).getAllByRole('button', { name: /Requirement classified/ });
+  expect(entries.map((button) => button.textContent?.replace(/\s+/g, ' ').trim())).toEqual(['Requirement classified 1 of 2 failed']);
+  await fireEvent.click(entries[0]);
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'execution.select', input: { node: 'req:classified' } });
+
+  // The host answers with the refreshed selection: one pressed entry, both item judgments, and no drawn graph.
+  await view.rerender({ ...(await loadExecution({ executionId: EXECUTIONS.settled, node: 'req:classified' }, { executor: reads.executor })), onaction });
+  expect(within(recorded()).getByRole('button', { name: /Requirement classified/ })).toHaveAttribute('aria-pressed', 'true');
+  const judgments = [...view.container.querySelectorAll('.judgment')].map((each) => [each.getAttribute('data-outcome'), each.textContent?.replace(/\s+/g, ' ')]);
+  expect(judgments.map(([outcome]) => outcome)).toEqual(['passed', 'failed']);
+  expect(judgments[0][1]).toContain('item 0');
+  expect(judgments[1][1]).toContain('item 1');
+  expect(judgments[1][1]).toContain('item 1 has two labels');
+  expect(view.container.querySelector('[data-node]')).toBeNull();
+});
+
+test('a requirement settled while other work runs stays readable from its recorded invocation when the definition is refused', async () => {
+  // Setup: a running execution with no result that has recorded one requirement judgment, and a Verifier Card the reader may not read.
+  const refusal = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };
+  const items: CardTypes.ExecutionInvocation[] = [
+    ...invocations[EXECUTIONS.running],
+    { state: 'requirement', producer: { step_id: 'has-answer', attempt: 1, item_index: null, iteration_index: 2 }, outcome: 'failed', speculation: 'none', reason: 'the answer is empty' }
+  ];
+  const page: CardTypes.InvocationPage = { execution_id: EXECUTIONS.running, status: 'running', items, next_cursor: null, history: { acknowledged: 0, pending: 0, failed: 0 } };
+  const reads = fixtureRecording((request) =>
+    request.op === 'cards.get_by_uid'
+      ? { ok: false, problem: refusal }
+      : request.op === 'verification.list_invocations'
+        ? { ok: true, value: page }
+        : undefined
+  );
+  const onaction = vi.fn();
+
+  // Action: open it with nothing selected, then select the recorded requirement.
+  const view = render(VerificationExecution, { ...(await loadExecution({ executionId: EXECUTIONS.running, node: 'none' }, { executor: reads.executor })), onaction });
+  const recorded = () => within(view.container).getByRole('group', { name: 'Recorded without the definition' });
+  const names = within(recorded()).getAllByRole('button').map((button) => button.textContent?.replace(/\s+/g, ' ').trim());
+  expect(names).toEqual(['Requirement has-answer failed', 'Step read-photo succeeded', 'Step score succeeded', 'Step classify started']);
+  await fireEvent.click(within(recorded()).getByRole('button', { name: /Requirement has-answer/ }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'execution.select', input: { node: 'req:has-answer' } });
+
+  // The host answers with the refreshed selection: its recorded outcome, reason and exact invocation, beside a running execution with no verdict.
+  await view.rerender({ ...(await loadExecution({ executionId: EXECUTIONS.running, node: 'req:has-answer' }, { executor: reads.executor })), onaction });
+  expect(within(recorded()).getByRole('button', { name: /Requirement has-answer/ })).toHaveAttribute('aria-pressed', 'true');
+  const judgment = view.container.querySelector('.judgment');
+  expect(judgment).toHaveAttribute('data-outcome', 'failed');
+  expect(judgment).toHaveTextContent('the answer is empty');
+  expect(judgment).toHaveTextContent('iteration 2 · attempt 1');
+  expect(view.container).not.toHaveTextContent('Not judged yet.');
+  expect(view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
+  expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
 });

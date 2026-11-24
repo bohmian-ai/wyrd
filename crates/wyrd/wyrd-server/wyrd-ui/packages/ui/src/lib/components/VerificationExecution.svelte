@@ -8,7 +8,7 @@
 <script lang="ts">
   import type { CardTypes } from 'wyrd-ai';
   import type { ActionProps } from '../contract.js';
-  import { attemptsOf, executionStates, sameProducer, settled, type Part, type VerificationExecutionProps } from '../execution.js';
+  import { attemptsOf, executionStates, requirementAttempts, requirementState, sameProducer, settled, type Part, type VerificationExecutionProps } from '../execution.js';
   import { fmtBytes, fmtCardRef, fmtDuration, fmtShortId, fmtYaml } from '../format.js';
   import type { ExecutionInput } from '../schemas.js';
   import Code from './Code.svelte';
@@ -69,10 +69,14 @@
 
   /** Steps that recorded an invocation, in recorded order; the only steps known when the definition is unavailable. */
   const ran = $derived([...new Set(items.filter((each) => each.state !== 'requirement').map((each) => each.producer.step_id))]);
+  /** Requirements judged in the result or by a settled invocation, each once, in recorded order; the only requirements known when the definition is unavailable. */
+  const judgedIds = $derived([...new Set([...(data?.status.result?.outcome.requirements.map((each) => each.id) ?? []), ...items.flatMap((each) => (each.state === 'requirement' ? [each.producer.step_id] : []))])]);
   const attempts = $derived(type === 'step' ? attemptsOf(items, id) : []);
   const attempt = $derived(attempts.find((each) => selection.producer && sameProducer(each.producer, selection.producer)) ?? attempts.at(-1));
   const produced = $derived(attempt ? outputs.filter((each) => sameProducer(each.producer, attempt.producer)) : []);
   const judgments = $derived(type === 'req' ? (data?.status.result?.outcome.requirements.filter((each) => each.id === id) ?? []) : []);
+  /** Without a judgment in the result, the requirement's settled invocations are what was recorded of it. */
+  const progress = $derived(type === 'req' && !judgments.length ? requirementAttempts(items, id) : []);
   const completed = $derived(data?.details?.state === 'populated' ? data.details.data.outcome : undefined);
 
   const where = (producer: Producer) =>
@@ -295,12 +299,12 @@
     {:else}
       <Panel title="Graph" note="The Verifier this execution ran">
         {@render refused(data.definition, 'Verifier definition')}
-        {@const judged = status.result?.outcome.requirements ?? []}
-        {#if judged.length + ran.length}
+        {#if judgedIds.length + ran.length}
           <div class="recorded" role="group" aria-label="Recorded without the definition">
             <p class="hint">Recorded requirements and invocations stay selectable. Declared order and edges need the definition.</p>
-            {#each judged as each (each.id)}
-              <button type="button" class="tool" aria-pressed={selection.node === `req:${each.id}`} onclick={() => select({ node: `req:${each.id}` })}><span class="label">Requirement</span> {each.id} <span class="muted">{each.outcome.replace('_', ' ')}</span></button>
+            {#each judgedIds as requirement (requirement)}
+              {@const mark = requirementState(status, items, requirement)}
+              <button type="button" class="tool" aria-pressed={selection.node === `req:${requirement}`} onclick={() => select({ node: `req:${requirement}` })}><span class="label">Requirement</span> {requirement} <span class="muted">{mark.word ?? mark.value.replace('_', ' ')}</span></button>
             {/each}
             {#each ran as step (step)}
               {@const last = attemptsOf(items, step).at(-1)}
@@ -443,7 +447,18 @@
               {#if each.detail?.drift}{@render drift(each.detail.drift, each.id)}{/if}
             </div>
           {:else}
-            <p class="hint">{settled(status.status) ? 'No judgment of this requirement was recorded.' : 'Not judged yet.'}</p>
+            {#each progress as each (where(each.producer))}
+              <div class="judgment" data-outcome={each.outcome} data-producer={where(each.producer)}>
+                <dl>
+                  <div class="fact"><dt>Outcome</dt><dd><StatusMark value={each.outcome} /></dd></div>
+                  {@render fact('Reason', each.reason)}
+                  {@render fact('Invocation', where(each.producer))}
+                  {@render fact('Disposition', each.speculation === 'none' ? undefined : each.speculation)}
+                </dl>
+              </div>
+            {:else}
+              <p class="hint">{settled(status.status) ? 'No judgment of this requirement was recorded.' : 'Not judged yet.'}</p>
+            {/each}
           {/each}
           {#if completed}
             {#each completed.requirements.filter((each) => each.id === id) as each, index (index)}

@@ -307,14 +307,23 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
       states[step.key] = { ...together(recorded), dim };
     }
   }
-  for (const requirement of [...graph.steps.flatMap((step) => step.requirements), ...graph.requirements]) {
-    const judged = status.result?.outcome.requirements.filter((each) => each.id === requirement.id).map((each) => each.outcome);
-    const recorded = judged?.length ? judged : attemptsOf(items, requirement.id).flatMap((item) => (item.state === 'requirement' ? [item.outcome] : []));
-    if (recorded.length === 0) states[requirement.key] = { value: 'not judged', dim: done };
-    else states[requirement.key] = together(recorded);
-  }
+  for (const requirement of [...graph.steps.flatMap((step) => step.requirements), ...graph.requirements]) states[requirement.key] = requirementState(status, items, requirement.id);
   return states;
 }
+
+/**
+ * The recorded state of one requirement, with or without its definition: its
+ * judgments in the selected result, else its settled requirement invocations,
+ * else not judged.
+ */
+export function requirementState(status: VerificationExecutionState, items: readonly Invocation[], id: string): NodeState {
+  const judged = status.result?.outcome.requirements.filter((each) => each.id === id).map((each) => each.outcome);
+  const recorded = judged?.length ? judged : requirementAttempts(items, id).map((item) => item.outcome);
+  return recorded.length ? together(recorded) : { value: 'not judged', dim: settled(status.status) };
+}
+
+/** The settled requirement invocations of `id`, one per item, iteration and attempt, in first-seen order. */
+export const requirementAttempts = (items: readonly Invocation[], id: string) => attemptsOf(items, id).flatMap((item) => (item.state === 'requirement' ? [item] : []));
 
 /** A refused part's problem, for callers that only report it. */
 export const refusal = (part: Part<unknown> | undefined): Problem | undefined => (part?.state === 'denied' || part?.state === 'error' ? part.problem : undefined);

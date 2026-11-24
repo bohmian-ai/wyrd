@@ -38,9 +38,6 @@ mod pg_tests {
         "a1".repeat(20)
     }
 
-    /// A deployment whose administrator connected installation 101
-    /// (`acme/api`, `acme/web`) and declared the Repository file at
-    /// `repository`, with pull request 7 of `acme/web` opened at [`head`].
     /// Each task `waits` names as its step or requirement ID and slot names.
     fn named(waits: &[InputWait]) -> Vec<(&str, Vec<&str>)> {
         waits
@@ -48,15 +45,15 @@ mod pg_tests {
             .map(|wait| {
                 (
                     wait.task_id.as_str(),
-                    wait.slots
-                        .iter()
-                        .map(wyrd_spec::ids::SlotName::as_str)
-                        .collect(),
+                    wait.slots.iter().map(|slot| slot.as_str()).collect(),
                 )
             })
             .collect()
     }
 
+    /// A deployment whose administrator connected installation 101
+    /// (`acme/api`, `acme/web`) and declared the Repository file at
+    /// `repository`, with pull request 7 of `acme/web` opened at [`head`].
     struct Opened {
         /// The running deployment.
         deployment: Deployment,

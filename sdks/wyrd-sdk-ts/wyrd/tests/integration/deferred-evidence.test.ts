@@ -11,6 +11,7 @@ import { expect, vi } from "vitest";
 import {
   Cards,
   GithubConnection,
+  type CardKind,
   type InputWait,
   Principals,
   type VerificationExecutionState,
@@ -135,11 +136,11 @@ test("another principal approves the pending signoff and the same execution pass
   // A reader of the Repository family alone, with no grant on the Verifier's definition, reads the same task wait;
   // a reader of only the shared Verifier, not the execution's parent, reads it as unknown.
   const principals = await Principals.connect({ client: admin });
-  const reader = async (name: string, kind: string, card: string): Promise<verify.Execution> => {
+  const reader = async (name: string, kind: CardKind, card: string): Promise<verify.Execution> => {
     const { credential } = await principals.createServicePrincipal({
       name,
       assignments: [{ role: "viewer", scope: { card: { family: { kind, name: card } } } }],
-    } as never);
+    });
     return verify.Execution.connect(id, { client: WyrdClient.connect({ credential }) });
   };
   expect((await (await reader("signoff-repository-reader", "Repository", "web")).status()).input_waits).toEqual(ciWait);

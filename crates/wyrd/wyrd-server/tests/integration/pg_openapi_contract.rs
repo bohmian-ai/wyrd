@@ -31,6 +31,17 @@ const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 /// The served name of the tenant browser-session cookie scheme.
 const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";
 
+/// The platform console's own session cookie, required by the console
+/// operations that act on an existing platform session.
+const PLATFORM_BROWSER_SESSION_SCHEME: &str = "wyrdPlatformBrowserSession";
+
+/// Console operations that require the platform session cookie and nothing else.
+const PLATFORM_SESSION_PATHS: [&str; 3] = [
+    "/platform/browser/session",
+    "/platform/browser/password/reauth",
+    "/platform/browser/oidc/reauth",
+];
+
 /// The requirement of an operation that accepts the access token or, without
 /// one, a browser session.
 fn token_or_browser_session() -> Value {
@@ -777,7 +788,9 @@ async fn every_problem_response_declares_its_media_type_and_stable_code() {
 /// with `security(())`. The only other override is the browser-session
 /// cookie, offered as an alternative to — never instead of — the access token,
 /// and only on the protected tenant `/v1` HTTP surface: MCP, OTLP, the platform
-/// plane and gateway inference stay bearer-only.
+/// plane and gateway inference stay bearer-only. The platform console's
+/// operations on an existing console session require that session's own
+/// cookie instead, and no other operation names it.
 #[tokio::test]
 async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     let server = WyrdTestServer::start_in_process()
@@ -810,8 +823,14 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
         );
     }
 
+    let platform = &document["components"]["securitySchemes"][PLATFORM_BROWSER_SESSION_SCHEME];
+    assert_eq!(platform["type"], "apiKey");
+    assert_eq!(platform["in"], "cookie");
+    assert_eq!(platform["name"], "wyrd_platform_session");
+
     let mut cleared = BTreeSet::new();
     let mut cookie_paths = BTreeSet::new();
+    let mut platform_session_paths = BTreeSet::new();
     let mut bearer_only_v1 = BTreeSet::new();
     for (path, item) in document["paths"].as_object().expect("paths object") {
         for (method, operation) in item.as_object().expect("path item is an object") {
@@ -829,6 +848,14 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
                 cookie_paths.insert(path.clone());
                 continue;
             }
+            if overridden == &serde_json::json!([{ PLATFORM_BROWSER_SESSION_SCHEME: [] }]) {
+                assert!(
+                    PLATFORM_SESSION_PATHS.contains(&path.as_str()),
+                    "{method} {path} requires the platform console session outside the console"
+                );
+                platform_session_paths.insert(path.as_str());
+                continue;
+            }
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
             assert!(
@@ -841,6 +868,11 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     assert!(
         !cleared.is_empty(),
         "sign-in and credential exchange cannot themselves require a session"
+    );
+    assert_eq!(
+        platform_session_paths,
+        BTreeSet::from(PLATFORM_SESSION_PATHS),
+        "each console session operation requires the platform session cookie"
     );
     for path in ["/v1/identity/oidc/connections", "/v1/cards"] {
         assert!(
@@ -2303,7 +2335,9 @@ async fn no_yaml_projection_is_routed() {
 
 /// The operations that clear their `security` requirement are exactly the
 /// ones an anonymous caller can reach, and the ones that offer the browser
-/// session are exactly the ones that read it.
+/// session are exactly the ones that read it. An operation that names its own
+/// scheme instead, such as the platform console session cookie, is protected:
+/// a credential-free caller and a tenant session cookie are both refused.
 ///
 /// This is the behavioural replacement for the hand-written anonymous-path
 /// list: each operation's own declaration is the input, and the assembled
@@ -2350,7 +2384,8 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
 
             let security = operation.get("security");
             let accepts_cookie = security == Some(&token_or_browser_session());
-            if security.is_some() && !accepts_cookie {
+            let anonymous = security == Some(&json!([{}]));
+            if anonymous {
                 cleared += 1;
                 if code == "WYRD_AUTH_401_UNAUTHENTICATED" {
                     defects.push(format!(
@@ -2364,7 +2399,7 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
                      answered {status} ({code}) without a token"
                 ));
             }
-            if security.is_some() && !accepts_cookie {
+            if anonymous {
                 continue;
             }
 

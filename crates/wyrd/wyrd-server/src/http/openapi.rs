@@ -47,12 +47,23 @@ impl Modify for SecurityAddon {
                  reaches is decided by its scope and by the route, never by the header.",
             ))),
         );
+        components.add_security_scheme(
+            PLATFORM_BROWSER_SESSION_SCHEME,
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                crate::components::platform::console::PLATFORM_SESSION_COOKIE,
+                "Opaque platform console session, scoped to `/platform`. Only the                  platform console's own session operations read it; tenant routes never                  accept it, and a tenant session cookie never satisfies it.",
+            ))),
+        );
         openapi.security = Some(vec![SecurityRequirement::new(
             WYRD_ACCESS_TOKEN_SCHEME,
             Vec::<String>::new(),
         )]);
     }
 }
+
+/// Name the contract gives the platform console browser-session cookie scheme,
+/// required by the console operations that act on an existing platform session.
+pub(crate) const PLATFORM_BROWSER_SESSION_SCHEME: &str = "wyrdPlatformBrowserSession";
 
 /// Name the contract gives the tenant browser-session cookie scheme.
 pub(crate) const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";

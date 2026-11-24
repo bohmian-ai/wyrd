@@ -1,0 +1,18 @@
+# Two independent approvals; the first carries its own requirement, judged
+# once that approval is decided while the second still waits.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: staged-signoff
+  version: 1.0.0
+spec:
+  description: A reviewer and then a release owner each sign off on the pull request.
+  steps:
+    - id: review
+      action: {kind: approval, message: Reviewed?}
+      requirements:
+        - id: reviewed
+          statement: A reviewer approved the change
+          check: {kind: assert, path: steps.review.output.status, operator: equals, expected: approved}
+    - id: release
+      action: {kind: approval, message: Release?}

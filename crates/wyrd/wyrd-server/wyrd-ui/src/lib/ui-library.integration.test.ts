@@ -10,9 +10,9 @@ import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import type { Cookies } from '@sveltejs/kit';
-import { render } from '@testing-library/svelte';
+import { render, within } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
-import { StatStrip, TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
+import { StatStrip, TraceWaterfall, VerificationExecution, type RepositoryRow } from 'wyrd-ai-ui';
 import { z } from 'zod';
 import { Bifrost, Cards, Gateway, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState, verify } from 'wyrd-ai';
 import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
@@ -2426,6 +2426,59 @@ deferred('TASK-005: a member whose Repository policy and Verifier Card were dele
   expect([member.repository, member.definition.state, member.invocations?.state]).toEqual([policy.name, 'error', 'populated']);
   expect(member.definition.state === 'error' && member.definition.problem.code).toBe('WYRD_REGISTRY_404_CARD_NOT_FOUND');
   expect(member.status.status).toBe(deleted.status);
+});
+
+deferred('TASK-005: a requirement judged while its execution waits stays readable to a Repository reader who cannot read the Verifier', async ({ server }) => {
+  // Setup: `staged-signoff` runs on pull request 7 of `acme/web`; the `review` approval is decided, so its `reviewed` requirement is judged while `release` still waits for a person.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/approvals/staged-repository.yaml'));
+  github.setPullRequest(2, 7, 'b2'.repeat(20), REVIEW_HEAD);
+  const accepted = await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '2', number: 7 }, 'task-005-checkpoint');
+  const [executionId] = accepted.executions;
+  const execution = await verify.Execution.connect(executionId, { client: admin });
+  const pending = async (step: string) => (await execution.status()).approvals?.find((approval) => approval.step_id === step && approval.status === 'pending');
+  await vi.waitFor(async () => expect(await pending('review')).toBeDefined(), { timeout: 30_000, interval: 200 });
+  await execution.decide((await pending('review'))!.approval_id, 'approved', 'reviewed the diff');
+  await vi.waitFor(
+    async () => {
+      const { invocations } = data(await loadExecution({ executionId, node: 'none' }, { executor: nodeExecutor(admin) }), 'admin');
+      expect(invocations?.state === 'populated' && invocations.data.items.some((item) => item.state === 'requirement')).toBe(true);
+    },
+    { timeout: 30_000, interval: 200 }
+  );
+  const state = await execution.status();
+  expect([state.status, state.approvals?.map((approval) => [approval.step_id, approval.status])]).toEqual(['waiting', [['review', 'approved'], ['release', 'pending']]]);
+
+  // A viewer of the Repository family may read the execution but not the `staged-signoff` Verifier Card.
+  const { credential } = await (await Principals.connect({ client: admin })).createServicePrincipal({
+    name: 'checkpoint-repository-viewer',
+    assignments: [{ role: 'viewer', scope: { card: { family: { kind: 'Repository', name: 'web' } } } }]
+  });
+  const executor = nodeExecutor(WyrdClient.connect({ credential }));
+
+  // Action: that reader opens the execution on the judged requirement.
+  const loaded = await loadExecution({ executionId, node: 'req:reviewed' }, { executor });
+  const opened = data(loaded, 'repository viewer');
+
+  // The server reports the execution still waiting with no result, refuses the definition, and lists the recorded judgment.
+  expect([opened.status.status, opened.status.result, opened.definition.state === 'populated']).toEqual(['waiting', undefined, false]);
+  const page = opened.invocations?.state === 'populated' ? opened.invocations.data.items : [];
+  expect(page.filter((item) => item.state === 'requirement').map((item) => [item.producer.step_id, item.state === 'requirement' && item.outcome, item.producer.attempt])).toEqual([['reviewed', 'passed', 1]]);
+
+  // The shared component shows that judgment as recorded, beside a waiting execution with no verdict.
+  const view = render(VerificationExecution, loaded);
+  const recorded = within(view.container).getByRole('group', { name: 'Recorded without the definition' });
+  expect(within(recorded).getByRole('button', { name: /Requirement reviewed/ })).toHaveAttribute('aria-pressed', 'true');
+  expect(within(recorded).getByRole('button', { name: /Requirement reviewed/ })).toHaveTextContent('passed');
+  const judgment = view.container.querySelector('.judgment');
+  expect(judgment).toHaveAttribute('data-outcome', 'passed');
+  expect(judgment).toHaveTextContent('attempt 1');
+  expect(view.container).not.toHaveTextContent('Not judged yet.');
+  expect(view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'waiting');
+  expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  view.unmount();
 });
 
 test('a reader of the subject but not the Verifier previews and downloads a recorded step output', async ({ server }) => {

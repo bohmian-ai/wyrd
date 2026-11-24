@@ -25,7 +25,6 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::gateway::ProviderDeploymentsApply;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::registry::ListCardsRequest;
-use wyrd_utils::secret::read_secret_file;
 
 use crate::card::OutputFormat;
 use crate::client::map_client_error;
@@ -149,9 +148,9 @@ struct DevServer {
     inputs: DevInputs,
     /// HTTP endpoint shared by setup, readiness, clients, MCP hosts, and the UI.
     endpoint: String,
-    /// Retained local deployment sealing key every child receives as
-    /// `WYRD_SEALING_KEY_FILE`, in place of any caller-supplied source.
-    sealing_key: PathBuf,
+    /// Directory holding the retained local `[kms]` key every child
+    /// receives as its file backend, in place of any caller-supplied `[kms]`.
+    kms_dir: PathBuf,
     /// Serving child retained across readiness, setup, and foreground waiting.
     child: Option<Child>,
     /// UI child started after the server is ready and settled with it.
@@ -497,9 +496,8 @@ impl InitArgs {
                 }
             } => installed?,
         };
-        let sealing_key =
-            local_sealing_key(installer.root()).map_err(|error| diagnostics.locate(error))?;
-        let mut server = DevServer::new(installed, inputs, sealing_key, diagnostics)?;
+        let kms_dir = local_kms_key(installer.root()).map_err(|error| diagnostics.locate(error))?;
+        let mut server = DevServer::new(installed, inputs, kms_dir, diagnostics)?;
         let result = tokio::select! {
             biased;
             signal = &mut interrupted => {
@@ -877,7 +875,7 @@ fn local_data(
 
 impl DevServer {
     /// Retain a compatible installed release, its loopback listener settings,
-    /// and the local sealing key every server child receives.
+    /// and the local `[kms]` key directory every server child receives.
     ///
     /// # Errors
     /// Refuses a release outside the CLI's supported version line.
@@ -887,7 +885,7 @@ impl DevServer {
     fn new(
         installed: InstalledServer,
         inputs: DevInputs,
-        sealing_key: PathBuf,
+        kms_dir: PathBuf,
         diagnostics: Diagnostics,
     ) -> Result<Self, WyrdCliError> {
         let cli = semver::Version::parse(env!("CARGO_PKG_VERSION"))
@@ -902,7 +900,7 @@ impl DevServer {
             installed,
             endpoint: format!("http://{}", inputs.bind),
             inputs,
-            sealing_key,
+            kms_dir,
             child: None,
             ui: None,
             agent: None,
@@ -913,8 +911,8 @@ impl DevServer {
     /// Construct each child with the same resolved inputs as canonical
     /// server environment variables, never arguments, preserving production
     /// hardening. The selected listeners override any server-file setting,
-    /// and the retained local sealing key, which equals any key the caller
-    /// supplied, is the server's ordinary `WYRD_SEALING_KEY_FILE`.
+    /// and the retained local key is the server's ordinary file-backed
+    /// `[kms]`, replacing every caller-supplied `WYRD_KMS_*` setting.
     fn command(&self) -> Command {
         let inputs = &self.inputs;
         let mut command = Command::new(self.installed.binary());
@@ -929,9 +927,15 @@ impl DevServer {
         if let Some(platform) = &inputs.platform_database {
             command.env("WYRD_PLATFORM_DATABASE_URL", platform.expose_secret());
         }
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("WYRD_KMS_") {
+                command.env_remove(name);
+            }
+        }
         command
-            .env("WYRD_SEALING_KEY_FILE", &self.sealing_key)
-            .env_remove("WYRD_SEALING_KEY_BASE64");
+            .env("WYRD_KMS_BACKEND", "file")
+            .env("WYRD_KMS_ACTIVE_KEY", LOCAL_KMS_KEY)
+            .env("WYRD_KMS_KEY_DIR", &self.kms_dir);
         command
     }
 
@@ -1537,104 +1541,54 @@ fn disclose_root(printed: &str, diagnostics: &Diagnostics) {
     }
 }
 
-/// Name of the local deployment sealing key under the install root.
-const SEALING_KEY_FILE: &str = "sealing.key";
+/// Directory under the install root holding the local `[kms]` key.
+const LOCAL_KMS_DIR: &str = "kms";
 
-/// Ensure the local deployment has the sealing key its server encrypts stored
-/// secrets with, such as gateway managed-secret provider keys, before the
-/// first boot, and return the file to supply as `WYRD_SEALING_KEY_FILE`.
+/// Name of the one local `[kms]` key file, and its key reference.
+const LOCAL_KMS_KEY: &str = "local";
+
+/// Ensure the local deployment has the `[kms]` key its server wraps every
+/// stored secret under before the first boot, and return the key directory
+/// to supply as `WYRD_KMS_KEY_DIR`.
 ///
-/// The key is retained in an owner-only `sealing.key` under the install root
-/// and every later run reuses it, so stored secrets keep opening across
-/// restarts, working directories, and releases. A first run retains a key the
-/// caller supplies through `WYRD_SEALING_KEY_FILE` or
-/// `WYRD_SEALING_KEY_BASE64`, else 32 random bytes. A supplied key on a later
-/// run must equal the retained one: a different key is refused, never
-/// written over the key existing secrets are sealed under. The file is staged
-/// beside its destination and moved into place without replacing an existing
-/// key, so an interrupted or concurrent first run never leaves a partial key.
-/// The key is never printed.
+/// The key is 32 random bytes retained in an owner-only `kms/local` under the
+/// install root, and every later run reuses it, so stored secrets keep
+/// opening across restarts, working directories, and releases. The file is
+/// staged beside its destination and moved into place without replacing an
+/// existing key, so an interrupted or concurrent first run never leaves a
+/// partial key or overwrites the one existing secrets are wrapped under. The
+/// key is never printed.
 ///
 /// # Errors
-/// Refuses an invalid supplied key or one that differs from the retained
-/// key, and returns a secret-free local-persistence error when the key cannot
-/// be staged or moved into place.
-fn local_sealing_key(root: &Path) -> Result<PathBuf, WyrdCliError> {
-    let path = root.join(SEALING_KEY_FILE);
-    let supplied = supplied_sealing_key()?;
-    if path.is_file() {
-        let retained = read_secret_file(&path)
-            .ok()
-            .and_then(|encoded| sealing_bytes(&encoded));
-        return match (supplied, retained) {
-            (Some(supplied), Some(retained))
-                if supplied.expose_secret() != retained.expose_secret() =>
-            {
-                Err(dev_error(
-                    "sealing key",
-                    "the supplied sealing key differs from the retained local sealing key, which is kept because stored provider keys are sealed under it; unset WYRD_SEALING_KEY_FILE and WYRD_SEALING_KEY_BASE64 or use a separate WYRD_CONFIG_HOME; no migration or setup has run",
-                ))
-            }
-            _ => Ok(path),
-        };
-    }
+/// Returns a secret-free local-persistence error when the directory or key
+/// cannot be created or moved into place.
+fn local_kms_key(root: &Path) -> Result<PathBuf, WyrdCliError> {
     let failed = || {
         dev_error(
             "local persistence",
-            "the local sealing key could not be written; restore safe permissions on the Wyrd config directory and rerun",
+            "the local stored-secret key could not be written; restore safe permissions on the Wyrd config directory and rerun",
         )
     };
-    let key = supplied.unwrap_or_else(|| SecretBox::new(Box::new(rand::random())));
+    let dir = root.join(LOCAL_KMS_DIR);
+    let path = dir.join(LOCAL_KMS_KEY);
+    if path.is_file() {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir).map_err(|_| failed())?;
+    let key = SecretBox::new(Box::new(rand::random::<[u8; 32]>()));
     // `NamedTempFile` is created owner-only, the mode the server requires of
-    // a mounted key file.
-    let mut staged = tempfile::NamedTempFile::new_in(root).map_err(|_| failed())?;
+    // a `[kms]` key file.
+    let mut staged = tempfile::NamedTempFile::new_in(&dir).map_err(|_| failed())?;
     staged
-        .write_all(BASE64_STANDARD.encode(key.expose_secret()).as_bytes())
+        .write_all(Zeroizing::new(BASE64_STANDARD.encode(key.expose_secret())).as_bytes())
         .and_then(|()| staged.as_file().sync_all())
         .map_err(|_| failed())?;
     match staged.persist_noclobber(&path) {
-        Ok(_) => Ok(path),
-        // A concurrent first run retained its key first; compare against it.
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            local_sealing_key(root)
-        }
+        Ok(_) => Ok(dir),
+        // A concurrent first run retained its key first; reuse it.
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
         Err(_) => Err(failed()),
     }
-}
-
-/// Read the sealing key the caller supplies, through the server's own
-/// owner-only secret-file rule for `WYRD_SEALING_KEY_FILE`; empty means unset.
-///
-/// # Errors
-/// Refuses both sources at once, an unreadable or permissive file, and a
-/// value that is not base64 of exactly 32 bytes, naming no path or value.
-fn supplied_sealing_key() -> Result<Option<SecretBox<[u8; 32]>>, WyrdCliError> {
-    let refused = || {
-        dev_error(
-            "sealing key",
-            "set only one of WYRD_SEALING_KEY_FILE, an owner-only file, or WYRD_SEALING_KEY_BASE64, holding base64 of exactly 32 bytes; no migration or setup has run",
-        )
-    };
-    let file = std::env::var_os("WYRD_SEALING_KEY_FILE").filter(|file| !file.is_empty());
-    let encoded = match (file, secret_var("WYRD_SEALING_KEY_BASE64")) {
-        (Some(_), Some(_)) => return Err(refused()),
-        (Some(file), None) => {
-            SecretString::from(read_secret_file(Path::new(&file)).map_err(|_| refused())?)
-        }
-        (None, Some(inline)) => inline,
-        (None, None) => return Ok(None),
-    };
-    sealing_bytes(encoded.expose_secret())
-        .map(Some)
-        .ok_or_else(refused)
-}
-
-/// Decode a sealing key as the server does: trimmed standard base64 of
-/// exactly 32 bytes. Returns `None` for any other value.
-fn sealing_bytes(encoded: &str) -> Option<SecretBox<[u8; 32]>> {
-    let bytes = Zeroizing::new(BASE64_STANDARD.decode(encoded.trim()).ok()?);
-    let key: [u8; 32] = bytes.as_slice().try_into().ok()?;
-    Some(SecretBox::new(Box::new(key)))
 }
 
 /// Select one listener from the resolved `value`, else the ordinary

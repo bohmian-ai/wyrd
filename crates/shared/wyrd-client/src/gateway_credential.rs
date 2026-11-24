@@ -109,6 +109,23 @@ impl CredentialWriter {
         self.send(Method::POST, &path, None::<&()>).await
     }
 
+    /// Renews an active managed secret's encryption under a fresh data key;
+    /// the provider key, name, and `rotated_at` are unchanged.
+    ///
+    /// # Arguments
+    /// * `name` - Provider credential to renew.
+    ///
+    /// # Errors
+    /// Returns the server's permission, not-found, conflict (revoked, no
+    /// managed secret, or changed concurrently), or availability error.
+    pub async fn renew_credential_encryption(
+        &self,
+        name: &ProviderCredentialName,
+    ) -> Result<ProviderCredentialView, WyrdError> {
+        let path = format!("{}/renew-encryption", credential_path(name));
+        self.send(Method::POST, &path, None::<&()>).await
+    }
+
     /// Deletes an unreferenced provider credential; an absent name succeeds.
     ///
     /// # Arguments

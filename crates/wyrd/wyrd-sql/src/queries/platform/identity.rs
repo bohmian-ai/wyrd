@@ -140,42 +140,30 @@ pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Resul
         .map_err(SqlError::from)
 }
 
-/// Read the platform connection's sealed client secret for sealing-key rewrap.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the read fails.
-pub async fn platform_sealed_secret(pool: &OperatorPool) -> Result<Option<Vec<u8>>, SqlError> {
-    sqlx::query_scalar(
-        "SELECT client_secret_enc FROM platform.oidc_connection
-          WHERE client_secret_enc IS NOT NULL",
-    )
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
-}
+/// Compare-and-swap of the platform connection's sealed secret.
+const SWAP_PLATFORM_SEALED_SECRET_SQL: &str = "UPDATE platform.oidc_connection
+    SET client_secret_enc = $2
+  WHERE client_secret_enc = $1";
 
-/// Replace the platform connection's sealed secret if it still holds `previous`.
-///
-/// Returns `false` when the connection changed since it was read, so a
-/// concurrent reconfiguration is never overwritten by a rewrap.
+/// Replace the platform connection's sealed secret with `renewed` on an open
+/// platform transaction if it still holds `previous`, so an administrative
+/// renewal commits with its audited decision. Returns `false` when the
+/// connection changed since it was read.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
-pub async fn swap_platform_sealed_secret(
-    pool: &OperatorPool,
+pub async fn swap_platform_sealed_secret_tx(
+    conn: &mut TenantConn<'_>,
     previous: &[u8],
-    rewrapped: &[u8],
+    renewed: &[u8],
 ) -> Result<bool, SqlError> {
-    sqlx::query(
-        "UPDATE platform.oidc_connection SET client_secret_enc = $2
-          WHERE client_secret_enc = $1",
-    )
-    .bind(previous)
-    .bind(rewrapped)
-    .execute(pool.pool())
-    .await
-    .map(|done| done.rows_affected() == 1)
-    .map_err(SqlError::from)
+    sqlx::query(SWAP_PLATFORM_SEALED_SECRET_SQL)
+        .bind(previous)
+        .bind(renewed)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|done| done.rows_affected() == 1)
+        .map_err(SqlError::from)
 }
 
 /// Persist one single-use login state row whose expiry `PostgreSQL` derives from

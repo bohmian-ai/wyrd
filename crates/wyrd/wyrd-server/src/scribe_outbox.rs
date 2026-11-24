@@ -1161,12 +1161,21 @@ pub struct ScribeSink {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct EncodingHold {
-    /// Encodings started so far.
-    started: Mutex<usize>,
-    /// Whether parked encodings may finish.
-    released: Mutex<bool>,
-    /// Wakes parked encodings and waiters on `started`.
+    /// Encodings started so far, and whether parked encodings may finish.
+    /// One mutex guards both because `changed` waits on either.
+    state: Mutex<HoldState>,
+    /// Wakes parked encodings and waiters on the started count.
     changed: std::sync::Condvar,
+}
+
+/// The state [`EncodingHold`] guards.
+#[cfg(test)]
+#[derive(Default)]
+struct HoldState {
+    /// Encodings started so far.
+    started: usize,
+    /// Whether parked encodings may finish.
+    released: bool,
 }
 
 #[cfg(test)]
@@ -1178,15 +1187,15 @@ impl EncodingHold {
     ///
     /// # Panics
     ///
-    /// Panics when a lock is poisoned.
+    /// Panics when the lock is poisoned.
     fn park(&self) {
-        *self.started.lock().expect("started") += 1;
+        let mut state = self.state.lock().expect("hold");
+        state.started += 1;
         self.changed.notify_all();
-        let released = self.released.lock().expect("released");
         drop(
             self.changed
-                .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
-                .expect("released"),
+                .wait_timeout_while(state, Duration::from_secs(30), |state| !state.released)
+                .expect("hold"),
         );
     }
 
@@ -1194,14 +1203,14 @@ impl EncodingHold {
     ///
     /// # Panics
     ///
-    /// Panics when a lock is poisoned.
+    /// Panics when the lock is poisoned.
     pub(crate) fn wait_started(&self, count: usize) {
         drop(
             self.changed
-                .wait_while(self.started.lock().expect("started"), |started| {
-                    *started < count
+                .wait_while(self.state.lock().expect("hold"), |state| {
+                    state.started < count
                 })
-                .expect("started"),
+                .expect("hold"),
         );
     }
 
@@ -1211,7 +1220,7 @@ impl EncodingHold {
     ///
     /// Panics when the lock is poisoned.
     pub(crate) fn started(&self) -> usize {
-        *self.started.lock().expect("started")
+        self.state.lock().expect("hold").started
     }
 
     /// Lets every parked and later encoding finish.
@@ -1220,7 +1229,7 @@ impl EncodingHold {
     ///
     /// Panics when the lock is poisoned.
     pub(crate) fn release(&self) {
-        *self.released.lock().expect("released") = true;
+        self.state.lock().expect("hold").released = true;
         self.changed.notify_all();
     }
 }

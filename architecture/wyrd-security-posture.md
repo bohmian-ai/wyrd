@@ -349,11 +349,8 @@ credential.
 - Interactive CLI login rate limiting is an ingress concern: deployments
   rate-limit `POST /auth/device`, the user-code entry form, per client address
   (RFC 8628 §5.1).
-- The deployment sealing keyring protects only stored provider and
-  workload-issuer client secrets and gateway `managed_secret` provider keys.
-  A gateway managed secret is sealed with its tenant, name, and provider
-  inside the authenticated payload, so an envelope copied into another
-  tenant's or credential's row does not open. Wyrd stores no recoverable access token,
+- Recoverable auth-provider and workload-issuer client secrets follow
+  [stored secrets](#stored-secrets). Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.
 - `wyrd init` keeps local database URLs and the tenant key only in the
   protected `credentials.toml`; `config.toml` `[dev]` holds non-secret
@@ -757,7 +754,7 @@ and opens no private listener.
 ## Outbound credentials and SSRF defense
 
 Operator Cards carry a tenant Operator-connection name;
-the server resolves its envelope-encrypted Postgres credential under the exact
+the server opens its Postgres credential through `WyrdKms` under the exact
 tenant, provider, HTTP origin, and auth authority immediately before delivery.
 Multi-tenant Operator credentials never use process environment selectors.
 Secret values are redacted in diagnostics and are not persisted in Card specs
@@ -806,6 +803,11 @@ is not an SSRF control.
   require decrypting another tenant's data. Deployments that cannot provide
   per-tenant keys use independently encrypted storage domains and retain the
   same logical isolation contract.
+- Recoverable stored secrets are isolated by independent, tenant-bound DEKs
+  under the shared deployment KEK, as described under
+  [stored secrets](#stored-secrets); platform secrets use a distinct platform
+  scope, never an invented tenant. Disabling the shared KEK is deployment-wide containment,
+  not tenant revocation.
 - Tenant identity is repeated in durable metadata and checked at each storage
   transition. Oracle's row tripwire fails the entire query on mismatch; it
   never filters mismatched rows and returns a partial result.
@@ -970,6 +972,50 @@ itself audited and never rewrites the retained event.
   File-mounted secrets require restrictive permissions and atomic replacement.
 - Cryptographic randomness comes from the operating system. Identifiers and
   nonces are never derived from timestamps alone.
+
+### Stored secrets
+
+- Every recoverable stored secret — tenant auth-provider and workload-issuer
+  client secrets, the platform OIDC client secret, gateway `managed_secret`
+  provider keys, Operator connection secrets, and any future owner's — is
+  sealed and opened only through the shared `WyrdKms` facade (`wyrd-kms`),
+  which server composition builds once. The facade generates a fresh
+  OS-random 32-byte data-encryption key (DEK) per stored value, encrypts the
+  value with AES-256-GCM under a fresh nonce, and has the configured
+  deployment key-encryption key (KEK) wrap the DEK. Backends are file,
+  explicit development memory, GCP KMS, AWS KMS, and Vault Transit; they differ
+  only in how the DEK is wrapped and authenticated, never in the stored
+  envelope. Remote providers retain the KEK and return plaintext DEKs only.
+  Payload encryption and DEK wrapping both authenticate canonical context
+  derived from verified authority and trusted row metadata: tenant or an
+  explicit platform scope, purpose, owner identity, provider or credential
+  authority, and secret version where the owner has one. An envelope copied
+  into another tenant's, owner's, purpose's, or version's row does not open,
+  and a refusal never tries another tenant or key source. The common envelope
+  carries format and algorithm identifiers, a logical wrapping-key reference,
+  the opaque backend-wrapped DEK, the payload nonce, and the ciphertext; the
+  reference resolves only through the deployment's configured active and
+  retained keys, so ciphertext cannot select an endpoint or key resource.
+  Unknown formats, disallowed keys, wrong DEK lengths, and authentication or
+  provider failures refuse; there is no legacy reader and no generated
+  substitute key. Neither plaintext DEKs nor KEKs are stored in Postgres.
+  Resource owners keep authorization, persistence, and domain lifecycle; no
+  generic decryption API exists.
+- One deployment KEK protects every tenant's DEKs. A compromise of that KEK
+  with database ciphertext, or of a server identity authorized to use it, can
+  expose every tenant's stored secrets; tenant binding prevents substitution,
+  not use by a compromised server that supplies valid context. Independent
+  tenant KMS revocation and tenant crypto-erasure of backup copies are not
+  provided. File mode holds its KEK in process memory and offers no remote
+  custody.
+- Encryption renewal reseals an existing value under a fresh DEK; credential
+  replacement seals a new value without opening the old one; routine
+  wrapping-key rotation rewraps DEKs and keeps payload ciphertext; compromise
+  recovery generates fresh DEKs and payload ciphertext. Retained keys stay
+  readable until live, prepared, and backup dependencies are accounted for.
+  Revocation uses the owner's existing disable or revoke lifecycle. None of
+  these revokes a copied credential at its issuer or withdraws data an
+  attacker already holds.
 
 ## Security operations
 

@@ -24,6 +24,9 @@ mod secret_sources;
 /// `wyrd server install` against a mock release service.
 #[path = "server_install.rs"]
 mod server_install;
+/// `wyrd platform stored-secrets maintain` routine and recovery passes.
+#[path = "stored_secret_journey.rs"]
+mod stored_secret_journey;
 
 /// `wyrd init --print-prompt` prints only this release's setup prompt and
 /// touches nothing: an unreadable saved configuration is never read, the

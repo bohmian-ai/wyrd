@@ -76,6 +76,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Agent tools](/wyrd/reference/agent-tools-and-authorization/): Built-in tools a Verifier's Agent can call and the permissions each call needs.
 - [Runtime limits](/wyrd/reference/verification-runtime-limits/): Server settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued executions, with defaults and startup rules.
 - [MCP tools](/wyrd/reference/mcp-tools/): Wyrd MCP tool names, permissions, shapes, and query limits.
+- [Stored-secret encryption](/wyrd/reference/stored-secret-encryption/): The [kms] server settings that select the wrapping backend and keys for stored secrets, with provider setup, startup refusals, and runtime errors.
 - [Error codes](/wyrd/api/errors/): Every stable Wyrd error code with its HTTP status, title, and fix.
 - [HTTP API](/wyrd/api/openapi/): Where a Wyrd server serves its OpenAPI document and how to use it.
 

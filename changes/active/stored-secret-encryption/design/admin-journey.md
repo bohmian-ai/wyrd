@@ -1,14 +1,14 @@
 # Rotate and revoke: the administrator's journey
 
-Status: reference for the finalized design.
-The operator model is agreed. Existing owner lifecycle semantics are retained;
-proposed route and implementation details are identified below. No specification or implementation approval
-is implied.
+Status: reference for the finalized design and approved spec revision 2.
+Existing owner lifecycle semantics are retained; illustrative route spellings
+remain implementation-owned. The approved spec defines the behavioral contract.
 
 ## The operator contract
 
 An administrator chooses a resource and uses **Rotate** or **Revoke** through
-one server API action, projected into CLI, SDK, MCP, and eventually UI. Clients
+one server HTTP action projected into the CLI. SDK/MCP actions and UI buttons
+are outside this packet's approved surface scope. Clients
 continue referencing the same connection/credential identity. The server owns
 key generation, wrapping, encrypted persistence, and cache transition.
 
@@ -28,10 +28,10 @@ action, not a raw encrypt/decrypt endpoint.
 | A stored secret's DEK leaked | Rotate the selected secret's encryption | Open the current value, generate a fresh DEK/nonce, encrypt and wrap using the active deployment key, atomically replace the envelope | Copied old ciphertext still decrypts with a stolen old DEK; replace the actual credential too if its value may have been exposed |
 | A provider token/password leaked | Rotate the selected credential using a valid replacement; revoke old value at its issuer | Persist the new value through the common fresh-DEK encryption path, preserve its resource identity, and transition runtime material | Wyrd cannot generically mint or revoke another service's credentials without a supported issuer integration |
 | A provider token/password expired | Rotate with a valid replacement | Same replacement path; no client configuration change | Already-failed calls cannot be repaired; an expired upstream credential cannot keep authenticating while a replacement is missing |
-| Deployment wrapping key leaked | Deployment administrator rotates/replaces the wrapping key and starts recovery for all stored secrets | Switch new writers to a safe replacement; regenerate DEKs and ciphertext for every affected secret through bounded, fenced background passes | Rewrapping old DEKs alone is insufficient if they may be exposed; revoke compromised provider access credentials too |
+| Deployment wrapping key leaked | Deployment administrator rotates/replaces the wrapping key and starts recovery for all stored secrets | Switch new writers to a safe replacement; regenerate DEKs and ciphertext for every affected secret through explicitly invoked bounded, fenced synchronous passes | Rewrapping old DEKs alone is insufficient if they may be exposed; revoke compromised provider access credentials too |
 | Access credentials used to call KMS expired | Restore/renew the workload identity or Vault authentication | The provider client uses refreshed access credentials; unchanged secret envelopes do not need rotation solely because a login token expired | If identity renewal fails, provider operations can remain unavailable; never generate replacement KEKs to hide the outage |
 | A selected credential must stop being used | Revoke that resource | Persist disabled/revoked authority, invalidate prepared material, refuse further use under that authority, and record the audit decision | Upstream revocation is a separate issuer operation unless explicitly supported; admitted/in-flight calls and cache propagation retain the existing owner behavior |
-| The wrapping key must stop being usable | Deployment administrator revokes/disables it | Stop new wrapping/unwrapping through the facade; invalidate dependent prepared material through the existing owners | All tenants using that wrapping key are affected; provider disable and already-cached material are not an instantaneous global erase |
+| The wrapping key must stop being usable | Deployment administrator stops affected processes, restricts active/retained configuration or external access, then restarts safely | Refuse references absent from trusted configuration; process replacement clears process-held prepared material | Deployment-wide interruption may be necessary; external denial alone does not clear caches and no Wyrd disable action is exposed |
 
 The main security distinction is operationally visible: refreshing encryption
 protects the newly stored representation. It does not revoke a copied Slack
@@ -149,24 +149,30 @@ Sources: [AWS key disabling](https://docs.aws.amazon.com/kms/latest/developergui
 
 ## Deployment wrapping-key operation
 
-Selected-secret actions do not change the deployment wrapping key. The
-deployment administrator has a separate platform-authorized action to activate
-a permitted replacement and run whole-store maintenance. It must expose counts
-and failed owners, resume after interruption, preserve concurrent credential
-changes, and preserve old-key read access until transition/backup policy permits
-retirement. Routine maintenance may rewrap existing DEKs; suspected DEK exposure
-requires fresh DEKs and payload re-encryption.
+Selected-secret actions do not change the deployment wrapping key. Deployment
+administration provisions and activates a permitted replacement through controlled
+configuration rollout; activation and startup never rewrite stored envelopes.
+The platform-authorized HTTP/CLI maintenance action then runs one bounded,
+synchronous pass and returns current/changed/remaining counts and redacted
+failures. Repeat the same mode and destination to resume; there is no job/status
+API. Client references remain stable.
 
-Cloud/provider setup determines how the replacement is provisioned and how
-activation becomes authoritative across replicas. Do not silently grant every
-tenant credential writer cloud key-admin privileges. A provider identity leak
-also requires identity/access remediation; rotating key material does not revoke
-an IAM credential that remains authorized on the replacement.
+For planned rotation, retain old reads and explicitly select routine rewrap.
+For compromise recovery, first contain the incident/remediate access, provision
+independent safe material under a fresh logical reference, and finish rollout
+with old writers/maintenance stopped or drained. Select recovery to renew all
+older-reference envelopes with fresh DEKs and payload ciphertext. Do not run
+routine rewrap into that destination. If some rewrap already happened, choose
+another fresh destination. This is an administrative precondition, not a durable
+incident lock. See the [complete lifecycle flow](task-004-lifecycle.md).
 
-Disabling the shared wrapping key is an explicit deployment-wide action with a
-clear affected-tenant warning, not a tenant's revoke button. Permanently
-destroying it is a separate destructive action governed by backup/retirement
-proof; ordinary revoke must not silently destroy data-recovery capability.
+Key refusal/disable stays in deployment administration. Stop affected serving
+processes for immediate containment, restrict trusted configuration/access, and
+restart safely. Removing old-key access prevents renewal unless controlled
+recovery access is restored; otherwise replace credentials through their owners.
+Preserve keys needed for backups and recovery; destruction is a separate decision.
+Replace/revoke potentially exposed credentials at their issuers. Neither key
+rotation nor renewal revokes a copied credential or erases stolen plaintext.
 
 ## Implementation reuse and boundary changes
 

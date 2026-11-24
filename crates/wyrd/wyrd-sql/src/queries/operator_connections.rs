@@ -2,11 +2,10 @@
 //!
 //! `wyrd.operator_connections` stores one row per tenant (provider, name). The
 //! nonsecret authority is the redacted read shape; the secret is stored only as
-//! [`SealedSecret`] bytes produced by `wyrd-crypt` in the server. Every tenant
-//! function runs on the caller's [`TenantConn`] under forced RLS and never
-//! commits, so a handler composes the write with its audit append. Key-rotation
-//! discovery is the one explicit [`OperatorPool`] read, limited by column
-//! grants to tenant and key version.
+//! the [`SealedSecret`] stored-secret envelope the server's facade produced.
+//! Every tenant function runs on the caller's [`TenantConn`] under forced RLS
+//! and never commits. Writes are fenced on the exact row they were prepared
+//! from, so the server seals with no row lock held.
 // raw-query grep allowlist: operator connection tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::error::Error as StdError;
@@ -16,20 +15,19 @@ use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
 use wyrd_spec::operator_connection::{
     OperatorConnectionConfig, OperatorConnectionStatus, OperatorConnectionView, OperatorProvider,
 };
 
-use crate::{OperatorPool, TenantConn};
+use crate::TenantConn;
 
 /// Every column a connection read returns, as a literal for `concat!`.
 macro_rules! columns {
     () => {
-        "connection_id, provider, name, config, status, secret_ciphertext, secret_nonce, \
-         wrapped_dek, dek_nonce, key_version, secret_version, created_at, updated_at"
+        "connection_id, provider, name, config, status, secret_ciphertext, secret_version, \
+         created_at, updated_at"
     };
 }
 
@@ -37,11 +35,10 @@ macro_rules! columns {
 const INSERT_SQL: &str = concat!(
     "INSERT INTO wyrd.operator_connections (
          connection_id, data_tenant_id, provider, name, config, status,
-         secret_ciphertext, secret_nonce, wrapped_dek, dek_nonce, key_version,
-         secret_version, sub_principal_id, act_principal_id, updated_by, created_at,
-         updated_at
-     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, 'active', $5, $6, $7, $8, $9,
-               $10, $11, $12, $11, statement_timestamp(), statement_timestamp())
+         secret_ciphertext, secret_version, sub_principal_id, act_principal_id,
+         updated_by, created_at, updated_at
+     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, 'active', $5, $6, $7, $8, $7,
+               statement_timestamp(), statement_timestamp())
      ON CONFLICT (data_tenant_id, provider, name) DO NOTHING
      RETURNING ",
     columns!()
@@ -61,13 +58,6 @@ const GET_SQL: &str = concat!(
     " FROM wyrd.operator_connections WHERE connection_id = $1"
 );
 
-/// Read and lock one connection by identity.
-const GET_FOR_UPDATE_SQL: &str = concat!(
-    "SELECT ",
-    columns!(),
-    " FROM wyrd.operator_connections WHERE connection_id = $1 FOR UPDATE"
-);
-
 /// Read one connection by provider and name.
 const FIND_SQL: &str = concat!(
     "SELECT ",
@@ -75,55 +65,35 @@ const FIND_SQL: &str = concat!(
     " FROM wyrd.operator_connections WHERE provider = $1 AND name = $2"
 );
 
-/// Apply one update; `NULL` secret parameters keep the stored secret.
+/// Apply one update to the exact row it was prepared from; `NULL` secret
+/// parameters keep the stored secret. No row is returned when the stored
+/// authority, status, secret version, or envelope changed since that read.
 const UPDATE_SQL: &str = concat!(
     "UPDATE wyrd.operator_connections
         SET config = $2, status = $3,
             secret_ciphertext = COALESCE($4, secret_ciphertext),
-            secret_nonce = COALESCE($5, secret_nonce),
-            wrapped_dek = COALESCE($6, wrapped_dek),
-            dek_nonce = COALESCE($7, dek_nonce),
-            key_version = COALESCE($8, key_version),
-            secret_version = COALESCE($9, secret_version),
-            updated_by = $10, updated_at = statement_timestamp()
+            secret_version = COALESCE($5, secret_version),
+            updated_by = $6, updated_at = statement_timestamp()
       WHERE connection_id = $1
+        AND config = $7 AND status = $8
+        AND secret_version = $9 AND secret_ciphertext = $10
       RETURNING ",
     columns!()
 );
 
-/// Lock rows wrapped under a non-active key version.
-const STALE_SQL: &str = concat!(
-    "SELECT ",
-    columns!(),
-    " FROM wyrd.operator_connections
-      WHERE key_version <> $1
-      ORDER BY connection_id
-      LIMIT $2
-        FOR UPDATE SKIP LOCKED"
-);
-
-/// Envelope ciphertext of one secret version; never plaintext.
+/// The stored-secret envelope of one secret version; never plaintext.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SealedSecret {
-    /// The secret encrypted under its data key.
-    pub ciphertext: Vec<u8>,
-    /// Nonce of `ciphertext`.
-    pub nonce: [u8; 12],
-    /// The data key encrypted under the tenant key-encryption key.
-    pub wrapped_dek: Vec<u8>,
-    /// Nonce of `wrapped_dek`.
-    pub dek_nonce: [u8; 12],
-    /// Version of the tenant key-encryption key that wrapped the data key.
-    pub key_version: i32,
+    /// The envelope bytes exactly as stored.
+    pub envelope: Vec<u8>,
 }
 
 impl Debug for SealedSecret {
-    /// Redacting debug: prints only the key version, never the ciphertext,
-    /// nonces, or wrapped data key.
+    /// Redacting debug: prints only the envelope length.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SealedSecret")
-            .field("key_version", &self.key_version)
-            .finish_non_exhaustive()
+            .field("len", &self.envelope.len())
+            .finish()
     }
 }
 
@@ -183,11 +153,7 @@ pub async fn insert_connection(
         .bind(<&'static str>::from(new.config.provider()))
         .bind(new.name.as_str())
         .bind(Json(new.config))
-        .bind(&new.sealed.ciphertext)
-        .bind(new.sealed.nonce.as_slice())
-        .bind(&new.sealed.wrapped_dek)
-        .bind(new.sealed.dek_nonce.as_slice())
-        .bind(new.sealed.key_version)
+        .bind(&new.sealed.envelope)
         .bind(new.secret_version)
         .bind(new.attribution.sub_principal_id.as_uuid())
         .bind(new.attribution.act_principal_id.as_uuid())
@@ -209,7 +175,7 @@ pub async fn list_connections(
     rows.into_iter().map(ConnectionRow::into_stored).collect()
 }
 
-/// Read one connection by identity, locking it when `for_update`.
+/// Read one connection by identity.
 ///
 /// An unknown or other-tenant identity is `Ok(None)`.
 ///
@@ -218,14 +184,8 @@ pub async fn list_connections(
 pub async fn get_connection(
     conn: &mut TenantConn<'_>,
     connection_id: OperatorConnectionId,
-    for_update: bool,
 ) -> Result<Option<StoredConnection>, SqlxError> {
-    let sql = if for_update {
-        GET_FOR_UPDATE_SQL
-    } else {
-        GET_SQL
-    };
-    let row: Option<ConnectionRow> = sqlx::query_as(sql)
+    let row: Option<ConnectionRow> = sqlx::query_as(GET_SQL)
         .bind(connection_id.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await?;
@@ -252,106 +212,34 @@ pub async fn find_connection(
     row.map(ConnectionRow::into_stored).transpose()
 }
 
-/// Apply one update to a connection previously read `for_update`.
+/// Apply one update to the connection exactly as `observed` was read.
 ///
-/// A rotated secret replaces the ciphertext, wrapped key, key version, and
-/// secret version together; otherwise they are untouched.
+/// A rotated secret replaces the envelope and secret version together;
+/// otherwise they are untouched. `Ok(None)` means the row's authority,
+/// status, secret version, or envelope changed after `observed` was read: a
+/// concurrent write won and this one changed nothing.
 ///
 /// # Errors
-/// Returns the database error when the update fails or matches no row, or a
-/// decode error.
+/// Returns the database error when the update fails, or a decode error.
 pub async fn update_connection(
     conn: &mut TenantConn<'_>,
-    connection_id: OperatorConnectionId,
+    observed: &StoredConnection,
     change: &ConnectionChange<'_>,
-) -> Result<StoredConnection, SqlxError> {
-    let sealed = change.secret.map(|(sealed, _)| sealed);
-    let row: ConnectionRow = sqlx::query_as(UPDATE_SQL)
-        .bind(connection_id.as_uuid())
+) -> Result<Option<StoredConnection>, SqlxError> {
+    let row: Option<ConnectionRow> = sqlx::query_as(UPDATE_SQL)
+        .bind(observed.view.connection_id.as_uuid())
         .bind(Json(change.config))
         .bind(<&'static str>::from(change.status))
-        .bind(sealed.map(|s| s.ciphertext.as_slice()))
-        .bind(sealed.map(|s| s.nonce.as_slice()))
-        .bind(sealed.map(|s| s.wrapped_dek.as_slice()))
-        .bind(sealed.map(|s| s.dek_nonce.as_slice()))
-        .bind(sealed.map(|s| s.key_version))
+        .bind(change.secret.map(|(sealed, _)| sealed.envelope.as_slice()))
         .bind(change.secret.map(|(_, version)| version))
         .bind(change.principal.as_uuid())
-        .fetch_one(&mut **conn.transaction())
+        .bind(Json(&observed.view.config))
+        .bind(<&'static str>::from(observed.view.status))
+        .bind(observed.secret_version)
+        .bind(&observed.sealed.envelope)
+        .fetch_optional(&mut **conn.transaction())
         .await?;
-    row.into_stored()
-}
-
-/// Lock up to `limit` of the tenant's connections not wrapped under `active`.
-///
-/// Skips rows another rewrap holds, so concurrent replicas share the work.
-///
-/// # Errors
-/// Returns the database error when the read fails, or a decode error.
-pub async fn stale_key_connections(
-    conn: &mut TenantConn<'_>,
-    active: i32,
-    limit: i64,
-) -> Result<Vec<StoredConnection>, SqlxError> {
-    let rows: Vec<ConnectionRow> = sqlx::query_as(STALE_SQL)
-        .bind(active)
-        .bind(limit)
-        .fetch_all(&mut **conn.transaction())
-        .await?;
-    rows.into_iter().map(ConnectionRow::into_stored).collect()
-}
-
-/// Replace one locked row's wrapped data key and key version.
-///
-/// Fenced on the secret version it was read with, so a concurrent secret
-/// rotation is never overwritten with a stale wrapped key.
-///
-/// # Errors
-/// Returns the database error when the update fails.
-pub async fn rewrap_connection(
-    conn: &mut TenantConn<'_>,
-    connection_id: OperatorConnectionId,
-    secret_version: i32,
-    wrapped_dek: &[u8],
-    dek_nonce: &[u8; 12],
-    key_version: i32,
-) -> Result<bool, SqlxError> {
-    let updated = sqlx::query(
-        "UPDATE wyrd.operator_connections
-            SET wrapped_dek = $3, dek_nonce = $4, key_version = $5
-          WHERE connection_id = $1 AND secret_version = $2",
-    )
-    .bind(connection_id.as_uuid())
-    .bind(secret_version)
-    .bind(wrapped_dek)
-    .bind(dek_nonce.as_slice())
-    .bind(key_version)
-    .execute(&mut **conn.transaction())
-    .await?;
-    Ok(updated.rows_affected() == 1)
-}
-
-/// Every (tenant, key version) pair still referenced, across tenants.
-///
-/// Rotation rewraps tenants whose rows reference a non-active version, and an
-/// operator retires an external key version only once it is absent here.
-///
-/// # Errors
-/// Returns the database error when the read fails.
-// tenant-isolation: cross-tenant OperatorPool
-pub async fn referenced_key_versions(
-    operator: &OperatorPool,
-) -> Result<Vec<(DataTenantId, i32)>, SqlxError> {
-    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
-        "SELECT DISTINCT data_tenant_id, key_version
-           FROM wyrd.operator_connections
-          ORDER BY data_tenant_id, key_version",
-    )
-    .fetch_all(operator.pool())
-    .await?;
-    rows.into_iter()
-        .map(|(tenant, version)| Ok((stored(DataTenantId::new(tenant))?, version)))
-        .collect()
+    row.map(ConnectionRow::into_stored).transpose()
 }
 
 /// One `wyrd.operator_connections` row.
@@ -367,16 +255,8 @@ struct ConnectionRow {
     config: Json<OperatorConnectionConfig>,
     /// Stored status name.
     status: String,
-    /// Secret ciphertext.
+    /// Secret envelope.
     secret_ciphertext: Vec<u8>,
-    /// Secret nonce.
-    secret_nonce: Vec<u8>,
-    /// Wrapped data key.
-    wrapped_dek: Vec<u8>,
-    /// Wrapped data key nonce.
-    dek_nonce: Vec<u8>,
-    /// Key-encryption key version.
-    key_version: i32,
     /// Secret version.
     secret_version: i32,
     /// Creation time.
@@ -390,7 +270,7 @@ impl ConnectionRow {
     ///
     /// # Errors
     /// Returns [`SqlxError::Decode`] for a malformed identity, name, status,
-    /// nonce, or a provider that disagrees with the stored authority.
+    /// or a provider that disagrees with the stored authority.
     fn into_stored(self) -> Result<StoredConnection, SqlxError> {
         let provider: OperatorProvider = stored(self.provider.parse())?;
         let Json(config) = self.config;
@@ -399,11 +279,6 @@ impl ConnectionRow {
                 "operator connection provider disagrees with its config".into(),
             ));
         }
-        let nonce = |bytes: Vec<u8>| -> Result<[u8; 12], SqlxError> {
-            bytes
-                .try_into()
-                .map_err(|_| SqlxError::Decode("operator connection nonce is not 12 bytes".into()))
-        };
         Ok(StoredConnection {
             view: OperatorConnectionView {
                 connection_id: stored(OperatorConnectionId::new(self.connection_id))?,
@@ -414,11 +289,7 @@ impl ConnectionRow {
                 updated_at: self.updated_at,
             },
             sealed: SealedSecret {
-                ciphertext: self.secret_ciphertext,
-                nonce: nonce(self.secret_nonce)?,
-                wrapped_dek: self.wrapped_dek,
-                dek_nonce: nonce(self.dek_nonce)?,
-                key_version: self.key_version,
+                envelope: self.secret_ciphertext,
             },
             secret_version: self.secret_version,
         })

@@ -738,7 +738,12 @@ async fn directory_snapshot_is_complete_or_rejected() {
     put(&workspace, "nfc/caf\u{e9}", b"x");
     put(&workspace, "nfc/cafe\u{301}", b"y");
     put(&workspace, "kinds/a", b"x");
-    std::fs::create_dir_all(workspace.work_dir().join("kinds/A")).expect("directory");
+    // A case-insensitive filesystem already holds `kinds/a` under this name;
+    // the collision case below then has one entry and is not expected.
+    match std::fs::create_dir(workspace.work_dir().join("kinds/A")) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        made => made.expect("directory"),
+    }
     for index in 0..9 {
         put(&workspace, &format!("count/{index}"), b"x");
     }

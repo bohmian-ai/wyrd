@@ -24,6 +24,8 @@ arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137ca
 arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137cae3ce946a77eff045df4440a800e02ae", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137cae3ce946a77eff045df4440a800e02ae", features = ["lz4", "zstd"] }
 arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137cae3ce946a77eff045df4440a800e02ae", default-features = false, features = ["canonical_extension_types"] }
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-lc-sys = { version = "0.45", default-features = false, features = ["prebuilt-nasm"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
@@ -156,6 +158,8 @@ arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137ca
 arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137cae3ce946a77eff045df4440a800e02ae", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137cae3ce946a77eff045df4440a800e02ae", features = ["lz4", "zstd"] }
 arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "cc90137cae3ce946a77eff045df4440a800e02ae", default-features = false, features = ["canonical_extension_types"] }
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-lc-sys = { version = "0.45", default-features = false, features = ["prebuilt-nasm"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
@@ -248,7 +252,6 @@ secrecy = { version = "0.10", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
-serde_derive = { version = "1" }
 serde_json = { version = "1", features = ["alloc", "float_roundtrip", "preserve_order", "raw_value"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", features = ["oid"] }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }

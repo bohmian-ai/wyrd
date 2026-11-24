@@ -160,10 +160,19 @@ mise run test:wyrd | test:skald | test:vala | test:shared   # family lanes
 mise run test:sql                        # SQL-backed integration
 mise run test:tonic                      # wyrd-tonic at its required feature union
 mise run test:storage:matrix             # object-store emulators
+mise run test:kms:vault                  # WyrdKms over a real dev Vault Transit
+mise run test:kms:gcp:cloud              # WyrdKms over real Cloud KMS (credentialed)
+mise run test:kms:aws:cloud              # WyrdKms over real AWS KMS (credentialed)
 mise run py:test:unit                    # Python
 mise run ts:test:unit                    # TypeScript
 mise run test:rust                       # full Rust aggregate
 ```
+
+The two KMS cloud lanes read `WYRD_KMS_BACKEND` and `WYRD_KMS_ACTIVE_KEY`
+from an untracked `mise.local.toml` and the provider's standard credentials.
+They need a key provisioned in advance with encrypt and decrypt access only,
+and fail naming the missing setting. CI runs them on pushes to `main` in
+`kms-integration-cloud.yml`.
 
 `test:rust` is the broad Rust aggregate. Capability work uses its capability
 lane instead; Bifrost-only pull requests run `verify:bifrost`.

@@ -31,6 +31,10 @@ pub enum OperatorConnectionCommand {
     Update(UpdateArgs),
     /// Disable one connection; it is never deleted.
     Disable(IdArgs),
+    /// Reseal one connection's unchanged secret under a fresh data key. This
+    /// does not replace or revoke the credential at its provider; use
+    /// `update` with a new secret for that.
+    RenewEncryption(IdArgs),
 }
 
 /// A request body read from a file or stdin.
@@ -110,6 +114,12 @@ pub async fn dispatch(command: OperatorConnectionCommand) -> Result<ExitCode, Wy
             &crate::client::operator_connections(args.endpoint.server.as_str())
                 .await?
                 .disable(&args.connection_id)
+                .await?,
+        ),
+        OperatorConnectionCommand::RenewEncryption(args) => print_json(
+            &crate::client::operator_connections(args.endpoint.server.as_str())
+                .await?
+                .renew_encryption(&args.connection_id)
                 .await?,
         ),
     };

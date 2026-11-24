@@ -5,7 +5,7 @@
 //! because human login trust lives only in the tenant OIDC connection store. At boot, [`seed_trusted_issuers`] runs OIDC discovery per entry
 //! (under a bounded retry schedule), maps each config DTO to the
 //! [`TrustedIssuer`] domain type, encrypts any client secret with the sealing
-//! key, and upserts the row into `wyrd.auth_trusted_issuers`. Postgres is then
+//! key (keeping an unchanged committed envelope), and upserts the row into `wyrd.auth_trusted_issuers`. Postgres is then
 //! the single source of issuer resolution for every request via
 //! [`crate::auth::pg_resolvers::PgIssuerResolver`].
 //!
@@ -28,15 +28,20 @@ use url::Url;
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, ScreenedHttp, TrustedIssuer, WorkloadBinding,
 };
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::WyrdKms;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::{DataTenantId, TenantSlug};
+use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::auth::{
-    trusted_issuer_exists, upsert_trusted_issuer, upsert_workload_binding,
+    TrustedIssuerWrite, trusted_issuer_by_url, trusted_issuer_exists, upsert_trusted_issuer,
+    upsert_workload_binding,
 };
-use wyrd_sql::{TenantConn, WyrdPostgres};
+use wyrd_sql::row_types::auth::TrustedIssuerRow;
 
-use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
+use crate::auth::pg_resolvers::{
+    IssuerSealError, binding_write_from_binding, client_auth_label, issuer_write_from_trusted,
+    issuer_write_with_envelope, trusted_issuer_secret_matches,
+};
 use crate::boot::ServerBootError;
 use wyrd_spec::auth::IssuerTokenPolicy;
 
@@ -83,11 +88,14 @@ pub async fn resolve_implicit_tenant(
 
 /// Seed every `[[trusted_issuers]]` config entry into Postgres for `tenant_id`.
 ///
-/// For each entry: run OIDC discovery (bounded retry), map the config DTO to a
-/// [`TrustedIssuer`], encrypt any client secret with `sealing_key`, and upsert
-/// the row (`ON CONFLICT DO UPDATE`, so re-seeding from config is idempotent).
-/// All writes share one tenant transaction opened through
-/// [`WyrdPostgres::tenant_conn`], committed once at the end.
+/// First read each entry's committed envelope in a short tenant transaction.
+/// Then, with no transaction open: run OIDC discovery (bounded retry), map
+/// the config DTO to a [`TrustedIssuer`], and seal any client secret through
+/// `kms`, keeping the committed envelope byte-for-byte when it already seals
+/// the configured secret for the configured client id and method, so a
+/// restart under a newly active key moves no unchanged issuer. Then upsert every row (`ON CONFLICT DO UPDATE`, so
+/// re-seeding from config is idempotent) in one tenant transaction opened
+/// through [`WyrdPostgres::tenant_conn`], committed once at the end.
 ///
 /// Discovery that is unreachable for an issuer whose row already exists is
 /// non-fatal (a restart while the IdP is briefly down keeps the prior row).
@@ -100,14 +108,14 @@ pub async fn resolve_implicit_tenant(
 /// connection store. Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when another Rustls
 /// provider already owns the process or for an unreachable, never-seeded
 /// issuer; [`ServerBootError::IssuerSeal`] when a secret-bearing issuer has no
-/// sealing key; and [`ServerBootError::Sql`] on a write failure. Cancellation
+/// `[kms]` or cannot be sealed; and [`ServerBootError::Sql`] on a write failure. Cancellation
 /// may leave earlier issuer entries committed while later entries remain
 /// unprocessed.
 pub async fn seed_trusted_issuers(
     postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     entries: &[IssuerEntry],
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<(), ServerBootError> {
     if entries.is_empty() {
         return Ok(());
@@ -130,54 +138,142 @@ pub async fn seed_trusted_issuers(
     // reachable; requests still go through the redirect-disabled transport.
     let discovery = ScreenedHttp::allowing_internal();
     let mut conn = postgres.tenant_conn(tenant_id).await?;
+    let mut prior = Vec::with_capacity(entries.len());
     for entry in entries {
-        seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &discovery).await?;
+        let row = match IssuerUrl::new(entry.issuer.clone()) {
+            Ok(issuer_url) => trusted_issuer_by_url(&mut conn, issuer_url.as_str())
+                .await
+                .map_err(|error| ServerBootError::Sql(error.into()))?,
+            Err(_) => None,
+        };
+        prior.push(row);
     }
     conn.commit().await?;
-    Ok(())
-}
-
-/// Seed a single trusted issuer, honoring the already-seeded restart exemption.
-async fn seed_one_trusted_issuer(
-    conn: &mut TenantConn<'_>,
-    tenant_id: DataTenantId,
-    entry: &IssuerEntry,
-    sealing_key: Option<&SealingKeyring>,
-    discovery: &ScreenedHttp,
-) -> Result<(), ServerBootError> {
-    match discover_with_retry(&entry.issuer, discovery).await {
-        Ok(jwks_uri) => {
-            let trusted = build_trusted_issuer(entry, tenant_id, jwks_uri)?;
-            let write = issuer_write_from_trusted(&trusted, sealing_key).map_err(|error| {
-                ServerBootError::IssuerSeal {
-                    issuer: entry.issuer.clone(),
-                    message: error.to_string(),
+    // Discovery and sealing wait on remote services, so both run between the
+    // read and the seeding transaction.
+    let mut writes = Vec::with_capacity(entries.len());
+    for (entry, prior) in entries.iter().zip(&prior) {
+        writes
+            .push(prepare_trusted_issuer(tenant_id, entry, prior.as_ref(), kms, &discovery).await?);
+    }
+    let mut conn = postgres.tenant_conn(tenant_id).await?;
+    for prepared in writes {
+        match prepared {
+            Prepared::Write(write) => upsert_trusted_issuer(&mut conn, &write)
+                .await
+                .map_err(|error| ServerBootError::Sql(error.into()))?,
+            Prepared::KeepExisting {
+                issuer_url,
+                discovery_error,
+            } => {
+                let exists = trusted_issuer_exists(&mut conn, issuer_url.as_str())
+                    .await
+                    .map_err(|error| ServerBootError::Sql(error.into()))?;
+                if !exists {
+                    return Err(discovery_error);
                 }
-            })?;
-            upsert_trusted_issuer(conn, &write)
-                .await
-                .map_err(|error| ServerBootError::Sql(error.into()))?;
-            Ok(())
-        }
-        Err(discovery_error) => {
-            // A normalized, parseable URL is required even to check existence;
-            // a malformed issuer fails closed regardless.
-            let Ok(issuer_url) = IssuerUrl::new(entry.issuer.clone()) else {
-                return Err(discovery_error);
-            };
-            let exists = trusted_issuer_exists(conn, issuer_url.as_str())
-                .await
-                .map_err(|error| ServerBootError::Sql(error.into()))?;
-            if exists {
                 tracing::warn!(
                     issuer = %issuer_url.as_str(),
                     "OIDC discovery unreachable at boot but trusted issuer is already \
                      seeded; keeping the existing row"
                 );
-                Ok(())
-            } else {
-                Err(discovery_error)
             }
+        }
+    }
+    conn.commit().await?;
+    Ok(())
+}
+
+/// One configured issuer, prepared for the seeding transaction.
+enum Prepared {
+    /// Discovery succeeded; upsert this sealed row.
+    Write(Box<TrustedIssuerWrite>),
+    /// Discovery failed; keep an already-seeded row, else fail with
+    /// `discovery_error`.
+    KeepExisting {
+        /// The normalized issuer whose row must already exist.
+        issuer_url: IssuerUrl,
+        /// The discovery failure boot returns when no row exists.
+        discovery_error: ServerBootError,
+    },
+}
+
+/// Discover one issuer and build its row against its committed `prior` row
+/// (see [`reconcile_trusted_issuer`]), honoring the already-seeded restart
+/// exemption; runs with no transaction open.
+///
+/// # Errors
+/// Returns the discovery error for a malformed issuer URL, and
+/// [`ServerBootError::IssuerSeal`] when its secret cannot be sealed.
+async fn prepare_trusted_issuer(
+    tenant_id: DataTenantId,
+    entry: &IssuerEntry,
+    prior: Option<&TrustedIssuerRow>,
+    kms: Option<&WyrdKms>,
+    discovery: &ScreenedHttp,
+) -> Result<Prepared, ServerBootError> {
+    match discover_with_retry(&entry.issuer, discovery).await {
+        Ok(jwks_uri) => {
+            let trusted = build_trusted_issuer(entry, tenant_id, jwks_uri)?;
+            reconcile_trusted_issuer(&trusted, prior, kms)
+                .await
+                .map(|write| Prepared::Write(Box::new(write)))
+                .map_err(|error| ServerBootError::IssuerSeal {
+                    issuer: entry.issuer.clone(),
+                    message: error.to_string(),
+                })
+        }
+        // A normalized, parseable URL is required even to check existence;
+        // a malformed issuer fails closed regardless.
+        Err(discovery_error) => match IssuerUrl::new(entry.issuer.clone()) {
+            Ok(issuer_url) => Ok(Prepared::KeepExisting {
+                issuer_url,
+                discovery_error,
+            }),
+            Err(_) => Err(discovery_error),
+        },
+    }
+}
+
+/// Build the configured `trusted` issuer's write against its committed
+/// `prior` row, sealing a client secret only when the configuration
+/// establishes a new one.
+///
+/// A new issuer, a row without a secret, or a changed client id or method (a
+/// new binding the old envelope cannot serve) is sealed afresh. Under an
+/// unchanged binding the committed envelope stays byte-for-byte when it opens
+/// to the configured secret, and is resealed when it opens to another one.
+/// When it cannot be opened for any reason, nothing establishes a change, so
+/// it also stays: the issuer keeps refusing as before, and the administrator
+/// restores the old key or replaces the secret through its owner. A restart
+/// therefore never renews or heals an existing credential.
+///
+/// # Errors
+/// Returns [`IssuerSealError`] when a needed seal fails or a JSONB column
+/// cannot be serialized.
+async fn reconcile_trusted_issuer(
+    trusted: &TrustedIssuer,
+    prior: Option<&TrustedIssuerRow>,
+    kms: Option<&WyrdKms>,
+) -> Result<TrustedIssuerWrite, IssuerSealError> {
+    let same_binding = prior.and_then(|row| {
+        let unchanged = row.client_id == trusted.client_id
+            && row.client_auth == client_auth_label(&trusted.client_auth);
+        row.client_secret_enc.as_deref().filter(|_| unchanged)
+    });
+    let Some(stored) = same_binding else {
+        return issuer_write_from_trusted(trusted, kms).await;
+    };
+    match trusted_issuer_secret_matches(trusted, stored, kms).await {
+        Some(false) => issuer_write_from_trusted(trusted, kms).await,
+        Some(true) => issuer_write_with_envelope(trusted, Some(stored.to_vec())),
+        None => {
+            tracing::warn!(
+                issuer = %trusted.issuer.as_str(),
+                "configured issuer secret could not be compared with its stored envelope; \
+                 keeping the stored envelope"
+            );
+            issuer_write_with_envelope(trusted, Some(stored.to_vec()))
         }
     }
 }
@@ -326,8 +422,8 @@ mod pg_tests {
     use secrecy::{ExposeSecret, SecretString};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_kms::{KmsConfig, WyrdKms};
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
 
     use super::*;
@@ -534,13 +630,14 @@ mod pg_tests {
     async fn seed_keeps_existing_row_when_discovery_unreachable_on_restart() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_id = fixture.data_tenant_id();
-        let key = SealingKeyring::new(SecretKey::from_bytes([3_u8; 32]));
+        let key = WyrdKms::new(&KmsConfig::memory("test"), false).expect("memory facade");
 
         // Pre-seed the row as a prior successful boot would have.
         let entry = issuer_entry(UNREACHABLE_ISSUER);
         let trusted = build_trusted_issuer(&entry, tenant_id, fake_jwks_uri(UNREACHABLE_ISSUER))
             .expect("issuer maps");
         let write = crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, Some(&key))
+            .await
             .expect("issuer encodes");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn");
         upsert_trusted_issuer(&mut conn, &write)
@@ -558,7 +655,7 @@ mod pg_tests {
     async fn seed_fails_closed_for_unreachable_unseeded_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_id = fixture.data_tenant_id();
-        let key = SealingKeyring::new(SecretKey::from_bytes([4_u8; 32]));
+        let key = WyrdKms::new(&KmsConfig::memory("test"), false).expect("memory facade");
 
         let entry = issuer_entry("https://idp.invalid/realms/never-seeded");
         let error = seed_trusted_issuers(fixture.wyrd_postgres(), tenant_id, &[entry], Some(&key))

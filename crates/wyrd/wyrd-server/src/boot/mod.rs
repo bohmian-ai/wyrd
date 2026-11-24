@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::resources::ResourcePlan;
 
+use crate::components::platform::stored_secrets::StoredSecretMaintenance;
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -43,10 +44,9 @@ use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::TokenExchangeSettings;
 use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth::platform_sessions::PlatformSessions;
-use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
-use wyrd_crypt::{SealingKeyring, SecretKey};
+use wyrd_kms::WyrdKms;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
@@ -63,7 +63,7 @@ use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
 use crate::components::github::review_cache::{CodeReviewMetadata, CodeReviewObjects};
 use crate::components::health::Health;
-use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
+use crate::components::operators::secrets::OperatorSecrets;
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
 use crate::mcp::Mcp;
 use crate::oracle::{OraclePeerAuthority, PostgresPeerSecurityAudit};
@@ -125,12 +125,6 @@ pub enum ServerBootError {
     /// The serving database URLs are missing or invalid.
     #[error(transparent)]
     Postgres(#[from] DsnError),
-    /// Operator connection keys could not be built, or a multi-tenant
-    /// production deployment could not read and decode an active tenant key.
-    /// Boot fails closed; the error names only the source kind, key version,
-    /// and failure class.
-    #[error("Operator connection keys are unavailable: {0}")]
-    OperatorKeys(#[from] KeyError),
     /// The GitHub App configuration is invalid.
     #[error(transparent)]
     Github(#[from] crate::config::ConfigError),
@@ -204,22 +198,21 @@ pub enum ServerBootError {
         /// The configured issuer URL.
         issuer: String,
     },
-    /// A configured `[[trusted_issuers]]` entry carries a client secret but no
-    /// sealing key was provisioned to encrypt it. Boot fails closed rather than
-    /// persisting a secret in plaintext.
+    /// A configured `[[trusted_issuers]]` entry carries a client secret that
+    /// could not be sealed: no `[kms]` is configured or sealing failed. Boot
+    /// fails closed rather than persisting a secret in plaintext.
     #[error("trusted issuer {issuer} could not be sealed: {message}")]
     IssuerSeal {
         /// The issuer URL whose secret could not be sealed.
         issuer: String,
-        /// What made sealing fail (missing key, encryption, or serialization).
+        /// What made sealing fail (no `[kms]`, encryption, or serialization).
         message: String,
     },
-    /// `WYRD_SEALING_KEY_FILE`/`WYRD_SEALING_KEY_BASE64` was set but did not
-    /// decode to a 32-byte AES-256-GCM key, or no key is set while provider
-    /// ciphertext is stored. Boot fails closed rather than proceeding with an
-    /// unusable sealing key or secrets it could never open.
-    #[error("WYRD_SEALING_KEY is invalid: {0}")]
-    SealingKey(String),
+    /// `[kms]` is invalid, or absent while stored secrets exist. Boot fails
+    /// closed rather than serve with an unusable facade or secrets it could
+    /// never open.
+    #[error("stored-secret encryption ([kms]) is unusable: {0}")]
+    Kms(String),
     /// gRPC router assembly failed (e.g. missing token verifier).
     #[error(transparent)]
     Grpc(#[from] wyrd_tonic::server::GrpcError),
@@ -1203,8 +1196,8 @@ pub struct StartInputs {
     pub dependencies: BifrostExternalDependencies,
     /// Wyrd workload signing key PEM; see [`resolve_signing_key`].
     pub signing_key: SecretString,
-    /// Deployment sealing keyring, or `None` for a secret-free deployment.
-    pub sealing_key: Option<Arc<SealingKeyring>>,
+    /// Deployment stored-secret facade, or `None` without `[kms]`.
+    pub kms: Option<Arc<WyrdKms>>,
     /// Token verification settings shared by request and external
     /// verification.
     pub verify_settings: WyrdAuthVerifySettings,
@@ -1238,7 +1231,7 @@ impl StartInputs {
     ///
     /// # Errors
     /// Returns [`ServerBootError`] when the database URLs, storage, catalog,
-    /// resource detection, data root, sealing or signing key, or peer TLS
+    /// resource detection, data root, `[kms]` or signing key, or peer TLS
     /// bundle is invalid or unavailable, or this executable's path is not
     /// available.
     pub async fn production(
@@ -1252,7 +1245,7 @@ impl StartInputs {
         Ok(Self {
             dependencies,
             signing_key: resolve_signing_key(config)?,
-            sealing_key: build_sealing_keyring(config)?,
+            kms: build_kms(config)?,
             verify_settings: WyrdAuthVerifySettings::default(),
             token_exchange: TokenExchangeSettings::default(),
             permission_check: Arc::new(RbacCheck),
@@ -1295,7 +1288,7 @@ impl AppState {
         let StartInputs {
             dependencies,
             signing_key,
-            sealing_key,
+            kms,
             verify_settings,
             token_exchange,
             permission_check,
@@ -1312,7 +1305,7 @@ impl AppState {
             dependencies.postgres.as_ref(),
             config,
             &signing_key,
-            sealing_key.clone(),
+            kms.clone(),
             verify_settings,
         )?;
         auth.token_exchange_settings = token_exchange;
@@ -1356,13 +1349,13 @@ impl AppState {
             &dependencies.postgres,
             &bifrost,
             config,
-            sealing_key.clone(),
+            kms.clone(),
         );
         let owners = async {
             let gateway = Gateway::from_config(
                 config.gateway.clone(),
                 config.deployment_profile,
-                sealing_key.clone(),
+                kms.clone(),
             )?;
             let blocks = if config.verification.enabled && config.role.serves_verifiers() {
                 Some(
@@ -1381,7 +1374,7 @@ impl AppState {
             let verification = Verification::new(
                 dependencies.postgres.wyrd().clone(),
                 blocks,
-                OperatorKeys::for_role(config.role, &config.verification.operator_keys)?,
+                OperatorSecrets::new(kms.clone()),
                 config.verification.runtime.execution_timeout,
             );
             let github = config
@@ -1424,7 +1417,7 @@ impl AppState {
             #[cfg(feature = "test-support")]
             test_hooks,
         });
-        if let Err(error) = state.validate_startup(config, sealing_key).await {
+        if let Err(error) = state.validate_startup(config, kms).await {
             rollback_roles(&state.bifrost).await;
             return Err(error);
         }
@@ -1448,21 +1441,21 @@ impl AppState {
     }
 
     /// The startup steps that need the assembled state: seed configured
-    /// federation, rewrap or prove absent sealed secrets, validate the
-    /// production posture, and verify Operator tenant keys.
+    /// federation, refuse stored secrets a keyless deployment cannot open,
+    /// and validate the
+    /// production posture.
     ///
     /// # Errors
     /// Returns the first failing step's [`ServerBootError`].
     async fn validate_startup(
         &self,
         config: &WyrdServerConfig,
-        sealing_key: Option<Arc<SealingKeyring>>,
+        kms: Option<Arc<WyrdKms>>,
     ) -> Result<(), ServerBootError> {
-        seed_federation(&self.postgres, config, sealing_key.as_deref()).await?;
-        rewrap_sealed_secrets(self.postgres.operator_pool(), sealing_key).await?;
+        seed_federation(&self.postgres, config, kms.as_deref()).await?;
+        refuse_unopenable_secrets(self.postgres.operator_pool(), kms.as_deref()).await?;
         self.production_validate()
-            .map_err(ServerBootError::ProductionValidation)?;
-        verify_operator_keys(self.verification.operator_keys(), &self.postgres, config).await
+            .map_err(ServerBootError::ProductionValidation)
     }
 
     /// The engine-owned background work this process runs until shutdown:
@@ -1554,84 +1547,39 @@ fn resolve_signing_key(config: &WyrdServerConfig) -> Result<SecretString, Server
     Ok(ephemeral)
 }
 
-/// Refuse startup of a multi-tenant production API server unless every
-/// active provisioned tenant's active Operator key reads and decodes.
+/// Prove a deployment without `[kms]` stores no secret it could not open.
 ///
-/// Development and explicitly single-tenant (`auth.tenant_slug`) deployments
-/// keep their deferred failure: a missing key refuses only credential writes
-/// and deliveries.
-///
-/// # Errors
-/// Returns [`ServerBootError::OperatorKeys`] when the tenant directory is
-/// unavailable or any tenant's active key is unavailable, missing, malformed,
-/// or not 32 bytes.
-pub async fn verify_operator_keys(
-    keys: &OperatorKeys,
-    postgres: &ServerPostgres,
-    config: &WyrdServerConfig,
-) -> Result<(), ServerBootError> {
-    if !(config.role.serves_api()
-        && config.deployment_profile.is_production()
-        && config.auth.tenant_slug.is_none())
-    {
-        return Ok(());
-    }
-    let directory = postgres
-        .operator_pool()
-        .ok_or_else(|| keys.unavailable(keys.active_version(), KeyFailure::Database))?;
-    let tenants = keys.verify_active(&directory).await?;
-    tracing::info!(
-        tenants,
-        key_version = keys.active_version(),
-        "active Operator tenant keys verified"
-    );
-    Ok(())
-}
-
-/// Reseal every stored provider and workload-issuer client secret and gateway
-/// managed secret under the current sealing write key, or prove a keyless
-/// deployment stores none.
-///
-/// This is the rewrap step of sealing-key rotation: with the new key configured
-/// as the write key and the old one retained, every boot converges stored
-/// ciphertext onto the write key, and the logged `remaining` count — from a
-/// pass that started after every writer moved to the new key — tells the
-/// operator when the old key may be retired. With a key, a failure is logged
-/// and left for the next boot: retained keys still open everything, so serving
-/// is unaffected. Without a key, the same pass counts every stored ciphertext
-/// as unopenable, and any count fails boot before readiness, because the
-/// server could never open those secrets. Production boot and the test
-/// harness both call this, so they behave identically. Skipped when no
+/// Boot never moves stored envelopes: activating a wrapping key changes only
+/// where new secrets are sealed, and a platform administrator moves stored
+/// ones with an explicit maintenance pass. With `[kms]` configured this does
+/// nothing. Without it, any stored envelope in any store fails boot before
+/// readiness, because the server could never open it. Production boot and the
+/// test harness both call this, so they behave identically. Skipped when no
 /// cross-tenant operator pool is configured, since nothing can be read.
 ///
 /// # Errors
-/// Returns [`ServerBootError::SealingKey`] when no sealing key is configured
-/// and any provider or workload-issuer ciphertext is stored, or the store
-/// cannot be read to prove there is none.
-pub async fn rewrap_sealed_secrets(
+/// Returns [`ServerBootError::Kms`] when no `[kms]` is configured and any
+/// stored secret exists, or the stores cannot be read to prove there is none.
+pub async fn refuse_unopenable_secrets(
     operator: Option<OperatorPool>,
-    keyring: Option<Arc<SealingKeyring>>,
+    kms: Option<&WyrdKms>,
 ) -> Result<(), ServerBootError> {
-    let Some(operator) = operator else {
+    let (Some(operator), None) = (operator, kms) else {
         return Ok(());
     };
-    let keyless = keyring.is_none();
-    match SealedSecretRewrap::new(operator, keyring).run().await {
-        Ok(report) if keyless && report.remaining > 0 => Err(ServerBootError::SealingKey(format!(
-            "{} stored sealed secret(s) (provider or workload-issuer client \
-                 secrets or gateway managed secrets) exist but no sealing key is \
-                 configured; configure the key they were sealed under",
-            report.remaining
+    match StoredSecretMaintenance::new(operator, None)
+        .holds_envelopes()
+        .await
+    {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ServerBootError::Kms(
+            "stored secrets exist but no [kms] is configured; configure the [kms] \
+             keys they were sealed under"
+                .to_owned(),
+        )),
+        Err(error) => Err(ServerBootError::Kms(format!(
+            "stored secrets could not be checked with no [kms] configured: {error}"
         ))),
-        Ok(_) => Ok(()),
-        Err(error) if keyless => Err(ServerBootError::SealingKey(format!(
-            "stored sealed secrets could not be checked with no sealing key \
-             configured: {error}"
-        ))),
-        Err(error) => {
-            tracing::error!(error = %error, "sealed secret rewrap failed; retrying next boot");
-            Ok(())
-        }
     }
 }
 
@@ -1646,7 +1594,7 @@ fn install_auth(
     postgres: &ServerPostgres,
     config: &WyrdServerConfig,
     signing_key: &SecretString,
-    sealing_key: Option<Arc<SealingKeyring>>,
+    kms: Option<Arc<WyrdKms>>,
     verify_settings: WyrdAuthVerifySettings,
 ) -> Result<ServerAuth, ServerBootError> {
     // Postgres is the single source of issuer/binding resolution. Both resolvers
@@ -1654,10 +1602,7 @@ fn install_auth(
     // issuers and binds no workloads, which they resolve as empty results. The
     // issuer resolver also feeds the issuance-side external (foreign-OIDC)
     // verifier so federated tokens can be exchanged for Wyrd tokens.
-    let issuer_resolver = Arc::new(PgIssuerResolver::new(
-        postgres.wyrd().clone(),
-        sealing_key.clone(),
-    ));
+    let issuer_resolver = Arc::new(PgIssuerResolver::new(postgres.wyrd().clone(), kms.clone()));
     let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(postgres.wyrd().clone()));
 
     let handles = crate::boot::auth::build_auth_handles(
@@ -1675,7 +1620,7 @@ fn install_auth(
         workload_binding_resolver: Some(binding_resolver),
         human_connections: None,
         platform_login: None,
-        sealing_key,
+        kms,
         ..ServerAuth::default()
     })
 }
@@ -1692,11 +1637,11 @@ fn attach_human_logins(
     postgres: &ServerPostgres,
     bifrost: &crate::state::Bifrost,
     config: &WyrdServerConfig,
-    sealing_key: Option<Arc<SealingKeyring>>,
+    kms: Option<Arc<WyrdKms>>,
 ) {
     auth.human_connections = Some(HumanConnections::new(
         postgres.wyrd().clone(),
-        sealing_key.clone(),
+        kms.clone(),
         config.deployment_profile.screened_http(),
         Arc::clone(bifrost.scribe_outbox()) as _,
     ));
@@ -1707,7 +1652,7 @@ fn attach_human_logins(
             .map(|(pool, issuing_key)| {
                 PlatformLogin::new(
                     pool.clone(),
-                    sealing_key,
+                    kms,
                     Arc::new(PlatformSessions::new(
                         pool,
                         issuing_key,
@@ -2153,7 +2098,7 @@ async fn release_failed_oracle_role(
 async fn seed_federation(
     postgres: &ServerPostgres,
     config: &WyrdServerConfig,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<(), ServerBootError> {
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
     // the implicit tenant. Both resolve the slug through the same
@@ -2172,7 +2117,7 @@ async fn seed_federation(
             postgres.wyrd(),
             tenant_id,
             &config.trusted_issuers,
-            sealing_key,
+            kms,
         )
         .await?;
 
@@ -2182,52 +2127,24 @@ async fn seed_federation(
     Ok(())
 }
 
-/// Build the deployment [`SealingKeyring`] from the configured write key and
-/// retained keys.
+/// Build the deployment stored-secret facade from `[kms]`.
 ///
-/// Returns `Ok(None)` when no write key is configured; secret-free deployments
-/// need none. Retained keys without a write key are refused, because nothing
-/// could seal or rewrap under them.
+/// Returns `Ok(None)` when no `[kms]` setting is present; secret-free
+/// deployments need none, and boot proves none are stored. Any setting
+/// selects a facade, which must then be valid for the deployment profile.
 ///
 /// # Errors
-/// Returns [`ServerBootError::SealingKey`] when any configured key is not valid
-/// base64 or does not decode to exactly 32 bytes, or when retained keys are set
-/// without a write key.
-fn build_sealing_keyring(
-    config: &WyrdServerConfig,
-) -> Result<Option<Arc<SealingKeyring>>, ServerBootError> {
-    let Some(encoded) = config.auth.sealing_key.as_ref() else {
-        if config.auth.sealing_retained_keys.is_empty() {
-            return Ok(None);
-        }
-        return Err(ServerBootError::SealingKey(
-            "retained sealing keys require a configured write sealing key".to_owned(),
-        ));
-    };
-    let mut keyring = SealingKeyring::new(decode_sealing_key(encoded, "sealing key")?);
-    for retained in &config.auth.sealing_retained_keys {
-        keyring = keyring.with_retained(decode_sealing_key(retained, "retained sealing key")?);
+/// Returns [`ServerBootError::Kms`] naming the offending setting (never a
+/// key or token) when the configuration is invalid, `memory` in production,
+/// or an endpoint is not https in production.
+pub fn build_kms(config: &WyrdServerConfig) -> Result<Option<Arc<WyrdKms>>, ServerBootError> {
+    if config.kms.is_unset() {
+        return Ok(None);
     }
-    tracing::info!(
-        write_key_id = %keyring.write_key_id(),
-        retained_key_ids = ?keyring.retained_key_ids(),
-        "sealing keyring configured"
-    );
-    Ok(Some(Arc::new(keyring)))
-}
-
-/// Decode one base64 sealing key into a 32-byte AES-256-GCM key.
-///
-/// # Errors
-/// Returns [`ServerBootError::SealingKey`] naming `label` (never the key) when
-/// the value is not base64 or not 32 bytes.
-fn decode_sealing_key(encoded: &SecretString, label: &str) -> Result<SecretKey, ServerBootError> {
-    crate::components::operators::keys::decode_key(encoded.expose_secret()).map_err(|failure| {
-        ServerBootError::SealingKey(format!(
-            "{label} must be base64 of exactly 32 bytes: {}",
-            failure.as_str()
-        ))
-    })
+    let kms = WyrdKms::new(&config.kms, config.deployment_profile.is_production())
+        .map_err(|error| ServerBootError::Kms(error.to_string()))?;
+    tracing::info!(backend = ?kms.backend(), "stored-secret encryption configured");
+    Ok(Some(Arc::new(kms)))
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all
@@ -2719,31 +2636,69 @@ pub(crate) mod pg_tests {
 }
 
 #[cfg(test)]
-mod sealing_boot_pg_tests {
+mod kms_boot_pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
 
     use super::*;
 
-    /// A keyless deployment boots while no provider secret is stored, and
-    /// refuses to boot with `SealingKey` once one is, since it could never
-    /// open that ciphertext.
+    /// A deployment without `[kms]` boots while no secret is stored, and
+    /// refuses to boot with `Kms` once any store holds one, Operator
+    /// connections and human connections alike, since it could never open
+    /// that envelope.
     ///
     /// # Panics
-    /// Panics when the fixture cannot be seeded or either boot outcome differs.
+    /// Panics when the fixture cannot be seeded or a boot outcome differs.
     #[tokio::test]
     async fn keyless_boot_refuses_only_when_ciphertext_is_stored() {
+        use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
+        use wyrd_spec::operator_connection::OperatorConnectionConfig;
+        use wyrd_sql::queries::operator_connections::{
+            NewConnection, SealedSecret, insert_connection,
+        };
+
         let fixture = PgFixture::start().await.expect("fixture starts");
         let operator = fixture.operator_pool().clone();
-        rewrap_sealed_secrets(Some(operator.clone()), None)
+        refuse_unopenable_secrets(Some(operator.clone()), None)
             .await
             .expect("a keyless deployment with no stored secret boots");
 
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_connection(
+            &mut conn,
+            &NewConnection {
+                connection_id: OperatorConnectionId::new_v7(),
+                name: &ConnectionName::new("ops").expect("connection name"),
+                config: &OperatorConnectionConfig::Slack {
+                    workspace_id: "T0001".to_owned(),
+                },
+                sealed: &SealedSecret {
+                    envelope: vec![1, 2],
+                },
+                secret_version: 1,
+                attribution: wyrd_spec::auth::Attribution::direct(
+                    wyrd_runtime::principal::PrincipalId::new(uuid::Uuid::now_v7()),
+                ),
+            },
+        )
+        .await
+        .expect("connection inserts")
+        .expect("connection name is free");
+        conn.commit().await.expect("seed commits");
+        let refused = refuse_unopenable_secrets(Some(operator.clone()), None)
+            .await
+            .expect_err("a keyless deployment with an Operator secret refuses to boot");
+        assert!(matches!(refused, ServerBootError::Kms(_)), "{refused:?}");
+
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
+        sqlx::query("DELETE FROM wyrd.operator_connections")
+            .execute(&superuser)
+            .await
+            .expect("the Operator secret is removed");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let binding = seed_active_human_connection(&mut conn)
             .await
             .expect("connection seeds");
         conn.commit().await.expect("seed commits");
-        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
             "UPDATE wyrd.auth_human_connections \
              SET client_auth = 'SecretPost', client_secret_enc = '\\x0102'::bytea \
@@ -2754,12 +2709,9 @@ mod sealing_boot_pg_tests {
         .await
         .expect("a sealed secret is stored");
 
-        let refused = rewrap_sealed_secrets(Some(operator), None)
+        let refused = refuse_unopenable_secrets(Some(operator), None)
             .await
             .expect_err("a keyless deployment with a stored secret refuses to boot");
-        assert!(
-            matches!(refused, ServerBootError::SealingKey(_)),
-            "{refused:?}"
-        );
+        assert!(matches!(refused, ServerBootError::Kms(_)), "{refused:?}");
     }
 }

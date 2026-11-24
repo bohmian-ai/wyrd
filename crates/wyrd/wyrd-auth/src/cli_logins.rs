@@ -85,7 +85,7 @@ pub struct CliLogins {
 }
 
 impl std::fmt::Debug for CliLogins {
-    /// Render only the type name; the owner holds the sealing keyring.
+    /// Render only the type name; the owner holds the `[kms]` facade.
     ///
     /// # Errors
     /// Returns the formatter's error when writing fails.
@@ -548,8 +548,8 @@ mod pg_tests {
     use wyrd_auth_oidc::MappedClaims;
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
-    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_kms::{KmsConfig, WyrdKms};
     use wyrd_spec::auth::{
         DeviceAuthorization, LoginInitiation, OAuthClientId, PrincipalId, PrincipalKindTag,
         SecretBearer, Sha256Hex,
@@ -626,9 +626,9 @@ mod pg_tests {
         CliLogins::new(
             HumanConnections::new(
                 fixture.wyrd_postgres().clone(),
-                Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
-                    [5_u8; 32],
-                )))),
+                Some(Arc::new(
+                    WyrdKms::new(&KmsConfig::memory("test"), false).expect("memory facade"),
+                )),
                 ScreenedHttp::allowing_internal(),
                 Arc::clone(audit) as _,
             ),

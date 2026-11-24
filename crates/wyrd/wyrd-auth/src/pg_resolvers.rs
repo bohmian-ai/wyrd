@@ -3,18 +3,19 @@
 //! These are the production implementations of [`IssuerConfigResolver`] and
 //! [`WorkloadBindingResolver`]. They live in `wyrd-auth` (not the SQL-free
 //! `wyrd-auth-oidc` crate) because they hold the [`WyrdPostgres`] handle and,
-//! for issuers, the optional process-wide sealing keyring.
+//! for issuers, the optional process-wide stored-secret facade.
 //!
 //! Issuer trust and workload bindings are tenant-scoped: every read acquires a
 //! [`TenantConn`](wyrd_sql::TenantConn) through [`WyrdPostgres`], so Postgres
 //! RLS is the load-bearing isolation boundary. A resolve for tenant A can
 //! never surface tenant B's issuers or bindings.
 //!
-//! The `client_secret_enc` BYTEA column stores `nonce ‖ ciphertext` (AES-256-GCM
-//! via `wyrd-crypt`). It is decrypted on read with the sealing key. A row that
-//! carries a secret but no sealing key is configured fails closed (a 503-class
-//! `JwksUnavailable`), never a silent drop that would masquerade as an untrusted
-//! issuer (401).
+//! The `client_secret_enc` BYTEA column stores the common stored-secret
+//! envelope, bound to the tenant (or platform), purpose, issuer URL, client
+//! id, and client-authentication method. It is opened on read through
+//! [`WyrdKms`] after the row's transaction ends. A row that carries a secret
+//! but no `[kms]` is configured fails closed (a 503-class `JwksUnavailable`),
+//! never a silent drop that would masquerade as an untrusted issuer (401).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, IssuerVerification, OidcError,
     TrustedIssuer, WorkloadBinding, WorkloadBindingResolver,
 };
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::{SecretContext, SecretPurpose, SecretScope, WyrdKms};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::HUMAN_SUBJECT_CLAIM;
 use wyrd_spec::auth::IssuerTokenPolicy;
@@ -59,45 +60,42 @@ const PRINCIPAL_KIND_WORKLOAD: &str = "Workload";
 /// Production [`IssuerConfigResolver`] backed by `wyrd.auth_trusted_issuers`.
 ///
 /// Holds the role-separated runtime [`WyrdPostgres`] handle and an optional
-/// process-wide sealing keyring. The keyring is `Option` because a deployment
-/// with only secret-free issuers (`PrivateKeyJwt`/`Public`) needs none;
-/// decryption is only attempted for rows that actually carry a sealed secret.
+/// process-wide stored-secret facade. The facade is `Option` because a
+/// deployment with only secret-free issuers (`PrivateKeyJwt`/`Public`) needs
+/// none; opening is only attempted for rows that actually carry a secret.
 #[derive(Clone)]
 pub struct PgIssuerResolver {
     /// Runtime Postgres handle; every read runs on an RLS [`TenantConn`](wyrd_sql::TenantConn)
     /// acquired through [`WyrdPostgres::tenant_conn`], so a resolve for one
     /// tenant can never observe another tenant's issuers.
     postgres: WyrdPostgres,
-    /// Keyring that opens sealed client secrets, `None` on a keyless
-    /// deployment. A row carrying a secret with no keyring fails closed with
-    /// [`IssuerDecodeError::SealingKeyMissing`] instead of being dropped.
-    sealing_key: Option<Arc<SealingKeyring>>,
+    /// Facade that opens stored client secrets, `None` without `[kms]`. A
+    /// row carrying a secret with no facade fails closed with
+    /// [`IssuerDecodeError::KmsMissing`] instead of being dropped.
+    kms: Option<Arc<WyrdKms>>,
 }
 
-/// Redacted debug view: names the keyring presence and hides the store handle.
+/// Redacted debug view: names the facade and hides the store handle.
 impl std::fmt::Debug for PgIssuerResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgIssuerResolver")
-            .field("sealing_key", &self.sealing_key)
+            .field("kms", &self.kms)
             .finish_non_exhaustive()
     }
 }
 
 impl PgIssuerResolver {
     /// Construct a resolver over the runtime Postgres handle with an optional
-    /// sealing keyring.
+    /// stored-secret facade.
     #[must_use]
-    pub fn new(postgres: WyrdPostgres, sealing_key: Option<Arc<SealingKeyring>>) -> Self {
-        Self {
-            postgres,
-            sealing_key,
-        }
+    pub fn new(postgres: WyrdPostgres, kms: Option<Arc<WyrdKms>>) -> Self {
+        Self { postgres, kms }
     }
 }
 
 impl IssuerConfigResolver for PgIssuerResolver {
-    /// List every trusted issuer configured for `tenant`, decrypting sealed
-    /// client secrets with the process sealing key.
+    /// List every trusted issuer configured for `tenant`, opening stored
+    /// client secrets after the read's transaction ends.
     ///
     /// # Errors
     ///
@@ -130,18 +128,20 @@ impl IssuerConfigResolver for PgIssuerResolver {
                 }
             })?;
 
-        let sealing_key = self.sealing_key.as_deref();
-        rows.into_iter()
-            .map(|row| {
-                let issuer_url = row.issuer_url.clone();
-                trusted_issuer_from_row(*tenant, row, sealing_key).map_err(|error| {
-                    OidcError::JwksUnavailable {
+        drop(conn);
+        let mut issuers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let issuer_url = row.issuer_url.clone();
+            issuers.push(
+                trusted_issuer_from_row(*tenant, row, self.kms.as_deref())
+                    .await
+                    .map_err(|error| OidcError::JwksUnavailable {
                         issuer: issuer_url,
                         message: error.to_string(),
-                    }
-                })
-            })
-            .collect()
+                    })?,
+            );
+        }
+        Ok(issuers)
     }
 
     /// Fetch only the tenant's issuer row keyed by `issuer` instead of listing
@@ -178,15 +178,17 @@ impl IssuerConfigResolver for PgIssuerResolver {
                     message: error.to_string(),
                 }
             })?;
-        row.map(|row| {
-            trusted_issuer_from_row(*tenant, row, self.sealing_key.as_deref()).map_err(|error| {
-                OidcError::JwksUnavailable {
-                    issuer: issuer.as_str().to_owned(),
-                    message: error.to_string(),
-                }
+        drop(conn);
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        trusted_issuer_from_row(*tenant, row, self.kms.as_deref())
+            .await
+            .map(Some)
+            .map_err(|error| OidcError::JwksUnavailable {
+                issuer: issuer.as_str().to_owned(),
+                message: error.to_string(),
             })
-        })
-        .transpose()
     }
 }
 
@@ -197,7 +199,7 @@ impl IssuerConfigResolver for PgIssuerResolver {
 /// Production [`WorkloadBindingResolver`] backed by `wyrd.auth_workload_bindings`.
 ///
 /// Holds only the runtime [`WyrdPostgres`] handle — bindings carry no
-/// secrets, so no sealing key is needed. Each lookup opens its tenant
+/// secrets, so no `[kms]` is needed. Each lookup opens its tenant
 /// transaction through [`WyrdPostgres::tenant_conn`], so RLS binds the read to
 /// the requested tenant. Audience precedence (exact match preferred,
 /// `NULL`-audience fallback) is enforced in the SQL query
@@ -293,13 +295,13 @@ impl WorkloadBindingResolver for PgWorkloadBindingResolver {
 /// Failure encoding a [`TrustedIssuer`] into a [`TrustedIssuerWrite`] for seeding.
 #[derive(Debug, thiserror::Error)]
 pub enum IssuerSealError {
-    /// The issuer authenticates with a client secret but no sealing key is
-    /// configured. Boot fails closed rather than persist a plaintext or empty
-    /// secret column.
-    #[error("trusted issuer carries a client secret but no sealing key is configured")]
-    SealingKeyMissing,
-    /// AES-GCM encryption of the client secret failed.
-    #[error("failed to encrypt trusted issuer client secret")]
+    /// The issuer authenticates with a client secret but no `[kms]` is
+    /// configured. Writes fail closed rather than persist a plaintext or
+    /// empty secret column.
+    #[error("the client secret cannot be stored: no [kms] is configured")]
+    KmsMissing,
+    /// Sealing the client secret failed, including a wrapping-backend failure.
+    #[error("failed to encrypt the client secret")]
     Encrypt,
     /// A JSONB column could not be serialized.
     #[error(transparent)]
@@ -333,11 +335,11 @@ pub(crate) enum IssuerDecodeError {
     /// ciphertext.
     #[error("client_auth requires a secret but client_secret_enc is null")]
     MissingSecret,
-    /// The row carries a sealed secret but the process holds no keyring.
-    #[error("client secret present but no sealing key is configured")]
-    SealingKeyMissing,
-    /// No held sealing key opens the stored ciphertext, or it is malformed
-    /// or tampered.
+    /// The row carries a stored secret but no `[kms]` is configured.
+    #[error("client secret present but no [kms] is configured")]
+    KmsMissing,
+    /// The stored envelope does not open under its expected context: a
+    /// disallowed key, a tampered or substituted value, or a backend failure.
     #[error("client secret could not be decrypted")]
     Decrypt,
     /// The opened secret is not UTF-8; its bytes are discarded, not echoed.
@@ -426,81 +428,183 @@ fn principal_kind_from_str(value: &str) -> Result<IssuerTokenPolicy, IssuerDecod
 }
 
 // --------------------------------------------------------------------------
-// Secret sealing (versioned keyring envelope)
+// Secret sealing (common stored-secret envelope)
 // --------------------------------------------------------------------------
 
-/// Seal `plaintext` under the keyring's write key for a BYTEA column.
+/// The trusted owner metadata a stored OIDC client secret is bound to.
 ///
-/// # Errors
-/// Returns [`IssuerSealError::Encrypt`] when encryption fails.
-pub(crate) fn seal_secret(
-    keyring: &SealingKeyring,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, IssuerSealError> {
-    keyring
-        .seal(plaintext)
-        .map_err(|_| IssuerSealError::Encrypt)
+/// Built from verified authority and the row's trusted columns, never from
+/// the envelope: the tenant (or the platform), the owning table's purpose,
+/// the issuer URL, the client id, the client-authentication method, and, for
+/// a tenant human connection, the connection id. A tenant's Active and
+/// Candidate connections can share issuer, client, and method, so only the
+/// connection id keeps one's secret from opening as the other's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientSecretOwner<'a> {
+    /// Owning tenant, or the platform.
+    pub(crate) scope: SecretScope,
+    /// Which table owns the secret.
+    pub(crate) purpose: SecretPurpose,
+    /// Issuer URL of the connection or issuer.
+    pub(crate) issuer_url: &'a str,
+    /// OAuth client id.
+    pub(crate) client_id: &'a str,
+    /// The owning human connection's id; `None` for an issuer or platform
+    /// connection, which its issuer URL already identifies.
+    pub(crate) connection_id: Option<&'a str>,
 }
 
-/// Open a stored sealed value with whichever held key it names.
-///
-/// The versioned envelope names its sealing key, so a secret sealed under a
-/// retained (pre-rotation) key still opens while the rewrap catches up. The
-/// underlying crypto error is dropped so no key or ciphertext detail leaks.
-///
-/// # Errors
-/// Returns [`IssuerDecodeError::Decrypt`] when the envelope is malformed, names
-/// a key the keyring does not hold, or fails authentication.
-fn open_secret(keyring: &SealingKeyring, bytes: &[u8]) -> Result<Vec<u8>, IssuerDecodeError> {
-    keyring.open(bytes).map_err(|_| IssuerDecodeError::Decrypt)
-}
+impl ClientSecretOwner<'_> {
+    /// Seal `client_auth`'s secret, or return `None` for a method that holds
+    /// none.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::seal_secret`].
+    pub(crate) async fn seal(
+        &self,
+        client_auth: &ClientAuth,
+        kms: Option<&WyrdKms>,
+    ) -> Result<Option<Vec<u8>>, IssuerSealError> {
+        let (ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret)) = client_auth else {
+            return Ok(None);
+        };
+        self.seal_secret(
+            client_auth_discriminant(client_auth),
+            secret.expose_secret().as_bytes(),
+            kms,
+        )
+        .await
+        .map(Some)
+    }
 
-/// Open a row's sealed client secret into a [`SecretString`].
-///
-/// Called only for secret-bearing client-authentication methods; the
-/// plaintext never leaves the returned secret wrapper.
-///
-/// # Errors
-/// Returns [`IssuerDecodeError::MissingSecret`] when the row stores no
-/// ciphertext, [`IssuerDecodeError::SealingKeyMissing`] when the process holds
-/// no keyring, [`IssuerDecodeError::Decrypt`] when no held key opens it, and
-/// [`IssuerDecodeError::SecretEncoding`] when the plaintext is not UTF-8.
-fn decode_secret(
-    secret_enc: Option<&[u8]>,
-    sealing_key: Option<&SealingKeyring>,
-) -> Result<SecretString, IssuerDecodeError> {
-    let bytes = secret_enc.ok_or(IssuerDecodeError::MissingSecret)?;
-    let key = sealing_key.ok_or(IssuerDecodeError::SealingKeyMissing)?;
-    let plaintext = open_secret(key, bytes)?;
-    let text = String::from_utf8(plaintext).map_err(|_| IssuerDecodeError::SecretEncoding)?;
-    Ok(SecretString::from(text))
-}
+    /// Whether `stored` opens under this owner to `client_auth`'s secret.
+    ///
+    /// `None` when the comparison is unavailable: there is no facade, or the
+    /// envelope does not open, whatever the reason (a removed or denied key,
+    /// a key-service failure, or damaged bytes). An unavailable comparison
+    /// proves neither equality nor a change. A method that holds no secret
+    /// never matches.
+    pub(crate) async fn opens_to(
+        &self,
+        client_auth: &ClientAuth,
+        stored: &[u8],
+        kms: Option<&WyrdKms>,
+    ) -> Option<bool> {
+        let (ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret)) = client_auth else {
+            return Some(false);
+        };
+        let authority = self.authority(client_auth_discriminant(client_auth));
+        match kms?.open(&self.context(&authority), stored).await {
+            Ok(plain) => Some(plain.as_slice() == secret.expose_secret().as_bytes()),
+            Err(error) => {
+                tracing::warn!(%error, purpose = self.purpose.as_str(), "stored client secret could not be compared");
+                None
+            }
+        }
+    }
 
-/// Rebuild a stored client-authentication method, opening its sealed secret.
-///
-/// Shared by the workload issuer, platform connection, and tenant human
-/// connection decoders so every store opens secrets through one keyring path.
-///
-/// # Errors
-/// Returns [`IssuerDecodeError`] for an unknown discriminant, a secret method
-/// with no stored secret, a missing keyring, or a secret no held key opens.
-pub(crate) fn client_auth_from_row(
-    discriminant: &str,
-    secret_enc: Option<&[u8]>,
-    sealing_key: Option<&SealingKeyring>,
-) -> Result<ClientAuth, IssuerDecodeError> {
-    match discriminant {
-        CLIENT_AUTH_SECRET_BASIC => Ok(ClientAuth::SecretBasic(decode_secret(
-            secret_enc,
-            sealing_key,
-        )?)),
-        CLIENT_AUTH_SECRET_POST => Ok(ClientAuth::SecretPost(decode_secret(
-            secret_enc,
-            sealing_key,
-        )?)),
-        CLIENT_AUTH_PRIVATE_KEY_JWT => Ok(ClientAuth::PrivateKeyJwt),
-        CLIENT_AUTH_PUBLIC => Ok(ClientAuth::Public),
-        other => Err(IssuerDecodeError::ClientAuth(other.to_owned())),
+    /// Seal `secret` for the stored client-authentication `method`.
+    ///
+    /// # Errors
+    /// Returns [`IssuerSealError::KmsMissing`] when `kms` is `None`, and
+    /// [`IssuerSealError::Encrypt`] when sealing fails.
+    pub(crate) async fn seal_secret(
+        &self,
+        method: &str,
+        secret: &[u8],
+        kms: Option<&WyrdKms>,
+    ) -> Result<Vec<u8>, IssuerSealError> {
+        let kms = kms.ok_or(IssuerSealError::KmsMissing)?;
+        let authority = self.authority(method);
+        kms.seal(&self.context(&authority), secret)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, purpose = self.purpose.as_str(), "client secret could not be sealed");
+                IssuerSealError::Encrypt
+            })
+    }
+
+    /// Renew the encryption of `envelope`, sealed for the stored
+    /// client-authentication `method`: the same secret resealed under a fresh
+    /// data key and nonce wrapped by the active key.
+    ///
+    /// # Errors
+    /// Returns [`IssuerSealError::KmsMissing`] when `kms` is `None`, and
+    /// [`IssuerSealError::Encrypt`] when the envelope does not open under
+    /// this owner or the reseal fails.
+    pub(crate) async fn renew_secret(
+        &self,
+        method: &str,
+        envelope: &[u8],
+        kms: Option<&WyrdKms>,
+    ) -> Result<Vec<u8>, IssuerSealError> {
+        let kms = kms.ok_or(IssuerSealError::KmsMissing)?;
+        let authority = self.authority(method);
+        kms.renew(&self.context(&authority), envelope)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, purpose = self.purpose.as_str(), "client secret could not be renewed");
+                IssuerSealError::Encrypt
+            })
+    }
+
+    /// Rebuild a stored client-authentication method, opening its secret.
+    ///
+    /// Shared by the workload issuer, platform connection, and tenant human
+    /// connection decoders so every store opens secrets through one path.
+    ///
+    /// # Errors
+    /// Returns [`IssuerDecodeError`] for an unknown discriminant, a secret
+    /// method with no stored secret, a missing facade, an envelope that does
+    /// not open under this owner, or a non-UTF-8 secret.
+    pub(crate) async fn client_auth(
+        &self,
+        discriminant: &str,
+        secret_enc: Option<&[u8]>,
+        kms: Option<&WyrdKms>,
+    ) -> Result<ClientAuth, IssuerDecodeError> {
+        let secret = || async {
+            let bytes = secret_enc.ok_or(IssuerDecodeError::MissingSecret)?;
+            let kms = kms.ok_or(IssuerDecodeError::KmsMissing)?;
+            let authority = self.authority(discriminant);
+            let plaintext = kms
+                .open(&self.context(&authority), bytes)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, purpose = self.purpose.as_str(), "client secret could not be opened");
+                    IssuerDecodeError::Decrypt
+                })?;
+            let text =
+                std::str::from_utf8(&plaintext).map_err(|_| IssuerDecodeError::SecretEncoding)?;
+            Ok::<_, IssuerDecodeError>(SecretString::from(text.to_owned()))
+        };
+        match discriminant {
+            CLIENT_AUTH_SECRET_BASIC => Ok(ClientAuth::SecretBasic(secret().await?)),
+            CLIENT_AUTH_SECRET_POST => Ok(ClientAuth::SecretPost(secret().await?)),
+            CLIENT_AUTH_PRIVATE_KEY_JWT => Ok(ClientAuth::PrivateKeyJwt),
+            CLIENT_AUTH_PUBLIC => Ok(ClientAuth::Public),
+            other => Err(IssuerDecodeError::ClientAuth(other.to_owned())),
+        }
+    }
+
+    /// The envelope authority for `method`: the client id, the method, and
+    /// the connection id when there is one.
+    fn authority<'b>(&'b self, method: &'b str) -> Vec<&'b str> {
+        [self.client_id, method]
+            .into_iter()
+            .chain(self.connection_id)
+            .collect()
+    }
+
+    /// The envelope context over `authority`, from [`Self::authority`].
+    fn context<'a>(&'a self, authority: &'a [&'a str]) -> SecretContext<'a> {
+        SecretContext {
+            scope: self.scope,
+            purpose: self.purpose,
+            owner: self.issuer_url,
+            authority,
+            version: None,
+        }
     }
 }
 
@@ -514,20 +618,24 @@ pub(crate) fn client_auth_from_row(
 /// `row.data_tenant_id == tenant.as_uuid()`, so we carry the already-validated
 /// [`DataTenantId`] through rather than re-parsing the column (which would
 /// re-impose `UUIDv7` validation the boundary already passed).
-fn trusted_issuer_from_row(
+async fn trusted_issuer_from_row(
     tenant: DataTenantId,
     row: TrustedIssuerRow,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<TrustedIssuer, IssuerDecodeError> {
     let issuer = IssuerUrl::new(row.issuer_url.clone())
         .map_err(|error| IssuerDecodeError::IssuerUrl(error.to_string()))?;
     let jwks_uri =
         Url::parse(&row.jwks_uri).map_err(|error| IssuerDecodeError::JwksUri(error.to_string()))?;
-    let client_auth = client_auth_from_row(
-        &row.client_auth,
-        row.client_secret_enc.as_deref(),
-        sealing_key,
-    )?;
+    let client_auth = ClientSecretOwner {
+        scope: SecretScope::Tenant(tenant),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .client_auth(&row.client_auth, row.client_secret_enc.as_deref(), kms)
+    .await?;
     let claim_mapping = claim_mapping_from_value(row.claim_mapping)?;
     let group_role_map: HashMap<String, Vec<String>> = serde_json::from_value(row.group_role_map)?;
     let default_roles: Vec<String> = serde_json::from_value(row.default_roles)?;
@@ -564,11 +672,11 @@ fn trusted_issuer_from_row(
 /// Returns [`IssuerDecodeError`] when the issuer or JWKS URI is malformed or
 /// absent, a JSON column does not decode, the subject claim is not `sub`
 /// ([`IssuerDecodeError::HumanSubject`]), or the client authentication cannot
-/// be reconstructed — including a sealed secret this process holds no key for.
-pub(crate) fn human_connection_trusted_issuer(
+/// be reconstructed — including a stored secret that does not open.
+pub(crate) async fn human_connection_trusted_issuer(
     tenant: DataTenantId,
     row: HumanConnectionRow,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<TrustedIssuer, IssuerDecodeError> {
     let claim_mapping = claim_mapping_from_value(row.claim_mapping)?;
     if claim_mapping.subject.as_str() != HUMAN_SUBJECT_CLAIM {
@@ -584,11 +692,16 @@ pub(crate) fn human_connection_trusted_issuer(
         .ok_or_else(|| IssuerDecodeError::JwksUri("the connection has no jwks uri".to_owned()))?;
     let jwks_uri =
         Url::parse(jwks_uri).map_err(|error| IssuerDecodeError::JwksUri(error.to_string()))?;
-    let client_auth = client_auth_from_row(
-        &row.client_auth,
-        row.client_secret_enc.as_deref(),
-        sealing_key,
-    )?;
+    let connection_id = row.connection_id.to_string();
+    let client_auth = ClientSecretOwner {
+        scope: SecretScope::Tenant(tenant),
+        purpose: SecretPurpose::AuthHumanConnection,
+        issuer_url: issuer.as_str(),
+        client_id: &row.client_id,
+        connection_id: Some(&connection_id),
+    }
+    .client_auth(&row.client_auth, row.client_secret_enc.as_deref(), kms)
+    .await?;
     Ok(TrustedIssuer {
         tenant_id: tenant,
         issuer,
@@ -620,21 +733,25 @@ pub(crate) fn human_connection_trusted_issuer(
 /// # Errors
 /// Returns an error when the issuer or JWKS URL is malformed, the claim mapping
 /// cannot be decoded, or the client authentication cannot be reconstructed —
-/// including when the row carries a secret and no sealing key is configured,
+/// including when the row carries a secret and no `[kms]` is configured,
 /// which fails closed rather than degrading to an unauthenticated client.
-pub fn platform_connection_from_row(
+pub async fn platform_connection_from_row(
     row: PlatformOidcConnectionRow,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<PlatformConnection, PlatformConnectionError> {
     let issuer = IssuerUrl::new(row.issuer_url.clone())
         .map_err(|error| PlatformConnectionError::IssuerUrl(error.to_string()))?;
     let jwks_uri = Url::parse(&row.jwks_uri)
         .map_err(|error| PlatformConnectionError::JwksUri(error.to_string()))?;
-    let client_auth = client_auth_from_row(
-        &row.client_auth,
-        row.client_secret_enc.as_deref(),
-        sealing_key,
-    )
+    let client_auth = ClientSecretOwner {
+        scope: SecretScope::Platform,
+        purpose: SecretPurpose::PlatformOidc,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .client_auth(&row.client_auth, row.client_secret_enc.as_deref(), kms)
+    .await
     .map_err(|error| PlatformConnectionError::ClientAuth(error.to_string()))?;
     let claim_mapping = claim_mapping_from_value(row.claim_mapping)
         .map_err(|error| PlatformConnectionError::ClaimMapping(error.to_string()))?;
@@ -674,23 +791,52 @@ pub enum PlatformConnectionError {
     ClaimMapping(String),
 }
 
-/// Seal a platform connection's client secret for storage.
+/// Seal the platform connection's client secret for storage, bound to the
+/// platform scope, `issuer_url`, and `client_id`.
 ///
 /// # Errors
-/// Returns [`IssuerSealError::SealingKeyMissing`] when a secret is present and
-/// no sealing key is configured, and [`IssuerSealError::Encrypt`] when
-/// encryption fails. A secret-bearing connection is never stored in the clear.
-pub fn seal_platform_client_secret(
+/// Returns [`IssuerSealError::KmsMissing`] when a secret is present and no
+/// `[kms]` is configured, and [`IssuerSealError::Encrypt`] when sealing
+/// fails. A secret-bearing connection is never stored in the clear.
+pub async fn seal_platform_client_secret(
+    issuer_url: &str,
+    client_id: &str,
     client_auth: &ClientAuth,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<Option<Vec<u8>>, IssuerSealError> {
-    match client_auth {
-        ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
-            let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
-            Ok(Some(seal_secret(key, secret.expose_secret().as_bytes())?))
-        }
-        ClientAuth::PrivateKeyJwt | ClientAuth::Public => Ok(None),
+    ClientSecretOwner {
+        scope: SecretScope::Platform,
+        purpose: SecretPurpose::PlatformOidc,
+        issuer_url,
+        client_id,
+        connection_id: None,
     }
+    .seal(client_auth, kms)
+    .await
+}
+
+/// Renew the platform connection's client-secret encryption: the same secret
+/// resealed under a fresh data key for the same issuer, client id, and
+/// method. Callers run this before opening the transaction that swaps it in.
+///
+/// # Errors
+/// Returns [`IssuerSealError::KmsMissing`] without a facade and
+/// [`IssuerSealError::Encrypt`] when the envelope does not open for this
+/// connection or the reseal fails.
+pub async fn renew_platform_client_secret(
+    row: &PlatformOidcConnectionRow,
+    envelope: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Result<Vec<u8>, IssuerSealError> {
+    ClientSecretOwner {
+        scope: SecretScope::Platform,
+        purpose: SecretPurpose::PlatformOidc,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .renew_secret(&row.client_auth, envelope, kms)
+    .await
 }
 
 /// Name the stored discriminant for a client authentication method.
@@ -703,27 +849,43 @@ pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
 // TrustedIssuer -> write (seed path)
 // --------------------------------------------------------------------------
 
-/// Encode a [`TrustedIssuer`] into a [`TrustedIssuerWrite`] for boot seeding.
+/// Encode a [`TrustedIssuer`] into a [`TrustedIssuerWrite`], sealing its
+/// configured client secret afresh.
 ///
-/// The client secret (for `SecretBasic`/`SecretPost`) is encrypted with the
-/// sealing key into `nonce ‖ ciphertext`. A secret-bearing issuer with no
-/// sealing key fails closed via [`IssuerSealError::SealingKeyMissing`].
+/// The client secret (for `SecretBasic`/`SecretPost`) is sealed into the
+/// common envelope bound to the issuer's tenant, URL, client id, and method,
+/// so this is for an intentional creation or replacement. Callers run this
+/// before opening the transaction that writes it, since a remote backend
+/// waits on its key service. A secret-bearing issuer with no facade fails
+/// closed via [`IssuerSealError::KmsMissing`].
 ///
 /// # Errors
-/// Returns [`IssuerSealError`] when a secret is present without a sealing key,
-/// encryption fails, or a JSONB column cannot be serialized.
-pub fn issuer_write_from_trusted(
+/// Returns [`IssuerSealError`] when a secret is present without a facade,
+/// sealing fails, or a JSONB column cannot be serialized.
+pub async fn issuer_write_from_trusted(
     issuer: &TrustedIssuer,
-    sealing_key: Option<&SealingKeyring>,
+    kms: Option<&WyrdKms>,
 ) -> Result<TrustedIssuerWrite, IssuerSealError> {
-    let client_secret_enc = match &issuer.client_auth {
-        ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
-            let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
-            Some(seal_secret(key, secret.expose_secret().as_bytes())?)
-        }
-        ClientAuth::PrivateKeyJwt | ClientAuth::Public => None,
-    };
+    let client_secret_enc = trusted_issuer_owner(issuer)
+        .seal(&issuer.client_auth, kms)
+        .await?;
+    issuer_write_with_envelope(issuer, client_secret_enc)
+}
 
+/// Encode a [`TrustedIssuer`] into a [`TrustedIssuerWrite`] that stores
+/// `client_secret_enc` as its envelope, byte-for-byte.
+///
+/// For re-seeding an issuer whose committed envelope stays: the caller has
+/// established that the envelope already belongs to this issuer's tenant,
+/// URL, client id, and method.
+///
+/// # Errors
+/// Returns [`IssuerSealError::Serialize`] when a JSONB column cannot be
+/// serialized.
+pub fn issuer_write_with_envelope(
+    issuer: &TrustedIssuer,
+    client_secret_enc: Option<Vec<u8>>,
+) -> Result<TrustedIssuerWrite, IssuerSealError> {
     Ok(TrustedIssuerWrite {
         issuer_url: issuer.issuer.as_str().to_owned(),
         jwks_uri: issuer.jwks_uri.to_string(),
@@ -737,6 +899,84 @@ pub fn issuer_write_from_trusted(
         jwks_ttl_secs: i64::try_from(issuer.jwks_ttl.as_secs()).unwrap_or(i64::MAX),
         client_secret_enc,
     })
+}
+
+/// Whether `stored` opens, bound to `issuer`'s tenant, URL, client id, and
+/// method, to its configured client secret.
+///
+/// `None` when the comparison is unavailable, for any reason the envelope
+/// does not open; the caller must then neither keep it as equal nor seal over
+/// it as changed on this evidence alone.
+pub async fn trusted_issuer_secret_matches(
+    issuer: &TrustedIssuer,
+    stored: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Option<bool> {
+    trusted_issuer_owner(issuer)
+        .opens_to(&issuer.client_auth, stored, kms)
+        .await
+}
+
+/// The secret owner of a configured trusted issuer.
+fn trusted_issuer_owner(issuer: &TrustedIssuer) -> ClientSecretOwner<'_> {
+    ClientSecretOwner {
+        scope: SecretScope::Tenant(issuer.tenant_id),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: issuer.issuer.as_str(),
+        client_id: &issuer.client_id,
+        connection_id: None,
+    }
+}
+
+/// Renew a stored trusted issuer's client-secret encryption: the same secret
+/// resealed under a fresh data key, bound to the same tenant, issuer URL,
+/// client id, and method. Callers run this outside any transaction, since a
+/// remote backend waits on its key service, then swap on the observed bytes.
+///
+/// # Errors
+/// Returns [`IssuerSealError::KmsMissing`] without a facade and
+/// [`IssuerSealError::Encrypt`] when the envelope does not open for this
+/// issuer or the reseal fails.
+pub async fn renew_trusted_issuer_secret(
+    tenant: DataTenantId,
+    row: &TrustedIssuerRow,
+    envelope: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Result<Vec<u8>, IssuerSealError> {
+    ClientSecretOwner {
+        scope: SecretScope::Tenant(tenant),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .renew_secret(&row.client_auth, envelope, kms)
+    .await
+}
+
+/// Seal `secret` as the replacement client secret of a stored trusted issuer,
+/// bound to its tenant, issuer URL, client id, and method. The old envelope is
+/// never opened, so a replacement succeeds when it can no longer decrypt.
+/// Callers run this outside any transaction, then swap on the observed bytes.
+///
+/// # Errors
+/// Returns [`IssuerSealError::KmsMissing`] without a facade and
+/// [`IssuerSealError::Encrypt`] when sealing fails.
+pub async fn seal_trusted_issuer_replacement(
+    tenant: DataTenantId,
+    row: &TrustedIssuerRow,
+    secret: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Result<Vec<u8>, IssuerSealError> {
+    ClientSecretOwner {
+        scope: SecretScope::Tenant(tenant),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .seal_secret(&row.client_auth, secret, kms)
+    .await
 }
 
 /// Encode a [`WorkloadBinding`] into a [`WorkloadBindingWrite`] for boot seeding.
@@ -764,8 +1004,8 @@ mod pg_tests {
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer, WorkloadBinding,
         WorkloadBindingResolver,
     };
-    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_kms::{KmsConfig, WyrdKms};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
@@ -781,8 +1021,12 @@ mod pg_tests {
 
     const ISSUER_URL: &str = "https://idp.example.com/realms/wyrd";
 
-    fn sealing_key() -> SealingKeyring {
-        SealingKeyring::new(SecretKey::from_bytes([7_u8; 32]))
+    /// An ephemeral memory facade with its own random key.
+    ///
+    /// # Panics
+    /// Panics when the memory configuration stops validating.
+    fn kms() -> Arc<WyrdKms> {
+        Arc::new(WyrdKms::new(&KmsConfig::memory("test"), false).expect("memory facade"))
     }
 
     fn sample_issuer(tenant: DataTenantId) -> TrustedIssuer {
@@ -833,15 +1077,17 @@ mod pg_tests {
         );
     }
 
-    #[test]
-    fn round_trips_through_write_and_row_losslessly() {
+    #[tokio::test]
+    async fn round_trips_through_write_and_row_losslessly() {
         let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
             .parse()
             .expect("tenant id is valid");
-        let key = sealing_key();
+        let key = kms();
         let issuer = sample_issuer(tenant);
 
-        let write = issuer_write_from_trusted(&issuer, Some(&key)).expect("encode succeeds");
+        let write = issuer_write_from_trusted(&issuer, Some(&key))
+            .await
+            .expect("encode succeeds");
         let row = wyrd_sql::row_types::auth::TrustedIssuerRow {
             data_tenant_id: tenant.as_uuid(),
             issuer_url: write.issuer_url,
@@ -859,7 +1105,9 @@ mod pg_tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let decoded = trusted_issuer_from_row(tenant, row, Some(&key)).expect("decode succeeds");
+        let decoded = trusted_issuer_from_row(tenant, row, Some(&key))
+            .await
+            .expect("decode succeeds");
         assert_issuer_eq(&issuer, &decoded);
         match decoded.client_auth {
             ClientAuth::SecretPost(secret) => assert_eq!(secret.expose_secret(), "super-secret"),
@@ -876,8 +1124,8 @@ mod pg_tests {
     /// Panics when the `email` subject row decodes, its error is not
     /// `HumanSubject("email")`, or the `sub` row fails to decode with its
     /// subject and email paths.
-    #[test]
-    fn stored_human_connection_requires_the_sub_subject_claim() {
+    #[tokio::test]
+    async fn stored_human_connection_requires_the_sub_subject_claim() {
         let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
             .parse()
             .expect("tenant id is valid");
@@ -904,10 +1152,12 @@ mod pg_tests {
         };
 
         let error = human_connection_trusted_issuer(tenant, row("email"), None)
+            .await
             .expect_err("a stored non-sub subject fails closed");
         assert!(matches!(error, IssuerDecodeError::HumanSubject(path) if path == "email"));
 
         let trusted = human_connection_trusted_issuer(tenant, row("sub"), None)
+            .await
             .expect("a sub mapping decodes");
         assert_eq!(trusted.claim_mapping.subject.as_str(), "sub");
         assert_eq!(
@@ -916,26 +1166,35 @@ mod pg_tests {
         );
     }
 
-    #[test]
-    fn encode_fails_closed_when_secret_present_without_sealing_key() {
+    #[tokio::test]
+    async fn encode_fails_closed_when_secret_present_without_kms() {
         let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
             .parse()
             .expect("tenant id is valid");
         let issuer = sample_issuer(tenant);
 
         let error = issuer_write_from_trusted(&issuer, None)
-            .expect_err("a secret-bearing issuer with no sealing key must fail closed");
-        assert!(matches!(error, IssuerSealError::SealingKeyMissing));
+            .await
+            .expect_err("a secret-bearing issuer with no facade must fail closed");
+        assert!(matches!(error, IssuerSealError::KmsMissing));
     }
 
-    #[test]
-    fn decode_fails_closed_when_secret_present_without_sealing_key() {
+    /// A stored secret opens only with a facade, under its own tenant, and
+    /// under the facade holding its key; every other read fails closed.
+    ///
+    /// # Panics
+    /// Panics when encoding fails or a keyless, cross-tenant, or other-key
+    /// decode succeeds.
+    #[tokio::test]
+    async fn decode_fails_closed_without_the_owner_or_key() {
         let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
             .parse()
             .expect("tenant id is valid");
-        let key = sealing_key();
+        let key = kms();
         let issuer = sample_issuer(tenant);
-        let write = issuer_write_from_trusted(&issuer, Some(&key)).expect("encode succeeds");
+        let write = issuer_write_from_trusted(&issuer, Some(&key))
+            .await
+            .expect("encode succeeds");
         let row = wyrd_sql::row_types::auth::TrustedIssuerRow {
             data_tenant_id: tenant.as_uuid(),
             issuer_url: write.issuer_url,
@@ -953,18 +1212,91 @@ mod pg_tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let error = trusted_issuer_from_row(tenant, row, None)
-            .expect_err("decrypting a secret with no key must fail closed");
-        assert!(format!("{error}").contains("no sealing key"));
+        let keyless = trusted_issuer_from_row(tenant, row.clone(), None)
+            .await
+            .expect_err("opening a secret with no facade must fail closed");
+        assert!(matches!(keyless, IssuerDecodeError::KmsMissing));
+        let foreign = trusted_issuer_from_row(DataTenantId::new_v7(), row.clone(), Some(&key))
+            .await
+            .expect_err("a secret copied to another tenant must not open");
+        assert!(matches!(foreign, IssuerDecodeError::Decrypt));
+        let other = trusted_issuer_from_row(tenant, row, Some(&kms()))
+            .await
+            .expect_err("another deployment key must not open the secret");
+        assert!(matches!(other, IssuerDecodeError::Decrypt));
+    }
+
+    /// Through the resolver the jwt-bearer exchange uses, a trusted issuer
+    /// whose stored envelope was copied from another tenant's issuer for the
+    /// same URL fails closed instead of serving that tenant's secret, while
+    /// the source tenant still resolves its own.
+    ///
+    /// # Panics
+    /// Panics when seeding or the copy fails, the copied row resolves, or the
+    /// source tenant's issuer stops resolving with its secret.
+    #[tokio::test]
+    async fn resolver_refuses_an_envelope_copied_from_another_tenant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let first = fixture.data_tenant_id();
+        let second = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(second, "issuer-copied")
+            .await
+            .expect("second tenant seeds");
+        let key = kms();
+        for (tenant, secret) in [(first, "first-secret"), (second, "second-secret")] {
+            let mut issuer = sample_issuer(tenant);
+            issuer.client_auth = ClientAuth::SecretPost(SecretString::from(secret.to_owned()));
+            let write = issuer_write_from_trusted(&issuer, Some(&key))
+                .await
+                .expect("encode succeeds");
+            let mut conn = fixture
+                .tenant_conn_for(tenant)
+                .await
+                .expect("tenant conn opens");
+            upsert_trusted_issuer(&mut conn, &write)
+                .await
+                .expect("issuer upsert");
+            conn.commit().await.expect("seed commits");
+        }
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
+        sqlx::query(
+            "UPDATE wyrd.auth_trusted_issuers SET client_secret_enc = \
+               (SELECT client_secret_enc FROM wyrd.auth_trusted_issuers WHERE data_tenant_id = $1) \
+             WHERE data_tenant_id = $2",
+        )
+        .bind(second.as_uuid())
+        .bind(first.as_uuid())
+        .execute(&superuser)
+        .await
+        .expect("envelope copies");
+
+        let resolver = PgIssuerResolver::new(fixture.wyrd_postgres().clone(), Some(key));
+        let url = IssuerUrl::new(ISSUER_URL).expect("issuer url is valid");
+        assert!(
+            resolver.trusted_issuer(&first, &url).await.is_err(),
+            "the copied envelope does not open for the first tenant"
+        );
+        let own = resolver
+            .trusted_issuer(&second, &url)
+            .await
+            .expect("the source tenant resolves")
+            .expect("its issuer is found");
+        match &own.client_auth {
+            ClientAuth::SecretPost(secret) => assert_eq!(secret.expose_secret(), "second-secret"),
+            other => panic!("expected SecretPost, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn resolver_reads_and_decrypts_seeded_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let key = sealing_key();
+        let key = kms();
         let issuer = sample_issuer(tenant);
-        let write = issuer_write_from_trusted(&issuer, Some(&key)).expect("encode succeeds");
+        let write = issuer_write_from_trusted(&issuer, Some(&key))
+            .await
+            .expect("encode succeeds");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         upsert_trusted_issuer(&mut conn, &write)
@@ -972,10 +1304,7 @@ mod pg_tests {
             .expect("issuer upsert");
         conn.commit().await.expect("seed commits");
 
-        let resolver = PgIssuerResolver::new(
-            fixture.wyrd_postgres().clone(),
-            Some(Arc::new(sealing_key())),
-        );
+        let resolver = PgIssuerResolver::new(fixture.wyrd_postgres().clone(), Some(key));
         let issuers = resolver
             .trusted_issuers(&tenant)
             .await
@@ -1017,9 +1346,11 @@ mod pg_tests {
     async fn binding_resolver_prefers_audience_then_falls_back() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let key = sealing_key();
+        let key = kms();
         let issuer = sample_issuer(tenant);
-        let issuer_write = issuer_write_from_trusted(&issuer, Some(&key)).expect("encode succeeds");
+        let issuer_write = issuer_write_from_trusted(&issuer, Some(&key))
+            .await
+            .expect("encode succeeds");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let account = insert_test_service_account(&mut conn, Uuid::now_v7(), None).await;

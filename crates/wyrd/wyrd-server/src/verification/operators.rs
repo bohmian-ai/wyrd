@@ -10,11 +10,8 @@
 //! Verifier result. Claims and settlements are engine mechanics, not
 //! authorization decisions, so none of them writes audit.
 //!
-//! Key rewrap runs beside the claim loop, never inside it, under its own
-//! cancellation and elapsed-time budgets, so a slow key provider cannot hold
-//! back another tenant's due dispatch. HTTP credentials are attached only to
-//! the request built from a client already screened and pinned to that
-//! effective URL.
+//! HTTP credentials are attached only to the request built from a client
+//! already screened and pinned to that effective URL.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -54,7 +51,8 @@ use super::RuntimeLimits;
 use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::health::RuntimeCapability;
 use super::permits::OperatorPermits;
-use crate::components::operators::keys::{KeyError, OperatorKeys};
+use crate::components::operators::secrets::OperatorSecrets;
+use wyrd_kms::KmsError;
 
 mod pager_duty;
 mod slack;
@@ -154,15 +152,15 @@ pub struct OperatorWorker {
     /// Wyrd Postgres owner that opens every tenant-scoped claim, read, and
     /// settlement transaction.
     postgres: WyrdPostgres,
-    /// Operator pool for the cross-tenant due list and rewrap passes.
+    /// Operator pool for the cross-tenant due list.
     operator: OperatorPool,
     /// Delivery ceilings and fenced transitions.
     queue: OperatorDispatchQueue,
     /// Shared claim loop owning Operator execution capacity (separate from
     /// the Verifier pool), admission, and drain.
     claims: ClaimLoop,
-    /// Tenant key-encryption keys for opening credentials.
-    keys: Arc<OperatorKeys>,
+    /// Credential owner that opens stored connection secrets.
+    secrets: OperatorSecrets,
     /// Provider wire adapters.
     delivery: OperatorDelivery,
     /// Runtime bounds.
@@ -175,7 +173,7 @@ impl OperatorWorker {
     pub fn new(
         postgres: WyrdPostgres,
         operator: OperatorPool,
-        keys: Arc<OperatorKeys>,
+        secrets: OperatorSecrets,
         delivery: OperatorDelivery,
         limits: RuntimeLimits,
     ) -> Self {
@@ -197,7 +195,7 @@ impl OperatorWorker {
                 limits.operator_deadline,
                 limits.operator_lease,
             ),
-            keys,
+            secrets,
             delivery,
             limits,
         }
@@ -211,48 +209,17 @@ impl OperatorWorker {
         self
     }
 
-    /// Claim and deliver dispatches until `stop` is cancelled, then drain,
-    /// while rewrapping stale keys beside the claim loop.
+    /// Claim and deliver dispatches until `stop` is cancelled, then drain.
     ///
     /// Delivery runs on the shared [`ClaimLoop`] exactly like the Verifier
     /// runner: each round claims one dispatch per due tenant with capacity;
     /// on `stop` no claim is admitted, in-flight attempts get the drain grace,
     /// and the rest are cancelled and released with their attempt refunded.
-    /// Rewrap is polled concurrently in the same task, so a slow key provider
-    /// delays only rewrap, and `stop` cancels it with the loop.
     ///
     /// # Panics
     /// Panics under `test-support` when a test armed an Operator-worker crash.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
-        tokio::join!(self.claims.run(&self, stop.clone()), self.rewrap(&stop));
-    }
-
-    /// Rewrap rows still on an older key version every rewrap interval until
-    /// `stop`, each pass bounded by the runtime's pass and tenant budgets.
-    ///
-    /// Cancellation drops the pass in progress, rolling back its open tenant
-    /// transaction; the next pass (here or on another replica) retries it.
-    async fn rewrap(&self, stop: &CancellationToken) {
-        loop {
-            tokio::select! {
-                biased;
-                () = stop.cancelled() => return,
-                pass = self.keys.rewrap_pass(
-                    &self.postgres,
-                    &self.operator,
-                    self.limits.rewrap_pass_budget,
-                    self.limits.rewrap_tenant_budget,
-                ) => {
-                    if let Err(error) = pass {
-                        tracing::warn!(%error, "operator key rewrap pass failed");
-                    }
-                }
-            }
-            tokio::select! {
-                () = stop.cancelled() => return,
-                () = tokio::time::sleep(self.limits.rewrap_interval) => {}
-            }
-        }
+        self.claims.run(&self, stop).await;
     }
 
     /// Resolve, authorize, decrypt, and deliver one attempt.
@@ -378,14 +345,20 @@ impl OperatorWorker {
             ));
         };
         let plaintext = self
-            .keys
+            .secrets
             .open(tenant, &stored)
             .await
             .map_err(|error| match error {
-                KeyError::Unavailable { .. } | KeyError::Client | KeyError::VersionOutOfRange => {
+                KmsError::Unavailable { .. }
+                | KmsError::Config { .. }
+                | KmsError::KeyNotAllowed => {
+                    tracing::warn!(%error, "operator credential cannot be opened yet");
                     store_down()
                 }
-                KeyError::Authentication { .. } => Attempt::terminal(
+                KmsError::UnknownFormat
+                | KmsError::Authentication
+                | KmsError::InvalidDek
+                | KmsError::Encrypt => Attempt::terminal(
                     CREDENTIAL_INVALID,
                     "the stored credential failed authentication",
                 ),

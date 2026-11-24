@@ -10068,6 +10068,8 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-compression",
+ "aws-lc-rs",
+ "aws-lc-sys",
  "axum",
  "axum-core",
  "base64 0.22.1",
@@ -10173,7 +10175,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_core",
- "serde_derive",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
@@ -10299,8 +10300,8 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
- "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-kms",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
@@ -10586,6 +10587,8 @@ dependencies = [
 name = "wyrd-dev-fixtures"
 version = "0.4.2"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
  "secrecy",
  "serde_json",
  "sqlx",
@@ -10635,7 +10638,7 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-benchmark",
- "wyrd-crypt",
+ "wyrd-kms",
  "wyrd-runtime",
  "wyrd-skald-providers",
  "wyrd-skald-spec",
@@ -10643,7 +10646,6 @@ dependencies = [
  "wyrd-tls",
  "wyrd-utils",
  "wyrd-vault",
- "zeroize",
 ]
 
 [[package]]
@@ -10662,6 +10664,35 @@ dependencies = [
  "wyrd-spec",
  "wyrd-utils",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "wyrd-kms"
+version = "0.4.2"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "object_store",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-crypt",
+ "wyrd-dev-fixtures",
+ "wyrd-spec",
+ "wyrd-tls",
+ "wyrd-utils",
+ "wyrd-vault",
+ "zeroize",
 ]
 
 [[package]]
@@ -10960,6 +10991,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-gateway",
+ "wyrd-kms",
  "wyrd-loader",
  "wyrd-queue",
  "wyrd-runtime",
@@ -10979,7 +11011,6 @@ dependencies = [
  "wyrd-tonic",
  "wyrd-types",
  "wyrd-utils",
- "wyrd-vault",
  "zeroize",
  "zip",
 ]
@@ -11208,12 +11239,14 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "wiremock",
  "workspace-hack",
  "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-testing",
  "wyrd-tls",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -11305,6 +11338,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-gateway",
+ "wyrd-kms",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
@@ -11375,6 +11409,7 @@ dependencies = [
 name = "wyrd-utils"
 version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "pyo3",
  "secrecy",
@@ -11382,6 +11417,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "temp-env",
  "thiserror 2.0.21",
  "walkdir",
  "workspace-hack",
@@ -11393,15 +11429,20 @@ dependencies = [
 name = "wyrd-vault"
 version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "reqwest 0.13.4",
  "secrecy",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "url",
  "wiremock",
  "workspace-hack",
+ "wyrd-crypt",
  "wyrd-tls",
+ "zeroize",
 ]
 
 [[package]]

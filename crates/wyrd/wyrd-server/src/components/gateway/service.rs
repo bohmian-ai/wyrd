@@ -12,11 +12,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Error as SqlxError;
-use wyrd_crypt::SealingKeyring;
 use wyrd_gateway::{
-    CredentialError, GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot,
-    ManagedSecretBinding,
+    GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot, ManagedSecretBinding,
 };
+use wyrd_kms::{KmsError, WyrdKms};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -31,10 +30,10 @@ use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId}
 use wyrd_sql::queries::gateway::{
     GatewayCredentialWrite, GatewayDeploymentWrite, GatewayPricingWrite, delete_gateway_credential,
     delete_gateway_deployment, gateway_credential, gateway_credential_for_share,
-    gateway_credentials, gateway_deployment, gateway_deployments, gateway_policies,
-    gateway_pricing, gateway_snapshot, lock_gateway_policies, revoke_gateway_credential,
-    update_gateway_policies, upsert_gateway_credential, upsert_gateway_deployment,
-    upsert_gateway_pricing,
+    gateway_credential_secret, gateway_credentials, gateway_deployment, gateway_deployments,
+    gateway_policies, gateway_pricing, gateway_snapshot, lock_gateway_policies,
+    renew_gateway_credential, revoke_gateway_credential, update_gateway_policies,
+    upsert_gateway_credential, upsert_gateway_deployment, upsert_gateway_pricing,
 };
 use wyrd_sql::row_types::gateway::{GatewayCredentialRow, GatewayPricingRow};
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
@@ -58,9 +57,9 @@ pub struct GatewayAdministration<'a> {
     postgres: &'a ServerPostgres,
     /// Operator-declared bindings and backends.
     config: &'a GatewayConfig,
-    /// Deployment sealing keyring protecting managed secrets; `None` on a
-    /// keyless deployment, which refuses managed-secret writes.
-    keyring: Option<&'a SealingKeyring>,
+    /// Deployment stored-secret facade protecting managed secrets; `None`
+    /// without `[kms]`, which refuses managed-secret writes.
+    kms: Option<&'a WyrdKms>,
 }
 
 impl<'a> GatewayAdministration<'a> {
@@ -71,7 +70,7 @@ impl<'a> GatewayAdministration<'a> {
             state,
             postgres: &state.postgres,
             config: state.gateway.config(),
-            keyring: state.auth.sealing_key.as_deref(),
+            kms: state.auth.kms.as_deref(),
         }
     }
 
@@ -79,12 +78,12 @@ impl<'a> GatewayAdministration<'a> {
     ///
     /// Environment and Vault sources must fall within an operator assignment
     /// for the caller's tenant and the credential provider. A `ManagedSecret`
-    /// value is sealed under the deployment sealing keyring, bound to the
-    /// caller's tenant, before the row is written, so the submitted plaintext exists only for the duration of
-    /// this call. Wyrd stores only the redacted source and, for a managed
-    /// secret, its opaque envelope; the response is the redacted view either
-    /// way. Protection and the row are written in one transaction, so a failed
-    /// seal or write leaves the previously committed value usable.
+    /// value is sealed through the deployment stored-secret facade, bound to
+    /// the caller's tenant, name, and provider, before the row is written,
+    /// so the submitted plaintext exists only for the duration of this call.
+    /// Wyrd stores only the redacted source and, for a managed secret, its
+    /// opaque envelope; the response is the redacted view either way. A
+    /// failed seal or write leaves the previously committed value usable.
     ///
     /// # Errors
     /// Returns a permission error when the caller lacks `gateway:write`,
@@ -93,7 +92,8 @@ impl<'a> GatewayAdministration<'a> {
     /// (undeclared and unauthorized sources are indistinguishable),
     /// `GatewayResourceConflict` when the name is revoked or a provider change
     /// would orphan a deployment, `ServiceUnavailable` when the deployment has
-    /// no sealing key, and `ServiceUnavailable` when storage fails.
+    /// no `[kms]` or it cannot seal, and `ServiceUnavailable` when storage
+    /// fails.
     pub async fn put_credential(
         &self,
         caller: &Caller,
@@ -101,14 +101,18 @@ impl<'a> GatewayAdministration<'a> {
         write: ProviderCredentialWrite,
     ) -> Result<ProviderCredentialView, WyrdError> {
         let resource = format!("gateway_provider_credential:{name}");
-        self.audited(
+        let write = &write;
+        self.audited_prepared(
             caller,
             &Permission::gateway_write(),
             "gateway.provider_credential.put",
             &resource,
-            |mut conn| async move {
+            async {
                 require_path_name(name.as_str(), write.name.as_str())?;
-                let view = self.write_credential(&mut conn, caller, &write).await?;
+                self.prepare_credential(caller, write).await
+            },
+            |mut conn, sealed| async move {
+                let view = self.write_credential(&mut conn, write, sealed).await?;
                 conn.commit().await.map_err(unavailable)?;
                 Ok(view)
             },
@@ -202,6 +206,106 @@ impl<'a> GatewayAdministration<'a> {
             },
         )
         .await
+    }
+
+    /// Renews an active managed secret's encryption: the same provider key is
+    /// resealed under a fresh DEK and nonce, and the credential keeps its
+    /// name, source, and `rotated_at`.
+    ///
+    /// The stored envelope is read and resealed before any write transaction
+    /// opens; the swap commits only while the row still holds the envelope
+    /// that was opened, so a replacement, revocation, or renewal that commits
+    /// first wins and this call changes nothing.
+    ///
+    /// # Errors
+    /// Returns a permission error without `gateway:write`,
+    /// `GatewayResourceNotFound` when the name is absent,
+    /// `GatewayResourceConflict` when the credential is revoked, holds no
+    /// managed secret, or changed during the renewal, and
+    /// `ServiceUnavailable` when the deployment has no `[kms]`, the envelope
+    /// cannot be opened or resealed, or storage fails.
+    pub async fn renew_credential_encryption(
+        &self,
+        caller: &Caller,
+        name: &ProviderCredentialName,
+    ) -> Result<ProviderCredentialView, WyrdError> {
+        let resource = format!("gateway_provider_credential:{name}");
+        self.audited_prepared(
+            caller,
+            &Permission::gateway_write(),
+            "gateway.provider_credential.renew_encryption",
+            &resource,
+            self.prepare_renewal(caller.data_tenant_id, name),
+            |mut conn, (observed, renewed)| async move {
+                let row = renew_gateway_credential(&mut conn, name.as_str(), &observed, &renewed)
+                    .await
+                    .map_err(unavailable)?
+                    .ok_or_else(|| {
+                        conflict(
+                            "credential changed during encryption renewal",
+                            name.as_str(),
+                        )
+                    })?;
+                let view = credential_view(row)?;
+                conn.commit().await.map_err(unavailable)?;
+                Ok(view)
+            },
+        )
+        .await
+    }
+
+    /// Reads `name`'s sealed managed secret and renews its encryption,
+    /// returning `(observed, renewed)` envelopes; the read commits before the
+    /// key service is called.
+    ///
+    /// # Errors
+    /// Returns the not-found, conflict, and unavailable errors of
+    /// [`Self::renew_credential_encryption`].
+    async fn prepare_renewal(
+        &self,
+        tenant: DataTenantId,
+        name: &ProviderCredentialName,
+    ) -> Result<(Vec<u8>, Vec<u8>), WyrdError> {
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .map_err(unavailable)?;
+        let (provider, state, sealed) = gateway_credential_secret(&mut conn, name.as_str())
+            .await
+            .map_err(unavailable)?
+            .ok_or_else(|| not_found("credential", name.as_str()))?;
+        conn.commit().await.map_err(unavailable)?;
+        if state != "active" {
+            return Err(conflict("credential is revoked", name.as_str()));
+        }
+        let Some(sealed) = sealed else {
+            return Err(conflict(
+                "credential holds no managed secret",
+                name.as_str(),
+            ));
+        };
+        let protection = || WyrdError::ServiceUnavailable {
+            message: "gateway credential protection is unavailable".to_owned(),
+            details: json!({ "resource": "credential" }),
+        };
+        let kms = self.kms.ok_or_else(|| {
+            tracing::warn!("gateway encryption renewal refused: no [kms] is configured");
+            protection()
+        })?;
+        let provider = ProviderId::new(&provider).map_err(unavailable)?;
+        let renewed = ManagedSecretBinding {
+            tenant,
+            name,
+            provider: &provider,
+        }
+        .renew(kms, &sealed)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "gateway managed secret could not be renewed");
+            protection()
+        })?;
+        Ok((sealed, renewed))
     }
 
     /// Deletes an unreferenced credential; deleting an absent name succeeds.
@@ -351,8 +455,9 @@ impl<'a> GatewayAdministration<'a> {
     /// Creates or replaces credentials and the deployments using them in one
     /// tenant transaction.
     ///
-    /// The document is validated whole first, then each credential and each
-    /// deployment runs the same validation, sealing, and reference checks as
+    /// The document is validated whole and every credential validated and
+    /// sealed first, outside any transaction; then each credential and each
+    /// deployment is written with the same reference checks as
     /// [`Self::put_credential`] and [`Self::put_deployment`] on one shared
     /// connection, so a deployment observes the submitted credentials and
     /// share-locks every referenced row until commit. Any refusal drops the
@@ -370,16 +475,23 @@ impl<'a> GatewayAdministration<'a> {
         caller: &Caller,
         apply: ProviderDeploymentsApply,
     ) -> Result<ProviderDeploymentsApplied, WyrdError> {
-        self.audited(
+        self.audited_prepared(
             caller,
             &Permission::gateway_write(),
             "gateway.provider_deployments.apply",
             "gateway_provider_deployments",
-            |mut conn| async move {
+            async move {
                 apply.validate().map_err(invalid)?;
-                let mut credentials = Vec::with_capacity(apply.credentials.len());
+                let mut sealed = Vec::with_capacity(apply.credentials.len());
                 for write in &apply.credentials {
-                    credentials.push(self.write_credential(&mut conn, caller, write).await?);
+                    sealed.push(self.prepare_credential(caller, write).await?);
+                }
+                Ok((apply, sealed))
+            },
+            |mut conn, (apply, sealed)| async move {
+                let mut credentials = Vec::with_capacity(apply.credentials.len());
+                for (write, sealed) in apply.credentials.iter().zip(sealed) {
+                    credentials.push(self.write_credential(&mut conn, write, sealed).await?);
                 }
                 for deployment in &apply.deployments {
                     self.write_deployment(&mut conn, caller, deployment).await?;
@@ -666,13 +778,8 @@ impl<'a> GatewayAdministration<'a> {
         }
     }
 
-    /// Authorizes one operation, stages its decision, and runs it.
-    ///
-    /// The decision is staged on the process audit outbox exactly once, before
-    /// any work starts; a denial is refused there. Otherwise a fresh tenant
-    /// transaction is handed to `work`, which MUST commit it as its final
-    /// fallible step. A successful write then warms this server's caches
-    /// ([`Self::warm`]).
+    /// Authorizes one operation, stages its decision, and runs it; see
+    /// [`Self::audited_prepared`].
     ///
     /// # Errors
     /// Returns the mapped permission denial, an unavailable store, or `work`'s
@@ -688,35 +795,88 @@ impl<'a> GatewayAdministration<'a> {
     where
         Fut: Future<Output = Result<T, WyrdError>>,
     {
+        self.audited_prepared(
+            caller,
+            required,
+            operation,
+            resource,
+            async { Ok(()) },
+            |conn, ()| work(conn),
+        )
+        .await
+    }
+
+    /// Authorizes one operation, stages its decision, runs `prepare`, and
+    /// then runs `work` with its result.
+    ///
+    /// The decision is staged on the process audit outbox exactly once, before
+    /// any work starts; a denial is refused there and `prepare` never runs.
+    /// `prepare` runs before any connection is taken, so key-service waits
+    /// such as sealing hold no transaction or lock. A fresh tenant transaction
+    /// is then handed to `work`, which MUST commit it as its final fallible
+    /// step. A successful write then warms this server's caches
+    /// ([`Self::warm`]).
+    ///
+    /// # Errors
+    /// Returns the mapped permission denial, `prepare`'s error, an
+    /// unavailable store, or `work`'s own error.
+    async fn audited_prepared<T, P, Prep, Fut>(
+        &self,
+        caller: &Caller,
+        required: &Permission,
+        operation: &str,
+        resource: &str,
+        prepare: Prep,
+        work: impl FnOnce(TenantConn<'a>, P) -> Fut,
+    ) -> Result<T, WyrdError>
+    where
+        Prep: Future<Output = Result<P, WyrdError>>,
+        Fut: Future<Output = Result<T, WyrdError>>,
+    {
         audit::authorize(self.state, caller, required, operation, resource)?;
+        let prepared = prepare.await?;
         let conn = self
             .postgres
             .tenant_conn(caller.data_tenant_id)
             .await
             .map_err(unavailable)?;
-        let result = work(conn).await;
+        let result = work(conn, prepared).await;
         if result.is_ok() && *required == Permission::gateway_write() {
             self.warm(caller.data_tenant_id).await;
         }
         result
     }
 
-    /// Validates, seals, and upserts one credential on the caller's open
-    /// transaction, returning its redacted view; the caller commits.
+    /// Validates `write`'s source for the caller and seals a submitted
+    /// managed secret, before any transaction opens.
     ///
     /// # Errors
-    /// Returns the source, sealing, revoked-name, and storage errors of
+    /// Returns the source and sealing errors of [`Self::put_credential`].
+    async fn prepare_credential(
+        &self,
+        caller: &Caller,
+        write: &ProviderCredentialWrite,
+    ) -> Result<Option<Vec<u8>>, WyrdError> {
+        let view = ProviderCredentialSourceView::from(&write.source);
+        self.validate_source(caller.data_tenant_id, &write.provider, &view)?;
+        self.seal(caller.data_tenant_id, &write.name, write).await
+    }
+
+    /// Upserts one prepared credential, with the envelope
+    /// [`Self::prepare_credential`] sealed, on the caller's open transaction,
+    /// returning its redacted view; the caller commits.
+    ///
+    /// # Errors
+    /// Returns the revoked-name and storage errors of
     /// [`Self::put_credential`].
     async fn write_credential(
         &self,
         conn: &mut TenantConn<'_>,
-        caller: &Caller,
         write: &ProviderCredentialWrite,
+        sealed: Option<Vec<u8>>,
     ) -> Result<ProviderCredentialView, WyrdError> {
         let name = write.name.as_str();
         let view = ProviderCredentialSourceView::from(&write.source);
-        self.validate_source(caller.data_tenant_id, &write.provider, &view)?;
-        let sealed = self.seal(caller.data_tenant_id, &write.name, write)?;
         let source = encode(&view)?;
         let row = upsert_gateway_credential(
             conn,
@@ -813,9 +973,8 @@ impl<'a> GatewayAdministration<'a> {
     /// Unknown bindings, backends, and Vault paths and those assigned to
     /// another tenant or provider produce one identical rejection, so a
     /// tenant cannot probe which assignments exist. A managed secret has no
-    /// operator assignment to check: the submitting tenant's own keyring is
-    /// its authority, and [`Self::seal`] refuses it when that keyring is
-    /// missing.
+    /// operator assignment to check: the submitting tenant is its authority,
+    /// and [`Self::seal`] refuses it when no `[kms]` is configured.
     ///
     /// # Errors
     /// Returns `GatewayInvalidConfiguration` for field `source` when no
@@ -843,20 +1002,20 @@ impl<'a> GatewayAdministration<'a> {
         }
     }
 
-    /// Seals a submitted `ManagedSecret` under the deployment sealing keyring,
-    /// or returns `None` for an operator-owned source that carries no value.
+    /// Seals a submitted `ManagedSecret` through the deployment stored-secret
+    /// facade, or returns `None` for an operator-owned source that carries no
+    /// value.
     ///
-    /// Sealing happens before the row is written and binds the tenant,
-    /// credential name, and provider into the protected payload, so the stored
-    /// envelope is unusable under any other identity.
+    /// The envelope authenticates the tenant, credential name, and provider,
+    /// so it is unusable under any other identity.
     ///
     /// # Errors
     /// Returns `GatewayInvalidConfiguration` for field `source.secret` when
     /// the submitted value is empty, and `ServiceUnavailable` when the
-    /// deployment has no sealing key or it cannot protect the value.
+    /// deployment has no `[kms]` or it cannot protect the value.
     /// Neither error discloses the value, the key, or another tenant's
     /// configuration.
-    fn seal(
+    async fn seal(
         &self,
         tenant: DataTenantId,
         name: &ProviderCredentialName,
@@ -872,24 +1031,23 @@ impl<'a> GatewayAdministration<'a> {
                 "must not be empty",
             )));
         }
-        self.keyring
-            .ok_or(CredentialError::Unconfigured)
-            .and_then(|keyring| {
-                ManagedSecretBinding {
-                    tenant,
-                    name,
-                    provider: &write.provider,
-                }
-                .seal(keyring, value)
-            })
-            .map(Some)
-            .map_err(|error| {
-                tracing::warn!(%error, "gateway managed secret protection unavailable");
-                WyrdError::ServiceUnavailable {
-                    message: "gateway credential protection is unavailable".to_owned(),
-                    details: json!({ "resource": "credential" }),
-                }
-            })
+        let protection = || WyrdError::ServiceUnavailable {
+            message: "gateway credential protection is unavailable".to_owned(),
+            details: json!({ "resource": "credential" }),
+        };
+        let kms = self.kms.ok_or_else(|| {
+            tracing::warn!("gateway managed secret refused: no [kms] is configured");
+            protection()
+        })?;
+        ManagedSecretBinding {
+            tenant,
+            name,
+            provider: &write.provider,
+        }
+        .seal(kms, value)
+        .await
+        .map(Some)
+        .map_err(|_| protection())
     }
 }
 
@@ -904,15 +1062,20 @@ struct StoredCredential {
     source: ProviderCredentialSourceView,
     /// Lifecycle state.
     state: ProviderCredentialState,
-    /// Base64 sealing-keyring envelope of a managed secret; absent otherwise.
+    /// Base64 stored-secret envelope of a managed secret; absent otherwise.
     secret_ciphertext: Option<String>,
 }
 
 /// Reads `tenant`'s gateway configuration in one SQL statement, so the
 /// snapshot is consistent even while administrators replace resources, and
-/// attaches `config`'s credential bindings. It never carries credential
-/// plaintext — environment bindings carry only the operator reference and
-/// external secrets only their opaque backend reference.
+/// attaches `config`'s credential bindings. Environment bindings carry only
+/// the operator reference and external secrets only their opaque backend
+/// reference.
+///
+/// With `kms`, each managed secret's envelope is opened after the statement's
+/// transaction commits, so no key-service wait holds a connection or lock;
+/// without it, managed secrets stay unprepared. Returns the snapshot and
+/// whether an open failed retryably, so the caller can load again.
 ///
 /// # Errors
 /// Returns `ServiceUnavailable` when storage fails and `Internal` when a
@@ -921,32 +1084,46 @@ pub(super) async fn load_snapshot(
     postgres: &WyrdPostgres,
     config: &GatewayConfig,
     tenant: DataTenantId,
-) -> Result<GatewayTenantSnapshot, WyrdError> {
+    kms: Option<&WyrdKms>,
+) -> Result<(GatewayTenantSnapshot, bool), WyrdError> {
     let mut conn = postgres.tenant_conn(tenant).await.map_err(unavailable)?;
     let row = gateway_snapshot(&mut conn).await.map_err(unavailable)?;
     conn.commit().await.map_err(unavailable)?;
-    let credentials: Vec<StoredCredential> = decode(row.credentials)?;
+    let stored: Vec<StoredCredential> = decode(row.credentials)?;
     let mut governance: GatewayGovernancePolicy = decode_or_default(row.governance)?;
     governance.pricing = decode(row.pricing)?;
-    Ok(GatewayTenantSnapshot {
-        deployments: decode(row.deployments)?,
-        credentials: credentials
-            .into_iter()
-            .map(|stored| credential_snapshot(config, stored))
-            .collect(),
-        fallback: decode_or_default(row.fallback)?,
-        governance,
-        capture: capture_from(row.capture)?,
-    })
+    let mut retry = false;
+    let mut credentials = Vec::with_capacity(stored.len());
+    for credential in stored {
+        let (snapshot, retryable) = credential_snapshot(config, tenant, kms, credential).await;
+        retry |= retryable;
+        credentials.push(snapshot);
+    }
+    Ok((
+        GatewayTenantSnapshot {
+            deployments: decode(row.deployments)?,
+            credentials,
+            fallback: decode_or_default(row.fallback)?,
+            governance,
+            capture: capture_from(row.capture)?,
+        },
+        retry,
+    ))
 }
 
 /// Builds one credential's runtime resolution inputs, attaching the
 /// operator reference and the assignment the resolver re-checks before
-/// dispatch.
-fn credential_snapshot(
+/// dispatch, and opening a managed secret with `kms` when given.
+///
+/// Returns the snapshot and whether its managed secret failed to open
+/// retryably. A refused envelope stays unprepared and resolves as
+/// unavailable; other credentials are unaffected.
+async fn credential_snapshot(
     config: &GatewayConfig,
+    tenant: DataTenantId,
+    kms: Option<&WyrdKms>,
     stored: StoredCredential,
-) -> GatewayCredentialSnapshot {
+) -> (GatewayCredentialSnapshot, bool) {
     let StoredCredential {
         name,
         provider,
@@ -955,6 +1132,7 @@ fn credential_snapshot(
         secret_ciphertext,
     } = stored;
     let assignment = config.assignment(&source).cloned();
+    let mut retry = false;
     let source = match source {
         ProviderCredentialSourceView::Environment { binding } => {
             GatewayCredentialSource::Environment {
@@ -968,20 +1146,44 @@ fn credential_snapshot(
         ProviderCredentialSourceView::ExternalSecret { backend, reference } => {
             GatewayCredentialSource::ExternalSecret { backend, reference }
         }
-        ProviderCredentialSourceView::ManagedSecret => GatewayCredentialSource::ManagedSecret {
-            sealed: sealed(secret_ciphertext),
-        },
+        ProviderCredentialSourceView::ManagedSecret => {
+            let mut secret = None;
+            if let Some(kms) = kms {
+                let binding = ManagedSecretBinding {
+                    tenant,
+                    name: &name,
+                    provider: &provider,
+                };
+                match binding.open(kms, &sealed(secret_ciphertext)).await {
+                    Ok(opened) => secret = Some(opened),
+                    Err(error) => {
+                        retry = matches!(error, KmsError::Unavailable { .. });
+                        tracing::warn!(
+                            tenant = %tenant.as_uuid(), credential = %name, %error,
+                            "gateway managed secret could not be prepared"
+                        );
+                    }
+                }
+            }
+            GatewayCredentialSource::ManagedSecret {
+                secret,
+                pending: retry,
+            }
+        }
     };
-    GatewayCredentialSnapshot {
-        name,
-        provider,
-        state,
-        source,
-        assignment,
-    }
+    (
+        GatewayCredentialSnapshot {
+            name,
+            provider,
+            state,
+            source,
+            assignment,
+        },
+        retry,
+    )
 }
 
-/// Decodes the sealed envelope of a managed secret from its snapshot column.
+/// Decodes the envelope of a managed secret from its snapshot column.
 ///
 /// The database `CHECK` constraint keeps the envelope present exactly with the
 /// managed source, so a row reaching here without it is corrupt. An absent or

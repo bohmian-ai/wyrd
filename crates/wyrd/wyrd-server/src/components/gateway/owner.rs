@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use wyrd_crypt::SealingKeyring;
 use wyrd_gateway::GatewayEngine;
+use wyrd_kms::WyrdKms;
 use wyrd_sql::WyrdPostgres;
 
 use super::{GatewayApiKeys, GatewaySnapshots, GatewayUsage};
@@ -46,21 +46,23 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// A gateway over `config` executing through `engine`.
+    /// A gateway over `config` executing through `engine`, whose snapshot
+    /// loads prepare tenant managed secrets with `kms` (none without
+    /// `[kms]`, which leaves them unavailable).
     #[must_use]
-    pub fn new(config: GatewayConfig, engine: GatewayEngine) -> Self {
+    pub fn new(config: GatewayConfig, engine: GatewayEngine, kms: Option<Arc<WyrdKms>>) -> Self {
         Self {
             config: Arc::new(config),
             engine,
-            snapshots: Arc::default(),
+            snapshots: Arc::new(GatewaySnapshots::new(kms)),
             usage: Arc::default(),
             api_keys: GatewayApiKeys::default(),
             tasks: TaskTracker::new(),
         }
     }
 
-    /// The gateway `config` describes: its credential resolver opens managed
-    /// secrets with `sealing_key`, and its HTTP provider dispatch screens the
+    /// The gateway `config` describes: its snapshot loads open managed
+    /// secrets with `kms`, and its HTTP provider dispatch screens the
     /// configured endpoints under `profile`.
     ///
     /// Synchronous, but not IO-free: building the credential resolver reads
@@ -73,13 +75,13 @@ impl Gateway {
     pub fn from_config(
         config: GatewayConfig,
         profile: DeploymentProfile,
-        sealing_key: Option<Arc<SealingKeyring>>,
+        kms: Option<Arc<WyrdKms>>,
     ) -> Result<Self, ServerBootError> {
         let transport =
             |error: &dyn std::fmt::Display| ServerBootError::GatewayTransport(error.to_string());
         let engine = GatewayEngine::new(
             config
-                .credential_resolver(sealing_key)
+                .credential_resolver()
                 .map_err(|error| transport(&error))?,
             wyrd_gateway::DeploymentHealth::default(),
             Arc::new(
@@ -90,7 +92,7 @@ impl Gateway {
                 .map_err(|error| transport(&error))?,
             ),
         );
-        Ok(Self::new(config, engine))
+        Ok(Self::new(config, engine, kms))
     }
 
     /// The operator configuration tenants' credentials may name.
@@ -108,6 +110,22 @@ impl Gateway {
     /// The per-tenant admission snapshot cache.
     pub(crate) fn snapshots(&self) -> &GatewaySnapshots {
         &self.snapshots
+    }
+
+    /// Whether the snapshot cache has no reload queued or running; see
+    /// [`GatewaySnapshots::settled`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn snapshots_settled(&self) -> bool {
+        self.snapshots.settled()
+    }
+
+    /// Invalidation notifications the snapshot cache has received; see
+    /// [`GatewaySnapshots::invalidations`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn snapshot_invalidations(&self) -> u64 {
+        self.snapshots.invalidations()
     }
 
     /// The process quota usage.
@@ -148,6 +166,7 @@ impl Gateway {
                         for tenant in snapshots.reloads().await {
                             failed |= snapshots.reload(&postgres, &config, tenant).await.is_err();
                         }
+                        snapshots.drained();
                         if failed {
                             tokio::time::sleep(RELOAD_RETRY).await;
                         }

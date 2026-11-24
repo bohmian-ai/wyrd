@@ -79,6 +79,7 @@ When the server refuses its database, it exits and its last log line says why.
 
 | Message contains | Cause | Fix |
 | --- | --- | --- |
-| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness) and restart. `wyrd init` creates one for you |
-| `exist but no sealing key is configured` at startup | Encrypted secrets are stored, and the server started without the key they were sealed under | Start with the same `WYRD_SEALING_KEY_FILE` as before |
-| A gateway call fails with an upstream-unavailable error after a key change | The provider key was sealed under a key the server no longer holds | List the old key in `WYRD_SEALING_RETAINED_KEYS_FILE` and restart, or put the credential again |
+| `gateway credential protection is unavailable` or `no [kms] is configured` | The server has no `[kms]`, so it cannot encrypt a stored secret | Set the `WYRD_KMS_*` variables as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness) and restart. `wyrd init` configures them for you |
+| `exist but no [kms] is configured` at startup | Encrypted secrets are stored, and the server started without `[kms]` | Start with the same `WYRD_KMS_*` settings as before |
+| A stored secret fails to open after a key change | It was encrypted under a key that is neither `WYRD_KMS_ACTIVE_KEY` nor listed in `WYRD_KMS_RETAINED_KEYS` | List the old key in `WYRD_KMS_RETAINED_KEYS` and restart, or store the secret again |
+| `wyrd platform stored-secrets maintain` prints `remaining` above `0` | The pass stopped at its bound, lost to a concurrent change, or listed a `failure` | Run it again with the same `--mode`; for a `failure`, see its `reason` in [Stored-secret encryption](/reference/stored-secret-encryption/#maintenance-pass) |

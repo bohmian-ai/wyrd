@@ -14,9 +14,9 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
-use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_gateway::{CredentialAssignment, CredentialError, ManagedSecretBinding};
+use wyrd_gateway::{CredentialAssignment, GatewayTenantSnapshot, ManagedSecretBinding};
+use wyrd_kms::{KmsError, WyrdKms};
 use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -67,7 +67,7 @@ pub(super) async fn test_state(fixture: &PgFixture) -> AppState {
         owners.gateway = crate::components::gateway::Gateway::from_config(
             gateway_config(fixture.data_tenant_id()),
             crate::config::DeploymentProfile::Development,
-            owners.auth.sealing_key.clone(),
+            owners.auth.kms.clone(),
         )
         .expect("the gateway builds");
     })
@@ -385,10 +385,39 @@ async fn gateway_credential_sources_resolve_from_operator_config() {
     settle_audit(&state).await;
 }
 
-/// Builds a deployment sealing keyring whose write key holds repeated `seed`
-/// bytes, the shape boot builds from `WYRD_SEALING_KEY_FILE`.
-pub(super) fn sealing_keyring(seed: u8) -> Arc<SealingKeyring> {
-    Arc::new(SealingKeyring::new(SecretKey::from_bytes([seed; 32])))
+/// Gives `state` the deployment `[kms]` facade `kms` for both managed-secret
+/// writes and a fresh Gateway owner (an empty snapshot cache) whose loads
+/// prepare them, the way boot hands one facade to every owner.
+///
+/// # Panics
+/// Panics when the Gateway owner cannot be built from the test config.
+pub(super) fn with_kms(state: AppState, fixture: &PgFixture, kms: &Arc<WyrdKms>) -> AppState {
+    state.with_owners_for_test(|owners| {
+        owners.auth.kms = Some(Arc::clone(kms));
+        owners.gateway = crate::components::gateway::Gateway::from_config(
+            gateway_config(fixture.data_tenant_id()),
+            crate::config::DeploymentProfile::Development,
+            Some(Arc::clone(kms)),
+        )
+        .expect("the gateway builds");
+    })
+}
+
+/// The provider key `credential` holds in `snapshot`, or `None` when its
+/// managed envelope was not prepared.
+///
+/// # Panics
+/// Panics when `credential` is not admitted or is not a managed secret.
+fn prepared(snapshot: &GatewayTenantSnapshot, credential: &str) -> Option<String> {
+    let credential = snapshot
+        .credential(&credential_name(credential))
+        .expect("admitted");
+    let GatewayCredentialSource::ManagedSecret { secret, .. } = &credential.source else {
+        panic!("managed source");
+    };
+    secret
+        .as_ref()
+        .map(|secret| secret.expose_secret().to_owned())
 }
 
 /// Reads the persisted credential row of `name` as `(json, ciphertext)`,
@@ -424,16 +453,16 @@ async fn stored_credential(
 ///
 /// Panics when the fixture or any administration call fails, when the view or
 /// the durable row discloses the submitted plaintext, when the envelope is not
-/// the deployment keyring's versioned form, when a copied envelope opens, or
-/// when the rejected replacement disturbs the stored envelope.
+/// the deployment `[kms]` envelope under its active key, when a copied
+/// envelope opens or is prepared, or when the rejected replacement disturbs
+/// the stored envelope.
 #[tokio::test]
 async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     const SUBMITTED: &str = "sk-live-managed-submission";
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
-    let state = test_state(&fixture).await;
-    let state =
-        state.with_owners_for_test(|owners| owners.auth.sealing_key = Some(sealing_keyring(1)));
+    let kms = crate::test_support::seeded_kms(1, &[]);
+    let state = with_kms(test_state(&fixture).await, &fixture, &kms);
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     let managed = |name: &str, secret: &str| {
@@ -471,10 +500,9 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
         "no column of the durable row holds the submitted plaintext"
     );
     let ciphertext = ciphertext.expect("sealed ciphertext");
-    let keyring = state.auth.sealing_key.clone().expect("sealing keyring");
     assert!(
-        !keyring.needs_rewrap(&ciphertext),
-        "sealed as the deployment keyring's versioned envelope under its write key"
+        kms.is_current(&ciphertext).expect("a [kms] envelope"),
+        "sealed as the deployment [kms] envelope under its active key"
     );
 
     // The envelope of `managed` copied onto another credential row stays shut.
@@ -489,28 +517,29 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     .expect("envelope copied");
     conn.commit().await.expect("copy commits");
 
-    let snapshot = gateway.snapshot(tenant).await.expect("snapshot");
-    let open = |name: &str| {
-        let credential = snapshot
-            .credential(&credential_name(name))
-            .expect("admitted");
-        let GatewayCredentialSource::ManagedSecret { sealed } = &credential.source else {
-            panic!("managed source");
-        };
-        ManagedSecretBinding {
-            tenant,
-            name: &credential.name,
-            provider: &credential.provider,
-        }
-        .open(&keyring, sealed)
-    };
-    assert_eq!(
-        open("managed").expect("own envelope opens").expose_secret(),
-        SUBMITTED
-    );
+    let provider = ProviderId::new("openai").expect("provider");
+    let copied = ManagedSecretBinding {
+        tenant,
+        name: &credential_name("copied"),
+        provider: &provider,
+    }
+    .open(&kms, &ciphertext)
+    .await;
     assert!(
-        matches!(open("copied"), Err(CredentialError::Unavailable)),
-        "an envelope copied onto another credential name never opens"
+        matches!(copied, Err(KmsError::Authentication)),
+        "an envelope copied onto another credential name never opens: {copied:?}"
+    );
+    // A fresh load prepares only the envelope sealed for its own row.
+    let reloaded = with_kms(test_state(&fixture).await, &fixture, &kms);
+    let snapshot = GatewayAdministration::new(&reloaded)
+        .snapshot(tenant)
+        .await
+        .expect("snapshot");
+    assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(SUBMITTED));
+    assert_eq!(
+        prepared(&snapshot, "copied"),
+        None,
+        "the copied envelope is never prepared"
     );
 
     // A rejected replacement leaves the previously sealed value in place.
@@ -525,9 +554,177 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     assert_invalid(&rejected, "source.secret");
     let (_, replaced) = stored_credential(&fixture, tenant, "managed").await;
     assert_eq!(replaced, Some(ciphertext));
+    let snapshot =
+        GatewayAdministration::new(&with_kms(test_state(&fixture).await, &fixture, &kms))
+            .snapshot(tenant)
+            .await
+            .expect("snapshot");
+    assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(SUBMITTED));
+    settle_audit(&state).await;
+}
+
+/// Renewing a managed secret's encryption reseals the same provider key under
+/// a fresh DEK on the same credential, and the next snapshot prepares the
+/// unchanged key. A renewal racing a revoke or a replacement loses with the
+/// resource conflict and leaves the winner's row; a revoked credential, a
+/// credential with no managed secret, and a key outage refuse without a write.
+///
+/// # Panics
+///
+/// Panics when an administration call, stored envelope, or prepared key
+/// differs.
+#[tokio::test]
+async fn gateway_managed_secret_renewal_keeps_the_key_and_loses_races() {
+    const SUBMITTED: &str = "sk-live-renewed-submission";
+    const REPLACED: &str = "sk-live-replacement-wins";
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let transit =
+        wyrd_testing::kms::TransitFixture::start_delayed(std::time::Duration::from_millis(300))
+            .await;
+    let kms = Arc::new(WyrdKms::new(&transit.config("gw", &[]), false).expect("transit facade"));
+    let state = with_kms(test_state(&fixture).await, &fixture, &kms);
+    let admin = admin(tenant);
+    let gateway = GatewayAdministration::new(&state);
+    let managed = |name: &str, secret: &str| {
+        credential(
+            name,
+            "openai",
+            json!({"managed_secret": {"secret": secret}}),
+        )
+    };
+    let name = credential_name("managed");
+    gateway
+        .put_credential(&admin, &name, managed("managed", SUBMITTED))
+        .await
+        .expect("managed submission stores");
+    let (_, before) = stored_credential(&fixture, tenant, "managed").await;
+
+    let renewed = gateway
+        .renew_credential_encryption(&admin, &name)
+        .await
+        .expect("renewal");
     assert_eq!(
-        open("managed").expect("still opens").expose_secret(),
-        SUBMITTED
+        (renewed.name.as_str(), renewed.state),
+        ("managed", ProviderCredentialState::Active)
+    );
+    assert!(
+        renewed.rotated_at.is_none(),
+        "renewal is not a credential rotation"
+    );
+    let (row, after) = stored_credential(&fixture, tenant, "managed").await;
+    assert!(!row.contains(SUBMITTED), "the row never holds plaintext");
+    assert_ne!(after, before, "the envelope is resealed under a fresh DEK");
+    let (snapshot, _) = super::service::load_snapshot(
+        fixture.wyrd_postgres(),
+        &gateway_config(tenant),
+        tenant,
+        Some(&kms),
+    )
+    .await
+    .expect("a fresh load opens the stored envelope");
+    assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(SUBMITTED));
+
+    let encrypts = transit.requests("encrypt").await;
+    let renewal = gateway.renew_credential_encryption(&admin, &name);
+    let replacement = async {
+        while transit.requests("encrypt").await <= encrypts {
+            tokio::task::yield_now().await;
+        }
+        gateway
+            .put_credential(&admin, &name, managed("managed", REPLACED))
+            .await
+    };
+    let (lost, won) = tokio::join!(renewal, replacement);
+    won.expect("the replacement commits first");
+    assert!(
+        matches!(lost, Err(WyrdError::GatewayResourceConflict { .. })),
+        "the renewal loses to the replacement: {lost:?}"
+    );
+    let (snapshot, _) = super::service::load_snapshot(
+        fixture.wyrd_postgres(),
+        &gateway_config(tenant),
+        tenant,
+        Some(&kms),
+    )
+    .await
+    .expect("a fresh load opens the stored envelope");
+    assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(REPLACED));
+
+    let encrypts = transit.requests("encrypt").await;
+    let renewal = gateway.renew_credential_encryption(&admin, &name);
+    let revoke = async {
+        while transit.requests("encrypt").await <= encrypts {
+            tokio::task::yield_now().await;
+        }
+        gateway.revoke_credential(&admin, &name).await
+    };
+    let (lost, revoked) = tokio::join!(renewal, revoke);
+    assert_eq!(
+        revoked.expect("revoke").state,
+        ProviderCredentialState::Revoked
+    );
+    assert!(
+        matches!(lost, Err(WyrdError::GatewayResourceConflict { .. })),
+        "the renewal loses to the revoke: {lost:?}"
+    );
+    let (_, revoked_envelope) = stored_credential(&fixture, tenant, "managed").await;
+    assert!(matches!(
+        gateway.renew_credential_encryption(&admin, &name).await,
+        Err(WyrdError::GatewayResourceConflict { .. })
+    ));
+    assert_eq!(
+        gateway.credential(&admin, &name).await.expect("read").state,
+        ProviderCredentialState::Revoked,
+        "renewal never re-enables a revoked credential"
+    );
+    assert_eq!(
+        stored_credential(&fixture, tenant, "managed").await.1,
+        revoked_envelope
+    );
+
+    let environment = credential_name("openai-env");
+    gateway
+        .put_credential(
+            &admin,
+            &environment,
+            credential(
+                "openai-env",
+                "openai",
+                json!({"environment": {"binding": "openai-env"}}),
+            ),
+        )
+        .await
+        .expect("environment credential stores");
+    assert!(matches!(
+        gateway
+            .renew_credential_encryption(&admin, &environment)
+            .await,
+        Err(WyrdError::GatewayResourceConflict { .. })
+    ));
+    assert!(matches!(
+        gateway
+            .renew_credential_encryption(&admin, &credential_name("missing"))
+            .await,
+        Err(WyrdError::GatewayResourceNotFound { .. })
+    ));
+
+    let outage = credential_name("outage");
+    gateway
+        .put_credential(&admin, &outage, managed("outage", SUBMITTED))
+        .await
+        .expect("managed submission stores");
+    let (_, sealed) = stored_credential(&fixture, tenant, "outage").await;
+    transit.set_available(false);
+    let refused = gateway.renew_credential_encryption(&admin, &outage).await;
+    transit.set_available(true);
+    assert!(
+        matches!(refused, Err(WyrdError::ServiceUnavailable { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        stored_credential(&fixture, tenant, "outage").await.1,
+        sealed
     );
     settle_audit(&state).await;
 }
@@ -587,7 +784,7 @@ async fn gateway_credential_sources_stay_within_operator_assignments() {
         owners.gateway = crate::components::gateway::Gateway::from_config(
             config,
             crate::config::DeploymentProfile::Development,
-            owners.auth.sealing_key.clone(),
+            owners.auth.kms.clone(),
         )
         .expect("the gateway builds");
     });
@@ -1469,7 +1666,7 @@ fn apply_document(value: Value) -> ProviderDeploymentsApply {
 }
 
 /// Proves the composite apply commits every named credential and deployment
-/// or none: a later invalid deployment, a missing sealing key, a denied
+/// or none: a later invalid deployment, a missing `[kms]`, a denied
 /// caller, another tenant's reference, and a concurrently revoked credential
 /// each leave the earlier resources exactly as they were, a later SQL
 /// foreign-key refusal rolls back an earlier rotation of an existing managed
@@ -1494,8 +1691,8 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
         .expect("tenant b");
     let keyless = test_state(&fixture).await;
     let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
-    let state =
-        state.with_owners_for_test(|owners| owners.auth.sealing_key = Some(sealing_keyring(2)));
+    let kms = crate::test_support::seeded_kms(2, &[]);
+    let state = with_kms(state, &fixture, &kms);
     let admin_of = admin;
     let admin = admin_of(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -1570,7 +1767,7 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
             })),
         )
         .await
-        .expect_err("no sealing key");
+        .expect_err("no [kms]");
     assert!(
         matches!(refused, WyrdError::ServiceUnavailable { .. }),
         "{refused:?}"
@@ -1689,23 +1886,15 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
         gateway.deployments(&admin).await.expect("deployments"),
         deployments
     );
-    let snapshot = gateway.snapshot(tenant).await.expect("snapshot");
-    let original = snapshot
-        .credential(&credential_name("managed-key"))
-        .expect("admitted");
-    let GatewayCredentialSource::ManagedSecret { sealed } = &original.source else {
-        panic!("managed source");
-    };
+    let snapshot =
+        GatewayAdministration::new(&with_kms(test_state(&fixture).await, &fixture, &kms))
+            .snapshot(tenant)
+            .await
+            .expect("snapshot");
     assert_eq!(
-        ManagedSecretBinding {
-            tenant,
-            name: &original.name,
-            provider: &original.provider,
-        }
-        .open(state.auth.sealing_key.as_ref().expect("keyring"), sealed)
-        .expect("the original envelope opens")
-        .expose_secret(),
-        SUBMITTED
+        prepared(&snapshot, "managed-key").as_deref(),
+        Some(SUBMITTED),
+        "the original envelope still opens"
     );
 
     // A revoke that commits while the apply waits on the credential row is

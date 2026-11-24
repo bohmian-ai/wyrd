@@ -114,6 +114,7 @@ wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-crypt = { workspace = true }
+wyrd-kms = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.4.2" }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
@@ -126,7 +127,6 @@ wyrd-gateway = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
 wyrd-utils = { workspace = true }
-wyrd-vault = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 zip = { workspace = true }

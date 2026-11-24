@@ -12,6 +12,7 @@ default = []
 python = ["dep:pyo3"]
 
 [dependencies]
+base64 = { workspace = true }
 secrecy = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
@@ -25,6 +26,7 @@ wyrd-spec = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+temp-env = { workspace = true }
 workspace-hack.workspace = true
 
 [lints]

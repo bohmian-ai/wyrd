@@ -11,6 +11,7 @@ exactly what a reader builds: its input files and one program per language
 | `integrate-fastapi/` | `connect/integrate-asgi` | `sdks/wyrd-sdk-python/tests/integration/test_asgi_integration.py::test_fastapi_example` |
 | `publish-deferred-evidence/` | `build-and-verify/verify/publish-deferred-evidence` | `crates/wyrd/wyrd-cli/tests/github_journey.rs` (`publish.sh`), `sdks/wyrd-sdk-rust/tests/integration/deferred_evidence.rs` |
 | `connect-github/` | `operate/connect-github` | `crates/wyrd/wyrd-cli/tests/github_journey.rs` (`connect.sh`, `status.sh`), `crates/wyrd/wyrd-server/src/config.rs::tests::github_guide_settings_configure_a_production_server` (`server.sh`) |
+| `respond-to-a-failed-verification/` (with `scheduled-check/record.*`) | `build-and-verify/verify/respond-to-a-failed-verification` | `sdks/wyrd-sdk-python/tests/integration/test_local_development.py::test_failed_verification_pages_on_call_across_restart` |
 | `review-a-pull-request/` | `build-and-verify/verify/review-a-pull-request` | `crates/wyrd/wyrd-server/tests/integration/pg_github_delivery.rs::the_review_example_fails_on_a_high_finding_and_comments_its_fix` |
 
 Adding an example: create its directory, add one `[[bin]]` to `Cargo.toml` and

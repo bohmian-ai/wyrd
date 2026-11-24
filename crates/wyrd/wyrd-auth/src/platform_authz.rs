@@ -37,6 +37,10 @@ pub const PLATFORM_AUTHZ_OPERATION: &str = "platform.authz";
 /// object rather than an identifier.
 pub const PLATFORM_CONNECTION_RESOURCE: &str = "platform:oidc_connection";
 
+/// Audited resource for a deployment wrapping-key maintenance pass over every
+/// recoverable stored secret.
+pub const PLATFORM_STORED_SECRETS_RESOURCE: &str = "platform:stored_secrets";
+
 /// Audited resource for a decision about the platform administrator directory
 /// as a whole, rather than about one administrator in it.
 pub const PLATFORM_ADMINS_RESOURCE: &str = "platform:admins";
@@ -155,6 +159,28 @@ impl PlatformAuthorization {
         request_id: &str,
         resource: &str,
     ) -> Result<TenantConn<'_>, PlatformAuthzError> {
+        self.decide(context, required, request_id, resource)?;
+        self.begin().await
+    }
+
+    /// Decide and record one platform-plane permission without opening the
+    /// operation's transaction.
+    ///
+    /// For an operation that must wait on a remote service (discovery, a
+    /// key service) after authorization: decide first, do the remote work,
+    /// then [`Self::begin`] the transaction, so no transaction is held
+    /// across the wait.
+    ///
+    /// # Errors
+    /// Returns [`PlatformAuthzError::Denied`] when the grant does not cover
+    /// `required`, after staging the denial record.
+    pub fn decide(
+        &self,
+        context: &AuthContext,
+        required: &Permission,
+        request_id: &str,
+        resource: &str,
+    ) -> Result<(), PlatformAuthzError> {
         let denied_resource = required.resource.as_str().unwrap_or("any_of");
         let action = required.action.as_str().unwrap_or("any_of");
 
@@ -166,13 +192,23 @@ impl PlatformAuthorization {
 
         let event = Self::decision_event(context, required, request_id, resource, allowed);
         self.audit.stage(DataTenantId::SYSTEM_OWNER, event);
-        if !allowed {
-            return Err(PlatformAuthzError::Denied {
+        if allowed {
+            Ok(())
+        } else {
+            Err(PlatformAuthzError::Denied {
                 resource: denied_resource,
                 action,
-            });
+            })
         }
+    }
 
+    /// Open the operator transaction of an operation [`Self::decide`]
+    /// already allowed; the caller commits it.
+    ///
+    /// # Errors
+    /// Returns [`PlatformAuthzError::Transaction`] when the transaction
+    /// cannot be opened.
+    pub async fn begin(&self) -> Result<TenantConn<'_>, PlatformAuthzError> {
         self.pool
             .begin_platform_audited()
             .await

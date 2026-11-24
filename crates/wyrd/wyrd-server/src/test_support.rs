@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
 use crate::components::health::Health;
-use crate::components::operators::keys::OperatorKeys;
+use crate::components::operators::secrets::OperatorSecrets;
 use crate::config::{DeploymentProfile, GatewayConfig, ServerTarget};
 use crate::mcp::Mcp;
 use crate::postgres::ServerPostgres;
@@ -159,7 +159,7 @@ pub fn shell_owners(
     let verification = Verification::new(
         postgres.wyrd().clone(),
         None,
-        OperatorKeys::default(),
+        OperatorSecrets::default(),
         crate::verification::RuntimeLimits::default().execution_timeout,
     );
     AppStateInner {
@@ -352,4 +352,38 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
         // SAFETY: the caller's `ptr`, `layout` and `new_size` are forwarded unchanged.
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
+}
+
+/// A `file` stored-secret facade whose active key `k{active}` and each
+/// retained key `k{seed}` hold the repeated `seed` byte, built through
+/// production [`WyrdKms::new`].
+///
+/// Equal seeds name equal keys, so two facades built with the same seeds
+/// open each other's envelopes the way two replicas sharing `[kms]` do.
+///
+/// # Panics
+/// Panics when the temporary key directory cannot be written or the
+/// configuration does not validate.
+pub(crate) fn seeded_kms(active: u8, retained: &[u8]) -> Arc<wyrd_kms::WyrdKms> {
+    use base64::Engine as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("key directory");
+    for seed in std::iter::once(&active).chain(retained) {
+        let path = dir.path().join(format!("k{seed}"));
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([*seed; 32]),
+        )
+        .expect("key file writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("key file is owner-only");
+    }
+    let config = wyrd_kms::KmsConfig {
+        backend: Some(wyrd_kms::KmsBackendKind::File),
+        active_key: Some(format!("k{active}")),
+        retained_keys: retained.iter().map(|seed| format!("k{seed}")).collect(),
+        key_dir: Some(dir.path().to_path_buf()),
+        ..wyrd_kms::KmsConfig::default()
+    };
+    Arc::new(wyrd_kms::WyrdKms::new(&config, false).expect("file facade builds"))
 }

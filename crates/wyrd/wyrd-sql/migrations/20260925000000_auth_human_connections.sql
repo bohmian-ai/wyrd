@@ -8,8 +8,8 @@
 -- sets removed_at, and leaves the connection id as a non-login tombstone that
 -- historical sessions and audit can still name.
 --
--- client_secret_enc is a keyring envelope ("wsk1" || key_id || nonce ||
--- ciphertext) written under the deployment sealing keyring. jwks_uri is set
+-- client_secret_enc is the common stored-secret envelope, bound to the
+-- tenant, issuer URL, client id, and client authentication method. jwks_uri is set
 -- only by a successful candidate test, which is also the only writer of
 -- tested_revision/tested_until; activation requires both to be current.
 --

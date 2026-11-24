@@ -44,7 +44,7 @@ use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
-use crate::components::operators::keys::OperatorKeys;
+use crate::components::operators::secrets::OperatorSecrets;
 use crate::state::{AppState, EngineWorker};
 
 use self::cache::VerifierCardCache;
@@ -76,8 +76,8 @@ pub struct Verification {
     /// Queue writer of submissions whose inputs Scribe acknowledged; its
     /// sink owns the resolved verification target cache.
     submissions: Arc<SubmissionOutbox>,
-    /// Operator connection key owner.
-    operator_keys: Arc<OperatorKeys>,
+    /// Operator connection credential owner.
+    operator_secrets: OperatorSecrets,
     /// The configured queued execution deadline, measured from admission,
     /// which also closes the execution's approval occurrences.
     execution_timeout: Duration,
@@ -85,7 +85,7 @@ pub struct Verification {
 
 impl Verification {
     /// Capabilities over `postgres`, hosting `blocks`, sealing Operator
-    /// connections with `operator_keys`, and closing queued executions
+    /// connections with `operator_secrets`, and closing queued executions
     /// `execution_timeout` after admission.
     ///
     /// # Panics
@@ -95,14 +95,14 @@ impl Verification {
     pub fn new(
         postgres: wyrd_sql::WyrdPostgres,
         blocks: Option<HostedBlocks>,
-        operator_keys: OperatorKeys,
+        operator_secrets: OperatorSecrets,
         execution_timeout: Duration,
     ) -> Self {
         Self {
             health: Arc::default(),
             blocks: blocks.map(Arc::new),
             submissions: SubmissionSink::outbox(postgres),
-            operator_keys: Arc::new(operator_keys),
+            operator_secrets,
             execution_timeout,
         }
     }
@@ -125,10 +125,10 @@ impl Verification {
         self.submissions.sink().verifier_cards()
     }
 
-    /// The Operator connection key owner.
+    /// The Operator connection credential owner.
     #[must_use]
-    pub const fn operator_keys(&self) -> &Arc<OperatorKeys> {
-        &self.operator_keys
+    pub const fn operator_secrets(&self) -> &OperatorSecrets {
+        &self.operator_secrets
     }
 
     /// The configured queued execution deadline, measured from admission.
@@ -201,20 +201,11 @@ pub struct RuntimeLimits {
     /// Server backoff after the first and every later failed Operator
     /// attempt.
     pub operator_backoff: [Duration; 2],
-    /// Wait between Operator key-rewrap passes; rewrap runs beside, never
-    /// inside, the delivery claim loop.
-    pub rewrap_interval: Duration,
-    /// Elapsed-time ceiling of one cross-tenant rewrap pass.
-    pub rewrap_pass_budget: Duration,
-    /// Elapsed-time ceiling of one tenant's rewrap transaction.
-    pub rewrap_tenant_budget: Duration,
 }
 
 impl Default for RuntimeLimits {
     /// Production bounds: 64 running Verifier executions, 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
-    /// renewed lease over a five-minute execution, a
-    /// thirty-second drain, and a five-minute rewrap interval whose passes stop after
-    /// two minutes and thirty seconds per tenant.
+    /// renewed lease over a five-minute execution, and a thirty-second drain.
     fn default() -> Self {
         Self {
             execution_slots: 64,
@@ -230,9 +221,6 @@ impl Default for RuntimeLimits {
             operator_lease: Duration::from_secs(45),
             operator_attempt_timeout: Duration::from_secs(30),
             operator_backoff: [Duration::from_secs(30), Duration::from_mins(2)],
-            rewrap_interval: Duration::from_mins(5),
-            rewrap_pass_budget: Duration::from_mins(2),
-            rewrap_tenant_budget: Duration::from_secs(30),
         }
     }
 }
@@ -344,7 +332,7 @@ impl VerificationRuntime {
             #[cfg(feature = "test-support")]
             crash: None,
             #[cfg(feature = "test-support")]
-            operator_keys: None,
+            operator_secrets: None,
         }
     }
 
@@ -429,10 +417,10 @@ pub struct VerificationRuntimeBuilder<'a> {
     /// Test-only capability crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
-    /// Test-only Operator key owner standing in for the process's own, as a
-    /// replica configured with other keys would hold.
+    /// Test-only Operator credential owner standing in for the process's
+    /// own, as a replica configured with other keys would hold.
     #[cfg(feature = "test-support")]
-    operator_keys: Option<Arc<OperatorKeys>>,
+    operator_secrets: Option<OperatorSecrets>,
 }
 
 impl VerificationRuntimeBuilder<'_> {
@@ -475,11 +463,11 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Deliver Operators with `keys` instead of the process's own owner.
+    /// Deliver Operators with `secrets` instead of the process's own owner.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn operator_keys(mut self, keys: Arc<OperatorKeys>) -> Self {
-        self.operator_keys = Some(keys);
+    pub fn operator_secrets(mut self, secrets: OperatorSecrets) -> Self {
+        self.operator_secrets = Some(secrets);
         self
     }
 
@@ -541,13 +529,13 @@ impl VerificationRuntimeBuilder<'_> {
             Some(crash) => fitter.with_crash(crash.clone()),
             None => fitter,
         };
-        let keys = Arc::clone(self.state.verification.operator_keys());
+        let secrets = self.state.verification.operator_secrets().clone();
         #[cfg(feature = "test-support")]
-        let keys = self.operator_keys.unwrap_or(keys);
+        let secrets = self.operator_secrets.unwrap_or(secrets);
         let worker = OperatorWorker::new(
             postgres.clone(),
             operator.clone(),
-            keys,
+            secrets,
             OperatorDelivery::new(
                 self.state.settings.deployment_profile.screened_http(),
                 self.endpoints,

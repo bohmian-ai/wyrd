@@ -75,7 +75,6 @@ mod pg_tests {
         ClaimMapping, ClaimPath, ClientAuth, MappedClaims, ScreenedHttp, TrustedIssuer,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
-    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::Permission;
     use wyrd_spec::DataTenantId;
@@ -903,6 +902,7 @@ mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let row = insert_human_candidate(
             &mut conn,
+            uuid::Uuid::now_v7(),
             &HumanConnectionWrite {
                 issuer_url: EXTERNAL_ISSUER.to_owned(),
                 client_id: EXTERNAL_AUDIENCE.to_owned(),
@@ -1364,7 +1364,7 @@ mod pg_tests {
     async fn test_state_with_human_connections(
         fixture: &PgFixture,
     ) -> (AppState, Arc<RecordingScribe>) {
-        let sealing_key = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
+        let kms = crate::test_support::seeded_kms(7, &[]);
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1388,11 +1388,11 @@ mod pg_tests {
                 token_verifier: Some(Arc::new(verifier)),
                 human_connections: Some(HumanConnections::new(
                     fixture.wyrd_postgres().clone(),
-                    Some(Arc::clone(&sealing_key)),
+                    Some(Arc::clone(&kms)),
                     ScreenedHttp::allowing_internal(),
                     audit,
                 )),
-                sealing_key: Some(sealing_key),
+                kms: Some(kms),
                 ..crate::components::auth::ServerAuth::default()
             }
         });

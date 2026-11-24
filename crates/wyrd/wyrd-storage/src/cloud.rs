@@ -91,7 +91,7 @@ impl CloudStore {
             .with_bucket_name(&config.bucket)
             .with_client_options(client)
             .with_retry(retry);
-        let key = crate::factory::service_account_json();
+        let key = wyrd_utils::secret::google_service_account_json();
         if let Some(key) = &key {
             builder = builder.with_service_account_key(key);
         }

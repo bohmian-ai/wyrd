@@ -8,7 +8,7 @@ use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, IssuerTokenPolicy, IssuerUrl,
-    SecretBearer, TrustedIssuerView,
+    ReplaceTrustedIssuerSecretRequest, SecretBearer, TrustedIssuerView,
 };
 
 use crate::error::WyrdCliError;
@@ -25,6 +25,12 @@ pub enum TrustedIssuerCommand {
     List(ListArgs),
     /// Remove a trusted OIDC issuer (DELETE /v1/admin/trusted-issuers?issuer=&cascade=).
     Rm(RmArgs),
+    /// Reseal an issuer's unchanged client secret under a fresh data key
+    /// (POST /v1/admin/trusted-issuers/renew-encryption?issuer=).
+    RenewEncryption(RenewArgs),
+    /// Replace an issuer's client secret in place, keeping its bindings
+    /// (PUT /v1/admin/trusted-issuers/client-secret?issuer=).
+    ReplaceSecret(ReplaceSecretArgs),
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +115,38 @@ pub struct RmArgs {
     pub server: Url,
 }
 
+/// Arguments for `wyrd auth trusted-issuer renew-encryption`.
+#[derive(Debug, Args)]
+pub struct RenewArgs {
+    /// Trusted issuer URL whose stored client secret to renew.
+    #[arg(long, value_name = "URL")]
+    pub issuer: String,
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
+    #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
+    pub server: Url,
+}
+
+/// Arguments for `wyrd auth trusted-issuer replace-secret`.
+///
+/// The new secret is read only from a file or the environment, as for `add`.
+#[derive(Debug, Args)]
+pub struct ReplaceSecretArgs {
+    /// Trusted issuer URL whose client secret to replace.
+    #[arg(long, value_name = "URL")]
+    pub issuer: String,
+    /// Read the new client secret from a file, trailing newline trimmed.
+    /// Without it the secret is read from `WYRD_ISSUER_CLIENT_SECRET`.
+    #[arg(long, value_name = "PATH")]
+    pub client_secret_file: Option<PathBuf>,
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
+    #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
+    pub server: Url,
+}
+
 /// Run one `wyrd auth trusted-issuer` subcommand.
 ///
 /// # Errors
@@ -119,6 +157,8 @@ pub async fn dispatch(command: TrustedIssuerCommand) -> Result<ExitCode, WyrdCli
         TrustedIssuerCommand::Add(args) => add(*args).await,
         TrustedIssuerCommand::List(args) => list(args).await,
         TrustedIssuerCommand::Rm(args) => rm(args).await,
+        TrustedIssuerCommand::RenewEncryption(args) => renew(args).await,
+        TrustedIssuerCommand::ReplaceSecret(args) => replace_secret(args).await,
     }
 }
 
@@ -220,6 +260,63 @@ async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("deleted: {}", args.issuer);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Renew a trusted issuer's client-secret encryption. The issuer, its secret
+/// at the provider, and its bindings are unchanged; no secret is sent.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the caller is unauthorized, the issuer is unknown,
+/// holds no secret, changed concurrently, or the key service is unavailable.
+async fn renew(args: RenewArgs) -> Result<ExitCode, WyrdCliError> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("issuer", &args.issuer)
+        .finish();
+    let view: TrustedIssuerView = crate::client::from_global(Some(args.server.as_str()))?
+        .request_json::<(), _>(
+            Method::POST,
+            &format!("{TRUSTED_ISSUERS_PATH}/renew-encryption?{query}"),
+            None,
+        )
+        .await
+        .map_err(|source| WyrdCliError::Server { source })?;
+    println!("renewed: {}", view.issuer);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Replace a trusted issuer's client secret. The issuer, its client id, and
+/// its workload bindings are unchanged; the secret is never printed.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] when neither secret source is
+/// set, an IO error when the secret file cannot be read, and the server's
+/// stable Wyrd error when the caller is unauthorized, the issuer is unknown,
+/// has no client secret, changed concurrently, or the key service is
+/// unavailable.
+async fn replace_secret(args: ReplaceSecretArgs) -> Result<ExitCode, WyrdCliError> {
+    let secret = resolve_client_secret(args.client_secret_file)?.ok_or_else(|| {
+        invalid(
+            "WYRD_ISSUER_CLIENT_SECRET",
+            "<unset>",
+            "a client secret from --client-secret-file or WYRD_ISSUER_CLIENT_SECRET",
+        )
+    })?;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("issuer", &args.issuer)
+        .finish();
+    let view: TrustedIssuerView = crate::client::from_global(Some(args.server.as_str()))?
+        .request_json(
+            Method::PUT,
+            &format!("{TRUSTED_ISSUERS_PATH}/client-secret?{query}"),
+            Some(&ReplaceTrustedIssuerSecretRequest {
+                client_secret: SecretBearer::new(secret.expose_secret().to_owned()),
+            }),
+        )
+        .await
+        .map_err(|source| WyrdCliError::Server { source })?;
+    println!("replaced: {}", view.issuer);
     Ok(ExitCode::SUCCESS)
 }
 

@@ -1,0 +1,42 @@
+[package]
+name = "wyrd-kms"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "WyrdKms: the one stored-secret envelope facade over file, memory, GCP KMS, AWS KMS, and Vault Transit wrapping backends."
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+# Only for the GCP and AWS workload credential chains and SigV4 signing.
+object_store = { workspace = true, features = ["aws", "gcp"] }
+reqwest = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+url = { workspace = true }
+wyrd-crypt = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-tls = { workspace = true }
+wyrd-utils = { workspace = true }
+wyrd-vault = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+temp-env = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+wiremock = { workspace = true }
+wyrd-dev-fixtures = { workspace = true }
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

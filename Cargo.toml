@@ -65,6 +65,7 @@ wyrd-benchmark = { path = "crates/shared/wyrd-benchmark", version = "0.4.2" }
 wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.4.2" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql" }
 wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.4.2" }
+wyrd-kms = { path = "crates/wyrd/wyrd-kms" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage" }
 wyrd-server = { path = "crates/wyrd/wyrd-server" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing" }
@@ -123,6 +124,7 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-axum = { version = "0.2" }
 thiserror = "2.0"
 base64 = "0.22"
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 bytes = "1"
 rayon = "1.12"
 futures-util = "0.3"

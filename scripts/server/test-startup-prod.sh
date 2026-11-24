@@ -28,8 +28,9 @@ serving_env=(
   -e WYRD_STORAGE_URL=file:///var/lib/wyrd/storage
   -e WYRD_SIGNING_KEY_FILE=/run/wyrd/signing.pem
   -e WYRD_SERVER_TENANT_SLUG=acme
-  -e WYRD_OPERATOR_KEK_SOURCE=file
-  -e WYRD_OPERATOR_KEK_DIR=/run/wyrd/kek
+  -e WYRD_KMS_BACKEND=file
+  -e WYRD_KMS_ACTIVE_KEY=v1
+  -e WYRD_KMS_KEY_DIR=/run/wyrd/kms
   ${WYRD_LOG:+-e "WYRD_LOG=$WYRD_LOG"}
 )
 

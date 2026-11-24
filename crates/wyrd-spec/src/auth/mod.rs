@@ -19,7 +19,7 @@ mod workload;
 
 pub use admin::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerTokenPolicy, TrustedIssuerView, WorkloadBindingView,
+    IssuerTokenPolicy, ReplaceTrustedIssuerSecretRequest, TrustedIssuerView, WorkloadBindingView,
 };
 pub use attribution::Attribution;
 pub use browser::{

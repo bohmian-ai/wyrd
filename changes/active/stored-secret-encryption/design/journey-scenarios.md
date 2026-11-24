@@ -2,8 +2,8 @@
 
 Four journeys describe the user goals. Owner types, backends, API projections,
 failures, and security invariants are coverage within these journeys, not
-additional journeys. These are recommendations for the later specification;
-the design remains finalized and no implementation is authorized.
+additional journeys. The design is finalized; the approved spec revision 2
+records their behavioral contract and Task 004 carries revised maintenance proof.
 
 ## 1. Get started and use stored credentials
 
@@ -56,11 +56,17 @@ recovery,
 unchanged, and Wyrd completes the affected stored-secret transition with truthful
 progress and no lost concurrent changes.
 
-Routine rotation may rewrap existing DEKs; compromise recovery generates fresh
-DEKs and ciphertext. Interrupted work resumes. Required old-key and backup
-access is preserved until retirement is safe. Deliberate wrapping-key revocation
-is deployment-wide containment and can interrupt dependent operations. A source
-outage or missing key is reported, never hidden by generating a substitute.
+Activation and startup leave existing envelopes untouched. Explicit HTTP/CLI
+routine passes rewrap existing DEKs; recovery passes renew older-reference
+envelopes under independent safe material at a fresh logical destination. Finish
+rollout and stop/drain old writers/maintenance first; do not routine-rewrap into
+a recovery destination. Repeating the same mode/destination resumes committed
+progress, with per-pass observations rather than a global completion promise.
+Required old-key and backup access is preserved until retirement is safe.
+Containment is deployment administration: stop affected processes as needed,
+restrict configuration/access, and restart safely, with possible deployment-wide
+interruption. There is no Wyrd disable action. A source outage or missing key
+is reported, never hidden by generating a substitute.
 
 ## Coverage, not more journeys
 

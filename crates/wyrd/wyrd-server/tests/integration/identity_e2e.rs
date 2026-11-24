@@ -20,7 +20,7 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::{ClientConfig, TokenCacheMode};
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_crypt::{SealingKeyring, SecretKey};
+use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
 use wyrd_spec::DataTenantId;
@@ -2872,10 +2872,30 @@ async fn tenant_connection_admin_journey() {
     srv.shutdown().await.expect("server shuts down cleanly");
 }
 
+/// Run one explicit routine wrapping-key maintenance pass on `replica`, as a
+/// platform administrator's `POST /platform/stored-secrets/maintenance` does.
+///
+/// # Panics
+/// Panics when the pass fails or leaves an envelope behind.
+async fn routine_pass(replica: &WyrdTestServer) {
+    let report = wyrd_server::components::platform::stored_secrets::StoredSecretMaintenance::new(
+        replica.operator_pool().clone(),
+        replica.state().auth.kms.clone(),
+    )
+    .run(
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Routine,
+        None,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("the pass reads the catalog");
+    assert_eq!(report.remaining, 0, "the pass moved everything: {report:?}");
+}
+
 /// Candidate lifecycle, secret rotation, and replica safety for one tenant.
 ///
-/// Two replicas share one database. Replica A seals with key K1 and retains
-/// K2; the journey proves:
+/// Two replicas share one database and one `[kms]` key directory. Replica A
+/// seals with active key K1 and retains K2; the journey proves:
 ///   1. an unsafe issuer (cloud metadata address) stages but fails its test
 ///      before any connection, and a stale `expected_revision` conflicts;
 ///   2. a candidate with a wrong secret begins its test, but the provider
@@ -2886,11 +2906,12 @@ async fn tenant_connection_admin_journey() {
 ///      refused;
 ///   4. two concurrent activations of the same revision, recovered by a
 ///      principal distinct from the bearer caller, yield exactly one winner;
-///   5. replica B boots with K2 as the write key and K1 retained, rewraps the
-///      stored secret under K2, and both replicas still sign alice in;
+///   5. replica B boots with K2 as the active key and K1 retained, which moves
+///      no stored secret; an explicit routine pass on B rewraps it under K2,
+///      and both replicas still sign alice in;
 ///   6. A, still sealing with K1, stages a late secret after B's pass; A,
-///      the only K1 writer, is then shut down, so the final pass (replica C,
-///      started from K2-writing B) runs with no K1 writer left in service,
+///      the only K1 writer, is then shut down, so the final explicit pass on
+///      K2-writing B runs with no K1 writer left in service,
 ///      leaves every stored secret current under K2, and a replica holding
 ///      only K2 then signs alice in;
 ///   7. from then on only K2 writers serve: a same-issuer secret rotation
@@ -2905,16 +2926,28 @@ async fn tenant_connection_admin_journey() {
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn tenant_connection_rotation_journey() {
-    let k1 = [0x11_u8; 32];
-    let k2 = [0x22_u8; 32];
-    let keyring = |write: [u8; 32], retained: [u8; 32]| {
-        std::sync::Arc::new(
-            SealingKeyring::new(SecretKey::from_bytes(write))
-                .with_retained(SecretKey::from_bytes(retained)),
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use base64::Engine as _;
+    let keys = tempfile::tempdir().expect("key directory");
+    for (name, byte) in [("k1", 0x11_u8), ("k2", 0x22_u8)] {
+        let path = keys.path().join(name);
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([byte; 32]),
         )
+        .expect("key file writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let keyring = |active: &str, retained: &[&str]| KmsConfig {
+        backend: Some(KmsBackendKind::File),
+        active_key: Some(active.to_owned()),
+        retained_keys: retained.iter().map(|key| (*key).to_owned()).collect(),
+        key_dir: Some(keys.path().to_path_buf()),
+        ..KmsConfig::default()
     };
     let replica_a = WyrdTestServerBuilder::default()
-        .with_sealing_keyring(keyring(k1, k2))
+        .with_kms_for_test(keyring("k1", &["k2"]))
         .start_in_process()
         .await
         .expect("replica A starts");
@@ -3159,33 +3192,44 @@ async fn tenant_connection_rotation_journey() {
     )
     .await;
 
-    // 5. Replica B switches the write key to K2; its boot rewraps the secret.
+    // 5. Replica B switches the write key to K2; activation moves nothing,
+    //    and an explicit routine pass on B rewraps the secret.
     let under_k1 = replica_a
         .human_connection_secret_ciphertext(tenant, "Active")
         .await
         .expect("ciphertext reads")
         .expect("active connection stores a secret");
-    let k2_only = SealingKeyring::new(SecretKey::from_bytes(k2));
+    let k2_only = WyrdKms::new(&keyring("k2", &[]), false).expect("K2 facade builds");
     assert!(
-        k2_only.open(&under_k1).is_err(),
+        !k2_only.is_current(&under_k1).expect("a common envelope"),
         "K1 sealed the first secret"
     );
     let replica_b = replica_a
-        .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(keyring(k2, k1)))
+        .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &["k1"])))
         .await
         .expect("replica B starts");
+    assert_eq!(
+        replica_a
+            .human_connection_secret_ciphertext(tenant, "Active")
+            .await
+            .expect("ciphertext reads")
+            .as_deref(),
+        Some(under_k1.as_slice()),
+        "activation alone moved no stored secret"
+    );
+    routine_pass(&replica_b).await;
     let under_k2 = replica_a
         .human_connection_secret_ciphertext(tenant, "Active")
         .await
         .expect("ciphertext reads")
         .expect("active connection stores a secret");
-    assert_ne!(under_k1, under_k2, "boot rewrapped the stored secret");
-    assert_eq!(
-        k2_only
-            .rewrap(&under_k2)
-            .expect("K2 opens the rewrapped secret"),
-        None,
-        "the rewrapped secret references only the write key"
+    assert_ne!(
+        under_k1, under_k2,
+        "the routine pass rewrapped the stored secret"
+    );
+    assert!(
+        k2_only.is_current(&under_k2).expect("a common envelope"),
+        "the rewrapped secret references only the active key"
     );
     for (replica, label) in [(&replica_a, "rotation-a"), (&replica_b, "rotation-b")] {
         let session = human_login(
@@ -3206,8 +3250,8 @@ async fn tenant_connection_rotation_journey() {
 
     // 6. A still seals with K1 after B's pass reported nothing left: a late
     //    K1 write. A is then taken out of service, so no K1 writer remains;
-    //    the final pass (replica C, started from K2-writing B) reseals the
-    //    late write, and a K2-only replica then serves login.
+    //    a final explicit pass on K2-writing B reseals the late write, and a
+    //    K2-only replica then serves login.
     let (status, late) = call_json(
         &replica_a,
         token,
@@ -3228,7 +3272,9 @@ async fn tenant_connection_rotation_journey() {
         .expect("ciphertext reads")
         .expect("the late candidate stores a secret");
     assert!(
-        k2_only.open(&late_under_k1).is_err(),
+        !k2_only
+            .is_current(&late_under_k1)
+            .expect("a common envelope"),
         "A sealed the late write under K1"
     );
     let mut recovery_decisions = activation_decisions(&replica_a, tenant).await;
@@ -3236,32 +3282,22 @@ async fn tenant_connection_rotation_journey() {
         .shutdown()
         .await
         .expect("replica A, the last K1 writer, shuts down");
-    let replica_c = replica_b
-        .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(keyring(k2, k1)))
-        .await
-        .expect("final-pass replica C starts");
+    routine_pass(&replica_b).await;
     for state in ["Active", "Candidate"] {
         let sealed = replica_b
             .human_connection_secret_ciphertext(tenant, state)
             .await
             .expect("ciphertext reads")
             .expect("the connection stores a secret");
-        assert_eq!(
-            k2_only
-                .rewrap(&sealed)
-                .expect("K2 opens every stored secret"),
-            None,
+        assert!(
+            k2_only.is_current(&sealed).expect("a common envelope"),
             "the final pass left the {state} secret current under K2"
         );
     }
-    replica_c.shutdown().await.expect("replica C shuts down");
-    let replica_k2 =
-        replica_b
-            .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(
-                std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k2))),
-            ))
-            .await
-            .expect("a K2-only replica starts once nothing needs K1");
+    let replica_k2 = replica_b
+        .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &[])))
+        .await
+        .expect("a K2-only replica starts once nothing needs K1");
     let session = human_login(
         &replica_k2,
         &keycloak,
@@ -4789,6 +4825,114 @@ async fn candidate_tested(srv: &WyrdTestServer, admin: &TenantAdmin) -> bool {
     !listed["candidate"]["tested_until"].is_null()
 }
 
+/// A client secret is bound to its own connection: when the Active
+/// connection's valid secret is copied onto a Candidate that names the same
+/// issuer, client, and method, the Candidate's test sign-in is refused before
+/// the secret reaches the provider and the Candidate stays untested. The
+/// Active connection still signs alice in with its own secret, and the
+/// Candidate tests once it is staged again with its own secret.
+///
+/// # Panics
+/// Panics when the copied secret is used, or an intact connection does not
+/// authenticate.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_connection_refuses_a_secret_copied_between_connections() {
+    let srv = WyrdTestServerBuilder::default()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = srv.data_tenant_id();
+    let admin = tenant_admin(&srv, tenant, "copied-secret-admin").await;
+    activate_keycloak_connection(
+        &srv,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    let (status, staged) = call_json(
+        &srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some("not-the-secret"),
+            None,
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate stages: {staged}");
+    let revision = staged["revision"].as_u64().expect("candidate revision");
+    let pool = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let copied = sqlx::query(
+        "UPDATE wyrd.auth_human_connections AS candidate \
+            SET client_secret_enc = active.client_secret_enc \
+           FROM wyrd.auth_human_connections AS active \
+          WHERE candidate.data_tenant_id = $1 AND candidate.state = 'Candidate' \
+            AND active.data_tenant_id = $1 AND active.state = 'Active'",
+    )
+    .bind(tenant.as_uuid())
+    .execute(&pool)
+    .await
+    .expect("the active secret copies onto the candidate");
+    assert_eq!(copied.rows_affected(), 1);
+
+    let (status, begun) = begin_test(&srv, &admin.token, revision).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    let reply = finish_test_sign_in(&srv, &begun).await;
+    assert_refused(
+        reply.status,
+        &reply.problem(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "WYRD_AUTH_503_VERIFY_UNAVAILABLE",
+    );
+    assert!(
+        !candidate_tested(&srv, &admin).await,
+        "a copied secret leaves the candidate untested"
+    );
+
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let session = human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    assert_v1_delegated_write_ok(
+        &srv,
+        session["access_token"].as_str().expect("access token"),
+        "copied-secret-active",
+    )
+    .await;
+    let (status, staged) = call_json(
+        &srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some(CONFIDENTIAL_HUMAN_SECRET),
+            Some(revision),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate restages: {staged}");
+    let revision = staged["revision"].as_u64().expect("candidate revision");
+    let (status, begun) = begin_test(&srv, &admin.token, revision).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    assert_test_completion(&finish_test_sign_in(&srv, &begun).await);
+}
+
 /// A candidate is tested by one real provider sign-in through the common
 /// callback, with login state's protections and nothing issued:
 ///   1. tenant A's genuine provider return presented under tenant B's test
@@ -5362,6 +5506,335 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
     // Client lifecycle: the production wyrd-client middleware caches one
     // exchange, reuses it while fresh, and re-exchanges on force_refresh.
     assert_client_workload_lifecycle(&srv, &assertion).await;
+
+    srv.shutdown().await.expect("server shuts down cleanly");
+}
+
+/// Tenant human-login and workload-issuer client secrets are sealed through
+/// the deployment's remote wrapping backend and opened through it by their
+/// real consumers, before and after a restart:
+///   1. a confidential Keycloak connection staged, tested, and activated
+///      through the served API seals its secret through Transit, and its test
+///      sign-in's code exchange already needs the opened secret;
+///   2. a person then signs in through that connection;
+///   3. a `SecretPost` trusted issuer authored through the CLI seals its
+///      secret through Transit, and a jwt-bearer exchange against it, which
+///      decodes the issuer and so opens the secret, returns `200`;
+///   4. the restarted process opens both committed envelopes through Transit
+///      again: the person signs in and the workload exchanges once more.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn auth_client_secrets_open_through_vault_transit_across_restart() {
+    let transit = wyrd_testing::kms::TransitFixture::start().await;
+    let srv = WyrdTestServerBuilder::default()
+        .with_kms_for_test(transit.config("identity", &[]))
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+
+    // 1–2. Tenant human login through a confidential connection.
+    let admin = tenant_admin(&srv, srv.data_tenant_id(), "transit-admin").await;
+    activate_keycloak_connection(
+        &srv,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let human_sealed = transit.requests("encrypt").await;
+    assert!(
+        human_sealed >= 1,
+        "the connection secret sealed through Transit"
+    );
+
+    // 3. Workload exchange against a CLI-authored confidential issuer.
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+    let card_ref = binding_card_ref(CardKind::Service, "transit-workload");
+    let principal = srv
+        .seed_card_principal(&card_ref, &["editor"])
+        .await
+        .expect("workload principal seeds");
+    assert_cli_succeeded(
+        &wyrd_cli(
+            trusted_issuer_add_args(&server_url, "SecretPost", "Workload"),
+            &[
+                ("WYRD_ACCESS_TOKEN", admin.token.clone()),
+                (
+                    "WYRD_ISSUER_CLIENT_SECRET",
+                    "transit-issuer-secret".to_owned(),
+                ),
+            ],
+        )
+        .await,
+        "CLI trusted-issuer add succeeds",
+    );
+    assert_cli_succeeded(
+        &wyrd_cli(
+            workload_binding_add_args(&server_url, &subject, principal, card_ref.uid.as_ref()),
+            &[("WYRD_ACCESS_TOKEN", admin.token.clone())],
+        )
+        .await,
+        "CLI workload-binding add succeeds",
+    );
+    assert!(
+        transit.requests("encrypt").await > human_sealed,
+        "the issuer secret sealed through Transit"
+    );
+    assert_eq!(
+        post_jwt_bearer(&srv, &assertion).await.status(),
+        StatusCode::OK,
+        "the workload exchanges against the confidential issuer"
+    );
+    let opened = transit.requests("decrypt").await;
+    assert!(
+        opened >= 2,
+        "both consumers opened their secret through Transit"
+    );
+
+    // 4. The restarted process opens both envelopes through Transit again.
+    let srv = Box::pin(srv.restart_bound(WyrdTestServerBuilder::default()))
+        .await
+        .expect("server restarts");
+    human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let human_reopened = transit.requests("decrypt").await;
+    assert!(
+        human_reopened > opened,
+        "the restarted sign-in opened its secret"
+    );
+    assert_eq!(
+        post_jwt_bearer(&srv, &assertion).await.status(),
+        StatusCode::OK,
+        "the workload exchanges after the restart"
+    );
+    assert!(
+        transit.requests("decrypt").await > human_reopened,
+        "the restarted exchange opened the issuer secret"
+    );
+
+    srv.shutdown().await.expect("server shuts down cleanly");
+}
+
+/// Renewing and replacing auth client secrets through the shipped surfaces
+/// keeps every client working with no reconfiguration:
+///   1. a person signs in through a confidential Keycloak connection;
+///   2. `POST /v1/identity/oidc/connections/{id}/renew-encryption` reseals its
+///      secret under the same id and revision; the existing session still
+///      reaches `/v1` and refreshes, and a fresh sign-in, whose code exchange
+///      opens the renewed secret, completes;
+///   3. a `SecretPost` trusted issuer and its workload binding are authored
+///      through the CLI, and a workload exchanges against them;
+///   4. `wyrd auth trusted-issuer renew-encryption` reseals the issuer secret
+///      and `wyrd auth trusted-issuer replace-secret` stores a new one, each
+///      changing the stored envelope while the binding keeps the workload
+///      exchanging; `replace-secret` with no secret source is refused before
+///      any request.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn renewing_and_replacing_auth_secrets_keeps_clients_working() {
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+
+    // 1. A live session through a confidential connection.
+    let admin = tenant_admin(&srv, srv.data_tenant_id(), "renewal-admin").await;
+    let active = activate_keycloak_connection(
+        &srv,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    let session = human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+
+    // 2. Renew over HTTP; the session and later sign-ins continue.
+    let id = active["id"].as_str().expect("connection id");
+    let (status, renewed) = call_json(
+        &srv,
+        &admin.token,
+        Method::POST,
+        &format!("{CONNECTIONS}/{id}/renew-encryption"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "renewal: {renewed}");
+    assert_eq!(
+        (&renewed["id"], &renewed["revision"], &renewed["state"]),
+        (&active["id"], &active["revision"], &active["state"]),
+        "renewal keeps the connection's identity and revision"
+    );
+    assert!(
+        !renewed.to_string().contains(CONFIDENTIAL_HUMAN_SECRET),
+        "the view never carries the secret"
+    );
+    let access_token = session["access_token"].as_str().expect("access token");
+    assert_v1_delegated_write_ok(&srv, access_token, "renewed-session").await;
+    let (status, refreshed) = post_refresh(
+        &srv,
+        session["refresh_token"].as_str().expect("refresh token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the session refreshes: {refreshed}");
+    human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+
+    // 3. A CLI-authored confidential issuer and binding exchange.
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+    let card_ref = binding_card_ref(CardKind::Service, "renewal-workload");
+    let principal = srv
+        .seed_card_principal(&card_ref, &["editor"])
+        .await
+        .expect("workload principal seeds");
+    let credential = [("WYRD_ACCESS_TOKEN", admin.token.clone())];
+    assert_cli_succeeded(
+        &wyrd_cli(
+            trusted_issuer_add_args(&server_url, "SecretPost", "Workload"),
+            &[
+                ("WYRD_ACCESS_TOKEN", admin.token.clone()),
+                ("WYRD_ISSUER_CLIENT_SECRET", "issuer-secret-v1".to_owned()),
+            ],
+        )
+        .await,
+        "CLI trusted-issuer add succeeds",
+    );
+    assert_cli_succeeded(
+        &wyrd_cli(
+            workload_binding_add_args(&server_url, &subject, principal, card_ref.uid.as_ref()),
+            &credential,
+        )
+        .await,
+        "CLI workload-binding add succeeds",
+    );
+    let exchanges = |label: &'static str| {
+        let srv = &srv;
+        let assertion = &assertion;
+        async move {
+            assert_eq!(
+                post_jwt_bearer(srv, assertion).await.status(),
+                StatusCode::OK,
+                "the workload exchanges {label}"
+            );
+        }
+    };
+    exchanges("before any rotation").await;
+    let stored = || async {
+        srv.trusted_issuer_secret_ciphertext(srv.data_tenant_id(), &keycloak_issuer())
+            .await
+            .expect("ciphertext reads")
+            .expect("the issuer stores a sealed secret")
+    };
+    let sealed = stored().await;
+
+    // 4. Renew and replace through the CLI; the binding keeps working.
+    let issuer_args = |verb: &str| {
+        [
+            "auth",
+            "trusted-issuer",
+            verb,
+            "--issuer",
+            &keycloak_issuer(),
+            "--server",
+            server_url.as_str(),
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let output = wyrd_cli(issuer_args("renew-encryption"), &credential).await;
+    assert_cli_succeeded(&output, "CLI trusted-issuer renew-encryption succeeds");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("renewed:"));
+    let renewed_envelope = stored().await;
+    assert_ne!(renewed_envelope, sealed, "renewal reseals the secret");
+    exchanges("after renewal").await;
+
+    let refused = wyrd_cli(issuer_args("replace-secret"), &credential).await;
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("WYRD_ISSUER_CLIENT_SECRET"),
+        "replace-secret needs a secret source: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        stored().await,
+        renewed_envelope,
+        "a refused replacement sends nothing"
+    );
+    let output = wyrd_cli(
+        issuer_args("replace-secret"),
+        &[
+            ("WYRD_ACCESS_TOKEN", admin.token.clone()),
+            ("WYRD_ISSUER_CLIENT_SECRET", "issuer-secret-v2".to_owned()),
+        ],
+    )
+    .await;
+    assert_cli_succeeded(&output, "CLI trusted-issuer replace-secret succeeds");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("replaced:") && !stdout.contains("issuer-secret-v2"));
+    assert_ne!(
+        stored().await,
+        renewed_envelope,
+        "replacement stores a new secret"
+    );
+    exchanges("after replacement, through the unchanged binding").await;
 
     srv.shutdown().await.expect("server shuts down cleanly");
 }

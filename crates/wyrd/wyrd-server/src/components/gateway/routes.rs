@@ -73,6 +73,7 @@ pub fn gateway_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_credentials))
         .routes(routes!(put_credential, get_credential, delete_credential))
         .routes(routes!(revoke_credential))
+        .routes(routes!(renew_credential_encryption))
         .routes(routes!(list_deployments, apply_deployments))
         .routes(routes!(put_deployment, get_deployment, delete_deployment))
         .routes(routes!(put_fallback, get_fallback, delete_fallback))
@@ -389,6 +390,49 @@ pub(crate) async fn revoke_credential(
     Ok(Json(
         GatewayAdministration::new(&state)
             .revoke_credential(&caller, &name)
+            .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/gateway/provider-credentials/{name}/renew-encryption",
+    params(("name" = String, Path, description = "Tenant-scoped resource name")),
+    responses(
+        (status = 200, body = ProviderCredentialView),
+        (status = 400, description = "Invalid name (WYRD_GATEWAY_400_INVALID_CONFIGURATION)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "Credential not found (WYRD_GATEWAY_404_RESOURCE_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "Credential is revoked, holds no managed secret, or changed during the renewal (WYRD_GATEWAY_409_RESOURCE_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Stored-secret encryption, the administration store, or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
+    ),
+    tag = "Gateway"
+)]
+/// `POST /v1/admin/gateway/provider-credentials/{name}/renew-encryption`.
+///
+/// Reseals an active managed secret's unchanged provider key under a fresh
+/// data key; deployments keep using the credential by name.
+///
+/// # Errors
+/// Returns `GatewayInvalidConfiguration` for an invalid name,
+/// `GatewayResourceNotFound` when absent, `GatewayResourceConflict` when
+/// revoked, not managed, or changed concurrently, and authentication,
+/// permission, encryption, or storage errors.
+#[tracing::instrument(
+    skip(state, caller),
+    fields(operation = "gateway.provider_credential.renew_encryption")
+)]
+pub(crate) async fn renew_credential_encryption(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(name): Path<String>,
+) -> GatewayResult<Json<ProviderCredentialView>> {
+    let name = credential_name(&name)?;
+    Ok(Json(
+        GatewayAdministration::new(&state)
+            .renew_credential_encryption(&caller, &name)
             .await?,
     ))
 }

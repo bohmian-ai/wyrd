@@ -1614,6 +1614,7 @@ GREEN:
   - RED: `cargo nextest run -p wyrd-server --lib -E 'test(=auth::cli_login::tests::device_pages_render_in_the_branded_entry_card)'` panicked: `html.contains("<main class=\"entry\"><div class=\"card\">")` was false.
   - GREEN: the test passes. The "Alice is given payments…" journey (which uses the device page) passed 1/1. `test:identity:ui` passed 2/2, clippy `-D warnings` was clean, and `ui:check` passed. Screenshots at 1280 and 390 wide, light and dark, match the entry card.
   - Limit: the page falls back to system fonts, because it serves no font assets. The mock has no device state.
+- **Startup lane retried (2026-11-24): still unproven.** `mise run test:server:startup:dev` was retried with 46 GiB available. The release link of `wyrd-server` was killed with SIGKILL (out of memory), exit 101, before the container started. The nginx host-routing check in that lane has not run.
 
 
 ### 17. An existing User explicitly connects another sign-in method

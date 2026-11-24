@@ -10,7 +10,13 @@ import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import { Bifrost, Cards, Principals, WyrdClient, WyrdState } from "wyrd-ai";
-import type { AccessSummary, CreateRoleBindingRequest, PrincipalKind } from "wyrd-ai";
+import type {
+  AccessOperation,
+  AccessSummary,
+  CreateRoleBindingRequest,
+  PrincipalKind,
+  PrincipalSummary,
+} from "wyrd-ai";
 
 import { observedServiceTest as test } from "../support/observed-service.js";
 import { declared, fixture, runtimeAccount } from "../support/server.js";
@@ -22,6 +28,9 @@ const TENANT_WIDE = "SELECT COUNT(*) AS n FROM bifrost.drift.observations";
 
 /** A Card only an author can register. */
 const AUTHORED = fixture("cards/gateway_inference/ask-prompt.yaml");
+
+/** The one operation the custom roles in these tests carry. */
+const READS: AccessOperation[] = [{ resource: "cards", action: "read" }];
 
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
@@ -111,6 +120,74 @@ test("direct and idp user assignments coexist", async ({ server }) => {
   expect(grants(await principals.access(user))).toEqual([["viewer", "provider"]]);
 });
 
+test("a role filter pages this tenants holders with their counts", async ({ server }) => {
+  const principals = await Principals.connect();
+  await principals.putRole("ledger_reader", { operations: READS });
+  const users = new Set(["ann", "bo"].map((name) => server.bootstrapUser(["ledger_reader"], name)));
+  const service = await issue("ledger-service");
+  await principals.bind(bindAll(service.principal, "service", "ledger_reader"));
+  // Another tenant's holder of a same-named role is never counted or listed.
+  const other = server.seedTenant("ledger-other");
+  const foreign = await Principals.connect({
+    client: WyrdClient.connect({ credential: server.bootstrapServiceInTenant(other, ["admin"], "other-admin") }),
+  });
+  await foreign.putRole("ledger_reader", { operations: READS });
+  await foreign.createServicePrincipal({ name: "stranger", assignments: [{ role: "ledger_reader", scope: "all" }] });
+
+  const seen: PrincipalSummary[] = [];
+  let after: string | null = null;
+  do {
+    const page = await principals.list({ role: "ledger_reader", limit: 1, after });
+    expect(page.counts).toEqual({ active: 3, suspended: 0 });
+    seen.push(...page.principals);
+    after = page.next ?? null;
+  } while (after);
+
+  const byId = new Map(seen.map((found) => [found.principal_id, found]));
+  expect(new Set(byId.keys())).toEqual(new Set([...users, service.principal]));
+  expect(byId.get(service.principal)).toMatchObject({
+    authentication: null,
+    roles: [
+      { role: "ledger_reader", scope: "all" },
+      { role: "workload", scope: "all" },
+    ],
+  });
+  for (const user of users) {
+    expect(byId.get(user)).toMatchObject({
+      authentication: "sso",
+      display_name: null,
+      roles: [{ role: "ledger_reader", scope: "all" }],
+    });
+  }
+});
+
+test("a role nobody holds lists no one", async () => {
+  const nobody = await (await Principals.connect()).list({ role: "no_such_role" });
+  expect(nobody.principals).toEqual([]);
+  expect(nobody.counts).toEqual({ active: 0, suspended: 0 });
+});
+
+test("roles carry their description and member count", async ({ server }) => {
+  const principals = await Principals.connect();
+  const created = await principals.putRole("summary_reader", { operations: READS, description: "Reads ledger Cards" });
+  expect(created).toMatchObject({ description: "Reads ledger Cards", member_count: 0 });
+
+  server.bootstrapUser(["summary_reader"], "summary-holder");
+  const roles = new Map((await principals.roles()).roles.map((role) => [role.name, role]));
+  expect(roles.get("summary_reader")?.member_count).toBe(1);
+  expect(roles.get("viewer")?.description).toBe("Read Cards, executions, artifacts and tables");
+
+  // The role is replaced whole: a request without a description clears it.
+  const cleared = await principals.putRole("summary_reader", { operations: READS });
+  expect(cleared).toMatchObject({ description: null, member_count: 1 });
+});
+
+test("a built in role refuses a new description", async () => {
+  await expect(
+    (await Principals.connect()).putRole("viewer", { operations: READS, description: "Mine now" }),
+  ).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+});
+
 test("users manage personal keys", async ({ server }) => {
   const ceiling = ["personal_credentials:write", "cards:read", "personal_credentials:read"];
   const [user, key] = server.bootstrapUserKey(["editor"], "keeper", ceiling) as [string, string];
@@ -122,6 +199,8 @@ test("users manage personal keys", async ({ server }) => {
     principal_kind: "user",
     username: "keeper",
     authentication: "password",
+    display_name: null,
+    email: null,
   });
   expect(me.permissions).toEqual([...ceiling].sort());
 

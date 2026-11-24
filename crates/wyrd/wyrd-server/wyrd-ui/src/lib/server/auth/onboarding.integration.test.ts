@@ -101,6 +101,24 @@ function mailedLink(text: string): string {
 }
 
 /** A name no earlier run of this journey used, for addresses and slugs. */
+/** Sign in to the journey workspace with a password and wait for its home page. */
+async function signIn(page: Page, username: string, password: string): Promise<void> {
+  await page.goto(`${journey.origin}/t/${slug}/login`);
+  await page.getByLabel('Username').fill(username);
+  await page.getByLabel('Password', { exact: true }).fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.waitForURL(`${journey.origin}/t/${slug}`);
+}
+
+/** Post a form as the `wyrd-cli` client from the page's origin, as the CLI would; returns the JSON answer. */
+async function cliForm(page: Page, path: string, fields: Record<string, string>): Promise<unknown> {
+  return page.evaluate(
+    async ([path, fields]) =>
+      (await fetch(path, { method: 'POST', body: new URLSearchParams({ client_id: 'wyrd-cli', ...fields }) })).json(),
+    [path, fields] as const
+  );
+}
+
 const run = Date.now().toString(36);
 /** The address and workspace the signup journey creates; later journeys use them. */
 const owner = `owner-${run}@example.test`;
@@ -263,11 +281,7 @@ test('a signed-in administrator verifies a recovery email from the account page'
   const { context, page } = await visitor();
   const recovery = `recovery-${run}@example.test`;
   try {
-    await page.goto(`${journey.origin}/t/${slug}/login`);
-    await page.getByLabel('Username').fill('owner');
-    await page.getByLabel('Password', { exact: true }).fill('a brand new passphrase for owner');
-    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-    await page.waitForURL(`${journey.origin}/t/${slug}`);
+    await signIn(page, 'owner', 'a brand new passphrase for owner');
 
     await page.goto(`${journey.origin}/t/${slug}/settings/account`);
     const section = page.getByRole('region', { name: 'Recovery email' });
@@ -301,11 +315,7 @@ test('the administrator invites a teammate who enrolls and approves a CLI sign-i
   const teammate = `teammate-${run}@example.test`;
   const admin = await visitor();
   try {
-    await admin.page.goto(`${journey.origin}/t/${slug}/login`);
-    await admin.page.getByLabel('Username').fill('owner');
-    await admin.page.getByLabel('Password', { exact: true }).fill('a brand new passphrase for owner');
-    await admin.page.getByRole('button', { name: 'Sign in', exact: true }).click();
-    await admin.page.waitForURL(`${journey.origin}/t/${slug}`);
+    await signIn(admin.page, 'owner', 'a brand new passphrase for owner');
     await admin.page.goto(`${journey.origin}/t/${slug}/settings/access?tab=users`);
     const invite = admin.page.getByRole('form', { name: 'Invite users' });
     await invite.getByLabel('Email addresses').fill(teammate);
@@ -328,28 +338,18 @@ test('the administrator invites a teammate who enrolls and approves a CLI sign-i
     await page.waitForURL(`${journey.origin}/t/${slug}`);
 
     // The CLI starts a device sign-in; the freshly enrolled teammate approves it in this browser.
-    const device = (await page.evaluate(async (tenant) => {
-      const response = await fetch('/auth/device_authorization', {
-        method: 'POST',
-        body: new URLSearchParams({ client_id: 'wyrd-cli', tenant })
-      });
-      return response.json();
-    }, slug)) as { device_code: string; verification_uri_complete: string };
+    const device = (await cliForm(page, '/auth/device_authorization', { tenant: slug })) as {
+      device_code: string;
+      verification_uri_complete: string;
+    };
     await page.goto(device.verification_uri_complete);
     await page.getByRole('button', { name: 'Approve and sign in' }).click();
     await page.getByRole('heading', { name: 'Login approved' }).waitFor();
 
-    const token = (await page.evaluate(async (deviceCode) => {
-      const response = await fetch('/auth/token', {
-        method: 'POST',
-        body: new URLSearchParams({
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-          device_code: deviceCode,
-          client_id: 'wyrd-cli'
-        })
-      });
-      return response.json();
-    }, device.device_code)) as { access_token: string };
+    const token = (await cliForm(page, '/auth/token', {
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: device.device_code
+    })) as { access_token: string };
     const me = await fetch(`${journey.server}/v1/principals/me`, {
       headers: { 'x-wyrd-access-token': `Bearer ${token.access_token}` }
     });

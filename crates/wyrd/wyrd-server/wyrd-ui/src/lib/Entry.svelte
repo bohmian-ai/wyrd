@@ -33,7 +33,7 @@
         <div class="app-problem" id="problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
           <strong>{issue.status >= 500 ? '✕ Sign-in unavailable' : `⊘ ${issue.title}`}</strong>
           <p>{issue.status >= 500 ? 'Please try again later.' : guidance(issue)}</p>
-          <code>{issue.code}</code>
+          {#if issue.code}<code>{issue.code}</code>{/if}
         </div>
       </div>
     {/if}

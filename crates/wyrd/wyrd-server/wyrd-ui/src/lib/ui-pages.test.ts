@@ -1380,3 +1380,12 @@ test('the workspace page renders the configured Turnstile challenge and sends it
     vi.unstubAllGlobals();
   }
 });
+
+import SignupPage from '../routes/signup/+page.svelte';
+
+test('a refused provider proof has no code to show, so the problem shows none', () => {
+  const page = render(SignupPage, { data: { signup: true, local: true, providers: ['google'], failed: true, problem: null } } as never);
+  const problem = page.getByRole('alert');
+  expect(problem).toHaveTextContent('Sign-in was not confirmed');
+  expect(problem.querySelector('code')).toBeNull();
+});

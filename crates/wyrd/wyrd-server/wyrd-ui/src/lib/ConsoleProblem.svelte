@@ -9,6 +9,6 @@
   <div class="app-problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
     <strong>{issue.status >= 500 ? '✕' : '⊘'} {issue.title}</strong>
     <p>{guidance(issue)}</p>
-    <code>{issue.code}</code>
+    {#if issue.code}<code>{issue.code}</code>{/if}
   </div>
 </div>

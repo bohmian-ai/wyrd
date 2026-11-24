@@ -101,6 +101,23 @@ struct GithubUser {
     id: u64,
     /// Public profile email, when the person published one.
     email: Option<String>,
+    /// Account handle.
+    login: Option<String>,
+    /// Public profile name, when the person set one.
+    name: Option<String>,
+}
+
+impl GithubUser {
+    /// The person's display name: the profile name, else the login when the
+    /// name is blank.
+    fn display_name(&self) -> Option<String> {
+        [self.name.as_deref(), self.login.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|name| !name.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 impl GithubOAuth {
@@ -202,6 +219,7 @@ impl GithubOAuth {
         let user: GithubUser = self
             .json(Self::api_get(&self.endpoints.user, &bearer)?)
             .await?;
+        let name = user.display_name();
         let email = if read_email {
             let mut emails: Vec<GithubEmail> = self
                 .json(Self::api_get(&self.endpoints.emails, &bearer)?)
@@ -214,6 +232,7 @@ impl GithubOAuth {
         };
         Ok(MappedClaims {
             subject: user.id.to_string(),
+            name,
             email,
             groups: Vec::new(),
         })

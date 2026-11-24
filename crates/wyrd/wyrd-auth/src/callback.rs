@@ -30,8 +30,8 @@ use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, LoginState, advance_authorization_revision,
     approve_device_authorization, consume_login_state, delete_user, human_connection_is_active,
-    insert_user, lock_human_connection_slot, lock_refresh_family, replace_idp_user_bindings,
-    upsert_user_identity, user_id_by_identity,
+    insert_user, lock_human_connection_slot, lock_refresh_family, refresh_display_name,
+    replace_idp_user_bindings, upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanLoginAnchor};
 use wyrd_sql::{SqlError, TenantConn};
@@ -390,6 +390,9 @@ impl AuthorizationCodeExchange {
         )
         .await
         .map_err(store_error)?;
+        refresh_display_name(&mut conn, principal_id, identity.name.as_deref())
+            .await
+            .map_err(store_error)?;
         // Concurrent callbacks for this User would otherwise each replace
         // roles unseen by the other and the later one mint their union; the
         // family lock held to commit makes one callback's set the whole truth.

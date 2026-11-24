@@ -157,20 +157,30 @@ class AccessSummary(TypedDict):
     permissions: list[Permission]
 
 class Role(TypedDict):
-    """One role and the operations it bundles."""
+    """One role and the operations it bundles. ``description`` is server-set
+    for a built-in role; ``member_count`` counts distinct accounts holding the
+    role at any scope, directly or through a group."""
 
     id: str
     name: str
     operations: list[Operation]
     builtin: bool
+    description: str | None
+    member_count: int
 
 class RoleList(TypedDict):
     """Roles ordered by name."""
 
     roles: list[Role]
 
-class PutRoleRequest(TypedDict):
-    """A custom role's complete operation set."""
+class _PutRoleOptional(TypedDict, total=False):
+    """Optional fields of ``PutRoleRequest``."""
+
+    description: str | None
+
+class PutRoleRequest(_PutRoleOptional):
+    """A custom role's complete operation set and optional one-line
+    description; omitting ``description`` clears it."""
 
     operations: list[Operation]
 
@@ -192,24 +202,40 @@ class GroupList(TypedDict):
 
     groups: list[Group]
 
+AccountAuthentication = Literal["password", "google", "github", "sso"]
+
 class PrincipalSummary(TypedDict):
     """One assignable principal; ``email`` is set for users and ``name`` for
-    Service accounts. ``workload_restriction`` is the Service account's
-    restriction, and ``None`` for users."""
+    Service accounts and local users. ``display_name`` is a user's
+    provider-sourced name and ``authentication`` how a user signs in; both are
+    ``None`` for Service accounts. ``roles`` are the distinct scoped roles the
+    account holds, directly or through a group. ``workload_restriction`` is
+    the Service account's restriction, and ``None`` for users."""
 
     principal_id: str
     kind: PrincipalKind
     status: Literal["active", "suspended"]
     email: str | None
     name: str | None
+    display_name: str | None
+    authentication: AccountAuthentication | None
+    roles: list[ScopedRoleAssignment]
     workload_restriction: WorkloadRestriction | None
+
+class PrincipalStatusCounts(TypedDict):
+    """How many principals matching the filters are in each status, across
+    every page."""
+
+    active: int
+    suspended: int
 
 class PrincipalPage(TypedDict):
     """One page of principals; ``next`` is the ``after`` of the following
-    page, or ``None`` on the last page."""
+    page, or ``None`` on the last page. ``counts`` covers every page."""
 
     principals: list[PrincipalSummary]
     next: str | None
+    counts: PrincipalStatusCounts
 
 class _CreateServicePrincipalOptional(TypedDict, total=False):
     """Optional fields of ``CreateServicePrincipalRequest``."""
@@ -258,14 +284,17 @@ class CredentialList(TypedDict):
     """The following page's cursor; absent on the last page and complete lists."""
 
 class CurrentUserProfile(TypedDict):
-    """The calling User's safe profile; ``permissions`` are informational."""
+    """The calling User's safe profile, with the caller's own ``email`` and
+    provider-sourced ``display_name``; ``permissions`` are informational."""
 
     tenant: str
     tenant_id: str
     principal_id: str
     principal_kind: Literal["user"]
     username: str | None
-    authentication: Literal["password", "sso"]
+    display_name: str | None
+    email: str | None
+    authentication: AccountAuthentication
     permissions: list[str]
 
 class RevokePrincipalRequest(TypedDict):
@@ -451,6 +480,7 @@ class Principals:
         kind: PrincipalKind | None = None,
         email: str | None = None,
         name: str | None = None,
+        role: str | None = None,
         limit: int | None = None,
         after: str | None = None,
     ) -> PrincipalPage:
@@ -462,6 +492,8 @@ class Principals:
             kind: only principals of this kind.
             email: only the user with this exact email.
             name: only the Service account with this exact name.
+            role: only principals holding this role at any scope, directly
+                or through a group.
             limit: page size from 1 to 200; omitted, 100.
             after: the previous page's ``next``.
 
@@ -503,7 +535,8 @@ class Principals:
 
         Args:
             role: the custom role name.
-            request: the operations the role bundles.
+            request: the operations the role bundles and its optional
+                description.
 
         Raises:
             WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is

@@ -81,8 +81,11 @@ export interface AccessSummary {
 
 /**
  * How a User account authenticates.
+ *
+ * Read from the account's stored credential and linked identity, never
+ * inferred from its email address.
  */
-export type AccountAuthentication = "password" | "sso";
+export type AccountAuthentication = "password" | "google" | "github" | "sso";
 
 /**
  * A data-producing step action. Actions read and compute only.
@@ -1599,14 +1602,25 @@ export type CurrencyCode = string;
 /**
  * Response of `GET /v1/principals/me`: the calling User's safe profile.
  *
- * Derived from the verified caller and current User state; never an email,
- * password verifier, provider subject, session identifier or key secret.
+ * Derived from the verified caller and current User state. It carries the
+ * caller's own email and display name, never another principal's email,
+ * and never a password verifier, provider subject, session identifier or key
+ * secret.
  */
 export interface CurrentUserProfile {
   /**
    * How the account authenticates, independent of this request's credential.
    */
   readonly authentication: AccountAuthentication;
+  /**
+   * The identity provider's name for the caller, refreshed at each sign-in
+   * that supplies one; `null` for a password account. Not user-editable.
+   */
+  readonly display_name: string | null;
+  /**
+   * The caller's own email; `null` when the account has none.
+   */
+  readonly email: string | null;
   /**
    * Sorted, distinct caller-effective `resource:action` names;
    * informational only, never authority.
@@ -5443,6 +5457,11 @@ export type PrincipalKindTag = "global_admin" | "tenant_admin" | "user" | "servi
  */
 export interface PrincipalPage {
   /**
+   * Status counts for the query's filters, independent of `limit` and
+   * `after`.
+   */
+  readonly counts: PrincipalStatusCounts;
+  /**
    * Cursor for the next page, present only when one may exist.
    */
   readonly next: PrincipalId | null;
@@ -5476,6 +5495,11 @@ export interface PrincipalQuery {
    * Exact account name: a Service's name or a local User's username.
    */
   readonly name?: string | null;
+  /**
+   * Role name: principals holding it at any scope, directly or through a
+   * Group.
+   */
+  readonly role?: string | null;
 }
 
 /**
@@ -5485,9 +5509,33 @@ export interface PrincipalQuery {
 export type PrincipalStatus = "active" | "suspended";
 
 /**
+ * How many principals matching a `GET /v1/principals` query are in each
+ * status, across every page.
+ */
+export interface PrincipalStatusCounts {
+  /**
+   * Active principals.
+   */
+  readonly active: number;
+  /**
+   * Suspended principals.
+   */
+  readonly suspended: number;
+}
+
+/**
  * One assignable principal in a `GET /v1/principals` page.
  */
 export interface PrincipalSummary {
+  /**
+   * How a User signs in; `null` for a Service.
+   */
+  readonly authentication: AccountAuthentication | null;
+  /**
+   * A User's provider-sourced display name; `null` for a Service or a
+   * password User. Label a person by display name, else name, else email.
+   */
+  readonly display_name: string | null;
   /**
    * Email, for users.
    */
@@ -5505,6 +5553,11 @@ export interface PrincipalSummary {
    * Durable principal id.
    */
   readonly principal_id: PrincipalId;
+  /**
+   * The distinct Roles the account holds, each at its scope, directly or
+   * through a Group; ordered by role.
+   */
+  readonly roles: readonly ScopedRoleAssignment[];
   /**
    * Lifecycle status.
    */
@@ -6239,6 +6292,10 @@ export interface PullRequestRef {
  * Request to create or replace a custom role's operations.
  */
 export interface PutRoleRequest {
+  /**
+   * One-line summary; omitted or `null` clears it.
+   */
+  readonly description?: string | null;
   /**
    * Operations from the closed catalog; never empty.
    */
@@ -7280,9 +7337,19 @@ export interface RoleView {
    */
   readonly builtin: boolean;
   /**
+   * One-line summary: server-set for a built-in role, administrator-set
+   * for a custom role; `null` when it has none.
+   */
+  readonly description: string | null;
+  /**
    * Role id.
    */
   readonly id: string;
+  /**
+   * Distinct Users and Service accounts holding the role at any scope,
+   * directly or through a Group, each counted once.
+   */
+  readonly member_count: number;
   /**
    * Role name.
    */

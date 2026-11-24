@@ -18,6 +18,9 @@ pub const NS_BUILTIN_ROLE: Uuid = Uuid::from_u128(0x6ad8_2377_3a8f_5f42_9d17_a9f
 pub struct BuiltinRole {
     /// Stable, read-only role name.
     pub name: &'static str,
+    /// Server-set, read-only one-line summary seeded into
+    /// `wyrd.auth_roles.description`.
+    pub description: &'static str,
     /// Operations seeded into `wyrd.auth_roles.permissions`.
     pub operations: &'static [Operation],
 }
@@ -100,26 +103,32 @@ const AUDITOR: &[Operation] = &[op(Resource::Audit, Action::Read)];
 pub const BUILTIN_ROLES: &[BuiltinRole] = &[
     BuiltinRole {
         name: "admin",
+        description: "Everything, including people, sign-in and secrets",
         operations: &[op(Resource::Wildcard, Action::Wildcard)],
     },
     BuiltinRole {
         name: "editor",
+        description: "Write Cards and tables, run Verifiers, invoke the gateway and Operators",
         operations: EDITOR,
     },
     BuiltinRole {
         name: "workload",
+        description: "What a service account needs to run verification",
         operations: WORKLOAD,
     },
     BuiltinRole {
         name: "viewer",
+        description: "Read Cards, executions, artifacts and tables",
         operations: VIEWER,
     },
     BuiltinRole {
         name: "approver",
+        description: "Read Cards and approve Verifiers",
         operations: APPROVER,
     },
     BuiltinRole {
         name: "auditor",
+        description: "Read the audit log",
         operations: AUDITOR,
     },
 ];

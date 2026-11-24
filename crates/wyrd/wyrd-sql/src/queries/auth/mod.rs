@@ -7,6 +7,55 @@
 //! and reused statements under `queries/auth/sql/` and load them with SQLx's
 //! query-file macros.
 
+/// Users and Service accounts a tenant administrator can assign Roles to, in
+/// one shape. The tenant administrator and the internal `system` writer are
+/// absent: their authority is fixed and never re-assigned. Shared by the
+/// principal directory and Role member counts so both describe the same
+/// people.
+macro_rules! assignable_principals_union {
+    () => {
+        r"
+                SELECT u.id, 'user'::text AS kind, u.status, u.email,
+                       u.username AS name, u.display_name,
+                       (SELECT i.issuer FROM wyrd.auth_user_identities i
+                         WHERE i.data_tenant_id = u.data_tenant_id AND i.user_id = u.id
+                         ORDER BY i.created_at, i.issuer LIMIT 1) AS identity_issuer,
+                       NULL::text AS restriction_kind, NULL::text AS restriction_name
+                  FROM wyrd.auth_users u
+                 WHERE u.data_tenant_id = wyrd.current_tenant()
+                   AND u.status <> 'deleted'
+                UNION ALL
+                SELECT s.id, s.principal_kind AS kind, s.status, NULL::text AS email,
+                       s.name, NULL::text AS display_name, NULL::text AS identity_issuer,
+                       s.restriction_kind, s.restriction_name
+                  FROM wyrd.auth_service_accounts s
+                 WHERE s.data_tenant_id = wyrd.current_tenant()
+                   AND s.principal_kind = 'service'
+                   AND s.status <> 'deleted'
+        "
+    };
+}
+
+/// Ids of accounts holding a Role at any scope, directly or through a Group,
+/// for the Role rows `r` the predicate selects. Group bindings contribute
+/// each member once; a Group without members contributes nothing.
+macro_rules! role_holders {
+    ($role_predicate:literal) => {
+        concat!(
+            r"
+                SELECT COALESCE(b.user_id, b.service_account_id, m.user_id, m.service_account_id)
+                  FROM wyrd.auth_role_bindings b
+                  JOIN wyrd.auth_roles r
+                    ON r.data_tenant_id = b.data_tenant_id AND r.id = b.role_id
+                  LEFT JOIN wyrd.auth_group_memberships m
+                    ON m.data_tenant_id = b.data_tenant_id AND m.group_id = b.group_id
+                 WHERE b.data_tenant_id = wyrd.current_tenant()
+                   AND ",
+            $role_predicate
+        )
+    };
+}
+
 pub mod api_keys;
 pub mod authority;
 pub mod browser_sessions;
@@ -68,7 +117,8 @@ pub use login_state::{
     insert_github_login_state, insert_login_state, insert_social_login_state,
 };
 pub use principal_directory::{
-    AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,
+    AssignablePrincipalRow, PrincipalFilter, PrincipalStatusCountsRow, assignable_principal,
+    count_assignable_principals, list_assignable_principals,
 };
 pub use refresh_tokens::{
     consume_active_refresh, insert_human_refresh_token, lock_refresh_family, refresh_by_hash,
@@ -83,7 +133,8 @@ pub use role_bindings::{
     replace_idp_user_bindings,
 };
 pub use roles::{
-    RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,
+    RoleListRow, RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name,
+    roles_by_name, set_role_description,
 };
 pub use service_accounts::{
     ApiKeyLookupRow, ApiKeyOwner, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
@@ -102,9 +153,9 @@ pub use user_identities::{
     user_id_by_identity,
 };
 pub use users::{
-    LocalCredentialRow, UserRow, delete_user, first_local_user, insert_local_user, insert_user,
-    local_credential_by_username, local_credential_for_update, local_username, set_password_hash,
-    user_by_id,
+    LocalCredentialRow, UserProfileRow, UserRow, delete_user, first_local_user, insert_local_user,
+    insert_user, local_credential_by_username, local_credential_for_update, local_username,
+    refresh_display_name, set_password_hash, user_by_id, user_profile,
 };
 pub use workload_bindings::{
     WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,

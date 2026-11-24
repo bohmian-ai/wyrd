@@ -218,6 +218,80 @@ pub async fn local_username(
         .map(Option::flatten)
 }
 
+/// What a User's own profile and the principal directory show about a User.
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct UserProfileRow {
+    /// Canonical local username; `None` for an account without a password.
+    pub username: Option<String>,
+    /// The account's email.
+    pub email: Option<String>,
+    /// The identity provider's name for the person, from the latest sign-in
+    /// that supplied one.
+    pub display_name: Option<String>,
+    /// Issuer of the User's linked external identity, when it has one; the
+    /// server maps it to a sign-in method.
+    pub identity_issuer: Option<String>,
+}
+
+/// The profile of User `id`; `None` for an unknown id.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn user_profile(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<Option<UserProfileRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserProfileRow>(USER_PROFILE_SQL)
+        .bind(id)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// One User's profile columns; the identity issuer is the earliest linked
+/// identity's, since an account links at most one.
+const USER_PROFILE_SQL: &str = r"
+SELECT u.username, u.email, u.display_name,
+       (SELECT i.issuer FROM wyrd.auth_user_identities i
+         WHERE i.data_tenant_id = u.data_tenant_id AND i.user_id = u.id
+         ORDER BY i.created_at, i.issuer LIMIT 1) AS identity_issuer
+  FROM wyrd.auth_users u
+ WHERE u.data_tenant_id = wyrd.current_tenant()
+   AND u.id = $1
+";
+
+/// Record the identity provider's `name` for User `id` after a successful
+/// sign-in.
+///
+/// A missing or blank `name` leaves the stored value unchanged, so a provider
+/// that stops sending one never erases it. Not an authorization change: the
+/// tenant's authorization revision does not advance.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn refresh_display_name(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    name: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+    sqlx::query(REFRESH_DISPLAY_NAME_SQL)
+        .bind(id)
+        .bind(name)
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(())
+}
+
+const REFRESH_DISPLAY_NAME_SQL: &str = r"
+UPDATE wyrd.auth_users
+   SET display_name = $2, updated_at = now()
+ WHERE data_tenant_id = wyrd.current_tenant()
+   AND id = $1
+   AND display_name IS DISTINCT FROM $2
+";
+
 /// Replace User `id`'s password verifier and advance its password revision,
 /// which ends every local session bound to an earlier one; returns the new
 /// revision.

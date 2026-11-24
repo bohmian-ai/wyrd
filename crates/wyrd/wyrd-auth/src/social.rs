@@ -44,7 +44,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, SocialAnchor, SocialLoginState, consume_social_login_state,
     insert_social_login_state, insert_user, insert_user_identity, linked_identity,
-    local_credential_for_update,
+    local_credential_for_update, refresh_display_name,
 };
 use wyrd_sql::queries::platform::signup::{
     SignupAdmissionScope, SignupProof, admit_signup, attach_signup_contact, finish_signup_creation,
@@ -380,6 +380,15 @@ impl SocialSignIn {
                 })
             }
         }
+    }
+
+    /// The social provider whose identities are recorded under `issuer`;
+    /// `None` for any other issuer, such as a company identity provider.
+    #[must_use]
+    pub fn provider_for_issuer(&self, issuer: &str) -> Option<SocialProvider> {
+        SocialProvider::ALL
+            .into_iter()
+            .find(|provider| self.issuer(*provider) == issuer)
     }
 
     /// The issuer namespace `provider`'s identities are recorded under.
@@ -1065,6 +1074,9 @@ impl BrowserSessions {
                 (user_id, identity_id)
             }
         };
+        refresh_display_name(&mut conn, user_id, identity.name.as_deref())
+            .await
+            .map_err(store_error)?;
         let verified = self
             .issuer
             .verify(&mut conn, user_id, TenantGrant::OidcLogin)

@@ -23,10 +23,10 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{AccessGroupId, RoleBindingId};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    MembershipRow, RoleBindingRow, SubjectColumns, advance_authorization_revision, delete_group,
-    delete_group_membership, delete_role, delete_role_binding, insert_group,
+    MembershipRow, RoleBindingRow, RoleListRow, SubjectColumns, advance_authorization_revision,
+    delete_group, delete_group_membership, delete_role, delete_role_binding, insert_group,
     insert_group_membership, insert_role, insert_role_binding, list_group_memberships, list_groups,
-    list_role_bindings, list_roles, role_by_name,
+    list_role_bindings, list_roles, role_by_name, set_role_description,
 };
 
 use super::routes::{authorize, internal, invalid, require_assignable, summary, tenant_conn};
@@ -92,26 +92,39 @@ pub(crate) async fn list_access_roles(
     conn.commit().await.map_err(internal)?;
     let roles = rows
         .into_iter()
-        .map(|row| {
-            Ok(RoleView {
-                builtin: is_builtin(&row.name),
-                operations: serde_json::from_value(row.permissions).map_err(internal)?,
-                id: row.id,
-                name: row.name,
-            })
-        })
+        .map(role_view)
         .collect::<Result<_, WyrdErrorResponse>>()?;
     Ok(Json(RoleList { roles }))
 }
 
-/// Create or replace one custom role's operations.
+/// Longest custom role description, in characters.
+const ROLE_DESCRIPTION_MAX_CHARS: usize = 200;
+
+/// Project one listed role row onto its wire view.
+///
+/// # Errors
+/// Returns an internal error when the stored bundle or count is corrupt.
+fn role_view(row: RoleListRow) -> Result<RoleView, WyrdErrorResponse> {
+    Ok(RoleView {
+        builtin: is_builtin(&row.name),
+        operations: serde_json::from_value(row.permissions).map_err(internal)?,
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        member_count: u64::try_from(row.member_count).map_err(internal)?,
+    })
+}
+
+/// Create or replace one custom role's operations and description.
 ///
 /// Built-in roles are read-only. Every binding of the role follows the new
-/// bundle at the next authority confirmation.
+/// bundle at the next authority confirmation. An omitted description clears
+/// the stored one.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` for a malformed name, a built-in name,
-/// or an empty bundle, the RBAC denial without `*`, and an internal error.
+/// an empty bundle, or a description over 200 characters, the RBAC denial
+/// without `*`, and an internal error.
 #[utoipa::path(
     put,
     path = "/access/roles/{role}",
@@ -119,8 +132,8 @@ pub(crate) async fn list_access_roles(
     request_body = PutRoleRequest,
     responses(
         (status = 200, description = "The stored role", body = RoleView),
-        (status = 400, description = "Malformed or built-in name, or no operations \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "Malformed or built-in name, no operations, or a \
+          description over 200 characters (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 403, description = "Tenant administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 500, description = "A tenant store write failed (WYRD_SPEC_500_INTERNAL)",
@@ -146,6 +159,14 @@ pub(crate) async fn put_access_role(
     if request.operations.is_empty() {
         return Err(refused("a role needs at least one operation"));
     }
+    let description = request
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty());
+    if description.is_some_and(|text| text.chars().count() > ROLE_DESCRIPTION_MAX_CHARS) {
+        return Err(refused("a role description is at most 200 characters"));
+    }
     let id = role_by_name(&mut conn, &role)
         .await
         .map_err(internal)?
@@ -159,13 +180,17 @@ pub(crate) async fn put_access_role(
     )
     .await
     .map_err(internal)?;
+    set_role_description(&mut conn, id, description)
+        .await
+        .map_err(internal)?;
+    let stored = list_roles(&mut conn)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| internal("the stored role was not listed"))?;
     commit_change(conn).await?;
-    Ok(Json(RoleView {
-        id,
-        name: role,
-        operations: request.operations,
-        builtin: false,
-    }))
+    role_view(stored).map(Json)
 }
 
 /// Delete one custom role that no binding references.
@@ -223,6 +248,8 @@ pub(crate) async fn delete_access_role(
         name: row.name,
         operations: serde_json::from_value(row.permissions).map_err(internal)?,
         builtin: false,
+        description: row.description,
+        member_count: 0,
     }))
 }
 
@@ -746,7 +773,7 @@ pub(crate) async fn principal_access(
             permissions: compiled,
         });
     }
-    let summary = summary(row)?;
+    let summary = summary(&state, row)?;
     Ok(Json(AccessSummary {
         principal_id: PrincipalId::new(principal_id),
         kind,

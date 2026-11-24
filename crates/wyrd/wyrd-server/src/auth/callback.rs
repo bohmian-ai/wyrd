@@ -1146,6 +1146,7 @@ mod pg_tests {
             subject: subject.to_owned(),
             email: email.map(ToOwned::to_owned),
             groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+            name: None,
         }
     }
 

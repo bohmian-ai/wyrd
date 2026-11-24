@@ -243,26 +243,33 @@ impl Principals {
         to_python(py, &summary)
     }
 
-    /// One page of assignable principals matching exact filters, ordered by
-    /// id; pass a page's `next` as `after` to read the following page.
+    /// One page of assignable principals matching exact and Role filters,
+    /// ordered by id, with status counts across every page; pass a page's
+    /// `next` as `after` to read the following page.
     ///
     /// # Errors
     /// Raises `WyrdError` when a filter does not match the wire contract, the
     /// caller lacks `service_accounts:write`, or the request fails.
-    #[pyo3(signature = (*, kind=None, email=None, name=None, limit=None, after=None))]
+    #[pyo3(signature = (*, kind=None, email=None, name=None, role=None, limit=None, after=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each keyword is one `PrincipalQuery` field, the Python projection of its query string."
+    )]
     fn list(
         &self,
         py: Python<'_>,
         kind: Option<&str>,
         email: Option<&str>,
         name: Option<&str>,
+        role: Option<&str>,
         limit: Option<u32>,
         after: Option<&str>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let query: PrincipalQuery = decode(
             "query",
             serde_json::json!({
-                "kind": kind, "email": email, "name": name, "limit": limit, "after": after,
+                "kind": kind, "email": email, "name": name, "role": role, "limit": limit,
+                "after": after,
             }),
         )?;
         let page = crate::trace::block_on(py, self.handle(py)?.list(&query))?;

@@ -24,10 +24,10 @@ pub use wyrd_spec::auth::{
     CredentialListResponse, CredentialMetadata, CurrentUserProfile, GrantSource, GroupList,
     GroupMember, GroupView, InvitationDelivery, IssuedCredential, IssuedUserInvitation,
     IssuedUserInvitations, Operation, PermissionScope, PrincipalId, PrincipalKindTag,
-    PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalSummary, PutRoleRequest,
-    RevokePrincipalRequest, RoleBindingList, RoleBindingQuery, RoleBindingView, RoleList,
-    RoleSource, RoleView, ScopedRoleAssignment, SecretBearer, WorkloadFamily, WorkloadKind,
-    WorkloadRestriction,
+    PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalStatusCounts, PrincipalSummary,
+    PutRoleRequest, RevokePrincipalRequest, RoleBindingList, RoleBindingQuery, RoleBindingView,
+    RoleList, RoleSource, RoleView, ScopedRoleAssignment, SecretBearer, WorkloadFamily,
+    WorkloadKind, WorkloadRestriction,
 };
 pub use wyrd_spec::error::WyrdError;
 pub use wyrd_spec::ids::{AccessGroupId, RoleBindingId};

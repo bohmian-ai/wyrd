@@ -25,12 +25,17 @@ pub struct MappedClaims {
     pub email: Option<String>,
     /// Groups or roles extracted from the token (input to RBAC resolution).
     pub groups: Vec<String>,
+    /// The person's name, from the standard top-level `name` claim (or a
+    /// GitHub profile), when the provider sends a nonblank one. Display only;
+    /// never identity or authority.
+    pub name: Option<String>,
 }
 
 /// Extract and normalize claims from a verified token payload.
 ///
 /// Applies the [`ClaimMapping`] to the raw JSON claims object. The `subject`
-/// claim is required; `email` and `groups` are optional.
+/// claim is required; `email` and `groups` are optional. `name` is always the
+/// standard top-level OIDC `name` claim, kept when it is a nonblank string.
 ///
 /// # Errors
 /// Returns [`OidcError::ClaimMissing`] when the `subject` path resolves to
@@ -55,10 +60,18 @@ pub fn map_claims(
         .and_then(|path| extract_string_array(claims, path))
         .unwrap_or_default();
 
+    let name = claims
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+
     Ok(MappedClaims {
         subject,
         email,
         groups,
+        name,
     })
 }
 
@@ -198,15 +211,18 @@ mod tests {
             subject: "u".to_owned(),
             email: None,
             groups: vec![],
+            name: None,
         };
         let MappedClaims {
             subject,
             email,
             groups,
+            name,
         } = mc;
         assert_eq!(subject, "u");
         assert!(email.is_none());
         assert!(groups.is_empty());
+        assert!(name.is_none());
     }
 
     #[test]
@@ -219,7 +235,28 @@ mod tests {
             subject: "x".to_owned(),
             email: None,
             groups: vec![],
+            name: None,
         };
         assert_only_external_fields(&mc);
+    }
+
+    #[test]
+    fn name_is_the_trimmed_standard_claim_when_nonblank() {
+        let mapping = ClaimMapping {
+            subject: ClaimPath::new("sub"),
+            email: None,
+            groups: None,
+        };
+        let named =
+            map_claims(&mapping, &json!({ "sub": "u1", "name": " Ada L. " })).expect("claims map");
+        assert_eq!(named.name.as_deref(), Some("Ada L."));
+        for claims in [
+            json!({ "sub": "u1" }),
+            json!({ "sub": "u1", "name": "  " }),
+            json!({ "sub": "u1", "name": 7 }),
+        ] {
+            let mapped = map_claims(&mapping, &claims).expect("claims map");
+            assert!(mapped.name.is_none(), "{claims}");
+        }
     }
 }

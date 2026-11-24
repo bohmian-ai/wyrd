@@ -25,10 +25,11 @@ use uuid::Uuid;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    Attribution, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CreateUserCredentialRequest, CredentialListQuery, CredentialListResponse, CredentialMetadata,
-    IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery,
-    PrincipalStatus, PrincipalSummary, SecretBearer, WorkloadFamily, WorkloadRestriction,
+    AccountAuthentication, Attribution, CreateServicePrincipalRequest,
+    CreateServicePrincipalResponse, CreateUserCredentialRequest, CredentialListQuery,
+    CredentialListResponse, CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag,
+    PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalStatusCounts, PrincipalSummary,
+    SecretBearer, SocialProvider, WorkloadFamily, WorkloadRestriction,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditOutcome;
@@ -36,9 +37,9 @@ use wyrd_sql::SqlError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyMetadataRow, AssignablePrincipalRow, PrincipalFilter, SubjectColumns,
-    assignable_principal, credential_belongs_to, insert_api_key, insert_service_account,
-    list_api_key_metadata, list_assignable_principals, revoke_api_key, service_account_by_id,
-    set_workload_restriction, user_by_id,
+    assignable_principal, count_assignable_principals, credential_belongs_to, insert_api_key,
+    insert_service_account, list_api_key_metadata, list_assignable_principals, revoke_api_key,
+    service_account_by_id, set_workload_restriction, user_by_id,
 };
 
 use super::accounts::{credential_page, is_principal_admin, is_self, mint_user_credential};
@@ -766,8 +767,10 @@ fn not_found() -> WyrdErrorResponse {
 /// Discover the tenant's assignable principals.
 ///
 /// Lists users and Service and Agent principals that are not deleted, ordered
-/// by id, with exact-match filters and keyset paging. The tenant
-/// administrator and the internal `system` writer are never listed.
+/// by id, with exact-match and Role filters and keyset paging, plus status
+/// counts over every page the filters match. Each item carries its display
+/// name, sign-in method and scoped Roles. The tenant administrator and the
+/// internal `system` writer are never listed.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` for a malformed query, a page size
@@ -832,10 +835,14 @@ async fn list_principals(
         kind: query.kind.as_ref().map(PrincipalKindTag::as_str),
         email: query.email.as_deref(),
         name: query.name.as_deref(),
+        role: query.role.as_deref(),
         after: query.after.map(|after| after.as_uuid()),
     };
-    // One row past the page says whether another page exists without a count.
+    // One row past the page says whether another page exists.
     let mut rows = list_assignable_principals(&mut conn, filter, i64::from(limit) + 1)
+        .await
+        .map_err(internal)?;
+    let counts = count_assignable_principals(&mut conn, filter)
         .await
         .map_err(internal)?;
     conn.commit().await.map_err(internal)?;
@@ -843,14 +850,22 @@ async fn list_principals(
     rows.truncate(limit as usize);
     let principals = rows
         .into_iter()
-        .map(summary)
+        .map(|row| summary(&state, row))
         .collect::<Result<Vec<_>, _>>()?;
     let next = if more {
         principals.last().map(|last| last.principal_id)
     } else {
         None
     };
-    Ok(Json(PrincipalPage { principals, next }))
+    let count = |n: i64| u64::try_from(n).map_err(internal);
+    Ok(Json(PrincipalPage {
+        principals,
+        next,
+        counts: PrincipalStatusCounts {
+            active: count(counts.active)?,
+            suspended: count(counts.suspended)?,
+        },
+    }))
 }
 
 /// Replace one Service account's workload restriction.
@@ -943,7 +958,7 @@ pub(crate) async fn set_workload_restriction_for(
             .await
             .map_err(|error| restriction_write_error(error, family))?;
         let (row, _) = require_assignable(&mut conn, principal_id).await?;
-        let summary = summary(row)?;
+        let summary = summary(state, row)?;
         conn.commit().await.map_err(internal)?;
         Ok(summary)
     }
@@ -1002,25 +1017,65 @@ pub(super) async fn require_assignable(
 /// # Errors
 /// Returns an internal error for a stored kind or status the directory query
 /// cannot produce.
-pub(super) fn summary(row: AssignablePrincipalRow) -> Result<PrincipalSummary, WyrdErrorResponse> {
+pub(super) fn summary(
+    state: &AppState,
+    row: AssignablePrincipalRow,
+) -> Result<PrincipalSummary, WyrdErrorResponse> {
     let kind = assignable_kind(&row.kind)?;
     let status = match row.status.as_str() {
         "active" => PrincipalStatus::Active,
         "suspended" => PrincipalStatus::Suspended,
         other => return Err(internal(format!("unexpected principal status {other:?}"))),
     };
-    let workload_restriction = match kind {
-        PrincipalKindTag::Service => Some(row.workload_family().map_err(internal)?.into()),
-        _ => None,
+    let (workload_restriction, authentication) = match kind {
+        PrincipalKindTag::Service => (Some(row.workload_family().map_err(internal)?.into()), None),
+        _ => (
+            None,
+            Some(account_authentication(
+                state,
+                row.name.as_deref(),
+                row.identity_issuer.as_deref(),
+            )),
+        ),
     };
+    let roles = serde_json::from_value(row.roles).map_err(internal)?;
     Ok(PrincipalSummary {
         principal_id: PrincipalId::new(row.id),
         kind,
         status,
         email: row.email,
         name: row.name,
+        display_name: row.display_name,
+        authentication,
+        roles,
         workload_restriction,
     })
+}
+
+/// How a User signs in: its local password when it has a username, else the
+/// social provider whose issuer its linked identity names, else company SSO.
+///
+/// Read from stored credentials only, never from an email address.
+pub(super) fn account_authentication(
+    state: &AppState,
+    username: Option<&str>,
+    identity_issuer: Option<&str>,
+) -> AccountAuthentication {
+    if username.is_some() {
+        return AccountAuthentication::Password;
+    }
+    let provider = identity_issuer.and_then(|issuer| {
+        state
+            .auth
+            .social_sign_in
+            .as_ref()?
+            .provider_for_issuer(issuer)
+    });
+    match provider {
+        Some(SocialProvider::Google) => AccountAuthentication::Google,
+        Some(SocialProvider::Github) => AccountAuthentication::Github,
+        None => AccountAuthentication::Sso,
+    }
 }
 
 /// Decode an assignable principal's stored kind label.

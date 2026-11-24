@@ -167,20 +167,29 @@ pub struct CreateUserCredentialRequest {
 }
 
 /// How a User account authenticates.
+///
+/// Read from the account's stored credential and linked identity, never
+/// inferred from its email address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AccountAuthentication {
     /// A Wyrd-owned local username and password.
     Password,
-    /// The tenant's identity provider.
+    /// Google sign-in.
+    Google,
+    /// GitHub sign-in.
+    Github,
+    /// The tenant's company identity provider.
     Sso,
 }
 
 /// Response of `GET /v1/principals/me`: the calling User's safe profile.
 ///
-/// Derived from the verified caller and current User state; never an email,
-/// password verifier, provider subject, session identifier or key secret.
+/// Derived from the verified caller and current User state. It carries the
+/// caller's own email and display name, never another principal's email,
+/// and never a password verifier, provider subject, session identifier or key
+/// secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -196,6 +205,13 @@ pub struct CurrentUserProfile {
     /// Canonical local username; `null` for an SSO-only account.
     #[serde(default)]
     pub username: Option<String>,
+    /// The identity provider's name for the caller, refreshed at each sign-in
+    /// that supplies one; `null` for a password account. Not user-editable.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The caller's own email; `null` when the account has none.
+    #[serde(default)]
+    pub email: Option<String>,
     /// How the account authenticates, independent of this request's credential.
     pub authentication: AccountAuthentication,
     /// Sorted, distinct caller-effective `resource:action` names;
@@ -514,10 +530,34 @@ pub struct PrincipalSummary {
     /// for an SSO-only User.
     #[serde(default)]
     pub name: Option<String>,
+    /// A User's provider-sourced display name; `null` for a Service or a
+    /// password User. Label a person by display name, else name, else email.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// How a User signs in; `null` for a Service.
+    #[serde(default)]
+    pub authentication: Option<AccountAuthentication>,
+    /// The distinct Roles the account holds, each at its scope, directly or
+    /// through a Group; ordered by role.
+    pub roles: Vec<crate::auth::ScopedRoleAssignment>,
     /// The account's workload restriction: explicit for a Service, null for a
     /// User.
     #[serde(default)]
     pub workload_restriction: Option<WorkloadRestriction>,
+}
+
+/// How many principals matching a `GET /v1/principals` query are in each
+/// status, across every page.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalStatusCounts {
+    /// Active principals.
+    pub active: u64,
+    /// Suspended principals.
+    pub suspended: u64,
 }
 
 /// Response of `GET /v1/principals`.
@@ -530,6 +570,9 @@ pub struct PrincipalPage {
     /// Cursor for the next page, present only when one may exist.
     #[serde(default)]
     pub next: Option<PrincipalId>,
+    /// Status counts for the query's filters, independent of `limit` and
+    /// `after`.
+    pub counts: PrincipalStatusCounts,
 }
 
 /// Query of `GET /v1/principals`: exact-match filters and keyset paging.
@@ -547,6 +590,10 @@ pub struct PrincipalQuery {
     /// Exact account name: a Service's name or a local User's username.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Role name: principals holding it at any scope, directly or through a
+    /// Group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Page size between 1 and 200; default 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 200))]

@@ -169,6 +169,13 @@ pub struct RoleView {
     pub operations: Vec<Operation>,
     /// Built-in roles are read-only.
     pub builtin: bool,
+    /// One-line summary: server-set for a built-in role, administrator-set
+    /// for a custom role; `null` when it has none.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Distinct Users and Service accounts holding the role at any scope,
+    /// directly or through a Group, each counted once.
+    pub member_count: u64,
 }
 
 /// Every role of the tenant.
@@ -187,6 +194,9 @@ pub struct RoleList {
 pub struct PutRoleRequest {
     /// Operations from the closed catalog; never empty.
     pub operations: Vec<Operation>,
+    /// One-line summary; omitted or `null` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// One optional local access group.
@@ -432,6 +442,9 @@ pub struct PutRoleArgs {
     pub role: String,
     /// Operations from the closed catalog; never empty.
     pub operations: Vec<Operation>,
+    /// One-line summary; omitted or `null` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// MCP input naming one custom role to delete.

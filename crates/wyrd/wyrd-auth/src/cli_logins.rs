@@ -1089,6 +1089,7 @@ mod pg_tests {
                 subject: "device-racer".to_owned(),
                 email: None,
                 groups: Vec::new(),
+                name: None,
             },
             "req-race",
         )

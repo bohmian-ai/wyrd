@@ -90,8 +90,8 @@ pub use tenant_principals::{
     CredentialListQuery, CredentialListResponse, CredentialMetadata, CredentialRevoked,
     CurrentUserArgs, CurrentUserProfile, INVITATION_RECIPIENTS_MAX, InvitationDelivery,
     IssuedCredential, IssuedUserInvitation, IssuedUserInvitations, IssuedUserPasswordReset,
-    ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalSummary,
-    RevokeCredentialArgs, RoleSource, SetWorkloadRestrictionArgs,
+    ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalStatusCounts,
+    PrincipalSummary, RevokeCredentialArgs, RoleSource, SetWorkloadRestrictionArgs,
     USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationList,
     UserInvitationView, UserPasswordResetView,
 };

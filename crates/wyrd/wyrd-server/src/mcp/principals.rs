@@ -522,6 +522,7 @@ impl WyrdMcpHandler {
                 let args: PutRoleArgs = parse_args(arguments, name)?;
                 let body = PutRoleRequest {
                     operations: args.operations,
+                    description: args.description,
                 };
                 project(
                     access::put_access_role(state(), caller, Ok(Path(args.role)), Ok(Json(body)))

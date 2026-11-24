@@ -32,20 +32,19 @@ use wyrd_auth::passwords::{
 };
 use wyrd_runtime::{Permission, PrincipalKind};
 use wyrd_spec::auth::{
-    AbsoluteUrl, AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,
-    CREDENTIAL_PAGE_MAX, CreateUserCredentialRequest, CreateUserInvitationRequest,
-    CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
-    CurrentUserProfile, InvitationDelivery, IssuedCredential, IssuedUserInvitation,
-    IssuedUserInvitations, IssuedUserPasswordReset, PrincipalId, PrincipalKindTag, SecretBearer,
-    Sha256Hex, USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS,
-    UserInvitationList, UserInvitationView, UserPasswordResetView,
+    AbsoluteUrl, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT, CREDENTIAL_PAGE_MAX,
+    CreateUserCredentialRequest, CreateUserInvitationRequest, CreateUserRequest, CreatedUser,
+    CredentialListQuery, CredentialListResponse, CurrentUserProfile, InvitationDelivery,
+    IssuedCredential, IssuedUserInvitation, IssuedUserInvitations, IssuedUserPasswordReset,
+    PrincipalId, PrincipalKindTag, SecretBearer, Sha256Hex, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
+    USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationList, UserInvitationView, UserPasswordResetView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    insert_user_api_key, local_username, page_api_key_metadata, pending_invitations,
-    record_invitation_delivery, revoke_invitation,
+    insert_user_api_key, page_api_key_metadata, pending_invitations, record_invitation_delivery,
+    revoke_invitation, user_profile,
 };
 
 use crate::audit;
@@ -353,21 +352,24 @@ pub(crate) async fn current_user_profile(
     }
     let tenant = tenant_slug(state, caller).await?;
     let mut conn = tenant_conn(state, caller).await?;
-    let username = local_username(&mut conn, caller.principal.id.as_uuid())
+    let profile = user_profile(&mut conn, caller.principal.id.as_uuid())
         .await
-        .map_err(internal)?;
+        .map_err(internal)?
+        .unwrap_or_default();
     conn.commit().await.map_err(internal)?;
     Ok(CurrentUserProfile {
         tenant,
         tenant_id: caller.data_tenant_id,
         principal_id: PrincipalId::new(caller.principal.id.as_uuid()),
         principal_kind: PrincipalKindTag::User,
-        authentication: if username.is_some() {
-            AccountAuthentication::Password
-        } else {
-            AccountAuthentication::Sso
-        },
-        username,
+        authentication: super::routes::account_authentication(
+            state,
+            profile.username.as_deref(),
+            profile.identity_issuer.as_deref(),
+        ),
+        username: profile.username,
+        display_name: profile.display_name,
+        email: profile.email,
         permissions: permission_names(
             &caller
                 .principal

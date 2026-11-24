@@ -105,6 +105,11 @@ impl ServerAuth {
                 self.token_exchange_settings.clone(),
                 Arc::clone(audit) as _,
             )
+            .with_operator(
+                self.human_connections
+                    .as_ref()
+                    .and_then(HumanConnections::operator_pool),
+            )
         })
     }
 

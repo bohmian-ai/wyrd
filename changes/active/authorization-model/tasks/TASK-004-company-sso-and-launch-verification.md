@@ -283,6 +283,52 @@ browser use and renewal across replicas, without method substitution or new
 grants. Reuse valid existing proof where correct; this is shipped-control
 correctness under REQ-012, not deferred self-service removal.
 
+Evidence (Rust/HTTP):
+
+- Selectors: scenario 1's runner with
+  `-E 'test(=platform_admin_e2e::company_sso::outage_replacement_and_recovery_keep_required_sso)'`
+  and `-E 'test(=platform_admin_e2e::company_sso::operator_method_disablement_ends_anchored_credentials)'`.
+- Outage/replacement/recovery:
+  - TDD VIOLATED: the enforcement came from scenarios 1–3, so the test had
+    no missing-behavior RED. Its only failure was contract-level: a read
+    showing `connection: null` could not be resubmitted (400). Fixed by
+    making `LoginPolicyChange.expected_connection` optional.
+  - GREEN, outage: company sign-in sets no session; the methods report and
+    password refusal are unchanged; the policy stays required.
+  - GREEN, independence: an API-key recovery session cannot disable. The
+    headless API key, platform login and another tenant's password method
+    keep working.
+  - GREEN, recovery: the existing recovery-key activation of a replacement
+    provider keeps the policy required. An in-flight old sign-in, old
+    company sessions and the old company refresh family are refused. The
+    same subject at the new issuer becomes a new User.
+  - GREEN, no Active connection: the policy stays required, `ready` is
+    false, no tenant method is offered, and a change gets 409
+    `no_active_connection`.
+- Operator method disablement (REQ-012 shipped-control regression):
+  - RED: a Google browser session stayed live on a second replica after the
+    operator disabled Google. Diagnosis:
+    - Symptom: `live_on(replica, google)` returned true.
+    - Evidence: `BrowserSessions::authorize` maps `Social(_)` to a grant
+      without reading `platform.social_providers`. Nothing at use read
+      `login_settings.password_enabled` either.
+    - Cause: the provider revision and the password setting were checked
+      only at completion.
+    - Fix site: `TenantTokenIssuer::method_still_offered`, the issuer both
+      session use (`BrowserSessions::authorize`) and renewal/device
+      redemption (`issue_human_access`) route through. It is fed the
+      operator pool via `with_operator` from `ServerAuth::tenant_issuer`.
+    - Other callers checked: `RefreshTokens` and `CliLogins` reach it
+      through `issue_human_session`.
+  - GREEN: disabling Google ends the Google session on the replica.
+    Disabling password ends the password session and refuses its refresh
+    family. The company session is unaffected. Pending-completion refusal on
+    provider disable/replace stays proven by
+    `platform_admin_e2e::google_proves_a_bound_login_without_admitting_a_stranger`
+    (step 6).
+- Regressions: `-E 'test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/)'`
+  passed 113; `-p wyrd-auth` passed 142.
+
 ### 6. Setup, invitation and signup outputs reach the actual clients
 
 Maps to REQ-002/004/005/011–014/017–020; AC-004/005/007–015. Use the real setup,

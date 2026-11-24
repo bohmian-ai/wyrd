@@ -33,16 +33,17 @@ use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditDelegationStep;
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
-use wyrd_sql::queries::auth::login_policy;
 use wyrd_sql::queries::auth::{
     ApiKeyOwner, api_key_owner, human_connection_is_active, insert_human_refresh_token,
     local_credential_for_update, lock_human_connection_slot, lock_refresh_family,
     refresh_issuance_instant, service_account_by_id, user_by_id,
 };
+use wyrd_sql::queries::auth::{SocialAnchor, login_policy};
+use wyrd_sql::queries::platform::social::{login_settings, social_provider};
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
 use wyrd_sql::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
-use wyrd_sql::{SqlError, TenantConn};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
 use crate::authority::{AuthorityError, TenantAuthority};
@@ -572,6 +573,10 @@ pub struct TenantTokenIssuer {
     settings: TokenExchangeSettings,
     /// Process audit stage every grant decision is staged on.
     audit: Arc<dyn AuditStage>,
+    /// Platform store holding the operator's password and social provider
+    /// settings; `None` when the deployment has none, so no social
+    /// credential exists and password sign-in keeps its default.
+    operator: Option<OperatorPool>,
 }
 
 impl std::fmt::Debug for TenantTokenIssuer {
@@ -595,7 +600,48 @@ impl TenantTokenIssuer {
             issuing_key,
             settings,
             audit,
+            operator: None,
         }
+    }
+
+    /// This issuer, rechecking the operator's method settings in `operator`
+    /// whenever a password or social credential is used or renewed.
+    #[must_use]
+    pub fn with_operator(mut self, operator: Option<OperatorPool>) -> Self {
+        self.operator = operator;
+        self
+    }
+
+    /// Whether the operator still offers the method a credential was created
+    /// through: password sign-in for `password`, and exactly the enabled
+    /// provider revision for `social`. A credential of a method no longer
+    /// offered is refused at use and renewal; it never switches methods.
+    ///
+    /// # Errors
+    /// Returns [`IssuanceError::Wyrd`] when the platform store fails.
+    pub async fn method_still_offered(
+        &self,
+        password: bool,
+        social: Option<SocialAnchor>,
+    ) -> Result<bool, IssuanceError> {
+        let Some(operator) = &self.operator else {
+            return Ok(true);
+        };
+        if password
+            && !login_settings(operator)
+                .await
+                .map_err(store_error)?
+                .password_enabled
+        {
+            return Ok(false);
+        }
+        let Some(anchor) = social else {
+            return Ok(true);
+        };
+        Ok(social_provider(operator, anchor.provider.as_str())
+            .await
+            .map_err(store_error)?
+            .is_some_and(|row| row.enabled && row.revision == anchor.provider_revision))
     }
 
     /// The process audit stage shared by every grant built on this issuer.
@@ -1051,8 +1097,9 @@ impl TenantTokenIssuer {
     /// A provider anchor then takes the tenant's connection slot lock — the
     /// lock every connection lifecycle mutation takes — and requires that
     /// exact revision to still be Active. A local anchor locks the User's
-    /// password row and requires its revision unchanged and the tenant not to
-    /// require company SSO, so a password change or reset, or a policy change,
+    /// password row and requires its revision unchanged, the tenant not to
+    /// require company SSO and the operator to still offer password sign-in,
+    /// so a password change or reset, or a policy or setting change,
     /// committed on any replica cuts the session off.
     ///
     /// # Errors
@@ -1091,6 +1138,7 @@ impl TenantTokenIssuer {
                     && !login_policy::requires_company_sso(conn)
                         .await
                         .map_err(store_error)?
+                    && self.method_still_offered(true, None).await?
             }
         };
         if !current {

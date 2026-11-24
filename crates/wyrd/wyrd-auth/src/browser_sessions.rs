@@ -432,6 +432,16 @@ impl BrowserSessions {
                 (TenantGrant::OidcLogin, BrowserCredential::Social)
             }
         };
+        let (password, social) = match live.authority {
+            BrowserSessionAuthority::Password(_) => (true, None),
+            BrowserSessionAuthority::Social(anchor) => (false, Some(anchor)),
+            BrowserSessionAuthority::Connection(_) | BrowserSessionAuthority::ApiKey(_) => {
+                (false, None)
+            }
+        };
+        if !self.issuer.method_still_offered(password, social).await? {
+            return Err(IssuanceError::ConnectionInactive.into());
+        }
         let verified = self.issuer.verify(conn, live.principal_id, grant).await?;
         Ok(BrowserSession {
             verified,

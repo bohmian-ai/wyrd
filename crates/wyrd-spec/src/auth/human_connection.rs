@@ -353,8 +353,10 @@ pub struct LoginPolicyChange {
     pub require_company_sso: bool,
     /// The policy revision the administrator read.
     pub expected_revision: u64,
-    /// The Active connection the administrator read.
-    pub expected_connection: LoginPolicyConnection,
+    /// The Active connection the administrator read, `None` when the read
+    /// showed none; a change without a current Active connection is always
+    /// a conflict.
+    pub expected_connection: Option<LoginPolicyConnection>,
 }
 
 /// Refuse a Human issuer on the workload trusted-issuer surfaces.

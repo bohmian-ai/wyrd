@@ -56,7 +56,7 @@ use wyrd_sql::queries::auth::{
     replace_human_candidate, stamp_human_candidate_tested,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow, HumanLoginAnchor};
-use wyrd_sql::{TenantConn, WyrdPostgres};
+use wyrd_sql::{OperatorPool, TenantConn, WyrdPostgres};
 
 use wyrd_runtime::audit::AuditStage;
 
@@ -193,6 +193,13 @@ impl HumanConnections {
     #[must_use]
     pub(crate) fn postgres(&self) -> &WyrdPostgres {
         &self.postgres
+    }
+
+    /// The platform store of the operator's login settings, when the
+    /// deployment has a cross-tenant role.
+    #[must_use]
+    pub fn operator_pool(&self) -> Option<OperatorPool> {
+        self.postgres.operator_pool()
     }
 
     /// Read the tenant's Active and Candidate connections as redacted views.
@@ -895,7 +902,7 @@ impl HumanConnections {
             )
             .await;
         }
-        if current != change.expected_connection {
+        if Some(current) != change.expected_connection {
             return commit_refusal(conn, policy_conflict("connection_changed")).await;
         }
         if u64::try_from(policy.revision).ok() != Some(change.expected_revision) {

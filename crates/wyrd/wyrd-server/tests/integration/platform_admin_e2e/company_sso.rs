@@ -19,7 +19,7 @@ use super::{
     BegunSocialLogin, PLATFORM_SIGNING_KEY, SOCIAL_HOST, authorization_query, begin_google,
     begin_social, body_json, enable_google, finish_google_session, identity_token_reply,
     initialize_platform_root, mount_platform_provider, platform_key_set, platform_session,
-    session_cookie, social_call, social_request,
+    session_cookie, set_google_enabled, social_call, social_request,
 };
 
 /// The tenant login-policy route.
@@ -48,6 +48,8 @@ struct Workspace {
     recovery_key: SecretString,
     /// A superuser pool for counting stored records.
     superuser: PgPool,
+    /// The deployment's platform root credential.
+    root: SecretString,
 }
 
 impl Workspace {
@@ -99,18 +101,19 @@ impl Workspace {
             google,
             admin,
             recovery_key,
+            root,
         };
-        workspace.activate_corp().await;
+        workspace.activate(&workspace.corp).await;
         workspace
     }
 
-    /// Stage the company connection (replacing any candidate), test it
-    /// through one company sign-in and activate it with the recovery key;
-    /// returns the Active view.
+    /// Stage a company connection to `provider` (replacing any candidate),
+    /// test it through one company sign-in and activate it with the recovery
+    /// key; returns the Active view.
     ///
     /// # Panics
     /// Panics when any step is refused.
-    async fn activate_corp(&self) -> Value {
+    async fn activate(&self, provider: &wiremock::MockServer) -> Value {
         let (_, listed) = self
             .bearer(Method::GET, "/v1/identity/oidc/connections", None)
             .await;
@@ -119,7 +122,7 @@ impl Workspace {
                 Method::PUT,
                 "/v1/identity/oidc/candidate",
                 Some(json!({
-                    "issuer": self.corp.uri(),
+                    "issuer": provider.uri(),
                     "client_id": CORP_CLIENT,
                     "client_auth": "Public",
                     "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
@@ -131,7 +134,7 @@ impl Workspace {
         assert_eq!(status, StatusCode::OK, "candidate stages: {candidate}");
         let revision = candidate["revision"].as_u64().expect("candidate revision");
         mount_platform_provider(
-            &self.corp,
+            provider,
             platform_key_set("corp-key"),
             wiremock::ResponseTemplate::new(500),
         )
@@ -145,10 +148,10 @@ impl Workspace {
             .await;
         assert_eq!(status, StatusCode::OK, "test begins: {begun}");
         let query = authorization_query(begun["authorization_url"].as_str().expect("url"));
-        self.answer_corp(&query["nonce"], "corp-tester", &[]).await;
+        answer(provider, &query["nonce"], "corp-tester", &[]).await;
         let resp = self
             .srv
-            .oneshot(self.callback_request(&query["state"], None))
+            .oneshot(callback_request(provider, &query["state"], None))
             .await
             .expect("callback responds");
         assert_eq!(resp.status(), StatusCode::OK, "the test sign-in completes");
@@ -166,50 +169,45 @@ impl Workspace {
         active
     }
 
-    /// Answer the next company token request with an ID token for `nonce`,
-    /// `subject` and `groups`.
-    async fn answer_corp(&self, nonce: &str, subject: &str, groups: &[&str]) {
-        mount_platform_provider(
-            &self.corp,
-            platform_key_set("corp-key"),
-            corp_token(&self.corp.uri(), nonce, subject, groups),
-        )
-        .await;
-    }
-
-    /// The common company callback for `state`, from a browser holding
-    /// `cookie` when given.
-    fn callback_request(&self, state: &str, cookie: Option<&str>) -> Request<Body> {
-        let issuer: String =
-            url::form_urlencoded::byte_serialize(self.corp.uri().as_bytes()).collect();
-        let mut builder = Request::builder()
-            .method(Method::GET)
-            .uri(format!(
-                "/auth/callback?code=corp-code&state={state}&iss={issuer}"
-            ))
-            .header(header::HOST, SOCIAL_HOST);
-        if let Some(cookie) = cookie {
-            builder = builder.header(header::COOKIE, cookie);
-        }
-        builder.body(Body::empty()).expect("request builds")
-    }
-
     /// Sign `subject` carrying `groups` in through company SSO from a fresh
     /// browser; returns the tenant session cookie pair.
     ///
     /// # Panics
     /// Panics when the sign-in does not set a session.
     async fn company_session(&self, subject: &str, groups: &[&str]) -> String {
-        let begun = begin_social(&self.srv, json!({ "tenant": self.slug })).await;
-        self.answer_corp(&begun.query["nonce"], subject, groups)
+        let begun = self.begin_company().await;
+        let (status, cookie) = self
+            .finish_company(&self.corp, &begun, subject, groups)
             .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "company sign-in");
+        cookie.expect("company sign-in sets a session")
+    }
+
+    /// Begin a company sign-in from a fresh browser.
+    async fn begin_company(&self) -> BegunSocialLogin {
+        begin_social(&self.srv, json!({ "tenant": self.slug })).await
+    }
+
+    /// Finish the company sign-in `begun` with `provider` answering as
+    /// `subject` carrying `groups`; returns the status and any session set.
+    async fn finish_company(
+        &self,
+        provider: &wiremock::MockServer,
+        begun: &BegunSocialLogin,
+        subject: &str,
+        groups: &[&str],
+    ) -> (StatusCode, Option<String>) {
+        answer(provider, &begun.query["nonce"], subject, groups).await;
         let resp = self
             .srv
-            .oneshot(self.callback_request(&begun.query["state"], Some(&begun.cookie)))
+            .oneshot(callback_request(
+                provider,
+                &begun.query["state"],
+                Some(&begun.cookie),
+            ))
             .await
             .expect("callback responds");
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "company sign-in");
-        session_cookie(&resp, &self.slug).expect("company sign-in sets a session")
+        (resp.status(), session_cookie(&resp, &self.slug))
     }
 
     /// Create a local password User holding `role` and sign them in;
@@ -347,6 +345,37 @@ impl Workspace {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
     }
+}
+
+/// Answer `provider`'s next token request with an ID token for `nonce`,
+/// `subject` and `groups`.
+async fn answer(provider: &wiremock::MockServer, nonce: &str, subject: &str, groups: &[&str]) {
+    mount_platform_provider(
+        provider,
+        platform_key_set("corp-key"),
+        corp_token(&provider.uri(), nonce, subject, groups),
+    )
+    .await;
+}
+
+/// The common callback for `state` naming `provider` as issuer, from a
+/// browser holding `cookie` when given.
+fn callback_request(
+    provider: &wiremock::MockServer,
+    state: &str,
+    cookie: Option<&str>,
+) -> Request<Body> {
+    let issuer: String = url::form_urlencoded::byte_serialize(provider.uri().as_bytes()).collect();
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/auth/callback?code=corp-code&state={state}&iss={issuer}"
+        ))
+        .header(header::HOST, SOCIAL_HOST);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    builder.body(Body::empty()).expect("request builds")
 }
 
 /// A browser `method` request to `uri` from the deployment origin, holding
@@ -1021,4 +1050,193 @@ async fn required_sso_ends_existing_credentials_and_disabling_revives_none() {
         StatusCode::OK,
         "a new password sign-in works"
     );
+}
+
+/// The methods report for the tenant `slug`.
+async fn methods_of(srv: &WyrdTestServer, slug: &str) -> Value {
+    let uri = format!("/auth/browser/methods?tenant={slug}");
+    body_json(
+        srv.oneshot(browser_request(Method::GET, &uri, None, None))
+            .await
+            .expect("methods respond"),
+    )
+    .await
+}
+
+/// Outage, replacement and recovery keep required company SSO and the
+/// tenant boundary:
+///   1. with the company provider down, company sign-in fails, the policy
+///      stays required and no password or social method appears;
+///   2. an API-key recovery session cannot disable it, while the
+///      headless administrator's API key and platform login keep working
+///      and another tenant still offers password sign-in;
+///   3. the existing recovery procedure activates a replacement provider
+///      with the recovery API key: the policy stays required, a sign-in
+///      begun against the old provider, old company sessions and refresh
+///      families are refused, and the same subject at the new provider is a
+///      new User, not the old one;
+///   4. with no Active connection the policy stays required, no tenant
+///      method is offered and a change is a conflict.
+///
+/// # Panics
+/// Panics when the policy weakens, a fallback appears, or an old
+/// credential survives replacement.
+#[tokio::test(flavor = "multi_thread")]
+async fn outage_replacement_and_recovery_keep_required_sso() {
+    let workspace = Workspace::start().await;
+    let member = workspace.company_session("corp-member", &[]).await;
+    let member_refresh = workspace.refresh_family(&member).await;
+    workspace.password_session("pat-admin", "admin").await;
+    workspace
+        .srv
+        .pg_fixture()
+        .seed_additional_tenant("company-sso-other")
+        .await
+        .expect("other tenant seeds");
+    let other_slug = "company-sso-other";
+    let (admin, enabled) = workspace.enable().await;
+    let in_flight = workspace.begin_company().await;
+    let company_only = methods_of(&workspace.srv, &workspace.slug).await;
+
+    // 1. Provider outage.
+    workspace.corp.reset().await;
+    let begun = workspace.begin_company().await;
+    let resp = workspace
+        .srv
+        .oneshot(callback_request(
+            &workspace.corp,
+            &begun.query["state"],
+            Some(&begun.cookie),
+        ))
+        .await
+        .expect("callback responds");
+    assert!(
+        session_cookie(&resp, &workspace.slug).is_none(),
+        "no company session during an outage"
+    );
+    assert_eq!(
+        methods_of(&workspace.srv, &workspace.slug).await,
+        company_only,
+        "no fallback during an outage"
+    );
+    let resp = workspace.password_login("pat-admin").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "no password fallback");
+    let (_, policy) = workspace.bearer(Method::GET, POLICY, None).await;
+    assert_eq!(policy["require_company_sso"], true, "{policy}");
+
+    // 2. Weaker proof, independent credentials and another tenant: the
+    //    headless API key still reads, the platform root still signs in.
+    let recovery = workspace.recovery_session().await;
+    let (status, refused) = workspace.change(&recovery, false, &enabled).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "recovery disable: {refused}");
+    platform_session(&workspace.srv, workspace.root.expose_secret()).await;
+    let other_methods = methods_of(&workspace.srv, other_slug).await;
+    assert_eq!(other_methods["password"], true, "{other_methods}");
+
+    // 3. Recovery activates a replacement provider.
+    let replacement = wiremock::MockServer::start().await;
+    let replaced = workspace.activate(&replacement).await;
+    let (_, policy) = workspace.bearer(Method::GET, POLICY, None).await;
+    assert_eq!(policy["require_company_sso"], true, "{policy}");
+    assert_eq!(policy["connection"]["id"], replaced["id"], "{policy}");
+    let (status, session) = workspace
+        .finish_company(&workspace.corp, &in_flight, "corp-member", &[])
+        .await;
+    assert!(session.is_none(), "old in-flight sign-in: {status}");
+    assert!(!workspace.live(&member).await, "old company session");
+    assert!(!workspace.live(&admin).await, "old company admin session");
+    let (status, _) = renew(&workspace.srv, &member_refresh).await;
+    assert_ne!(status, StatusCode::OK, "old company refresh family");
+    let users = workspace.users().await;
+    let begun = workspace.begin_company().await;
+    let (status, session) = workspace
+        .finish_company(&replacement, &begun, "corp-member", &[])
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "replacement sign-in");
+    assert!(session.is_some());
+    assert_eq!(
+        workspace.users().await,
+        users + 1,
+        "a new User, not the old one"
+    );
+
+    // 4. No Active connection.
+    let (status, body) = workspace
+        .bearer(Method::POST, "/v1/identity/oidc/active/deactivate", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, policy) = workspace.bearer(Method::GET, POLICY, None).await;
+    assert_eq!(policy["require_company_sso"], true, "{policy}");
+    assert_eq!(policy["connection"], Value::Null, "{policy}");
+    assert_eq!(policy["ready"], false, "{policy}");
+    let methods = methods_of(&workspace.srv, &workspace.slug).await;
+    assert_eq!(methods["company_sso"], false, "{methods}");
+    assert_eq!(methods["password"], false, "{methods}");
+    let (status, refused) = workspace.change(&recovery, false, &policy).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["details"]["reason"], "no_active_connection");
+}
+
+/// Operator method controls end the credentials anchored to them on every
+/// replica, without switching methods:
+///   1. disabling Google ends a Google browser session;
+///   2. disabling password sign-in ends a password browser session and
+///      refuses its refresh family;
+///   3. company credentials are unaffected.
+///
+/// # Panics
+/// Panics when an anchored credential outlives its method.
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_method_disablement_ends_anchored_credentials() {
+    let workspace = Workspace::start().await;
+    let google = workspace.google_session("google-sam").await;
+    let password = workspace.password_session("pat-admin", "admin").await;
+    let password_refresh = workspace.refresh_family(&password).await;
+    let company = workspace.company_session("corp-member", &[]).await;
+    let replica = workspace
+        .srv
+        .start_replica(wyrd_testing::WyrdTestServerBuilder::default())
+        .await
+        .expect("replica boots");
+    let slug = workspace.slug.clone();
+    let operator = platform_session(&workspace.srv, workspace.root.expose_secret()).await;
+
+    // 1. Google.
+    let (_, listed) = social_call(
+        &workspace.srv,
+        social_request(
+            Method::GET,
+            "/platform/social/providers",
+            Some(&operator),
+            None,
+        ),
+    )
+    .await;
+    let revision = listed["providers"][0]["revision"]
+        .as_u64()
+        .expect("a Google revision");
+    set_google_enabled(&workspace.srv, &operator, revision, false).await;
+    assert!(!live_on(&replica, &slug, &google).await, "Google session");
+
+    // 2. Password.
+    let (status, body) = social_call(
+        &workspace.srv,
+        social_request(
+            Method::PUT,
+            "/platform/login-settings",
+            Some(&operator),
+            Some(json!({ "password_enabled": false, "signup_enabled": false })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "password disables: {body}");
+    assert!(
+        !live_on(&replica, &slug, &password).await,
+        "password session"
+    );
+    let (status, _) = renew(&replica, &password_refresh).await;
+    assert_ne!(status, StatusCode::OK, "password refresh family");
+
+    // 3. Company.
+    assert!(live_on(&replica, &slug, &company).await, "company session");
 }

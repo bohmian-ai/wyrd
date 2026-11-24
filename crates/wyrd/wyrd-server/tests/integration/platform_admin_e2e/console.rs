@@ -1031,6 +1031,151 @@ async fn removing_platform_oidc_ends_its_sessions_for_good() {
     assert_eq!(session_status(&srv, &kept).await, StatusCode::OK);
 }
 
+/// A token endpoint that answers each code exchange only when the journey
+/// releases it: every exchange is announced on `arrived`, then waits for the
+/// next body sent on `release`.
+struct HeldTokenEndpoint {
+    /// The token endpoint URL to advertise.
+    url: String,
+    /// One message per code exchange the endpoint has received.
+    arrived: tokio::sync::mpsc::UnboundedReceiver<()>,
+    /// Each body sent here answers the next held exchange.
+    release: tokio::sync::mpsc::UnboundedSender<Value>,
+}
+
+impl HeldTokenEndpoint {
+    /// Serve a held token endpoint on a free local port.
+    ///
+    /// # Panics
+    /// Panics when no local port can be bound.
+    async fn start() -> Self {
+        let (arrived_tx, arrived) = tokio::sync::mpsc::unbounded_channel();
+        let (release, bodies) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(bodies));
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let (arrived_tx, bodies) = (arrived_tx.clone(), std::sync::Arc::clone(&bodies));
+                async move {
+                    arrived_tx.send(()).expect("the journey is listening");
+                    let body = bodies
+                        .lock()
+                        .await
+                        .recv()
+                        .await
+                        .expect("the journey releases it");
+                    axum::Json(body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("token endpoint binds");
+        let url = format!(
+            "http://{}/token",
+            listener.local_addr().expect("bound address")
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Self {
+            url,
+            arrived,
+            release,
+        }
+    }
+}
+
+/// A callback already exchanging its code when the platform OIDC
+/// connection is removed and reinstalled cannot create a session:
+///   1. the callback's code exchange reaches the provider and is held there;
+///   2. the connection is removed and reinstalled at the same issuer;
+///   3. once the provider returns a valid token for the original login, the
+///      callback is refused, sets no platform cookie and leaves no live OIDC
+///      session;
+///   4. a fresh sign-in after the reinstall succeeds, and a password session
+///      and the API-token channel keep working.
+///
+/// # Panics
+/// Panics when the held callback signs in, or a preserved way in stops
+/// working.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_platform_oidc_refuses_a_callback_already_exchanging_its_code() {
+    let (srv, _root, api) = console_server().await;
+    let provider = wiremock::MockServer::start().await;
+    let issuer = provider.uri();
+    let mut token = HeldTokenEndpoint::start().await;
+    super::mount_platform_discovery(&provider, super::platform_key_set("mock-1"), &token.url).await;
+    let token_for = |nonce: &str| {
+        super::identity_token_body(
+            &issuer,
+            nonce,
+            super::PLATFORM_CLIENT,
+            "mock-1",
+            "provider-subject-1",
+            "ops@example.com",
+            true,
+        )
+    };
+    configure_platform_oidc(&srv, &api, &issuer).await;
+    let (status, body) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/admins",
+            Some(&api),
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    register_password_operator(&srv, &api, "keeper").await;
+    let kept = signed_in(&srv, "keeper", OPERATOR_PASSWORD).await;
+
+    // 1–3. Removal and reinstall land while the provider holds the answer.
+    let held = begin_oidc(&srv).await;
+    let cookies = [held.binding.as_str()];
+    let (reply, ()) = tokio::join!(oidc_callback(&srv, &cookies, &held.state, &issuer), async {
+        token
+            .arrived
+            .recv()
+            .await
+            .expect("the code exchange arrives");
+        remove_platform_oidc(&srv, &api).await;
+        configure_platform_oidc(&srv, &api, &issuer).await;
+        token
+            .release
+            .send(token_for(&held.nonce))
+            .expect("endpoint waits");
+    });
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert!(reply.cookie(PLATFORM_COOKIE).is_none());
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.browser_sessions
+          WHERE connection_revision IS NOT NULL AND revoked_at IS NULL",
+    )
+    .fetch_one(srv.operator_pool().pool())
+    .await
+    .expect("sessions count");
+    assert_eq!(live, 0, "the held callback left no OIDC session");
+
+    // 4. A fresh sign-in, the password session and the API token still work.
+    let begun = begin_oidc(&srv).await;
+    token
+        .release
+        .send(token_for(&begun.nonce))
+        .expect("endpoint waits");
+    let reply = oidc_callback(&srv, &[&begun.binding], &begun.state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let fresh = reply.cookie(PLATFORM_COOKIE).expect("platform cookie");
+    assert_eq!(session_status(&srv, &fresh).await, StatusCode::OK);
+    assert_eq!(session_status(&srv, &kept).await, StatusCode::OK);
+    let (status, body) = social_call(
+        &srv,
+        social_request(Method::GET, "/platform/tenants", Some(&api), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// Make the session `cookie` names hold no fresh proof, as if its last
 /// sign-in or re-authentication were six minutes ago.
 ///

@@ -235,12 +235,13 @@ pub async fn resolve_platform_browser_session(
 }
 
 /// Record fresh human authentication on live session `id` of principal
-/// `principal_id`. Returns whether a live session was refreshed.
+/// `principal_id` on the caller's operator transaction, so it commits with
+/// the proof that earned it. Returns whether a live session was refreshed.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
 pub async fn refresh_platform_browser_session(
-    pool: &OperatorPool,
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     principal_id: Uuid,
 ) -> Result<bool, SqlError> {
@@ -253,7 +254,7 @@ pub async fn refresh_platform_browser_session(
     )
     .bind(id)
     .bind(principal_id)
-    .execute(pool.pool())
+    .execute(&mut **conn.transaction())
     .await
     .map(|done| done.rows_affected() == 1)
     .map_err(SqlError::from)

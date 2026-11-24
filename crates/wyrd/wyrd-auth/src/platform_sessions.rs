@@ -30,7 +30,7 @@ use wyrd_sql::queries::platform::console::{
 };
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::queries::platform::identity::{
-    pin_platform_identity, platform_identity_by_subject, platform_identity_by_subject_tx,
+    finish_platform_login_state_tx, pin_platform_identity, platform_identity_by_subject_tx,
 };
 use wyrd_sql::queries::platform::principals::{
     PlatformPrincipalRow, platform_principal_by_id, platform_principal_by_id_tx,
@@ -402,18 +402,23 @@ impl PlatformSessions {
 
     /// Sign the platform principal a federated login just verified in to a
     /// new browser session anchored to connection revision
-    /// `connection_revision`.
+    /// `connection_revision`, finishing the claimed login state
+    /// `login_state`.
     ///
-    /// Resolving or first-pinning the identity and creating the session
-    /// commit together, as [`Self::issue_federated`] does for a token.
+    /// Finishing the login, resolving or first-pinning the identity and
+    /// creating the session commit together, as [`Self::issue_federated`]
+    /// does for a token. Finishing comes first, so a connection removed while
+    /// the provider was answering has already deleted the login, or waits for
+    /// this commit and then revokes the session.
     ///
     /// # Errors
-    /// Returns [`PlatformSessionError::Invalid`] when no active registration
-    /// matches, or the connection was replaced since the login began, and
-    /// [`PlatformSessionError::Store`] when the store fails.
-    #[tracing::instrument(level = "debug", skip(self), err)]
+    /// Returns [`PlatformSessionError::Invalid`] when the login is gone, no
+    /// active registration matches, or the connection was replaced since the
+    /// login began, and [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip(self, login_state), err)]
     pub async fn browser_federated(
         &self,
+        login_state: &str,
         issuer: &str,
         subject: &str,
         match_claim: Option<&str>,
@@ -421,6 +426,9 @@ impl PlatformSessions {
         request_id: &str,
     ) -> Result<CreatedPlatformBrowserSession, PlatformSessionError> {
         let mut conn = self.pool.begin_platform_audited().await?;
+        if !finish_platform_login_state_tx(&mut conn, login_state).await? {
+            return Err(PlatformSessionError::Invalid);
+        }
         let principal = federated_principal(&mut conn, issuer, subject, match_claim).await?;
         self.create_browser(
             conn,
@@ -529,28 +537,36 @@ impl PlatformSessions {
         if !matched {
             return Err(PlatformSessionError::Invalid);
         }
-        self.refresh_browser(session).await
+        Self::refresh_browser(self.pool.begin_platform_audited().await?, session).await
     }
 
     /// Record fresh proof on `session` after the platform IdP freshly
     /// authenticated `subject` at `issuer`, which must be the identity
-    /// already pinned to the session's own principal. Re-authentication never
-    /// pins: an unpinned or another operator's identity refreshes nothing.
+    /// already pinned to the session's own principal, finishing the claimed
+    /// login state `login_state`. Re-authentication never pins: an unpinned
+    /// or another operator's identity refreshes nothing. Finishing the login
+    /// and the refresh commit together, so a connection removed meanwhile
+    /// either deleted the login first or revokes the refreshed session after.
     ///
     /// # Errors
-    /// Returns [`PlatformSessionError::Invalid`] when the identity is not the
-    /// session principal's or the session is no longer live, and
-    /// [`PlatformSessionError::Store`] when the store fails.
-    #[tracing::instrument(level = "debug", skip(self, session), err)]
+    /// Returns [`PlatformSessionError::Invalid`] when the login is gone, the
+    /// identity is not the session principal's or the session is no longer
+    /// live, and [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip(self, login_state, session), err)]
     pub async fn reauthenticate_federated(
         &self,
+        login_state: &str,
         session: &PlatformBrowserSession,
         issuer: &str,
         subject: &str,
     ) -> Result<(), PlatformSessionError> {
-        match platform_identity_by_subject(&self.pool, issuer, subject).await? {
+        let mut conn = self.pool.begin_platform_audited().await?;
+        if !finish_platform_login_state_tx(&mut conn, login_state).await? {
+            return Err(PlatformSessionError::Invalid);
+        }
+        match platform_identity_by_subject_tx(&mut conn, issuer, subject).await? {
             Some(identity) if identity.principal_id == session.principal_id.as_uuid() => {
-                self.refresh_browser(session).await
+                Self::refresh_browser(conn, session).await
             }
             _ => Err(PlatformSessionError::Invalid),
         }
@@ -567,22 +583,23 @@ impl PlatformSessions {
         Ok(purge_ended_platform_browser_sessions(&self.pool, BROWSER_PURGE_BATCH).await?)
     }
 
-    /// Record fresh proof on `session`, which must still be live.
+    /// Record fresh proof on `session`, which must still be live, on `conn`
+    /// and commit it with whatever else `conn` holds.
     ///
     /// # Errors
     /// Returns [`PlatformSessionError::Invalid`] when the session is no
     /// longer live and [`PlatformSessionError::Store`] when the store fails.
     async fn refresh_browser(
-        &self,
+        mut conn: TenantConn<'_>,
         session: &PlatformBrowserSession,
     ) -> Result<(), PlatformSessionError> {
-        if refresh_platform_browser_session(&self.pool, session.id, session.principal_id.as_uuid())
+        if !refresh_platform_browser_session(&mut conn, session.id, session.principal_id.as_uuid())
             .await?
         {
-            Ok(())
-        } else {
-            Err(PlatformSessionError::Invalid)
+            return Err(PlatformSessionError::Invalid);
         }
+        conn.commit().await?;
+        Ok(())
     }
 
     /// Stage the one canonical grant record for a platform session.

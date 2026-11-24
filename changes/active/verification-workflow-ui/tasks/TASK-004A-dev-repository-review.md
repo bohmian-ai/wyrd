@@ -1,7 +1,7 @@
 ---
 id: TASK-004A
 kind: implementation
-status: proposed
+status: complete
 spec: SPEC-verification-workflow-ui
 spec_revision: 5
 requirements: [REQ-010, REQ-011, REQ-013, REQ-016, REQ-017, AC-006, AC-009, AC-011]

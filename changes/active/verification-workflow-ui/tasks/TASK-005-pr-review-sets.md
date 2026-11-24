@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 kind: implementation
-status: proposed
+status: complete
 spec: SPEC-verification-workflow-ui
 spec_revision: 8
 supporting_spec: SPEC-authorization-model

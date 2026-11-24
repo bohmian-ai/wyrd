@@ -1491,26 +1491,62 @@ fn identity_token_reply_with(
     email: &str,
     email_verified: bool,
 ) -> wiremock::ResponseTemplate {
+    signed_identity_reply(
+        kid,
+        &identity_claims(issuer, nonce, audience, subject, email, email_verified),
+    )
+}
+
+/// [`identity_token_reply`] carrying the standard `name` claim when `name`
+/// is given.
+fn identity_token_reply_named(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    name: Option<&str>,
+) -> wiremock::ResponseTemplate {
+    let mut claims = identity_claims(issuer, nonce, audience, subject, email, true);
+    if let Some(name) = name {
+        claims["name"] = json!(name);
+    }
+    signed_identity_reply(kid, &claims)
+}
+
+/// The ID-token claims a provider at `issuer` asserts for `subject`.
+fn identity_claims(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> Value {
     let now = chrono::Utc::now().timestamp();
+    json!({
+        "iss": issuer,
+        "sub": subject,
+        "aud": audience,
+        "exp": now + 3600,
+        "iat": now,
+        "nonce": nonce,
+        "email": email,
+        "email_verified": email_verified,
+    })
+}
+
+/// A token-endpoint reply whose ID token carries `claims`, signed under `kid`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn signed_identity_reply(kid: &str, claims: &Value) -> wiremock::ResponseTemplate {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     header.kid = Some(kid.to_owned());
     let key = jsonwebtoken::EncodingKey::from_ed_pem(PLATFORM_SIGNING_KEY.as_bytes())
         .expect("test key loads");
-    let id_token = jsonwebtoken::encode(
-        &header,
-        &json!({
-            "iss": issuer,
-            "sub": subject,
-            "aud": audience,
-            "exp": now + 3600,
-            "iat": now,
-            "nonce": nonce,
-            "email": email,
-            "email_verified": email_verified,
-        }),
-        &key,
-    )
-    .expect("token signs");
+    let id_token = jsonwebtoken::encode(&header, claims, &key).expect("token signs");
     wiremock::ResponseTemplate::new(200).set_body_json(json!({
         "access_token": "provider-access",
         "token_type": "Bearer",
@@ -7639,7 +7675,7 @@ async fn an_invited_person_enrolls_with_github_and_returns() {
     let before = local_records(&superuser).await;
     let (begun, (status, location, cookie)) = sign_in(
         Some(code_of(&issued)),
-        json!({ "id": 4242, "login": "ana-gh", "email": "ana@users.example" }),
+        json!({ "id": 4242, "login": "ana-gh", "name": "  ", "email": "ana@users.example" }),
     )
     .await;
     assert_eq!(begun.query["client_id"], "wyrd-github");
@@ -7702,18 +7738,47 @@ async fn an_invited_person_enrolls_with_github_and_returns() {
     assert_eq!(status, StatusCode::OK, "the invited scope: {body}");
     let (_, viewed) = browser_get(&srv, "/auth/browser/session", &cookie).await;
     assert_eq!(viewed["sessions"][0]["credential"], "social");
+    // A blank profile name falls back to the login, read back through `/me`
+    // and the directory as a GitHub sign-in.
+    let named = |cookie: String| {
+        let srv = &srv;
+        let admin = &admin;
+        async move {
+            let (status, me) = browser_get(srv, "/v1/principals/me", &cookie).await;
+            assert_eq!(status, StatusCode::OK, "profile reads: {me}");
+            let (_, page) = social_call(
+                srv,
+                social_request(
+                    Method::GET,
+                    "/v1/principals?email=ana@users.example",
+                    Some(admin),
+                    None,
+                ),
+            )
+            .await;
+            let item = &page["principals"][0];
+            assert_eq!(item["authentication"], "github");
+            assert_eq!(item["display_name"], me["display_name"]);
+            assert_eq!(me["authentication"], "github");
+            assert_eq!(me["email"], "ana@users.example");
+            me["display_name"].clone()
+        }
+    };
+    assert_eq!(named(cookie.clone()).await, json!("ana-gh"));
 
-    // 4. A renamed login with the same numeric ID returns to the same User.
+    // 4. A renamed login with the same numeric ID returns to the same User,
+    // whose profile name now replaces the stored one.
     let records = local_records(&superuser).await;
     let (_, (status, _, returned)) = sign_in(
         None,
-        json!({ "id": 4242, "login": "ana-renamed", "email": null }),
+        json!({ "id": 4242, "login": "ana-renamed", "name": "Ana Lima", "email": null }),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let returned = returned.expect("the returning sign-in sets a session");
     let (_, viewed) = browser_get(&srv, "/auth/browser/session", &returned).await;
     assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    assert_eq!(named(returned.clone()).await, json!("Ana Lima"));
     let after = local_records(&superuser).await;
     assert_eq!(
         (after.0, after.1, after.3),

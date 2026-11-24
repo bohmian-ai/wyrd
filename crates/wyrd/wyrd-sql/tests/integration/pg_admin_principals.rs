@@ -14,16 +14,22 @@ mod pg_tests {
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::{PgFixture, UnmigratedDatabase};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{Attribution, PrincipalKindTag, WorkloadFamily, WorkloadKind};
+    use wyrd_spec::auth::{
+        Attribution, PermissionScope, PrincipalId, PrincipalKindTag, RoleSource, WorkloadFamily,
+        WorkloadKind,
+    };
     use wyrd_spec::ids::CardName;
     use wyrd_sql::SqlError;
     use wyrd_sql::queries::auth::{
-        ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
-        delete_service_account, family_account_id, insert_api_key, insert_refresh_token,
-        insert_role, insert_service_account, insert_user, list_api_key_metadata,
-        list_role_bindings, provision_system_principal, replace_idp_user_bindings,
-        service_account_by_id, set_workload_restriction, suspend_service_account_principal,
-        system_principal_id, tenant_admin_principal_id,
+        ApiKeyStatus, PrincipalFilter, SubjectColumns, api_key_by_prefix, api_key_status_by_prefix,
+        count_assignable_principals, credential_belongs_to, delete_service_account,
+        family_account_id, insert_api_key, insert_group, insert_group_membership,
+        insert_local_user, insert_refresh_token, insert_role, insert_role_binding,
+        insert_service_account, insert_user, list_api_key_metadata, list_assignable_principals,
+        list_role_bindings, list_roles, provision_system_principal, refresh_display_name,
+        replace_idp_user_bindings, service_account_by_id, set_role_description,
+        set_workload_restriction, suspend_service_account_principal, system_principal_id,
+        tenant_admin_principal_id, user_profile,
     };
     use wyrd_sql::queries::platform::credentials::{
         insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
@@ -1124,5 +1130,369 @@ mod pg_tests {
             sentinel_writers, 0,
             "the platform sentinel tenant owns no verification-result writer"
         );
+    }
+
+    /// The display name User `id` stores, as its own profile reads it.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn display_name_of(
+        conn: &mut wyrd_sql::TenantConn<'_>,
+        id: Uuid,
+    ) -> Option<Option<String>> {
+        user_profile(conn, id)
+            .await
+            .expect("profile reads")
+            .map(|profile| profile.display_name)
+    }
+
+    /// A User's display name is nullable, set and replaced by each nonblank
+    /// provider name, and kept when a sign-in omits it or sends a blank one.
+    /// A password User has none. Another tenant can neither read nor change
+    /// it, and its own names never appear in this tenant's directory.
+    ///
+    /// # Panics
+    /// Panics when a stored name differs or crosses tenants.
+    #[tokio::test]
+    async fn display_names_are_nullable_refreshed_and_tenant_confined() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant_b = fixture
+            .seed_additional_tenant(&format!("names-b-{}", Uuid::now_v7()))
+            .await
+            .expect("second tenant seeds");
+        let social = Uuid::now_v7();
+        let local = Uuid::now_v7();
+        let mut conn = fixture.tenant_conn().await.expect("A opens");
+        insert_user(&mut conn, social, Some("ada@example.test"), "oidc", None)
+            .await
+            .expect("social User inserts");
+        insert_local_user(&mut conn, local, "local-only", &verifier("local"), None)
+            .await
+            .expect("password User inserts");
+        assert_eq!(display_name_of(&mut conn, social).await, Some(None));
+        for (name, stored) in [
+            (Some("Ada"), "Ada"),
+            (None, "Ada"),
+            (Some("   "), "Ada"),
+            (Some(" Ada Lovelace "), "Ada Lovelace"),
+        ] {
+            refresh_display_name(&mut conn, social, name)
+                .await
+                .expect("name refreshes");
+            assert_eq!(
+                display_name_of(&mut conn, social).await,
+                Some(Some(stored.to_owned())),
+                "after {name:?}"
+            );
+        }
+        let profile = user_profile(&mut conn, local)
+            .await
+            .expect("profile reads")
+            .expect("password User exists");
+        assert_eq!(profile.username.as_deref(), Some("local-only"));
+        assert_eq!(profile.display_name, None);
+        let listed = list_assignable_principals(
+            &mut conn,
+            PrincipalFilter {
+                email: Some("ada@example.test"),
+                ..PrincipalFilter::default()
+            },
+            10,
+        )
+        .await
+        .expect("directory lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].display_name.as_deref(), Some("Ada Lovelace"));
+        conn.commit().await.expect("A commits");
+
+        let other = Uuid::now_v7();
+        let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B opens");
+        assert_eq!(
+            display_name_of(&mut conn, social).await,
+            None,
+            "B cannot read A's User"
+        );
+        refresh_display_name(&mut conn, social, Some("Mallory"))
+            .await
+            .expect("B's update runs");
+        insert_user(&mut conn, other, Some("bea@example.test"), "oidc", None)
+            .await
+            .expect("B User inserts");
+        refresh_display_name(&mut conn, other, Some("Bea Only"))
+            .await
+            .expect("B names its User");
+        conn.commit().await.expect("B commits");
+
+        let mut conn = fixture.tenant_conn().await.expect("A reopens");
+        assert_eq!(
+            display_name_of(&mut conn, social).await,
+            Some(Some("Ada Lovelace".to_owned())),
+            "B's update reaches no A row"
+        );
+        let names: Vec<Option<String>> =
+            list_assignable_principals(&mut conn, PrincipalFilter::default(), 200)
+                .await
+                .expect("directory lists")
+                .into_iter()
+                .map(|row| row.display_name)
+                .collect();
+        assert!(
+            !names.contains(&Some("Bea Only".to_owned())),
+            "B's names stay in B: {names:?}"
+        );
+    }
+
+    /// The Role filter, its status counts and each Role's member count share
+    /// one holder rule: an account holding the Role at any scope, directly or
+    /// through a Group, counts once; a memberless Group adds no one; counts
+    /// span every page; and another tenant's holders of a same-named Role
+    /// never count.
+    ///
+    /// # Panics
+    /// Panics when a page, count, Role assignment or description differs.
+    #[tokio::test]
+    async fn role_holders_filter_count_and_member_count_alike() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant_b = fixture
+            .seed_additional_tenant(&format!("holders-b-{}", Uuid::now_v7()))
+            .await
+            .expect("second tenant seeds");
+        let payments: PermissionScope = serde_json::from_value(serde_json::json!({
+            "card": { "family": { "kind": "Prompt", "name": "payments" } }
+        }))
+        .expect("scope parses");
+        let user = |id: Uuid| SubjectColumns {
+            user_id: Some(id),
+            service_account_id: None,
+            group_id: None,
+        };
+        let role = Uuid::now_v7();
+        let [direct, grouped, both, suspended, bystander] =
+            std::array::from_fn::<_, 5, _>(|_| Uuid::now_v7());
+        let service = Uuid::now_v7();
+        let (group, empty_group) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let mut conn = fixture.tenant_conn().await.expect("A opens");
+        insert_role(
+            &mut conn,
+            role,
+            "holder-probe",
+            &serde_json::json!([]),
+            false,
+        )
+        .await
+        .expect("role inserts");
+        for (id, label) in [
+            (direct, "direct"),
+            (grouped, "grouped"),
+            (both, "both"),
+            (suspended, "suspended"),
+            (bystander, "bystander"),
+        ] {
+            insert_user(
+                &mut conn,
+                id,
+                Some(&format!("{label}@holders.test")),
+                "oidc",
+                None,
+            )
+            .await
+            .expect("User inserts");
+        }
+        sqlx::query("UPDATE wyrd.auth_users SET status = 'suspended' WHERE id = $1")
+            .bind(suspended)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("User suspends");
+        insert_service_account(
+            &mut conn,
+            service,
+            "service",
+            None,
+            "holder-service",
+            None,
+            Attribution::direct(PrincipalId::new(Uuid::now_v7())),
+        )
+        .await
+        .expect("Service inserts");
+        insert_group(&mut conn, group, "holder-group")
+            .await
+            .expect("group inserts");
+        insert_group(&mut conn, empty_group, "holder-empty")
+            .await
+            .expect("empty group inserts");
+        for member in [grouped, both] {
+            insert_group_membership(&mut conn, group, user(member))
+                .await
+                .expect("member joins");
+        }
+        let service_subject = SubjectColumns {
+            user_id: None,
+            service_account_id: Some(service),
+            group_id: None,
+        };
+        let group_subject = |id: Uuid| SubjectColumns {
+            user_id: None,
+            service_account_id: None,
+            group_id: Some(id),
+        };
+        for (subject, scope) in [
+            (user(direct), &PermissionScope::All),
+            (user(both), &payments),
+            (user(suspended), &PermissionScope::All),
+            (service_subject, &payments),
+            (group_subject(group), &PermissionScope::All),
+            (group_subject(empty_group), &PermissionScope::All),
+        ] {
+            insert_role_binding(
+                &mut conn,
+                Uuid::now_v7(),
+                role,
+                subject,
+                scope,
+                RoleSource::Direct,
+            )
+            .await
+            .expect("binding inserts");
+        }
+        conn.commit().await.expect("A commits");
+
+        let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B opens");
+        let (b_role, b_user) = (Uuid::now_v7(), Uuid::now_v7());
+        insert_role(
+            &mut conn,
+            b_role,
+            "holder-probe",
+            &serde_json::json!([]),
+            false,
+        )
+        .await
+        .expect("B role inserts");
+        insert_user(&mut conn, b_user, Some("b@holders.test"), "oidc", None)
+            .await
+            .expect("B User inserts");
+        insert_role_binding(
+            &mut conn,
+            Uuid::now_v7(),
+            b_role,
+            user(b_user),
+            &PermissionScope::All,
+            RoleSource::Direct,
+        )
+        .await
+        .expect("B binding inserts");
+        conn.commit().await.expect("B commits");
+
+        let mut conn = fixture.tenant_conn().await.expect("A reopens");
+        let holders = PrincipalFilter {
+            role: Some("holder-probe"),
+            ..PrincipalFilter::default()
+        };
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page =
+                list_assignable_principals(&mut conn, PrincipalFilter { after, ..holders }, 2)
+                    .await
+                    .expect("page lists");
+            let counts =
+                count_assignable_principals(&mut conn, PrincipalFilter { after, ..holders })
+                    .await
+                    .expect("counts read");
+            assert_eq!(
+                (counts.active, counts.suspended),
+                (4, 1),
+                "counts span every page"
+            );
+            let Some(last) = page.last().map(|row| row.id) else {
+                break;
+            };
+            seen.extend(page);
+            after = Some(last);
+        }
+        let mut ids: Vec<Uuid> = seen.iter().map(|row| row.id).collect();
+        ids.sort();
+        let mut expected = vec![direct, grouped, both, suspended, service];
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "each holder once; the bystander and B absent"
+        );
+        let roles_of = |id: Uuid| {
+            seen.iter()
+                .find(|row| row.id == id)
+                .map(|row| row.roles.clone())
+                .expect("holder listed")
+        };
+        assert_eq!(
+            roles_of(both),
+            serde_json::json!([
+                { "role": "holder-probe", "scope": "all" },
+                { "role": "holder-probe", "scope": payments },
+            ]),
+            "a direct and a Group grant are both listed with their scopes"
+        );
+        assert_eq!(
+            roles_of(grouped),
+            serde_json::json!([{ "role": "holder-probe", "scope": "all" }])
+        );
+
+        let services = count_assignable_principals(
+            &mut conn,
+            PrincipalFilter {
+                kind: Some("service"),
+                ..holders
+            },
+        )
+        .await
+        .expect("counts read");
+        assert_eq!((services.active, services.suspended), (1, 0));
+        let nobody = PrincipalFilter {
+            role: Some("no-such-role"),
+            ..PrincipalFilter::default()
+        };
+        assert!(
+            list_assignable_principals(&mut conn, nobody, 10)
+                .await
+                .expect("page lists")
+                .is_empty()
+        );
+        let zero = count_assignable_principals(&mut conn, nobody)
+            .await
+            .expect("counts read");
+        assert_eq!((zero.active, zero.suspended), (0, 0));
+
+        let probe = |rows: Vec<wyrd_sql::queries::auth::RoleListRow>| {
+            rows.into_iter()
+                .find(|row| row.name == "holder-probe")
+                .expect("probe role listed")
+        };
+        let listed = probe(list_roles(&mut conn).await.expect("roles list"));
+        assert_eq!(
+            listed.member_count, 5,
+            "member count equals the filter's total"
+        );
+        assert_eq!(listed.description, None);
+        set_role_description(&mut conn, role, Some("Reads payments"))
+            .await
+            .expect("description sets");
+        let described = probe(list_roles(&mut conn).await.expect("roles list"));
+        assert_eq!(described.description.as_deref(), Some("Reads payments"));
+        set_role_description(&mut conn, role, None)
+            .await
+            .expect("description clears");
+        let cleared = probe(list_roles(&mut conn).await.expect("roles list"));
+        assert_eq!(cleared.description, None);
+        conn.commit().await.expect("A commits");
+
+        let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B reopens");
+        let b_listed = probe(list_roles(&mut conn).await.expect("B roles list"));
+        assert_eq!(b_listed.member_count, 1, "B counts only its own holder");
     }
 }

@@ -18,7 +18,7 @@ use uuid::Uuid;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::auth::{
-    delete_service_account, insert_service_account, replace_idp_user_bindings,
+    delete_service_account, insert_service_account, refresh_display_name, replace_idp_user_bindings,
 };
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -758,9 +758,13 @@ async fn discovery_filters_and_pages_by_id() {
                 "status": "active",
                 "email": "pr-person@test.wyrd",
                 "name": null,
+                "display_name": null,
+                "authentication": "sso",
+                "roles": [],
                 "workload_restriction": null,
             }],
             "next": null,
+            "counts": { "active": 1, "suspended": 0 },
         })
     );
     let (_, by_name) = call(
@@ -805,6 +809,294 @@ async fn discovery_filters_and_pages_by_id() {
         assert!(seen.contains(id), "{id} is reached by paging");
     }
     assert!(!seen.contains(&admin.to_string()), "kind filters users out");
+}
+
+/// Give User `id` of `tenant` the provider display name `name`, as a
+/// successful provider sign-in stores it.
+///
+/// # Panics
+/// Panics when the write fails.
+async fn sign_in_name(
+    server: &WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    id: Uuid,
+    name: &str,
+) {
+    let mut conn = server.tenant_conn_for(tenant).await.expect("tenant opens");
+    refresh_display_name(&mut conn, id, Some(name))
+        .await
+        .expect("name stores");
+    conn.commit().await.expect("name commits");
+}
+
+/// The directory projects people and Role holders the same way:
+///   1. each item carries its display name, sign-in method and scoped Roles;
+///      a Service carries no human sign-in method;
+///   2. the `role` filter pages every holder at any scope, and the status
+///      counts describe the whole filter set on every page, including zero
+///      matches;
+///   3. a Role lists its description and member count, which equals the
+///      filter's total; a custom Role's description is set and cleared by
+///      its PUT, an over-long one is refused, and a built-in's is read-only;
+///   4. another tenant's holders, names and counts never appear;
+///   5. a non-administrator's directory read is refused.
+///
+/// # Panics
+/// Panics when the server fails to start or a route answers unexpectedly.
+#[tokio::test(flavor = "current_thread")]
+async fn directory_projects_names_methods_roles_and_counts() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (_, admin_jwt) = user(&server, "rd-admin", &["admin"]).await;
+    let operations = json!([{ "resource": "cards", "action": "read" }]);
+    let (status, role) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        "/v1/access/roles/rd_reader",
+        Some(json!({ "operations": operations, "description": "  Reads payment Cards  " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{role}");
+    assert_eq!(role["description"], json!("Reads payment Cards"));
+    assert_eq!(role["member_count"], json!(0));
+
+    let (named, viewer_jwt) = user(&server, "rd-named", &["rd_reader"]).await;
+    sign_in_name(&server, tenant, named, "Rhea Named").await;
+    let (quiet, _) = user(&server, "rd-quiet", &["rd_reader"]).await;
+    let mut conn = server.tenant_conn_for(tenant).await.expect("tenant opens");
+    sqlx::query("UPDATE wyrd.auth_users SET status = 'suspended' WHERE id = $1")
+        .bind(quiet)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("User suspends");
+    conn.commit().await.expect("suspension commits");
+    let (status, created) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/principals/users",
+        Some(json!({
+            "username": "rd-local",
+            "password": "Quiet harbor lantern for rd-local",
+            "assignments": [{ "role": "viewer", "scope": "all" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (service_id, _) = service(&server, "rd-service", &[]).await;
+    let payments = json!({ "card": { "family": { "kind": "Prompt", "name": "payments" } } });
+    let (status, bound) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/access/bindings",
+        Some(json!({
+            "subject": { "principal": { "id": service_id, "kind": "service" } },
+            "role": "rd_reader",
+            "scope": payments,
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "{bound}");
+
+    let other = server.seed_tenant("rd-other").await.expect("tenant seeds");
+    let Bootstrap::User { id: stranger, .. } = server
+        .bootstrap_user_in_tenant(other, "rd-stranger", &["viewer"])
+        .await
+        .expect("stranger bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    sign_in_name(&server, other, stranger.as_uuid(), "Stranger Name").await;
+
+    // 1. Items carry display name, sign-in method and scoped Roles.
+    let (status, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?email=rd-named@test.wyrd",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let item = &page["principals"][0];
+    assert_eq!(item["display_name"], json!("Rhea Named"));
+    assert_eq!(item["authentication"], json!("sso"));
+    assert_eq!(
+        item["roles"],
+        json!([{ "role": "rd_reader", "scope": "all" }])
+    );
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?name=rd-local",
+    )
+    .await;
+    let item = &page["principals"][0];
+    assert_eq!(
+        (&item["authentication"], &item["display_name"]),
+        (&json!("password"), &Value::Null)
+    );
+    assert_eq!(item["roles"], json!([{ "role": "viewer", "scope": "all" }]));
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?name=rd-service",
+    )
+    .await;
+    let item = &page["principals"][0];
+    assert_eq!(
+        item["authentication"],
+        Value::Null,
+        "a Service has no human method"
+    );
+    assert_eq!(
+        item["roles"],
+        json!([{ "role": "rd_reader", "scope": payments }])
+    );
+
+    // 2. The role filter pages every holder; counts cover the filter set.
+    let mut seen = Vec::new();
+    let mut uri = "/v1/principals?role=rd_reader&limit=1".to_owned();
+    loop {
+        let (status, page) = call(&server, &admin_jwt, Method::GET, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["counts"], json!({ "active": 2, "suspended": 1 }));
+        seen.extend(
+            page["principals"]
+                .as_array()
+                .expect("principals")
+                .iter()
+                .map(|item| item["principal_id"].as_str().expect("id").to_owned()),
+        );
+        match page["next"].as_str() {
+            Some(next) => uri = format!("/v1/principals?role=rd_reader&limit=1&after={next}"),
+            None => break,
+        }
+    }
+    seen.sort();
+    let mut expected = vec![named.to_string(), quiet.to_string(), service_id.to_string()];
+    expected.sort();
+    assert_eq!(seen, expected);
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?role=rd_reader&kind=service",
+    )
+    .await;
+    assert_eq!(page["counts"], json!({ "active": 1, "suspended": 0 }));
+    let (status, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?role=rd-none",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        (&page["principals"], &page["counts"]),
+        (&json!([]), &json!({ "active": 0, "suspended": 0 }))
+    );
+
+    // 3. Role descriptions and member counts.
+    let listed = |roles: &Value, name: &str| -> Value {
+        roles["roles"]
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} listed"))
+    };
+    let (status, roles) = call(&server, &admin_jwt, Method::GET, "/v1/access/roles").await;
+    assert_eq!(status, StatusCode::OK, "{roles}");
+    let reader = listed(&roles, "rd_reader");
+    assert_eq!(
+        reader["member_count"],
+        json!(3),
+        "equals the filter's total"
+    );
+    assert_eq!(reader["description"], json!("Reads payment Cards"));
+    let admin_role = listed(&roles, "admin");
+    assert_eq!(
+        admin_role["description"],
+        json!("Everything, including people, sign-in and secrets")
+    );
+    assert_eq!(admin_role["builtin"], json!(true));
+    let (_, cleared) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        "/v1/access/roles/rd_reader",
+        Some(json!({ "operations": operations })),
+    )
+    .await;
+    assert_eq!(
+        cleared["description"],
+        Value::Null,
+        "an omitted description clears"
+    );
+    assert_eq!(cleared["member_count"], json!(3));
+    for (role, body) in [
+        (
+            "rd_reader",
+            json!({ "operations": operations, "description": "x".repeat(201) }),
+        ),
+        (
+            "viewer",
+            json!({ "operations": operations, "description": "Mine now" }),
+        ),
+    ] {
+        let (status, refused) = send(
+            &server,
+            &admin_jwt,
+            Method::PUT,
+            &format!("/v1/access/roles/{role}"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{role}: {refused}");
+        assert_eq!(refused["code"], json!("WYRD_SPEC_400_VALIDATION"));
+    }
+    let (_, roles) = call(&server, &admin_jwt, Method::GET, "/v1/access/roles").await;
+    assert_eq!(
+        listed(&roles, "viewer")["description"],
+        json!("Read Cards, executions, artifacts and tables"),
+        "a built-in description is unchanged"
+    );
+    assert_eq!(listed(&roles, "rd_reader")["description"], Value::Null);
+
+    // 4. Another tenant contributes no rows, names or counts.
+    let (_, everyone) = call(&server, &admin_jwt, Method::GET, "/v1/principals?limit=200").await;
+    let text = everyone.to_string();
+    assert!(!text.contains(&stranger.to_string()) && !text.contains("Stranger Name"));
+    let viewers = listed(&roles, "viewer")["member_count"]
+        .as_u64()
+        .expect("count");
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?role=viewer",
+    )
+    .await;
+    let counts = &page["counts"];
+    assert_eq!(
+        counts["active"].as_u64().expect("active")
+            + counts["suspended"].as_u64().expect("suspended"),
+        viewers,
+        "the other tenant's viewer counts in neither"
+    );
+
+    // 5. A non-administrator cannot read the directory.
+    let (status, refused) = call(&server, &viewer_jwt, Method::GET, "/v1/principals").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["code"], json!("WYRD_PERMISSION_403_DENIED_RBAC"));
 }
 
 /// Register an empty Service `name` at `version` as `jwt` and return its UID.

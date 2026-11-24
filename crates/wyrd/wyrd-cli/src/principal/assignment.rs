@@ -66,6 +66,7 @@ pub async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
         kind: args.kind.map(PrincipalKindTag::from),
         email: args.email,
         name: args.name,
+        role: None,
         limit: args.limit,
         after: args.after.as_deref().map(principal_id).transpose()?,
     };

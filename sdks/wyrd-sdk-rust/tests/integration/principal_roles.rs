@@ -1166,6 +1166,7 @@ async fn group_custom_and_exact_version_bindings_scope_reads() {
                     )
                     .expect("operation parses"),
                 ],
+                description: None,
             },
         )
         .await

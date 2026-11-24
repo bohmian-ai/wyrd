@@ -16,10 +16,11 @@ use sqlx::PgPool;
 use wyrd_testing::WyrdTestServer;
 
 use super::{
-    BegunSocialLogin, PLATFORM_SIGNING_KEY, SOCIAL_HOST, authorization_query, begin_google,
+    BegunSocialLogin, SOCIAL_HOST, authorization_query, begin_google, begin_google_login,
     begin_social, body_json, enable_google, finish_google_session, identity_token_reply,
-    initialize_platform_root, mount_platform_provider, platform_key_set, platform_session,
-    session_cookie, set_google_enabled, social_call, social_request,
+    identity_token_reply_named, initialize_platform_root, mount_platform_provider,
+    platform_key_set, platform_session, session_cookie, set_google_enabled, signed_identity_reply,
+    social_call, social_request,
 };
 use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_spec::auth::SecretBearer;
@@ -352,10 +353,22 @@ impl Workspace {
 /// Answer `provider`'s next token request with an ID token for `nonce`,
 /// `subject` and `groups`.
 async fn answer(provider: &wiremock::MockServer, nonce: &str, subject: &str, groups: &[&str]) {
+    answer_named(provider, nonce, subject, groups, None).await;
+}
+
+/// [`answer`] whose ID token carries the standard `name` claim when `name`
+/// is given.
+async fn answer_named(
+    provider: &wiremock::MockServer,
+    nonce: &str,
+    subject: &str,
+    groups: &[&str],
+    name: Option<&str>,
+) {
     mount_platform_provider(
         provider,
         platform_key_set("corp-key"),
-        corp_token(&provider.uri(), nonce, subject, groups),
+        corp_token(&provider.uri(), nonce, subject, groups, name),
     )
     .await;
 }
@@ -416,7 +429,7 @@ fn password_of(username: &str) -> String {
 }
 
 /// A company token-endpoint reply: an ID token from `issuer` for `nonce`
-/// naming `subject` and carrying `groups`.
+/// naming `subject`, carrying `groups` and, when given, the person's `name`.
 ///
 /// # Panics
 /// Panics when the test key does not load or the token does not sign.
@@ -425,32 +438,23 @@ fn corp_token(
     nonce: &str,
     subject: &str,
     groups: &[&str],
+    name: Option<&str>,
 ) -> wiremock::ResponseTemplate {
     let now = chrono::Utc::now().timestamp();
-    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
-    header.kid = Some("corp-key".to_owned());
-    let key = jsonwebtoken::EncodingKey::from_ed_pem(PLATFORM_SIGNING_KEY.as_bytes())
-        .expect("test key loads");
-    let id_token = jsonwebtoken::encode(
-        &header,
-        &json!({
-            "iss": issuer,
-            "sub": subject,
-            "aud": CORP_CLIENT,
-            "exp": now + 3600,
-            "iat": now,
-            "nonce": nonce,
-            "email": format!("{subject}@corp.test"),
-            "groups": groups,
-        }),
-        &key,
-    )
-    .expect("token signs");
-    wiremock::ResponseTemplate::new(200).set_body_json(json!({
-        "access_token": "provider-access",
-        "token_type": "Bearer",
-        "id_token": id_token,
-    }))
+    let mut claims = json!({
+        "iss": issuer,
+        "sub": subject,
+        "aud": CORP_CLIENT,
+        "exp": now + 3600,
+        "iat": now,
+        "nonce": nonce,
+        "email": format!("{subject}@corp.test"),
+        "groups": groups,
+    });
+    if let Some(name) = name {
+        claims["name"] = json!(name);
+    }
+    signed_identity_reply("corp-key", &claims)
 }
 
 /// A company-authenticated administrator reads the tenant login policy and
@@ -527,6 +531,148 @@ async fn a_company_administrator_reads_the_policy_and_its_account_warning() {
     for leaked in ["users_without_company_identity", "users", "revision"] {
         assert!(methods.get(leaked).is_none(), "{leaked} in {methods}");
     }
+}
+
+/// Each successful provider sign-in stores the provider's name for the
+/// person, and `/me` and the directory read it back with the sign-in method:
+///   1. company OIDC `name` is stored, a changed one replaces it, and a
+///      sign-in omitting it keeps the stored value;
+///   2. Google's ID-token `name` behaves the same from enrollment through
+///      later sign-ins;
+///   3. a password User has no display name;
+///   4. reading the profile or directory changes no stored name.
+///
+/// # Panics
+/// Panics when a sign-in is refused or a read differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_sign_ins_store_and_refresh_the_display_name() {
+    let workspace = Workspace::start().await;
+    let me = |cookie: String| {
+        let workspace = &workspace;
+        async move {
+            let (status, profile) = workspace
+                .browser(Method::GET, "/v1/principals/me", &cookie, None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "profile reads: {profile}");
+            profile
+        }
+    };
+    let listed = |email: &'static str| {
+        let workspace = &workspace;
+        async move {
+            let (status, page) = workspace
+                .bearer(Method::GET, &format!("/v1/principals?email={email}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "directory reads: {page}");
+            page["principals"][0].clone()
+        }
+    };
+
+    // 1. Company OIDC.
+    for (name, stored) in [
+        (Some("Corp Ada"), "Corp Ada"),
+        (Some("Ada Corp-Lovelace"), "Ada Corp-Lovelace"),
+        (None, "Ada Corp-Lovelace"),
+    ] {
+        let begun = workspace.begin_company().await;
+        answer_named(
+            &workspace.corp,
+            &begun.query["nonce"],
+            "corp-ada",
+            &[],
+            name,
+        )
+        .await;
+        let resp = workspace
+            .srv
+            .oneshot(callback_request(
+                &workspace.corp,
+                &begun.query["state"],
+                Some(&begun.cookie),
+            ))
+            .await
+            .expect("callback responds");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "company sign-in");
+        let cookie = session_cookie(&resp, &workspace.slug).expect("a session is set");
+        let profile = me(cookie).await;
+        assert_eq!(profile["display_name"], json!(stored), "after {name:?}");
+        assert_eq!(profile["email"], json!("corp-ada@corp.test"));
+        assert_eq!(profile["username"], Value::Null);
+        assert_eq!(profile["authentication"], json!("sso"));
+        let item = listed("corp-ada@corp.test").await;
+        assert_eq!(item["display_name"], json!(stored));
+        assert_eq!(item["authentication"], json!("sso"));
+    }
+
+    // 2. Google, from invitation through later sign-ins.
+    let google = workspace.google.uri();
+    let begun = workspace.begin_google_invitation().await;
+    let mut steps = vec![(begun, Some("Grace Hopper"), "Grace Hopper")];
+    for (name, stored) in [
+        (Some("Grace B. Hopper"), "Grace B. Hopper"),
+        (None, "Grace B. Hopper"),
+    ] {
+        steps.push((
+            begin_google_login(&workspace.srv, &workspace.slug).await,
+            name,
+            stored,
+        ));
+    }
+    for (begun, name, stored) in steps {
+        mount_platform_provider(
+            &workspace.google,
+            platform_key_set("google-key"),
+            identity_token_reply_named(
+                &google,
+                &begun.query["nonce"],
+                "wyrd-google",
+                "google-key",
+                "google-grace",
+                "grace@gmail.test",
+                name,
+            ),
+        )
+        .await;
+        let (status, location, cookie) =
+            finish_google_session(&workspace.srv, &begun, &google, &workspace.slug).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "Google sign-in: {location:?}"
+        );
+        let profile = me(cookie.expect("a session is set")).await;
+        assert_eq!(profile["display_name"], json!(stored), "after {name:?}");
+        assert_eq!(profile["email"], json!("grace@gmail.test"));
+        assert_eq!(profile["authentication"], json!("google"));
+        let item = listed("grace@gmail.test").await;
+        assert_eq!(
+            (&item["display_name"], &item["authentication"]),
+            (&json!(stored), &json!("google"))
+        );
+    }
+
+    // 3. A password User has no display name.
+    let cookie = workspace.password_session("pat-local", "viewer").await;
+    let profile = me(cookie).await;
+    assert_eq!(profile["display_name"], Value::Null);
+    assert_eq!(profile["username"], json!("pat-local"));
+    assert_eq!(profile["authentication"], json!("password"));
+
+    // 4. Reads change no stored name.
+    let names: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT display_name FROM wyrd.auth_users \
+          WHERE email IN ('corp-ada@corp.test', 'grace@gmail.test') ORDER BY email",
+    )
+    .fetch_all(&workspace.superuser)
+    .await
+    .expect("names read");
+    assert_eq!(
+        names,
+        vec![
+            (Some("Ada Corp-Lovelace".to_owned()),),
+            (Some("Grace B. Hopper".to_owned()),),
+        ]
+    );
 }
 
 impl Workspace {

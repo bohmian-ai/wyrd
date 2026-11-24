@@ -326,6 +326,7 @@ pub async fn dispatch(command: AccessCommand) -> Result<ExitCode, WyrdCliError> 
         AccessCommand::PutRole(args) => {
             let request = PutRoleRequest {
                 operations: args.operations.iter().map(Operation::of).collect(),
+                description: None,
             };
             let role = principals
                 .put_role(&args.role, &request)

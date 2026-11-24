@@ -629,6 +629,93 @@ async fn tenant_login_operations_publish_their_contract() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// The principal read projections publish their fields: the caller's own
+/// email and display name on `/me`, every sign-in method, each directory
+/// item's display name, method and scoped Roles, the page's status counts,
+/// the `role` filter, and each Role's description and member count, with the
+/// Role PUT's optional description and its length refusal.
+///
+/// # Panics
+/// Panics when the served document omits one of them.
+#[tokio::test]
+async fn principal_read_projections_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let required = |schema: &str| -> Vec<String> {
+        schemas[schema]["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect()
+    };
+    for (schema, fields, always) in [
+        (
+            "CurrentUserProfile",
+            &["display_name", "email", "authentication"][..],
+            &["authentication"][..],
+        ),
+        (
+            "PrincipalSummary",
+            &["display_name", "authentication", "roles"][..],
+            &["roles"][..],
+        ),
+        ("PrincipalPage", &["counts"][..], &["counts"][..]),
+        (
+            "PrincipalStatusCounts",
+            &["active", "suspended"][..],
+            &["active", "suspended"][..],
+        ),
+        (
+            "RoleView",
+            &["description", "member_count"][..],
+            &["member_count"][..],
+        ),
+        ("PutRoleRequest", &["description"][..], &[][..]),
+    ] {
+        for field in fields {
+            assert!(
+                schemas[schema]["properties"][field].is_object(),
+                "{schema} publishes {field}: {}",
+                schemas[schema]
+            );
+        }
+        let required = required(schema);
+        for field in always {
+            assert!(
+                required.iter().any(|name| name == field),
+                "{schema} requires {field}"
+            );
+        }
+    }
+    assert!(
+        !required("PutRoleRequest").contains(&"description".to_owned()),
+        "a Role description is optional"
+    );
+    assert_eq!(
+        schemas["AccountAuthentication"]["enum"],
+        serde_json::json!(["password", "google", "github", "sso"])
+    );
+    assert!(
+        document["paths"]["/v1/principals"]["get"]["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|parameter| parameter["name"] == "role" && parameter["in"] == "query"),
+        "the directory takes the role filter"
+    );
+    assert!(
+        documented_description(&document, "/v1/access/roles/{role}", "put", 400)
+            .contains("200 characters"),
+        "the Role PUT documents its description limit"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The local backend's byte-transfer operations are public Wyrd operations and
 /// are published with their real contract.
 ///

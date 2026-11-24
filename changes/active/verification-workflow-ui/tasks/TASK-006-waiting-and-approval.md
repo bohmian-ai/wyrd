@@ -207,8 +207,8 @@ behavior remains test-first.
      the same decision and reason returns the identical receipt
      (`actor_id`, `decided_at`). Replaying the same rejection gives an equal
      response. A different decision gets 409. [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…": while one decision is
-     pending, the other step's controls are disabled, and its answer never
-     appears under another occurrence.
+     pending, the other step's controls are disabled. The answer is the mock's
+     page notice under the header, naming the occurrence it was sent for.
    - RED: [P1] (no dispatch or readback). The Wyrd Factory hook found two
      defects, both fixed before commit. A rejected `invalidateAll` left the
      action pending (the reread now settles, and cancel shares the fix). An
@@ -232,35 +232,53 @@ behavior remains test-first.
      route returns `cancelled`. `release` becomes `expired`, deciding it gets
      409, the invocations stay populated, and the rendered occurrence reads
      `expired` with no Approve. [U1] `ui-library.test.ts:3213` "TASK-006: a waiting execution shows each reached approval occurrence…": after `timed_out`, the occurrence reads
-     expired with "The execution ended before anyone decided." Prerequisites:
+     ⧗ expired with no controls. Prerequisites:
      `pg_approvals::a_pending_approval_is_decided_once_and_resumes_the_same_execution`
      and `pg_approvals::an_approval_expires_with_its_execution` 2 passed (command
      under Verification).
    - AC-009 comparison: the mock's `selfcheck.mjs --shots` (`exec-approval`
      light, dark, mobile) beside [B1]'s `captureRepositories` of the pending and
-     decided page at 1440 and 390, light and dark, with no sideways scroll.
-     Matching: the orange-ruled "HUMAN APPROVAL" box, message, Occurrence/For,
-     optional reason textarea, primary Approve and secondary Reject, ◷ pending
-     mark, and APPROVAL kind badge. At 390 the graph scrolls inside its region.
-   - Differences awaiting the maintainer's ruling:
-     1. The mock's Requested/Expires timestamps are replaced by lifecycle wording
-        (the wire carries no deadline per occurrence; spec-sanctioned).
-     2. The graph mark reads "◷ waiting" for an approval step. The mock reads
-        "waiting for approval" or "waiting for input". Production keeps input
-        and approval apart through the "Waiting for input" fact and the
-        APPROVAL badge.
-     3. The header status reads `waiting`. The mock shows pills "running ·
-        waiting for input · waiting for approval" (owned by the existing status
-        mapping).
-     4. "For" shows `iteration N` or `item N`. The mock shows `attempt 1`
-        (occurrences carry no attempt on the wire).
-     5. Facts use the inspector's stacked uppercase labels. The mock uses
-        side-by-side rows. The pending mark is unboxed.
-     6. No viewer note. Authority is not inferred (see 3).
-     7. Found in the decided capture: right after `release` is rejected, its
-        graph node reads "○ not started" until the engine records the
-        approval step's invocation. The occurrence already reads `rejected`,
-        and the next refresh shows the step's recorded state.
+     decided page at 1440 and 390, light and dark, with no sideways scroll. The
+     first comparison was rejected by the maintainer, and the UI was realigned
+     to the mock's source (`Inspector.svelte`, `StepNode.svelte`,
+     `DepEdge.svelte`, `app.css`):
+     - Header: the lifecycle badge plus dashed tags "waiting for input **ci**"
+       and "waiting for approval". The verdict reads "none while running" (or
+       "no recorded verdict" once settled).
+     - Graph: each waiting node has the dashed warn border. A step's state sits
+       on its second row ("◷ waiting for approval" / "◷ waiting for input")
+       under its name. The missing input reads "not provided yet", and its edge
+       is dashed.
+     - Approval box: "Human approval" with the boxed state, the message, then
+       `dl.dkv` rows (Occurrence, For, Expires, Decided) in 12px mono, stacked
+       under 900px. Then "Reason (optional)", Approve and Reject, and
+       "Submitting for X…" while busy.
+     - Read-only and refused readers see the viewer note instead of the
+       controls.
+     - Decisions report on the page as the mock's `.banner` notices: "Accepted
+       by the server: … no new work was started.", "Refreshed: X already
+       rejected Y. Your approval was not applied.", "Refreshed: Y has expired.
+       Nothing was applied."
+     - Waitnotes on a step that waits for an input and on the missing input's
+       panel.
+     Asserted in [U1], [P1] and [B1] (`data-blocked`, `data-decision-notice`,
+     `data-viewer-note`, `g.dep.awaited`, "not provided yet").
+   - Differences that remain, awaiting the maintainer's ruling:
+     1. Expires reads "with this execution · at its deadline, on cancellation,
+        or when newer work supersedes it". There is no Requested row. The wire
+        (`ApprovalOccurrenceState`) carries neither timestamp.
+     2. For reads `… · step review · iteration 0` (or `item N`), not
+        `attempt 1`. Occurrences carry no attempt number.
+     3. The header badge reads the server's lifecycle `waiting`, where the mock
+        shows `running`. The mock's header layout (title, description, Copy
+        link / ← Verify / Cancel row) is TASK-005's panel and is unchanged here.
+     4. The step panel head (name, kind, waiting tag, Overview/Outputs tabs,
+        and Action / Depends on / Invocation rows) is the earlier tasks' step
+        inspector, which shows "Step review · Recorded invocations" and "No
+        invocation of this step is recorded yet."; unchanged here.
+   - Not reproduced: the integrated `development environment lifecycle`
+     journey refuses to start while another local service holds port 8000.
+     Every other journey in both integration files passed (24/24 and 21/22).
    - Limits: long messages and the touch layout are checked only at 390 in the
      captures, with no separate long-message fixture.
 

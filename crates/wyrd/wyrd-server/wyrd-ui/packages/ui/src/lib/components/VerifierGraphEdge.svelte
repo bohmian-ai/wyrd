@@ -39,9 +39,11 @@
     };
   });
   const hot = $derived(graph.selected === source || graph.selected === target);
+  /** An edge from an input not provided yet is dashed, as is the node it leaves. */
+  const awaited = $derived(source.startsWith('input:') && !!graph.states?.[source]?.wait);
 </script>
 
-<g class="dep" class:hot data-edge={data.id}>
+<g class="dep" class:hot class:awaited data-edge={data.id}>
   <path class="line" d={drawn.line} />
   <path class="arrow" d={drawn.head} />
   {#if data.labelAt}
@@ -58,6 +60,9 @@
   .arrow {
     fill: var(--muted);
     stroke: none;
+  }
+  .awaited .line {
+    stroke-dasharray: 4 4;
   }
   .hot .line {
     stroke: var(--declare);

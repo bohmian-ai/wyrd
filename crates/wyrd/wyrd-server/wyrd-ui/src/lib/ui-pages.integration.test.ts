@@ -2673,6 +2673,7 @@ reviewing('TASK-006: an approver reads each waiting approval in the execution pa
     expect(await page.locator('[data-blocked="awaiting_input"]').textContent()).toBe('waiting for input ci');
     expect(await page.locator('[data-blocked="awaiting_approval"]').textContent()).toBe('waiting for approval');
     expect(await page.locator('[data-node="input:ci"]').textContent()).toContain('not provided yet');
+    expect(await page.locator('g.dep.awaited').count()).toBe(1);
     for (const step of ['review', 'release']) expect(await page.locator(`[data-node="step:${step}"]`).textContent()).toContain('waiting for approval');
     await captureRepositories(page, 'execution-approval-pending');
 

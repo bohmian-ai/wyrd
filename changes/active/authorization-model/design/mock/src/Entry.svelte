@@ -53,9 +53,6 @@
     justify-content: center;
     gap: 10px;
   }
-  img {
-    border-radius: var(--r);
-  }
   .wordmark {
     font: 600 18px var(--font-sans);
   }

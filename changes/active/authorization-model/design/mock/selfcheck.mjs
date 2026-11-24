@@ -116,7 +116,7 @@ try {
   await check('journey: provider, name, derived then edited slug, create, land on /t/<slug>', async () => {
     const p = await fresh('#/signup');
     await p.click('button[data-provider=google]');
-    assert.equal(await p.locator('[data-testid=identity]').innerText(), 'Signed in with Google as sam@example.test.');
+    assert.equal(await p.locator('[data-testid=identity]').innerText(), 'Signed in with Google.');
     assert.equal(await p.locator('[data-testid=turnstile]').count(), 0);
     await p.fill('#display-name', 'Acme Research');
     assert.equal(await p.inputValue('#slug'), 'acme-research');
@@ -185,7 +185,7 @@ try {
     assert.match(await problem(p), /Try again in 23 minutes\./);
     assert.ok(await p.locator('[data-testid=create]').isEnabled());
     await open(p, '#/signup/workspace?preview=limit');
-    assert.match(await problem(p), /maximum number of workspaces \(3\)[\s\S]*WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT/);
+    assert.match(await problem(p), /maximum number of workspaces\. [\s\S]*WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT/);
     await open(p, '#/signup/workspace?preview=disabled');
     assert.equal(await p.locator('form').count(), 0);
     assert.ok(await p.getByRole('link', { name: 'Sign in to an existing workspace' }).isVisible());
@@ -313,6 +313,13 @@ try {
     const p = await fresh('#/platform');
     assert.equal(await p.locator('h1').innerText(), 'Platform admin');
     assert.equal(await p.locator('input').count(), 2, 'username and password only: no key field');
+    assert.equal(await p.locator('[data-testid=platform-sso]').count(), 1, 'platform OIDC configured: SSO offered');
+    await open(p, '#/platform?sso=off');
+    assert.equal(await p.locator('[data-testid=platform-sso]').count(), 0, 'no platform OIDC: no SSO button');
+    await open(p, '#/platform?preview=nosso');
+    assert.match(await problem(p), /WYRD_SPEC_404_NOT_FOUND/);
+    assert.equal(await p.locator('[data-testid=platform-sso]').count(), 0, 'OIDC removed: the 404 shows without the button');
+    await open(p, '#/platform');
     await p.fill('#username', 'ops-oncall');
     await p.fill('#password', 'a long enough passphrase');
     await p.click('[data-testid=platform-signin]');

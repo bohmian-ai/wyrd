@@ -1,18 +1,23 @@
 <!-- #/platform: the console entry, "Platform admin"; #/platform/ui/callback: where platform SSO returns.
-     Platform operators only; a tenant session, API key or bootstrap key never signs in here. -->
+     Platform operators only; a tenant session, API key or bootstrap key never signs in here. GET
+     /platform/browser/methods says whether platform OIDC exists; the SSO button shows only when it does. -->
 <script>
   import Entry from './Entry.svelte';
-  import { P, platformSession } from './data.js';
+  import { P, PROBLEMS, platformSession } from './data.js';
   let { callback = false, query } = $props();
   // App re-creates the page on every hash change, so reading the props once is the whole lifetime.
   const q = (key) => query.get(key);
   const preview = q('preview');
-  const opening = (() => callback ? (preview === 'refused' ? P.platformIdentity : null) : { refused: P.platformRefused, throttled: P.platformThrottled, nosso: P.platformNoSso }[preview])();
+  const opening = (() => callback ? (preview === 'refused' ? P.platformIdentity : null) : { refused: P.platformRefused, throttled: P.platformThrottled, nosso: P.platformNoSso, unavailable: PROBLEMS.unavailable }[preview])();
   let issue = $state.raw(opening ?? null);
   let username = $state(preview === 'refused' ? 'ops-oncall' : '');
   let password = $state('');
-  const returning = (() => callback && preview !== 'refused')();
-  let busy = $state(returning ? 'sso' : '');
+  // `?sso=off`: no platform OIDC configured. `nosso` is the 404 a stale page gets after it was removed.
+  const oidc = q('sso') !== 'off' && preview !== 'nosso';
+  // The callback page renders after the server finished the login: a sign-in opens the console, a
+  // re-authentication in a pop-up reports to the console (`popup`), or one opened directly confirms (`reauth`).
+  if (callback && !preview) location.hash = '#/platform/ui';
+  let busy = $state('');
 
   // Simulates POST /platform/browser/password/login {username, password}: 200 with the session view and a fresh
   // Path=/platform cookie; every refusal is one 401.
@@ -33,15 +38,18 @@
   function sso(event) {
     event.preventDefault();
     issue = null;
-    location.hash = '#/platform/ui/callback?code=sample&state=sample';
+    busy = 'sso';
+    setTimeout(() => { Object.assign(platformSession, { method: 'oidc', recent: true }); location.hash = '#/platform/ui'; }, 900);
   }
-  if (returning) setTimeout(() => { Object.assign(platformSession, { method: 'oidc', recent: true }); location.hash = '#/platform/ui'; }, 900);
 </script>
 
 <Entry heading="Platform admin" {issue}>
   {#if callback}
-    {#if busy}
-      <p class="center" role="status" aria-busy="true" data-testid="callback">Finishing platform SSO sign-in…</p>
+    {#if preview === 'popup'}
+      <p class="center" role="status" data-testid="callback">Returning to the console…</p>
+    {:else if preview === 'reauth'}
+      <p class="center" role="status" data-testid="callback">Your sign-in is confirmed for five minutes.</p>
+      <a class="app-control primary wide" href="#/platform/ui">Back to the console</a>
     {:else}
       <a class="app-control primary wide" href="#/platform">Back to sign-in</a>
     {/if}
@@ -55,7 +63,9 @@
       <input id="password" class="app-input" type="password" name="password" autocomplete="current-password" readonly={!!busy} bind:value={password} />
       <button class="app-control primary wide" type="submit" disabled={!!busy} aria-busy={busy === 'password' ? 'true' : undefined} data-testid="platform-signin">{busy === 'password' ? 'Signing in…' : 'Sign in'}</button>
     </form>
-    <form onsubmit={sso}><button class="app-control wide" type="submit" disabled={!!busy || preview === 'nosso'} data-testid="platform-sso">Sign in with platform SSO</button></form>
+    {#if oidc}
+      <form onsubmit={sso}><button class="app-control wide" type="submit" disabled={!!busy} data-testid="platform-sso">Sign in with platform SSO</button></form>
+    {/if}
   {/if}
 </Entry>
 

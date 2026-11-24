@@ -46,12 +46,13 @@ switches light and dark.
 | `#/signup?preview=disabled` | Signup turned off: explanation and a link to sign in |
 | `#/signup?signup=failed` | The provider proof was refused (the server's own redirect query); retry |
 | `#/signup?preview=throttled` | `429 WYRD_AUTH_429_SIGNUP_ATTEMPTS`, "Try again in 23 minutes." |
-| `#/signup/workspace` | Proven Google identity with email, empty form, no challenge |
+| `#/signup/workspace?preview=checking` | The page reads the proof method before it shows the form |
+| `#/signup/workspace` | Proven Google identity, empty form, no challenge |
 | `#/signup/workspace?identity=email` | Email proof: the form adds the administrator username and password (`local_credentials`) |
 | `#/signup/workspace?identity=github` | Proven GitHub identity without an email |
 | `#/signup/workspace?identity=github&preview=contact` | `409` `details.reason: contact_required`: confirm an email bound to the provider attempt |
 | `#/signup/workspace?identity=github&local=off&preview=contact` | The same without a relay: the attempt ends, Start again |
-| `#/signup/workspace?challenge=on` | The form with the Turnstile placeholder |
+| `#/signup/workspace?challenge=on` | The form with the Turnstile placeholder; production renders the real widget from the published site key |
 | `#/signup/workspace?preview=invalid` | Inline slug validation |
 | `#/signup/workspace?preview=taken` | `409`: the slug is taken |
 | `#/signup/workspace?preview=throttled` | `429` with the retry time |
@@ -83,9 +84,10 @@ switches light and dark.
 | `#/t/<slug>/reset?preview=invalid` | `401 ONE_TIME_CODE_INVALID` on redemption |
 | `#/t/<slug>/reset?preview=sso` | Company SSO required: `403 METHOD_UNAVAILABLE`, no form |
 | `#/t/<slug>/login?reset=done` | Back at sign-in after `204`; reset never signs in |
-| `#/platform` | Entry, heading "Platform admin": operator username and password, Sign in with platform SSO |
-| `#/platform?preview=refused` / `throttled` / `nosso` / `ended` | `401 UNAUTHENTICATED` / `429 SIGN_IN_ATTEMPTS` / `404` no platform OIDC / session ended |
-| `#/platform/ui/callback` | Platform SSO return; `?preview=refused` is an unregistered identity (`401`) |
+| `#/platform` | Entry, heading "Platform admin": operator username and password, then Sign in with platform SSO when platform OIDC is configured |
+| `#/platform?sso=off` | No platform OIDC: the SSO button is not shown |
+| `#/platform?preview=refused` / `throttled` / `nosso` / `ended` / `unavailable` | `401 UNAUTHENTICATED` / `429 SIGN_IN_ATTEMPTS` / `404` platform OIDC removed since the page loaded (no button) / session ended / any 5xx |
+| `#/platform/ui/callback` | Platform SSO return: a sign-in opens the console; `?preview=refused` is an unregistered identity (`401`), `reauth` a confirmed re-authentication, `popup` the re-authentication pop-up handing back to the console |
 | `#/platform/ui` | Console overview: safe session metadata and workspaces with Suspend and Resume |
 | `#/platform/ui?preview=reauth` (`&method=oidc`) | Fresh-proof prompt before a destructive change, by password or forced platform SSO |
 | `#/platform/ui?preview=reauth-refused` | Re-authentication refused; nothing changed |
@@ -123,8 +125,8 @@ Wording and styling that no owner fixes yet; each needs a ruling before producti
 - **Slug field.** A refused slug gets a `--danger` border plus a "⊘" line beneath; the existing auth pages have no
   field-level error style to copy. The slug rule shown is the one in the mock brief (no underscore), which is narrower
   than the root page's tenant-key pattern.
-- **Identity line** shows the email in the strong text colour, and "Signed in with GitHub." when no email was proven.
-- **Turnstile** is a dashed placeholder box; the real widget brings its own look.
+- **Identity line** names the provider only ("Signed in with GitHub."); the proof read carries no address.
+- **Turnstile** is a dashed placeholder box; production renders Cloudflare's widget, which brings its own look.
 - **Success** is a "✓ Workspace created. Opening /t/<slug>…" status line under the button before navigation.
 - **Email proof pages.** One "Check your email" answer, worded the same for every address, with a paste field because
   the message also carries the code. The workspace list shows display name and route key per link.
@@ -132,18 +134,15 @@ Wording and styling that no owner fixes yet; each needs a ruling before producti
 - **Console** layout (top bar, four views, panels) and the in-place "Confirm it is you" prompt are this mock's.
   Workspace "retirement" is the wire's `suspended` status, so the console says Suspend and Resume.
 
-## Contract readings to rule on
+## Contract readings (ruled in cycle 15)
 
-- **Proof kind on `/signup/workspace`.** `ProofStatusResponse` is only `{status}` and the social callback redirects
-  without a query, so the page cannot tell an email proof (needs `local_credentials`) from a provider proof (refuses
-  them), nor which provider or address was proven. Either the page tracks how it started (the mock's `identity=`), or
-  the server should say. The existing "Signed in with Google as …" line has the same gap.
-- **Contact verification availability.** `/auth/browser/methods` has no flag for it; the page learns
-  `403 METHOD_UNAVAILABLE` only on submit. Either reuse `email_discovery` as the relay signal, or offer and refuse.
-- **Current recovery contact.** No read returns it, so the section cannot say which address is verified.
-- **Platform SSO button.** No signed-out read says whether platform OIDC exists; `/platform/browser/oidc/login` answers
-  `404`. Either always show the button (the mock) or add a read, per AC-013.
-- **`/platform` vs `/platform/ui`.** The mock puts the sign-in form on exact `/platform` and the console at
-  `/platform/ui`; a sign-in page under `/platform/ui/…` with `/platform` only redirecting reads the spec equally.
-- **Relay password on save.** `PUT /platform/mail` replaces the relay; an omitted password stores none, unlike the
-  challenge secret, which is kept when omitted.
+- **Proof kind on `/signup/workspace`.** `GET /auth/signup/proof` reports the method; the page names the provider and
+  never an address, and shows "Checking this browser's sign-in…" while it reads.
+- **Contact verification availability.** The recovery-email section appears only when `email_discovery` is offered.
+- **Current recovery contact.** No read returns it, so the section never shows the current address.
+- **Platform SSO button.** `GET /platform/browser/methods` says whether platform OIDC exists; the button shows only
+  then. A page loaded before OIDC was removed still gets the `404` (`?preview=nosso`).
+- **`/platform` vs `/platform/ui`.** Sign-in on exact `/platform`, the console under `/platform/ui`.
+- **Retirement** is Suspend and Resume; the platform's own `wyrd-system` workspace never suspends.
+- **Relay password on save.** A blank password keeps the stored one; "Remove the stored username and password" drops
+  both.

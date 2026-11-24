@@ -13,7 +13,6 @@ export const IDENTITIES = {
 
 /** Slugs the simulated server already holds. */
 export const TAKEN = ['acme', 'wyrd', 'demo'];
-export const WORKSPACE_LIMIT = 3;
 
 export const PROBLEMS = {
   // POST /auth/signup/complete for a provider proof without a verified email: 409 with details.reason contact_required.
@@ -23,7 +22,7 @@ export const PROBLEMS = {
   // GET /signup?signup=failed: a redirect, so no problem body and no code.
   failed: { status: 401, code: null, title: 'Sign-in was not confirmed', remediation: 'The provider did not confirm who you are, so no workspace was created. Try again.' },
   taken: { status: 409, code: 'WYRD_SPEC_409_CONFLICT', title: 'That URL is already taken', remediation: 'Choose a different URL slug and create the workspace again.' },
-  limit: { status: 403, code: 'WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT', title: 'Workspace limit reached', remediation: `This account already owns the maximum number of workspaces (${WORKSPACE_LIMIT}). Sign in to an existing workspace, or contact the operator to raise the limit.` },
+  limit: { status: 403, code: 'WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT', title: 'Workspace limit reached', remediation: `This account already owns the maximum number of workspaces. Sign in to an existing workspace, or contact the operator to raise the limit.` },
   challenge: { status: 403, code: 'WYRD_AUTH_403_SIGNUP_CHALLENGE', title: 'Challenge not passed', remediation: 'Complete the challenge below, then create the workspace again.' },
   disabled: { status: 401, code: 'WYRD_AUTH_401_INVALID_TOKEN', title: 'Workspace signup is no longer available', remediation: 'The operator turned off signup, or this sign-in method, after you started. No workspace was created.' },
   expired: { status: 400, code: 'WYRD_AUTH_400_INVALID_STATE', title: 'This signup expired', remediation: 'Start again to confirm who you are, then name your workspace.' },
@@ -68,6 +67,7 @@ export const STATES = [
   ['Signup verify · email confirmed', '#/signup/verify?preview=proven'],
   ['Signup verify · link not accepted (401)', '#/signup/verify?preview=invalid'],
   ['Signup verify · link expired (400)', '#/signup/verify?preview=expired'],
+  ['Workspace · reading the proof', '#/signup/workspace?preview=checking'],
   ['Workspace · Google, empty form', '#/signup/workspace'],
   ['Workspace · email proof, administrator sign-in', '#/signup/workspace?identity=email'],
   ['Workspace · GitHub, no email', '#/signup/workspace?identity=github'],
@@ -112,9 +112,13 @@ export const STATES = [
   ['Platform · sign-in', '#/platform'],
   ['Platform · sign-in refused (401)', '#/platform?preview=refused'],
   ['Platform · too many attempts (429)', '#/platform?preview=throttled'],
-  ['Platform · SSO not configured (404)', '#/platform?preview=nosso'],
+  ['Platform · no platform SSO configured', '#/platform?sso=off'],
+  ['Platform · SSO removed since the page loaded (404)', '#/platform?preview=nosso'],
+  ['Platform · server failure (5xx)', '#/platform?preview=unavailable'],
   ['Platform · session ended', '#/platform?preview=ended'],
   ['Platform · SSO return refused (401)', '#/platform/ui/callback?preview=refused'],
+  ['Platform · SSO re-authentication confirmed', '#/platform/ui/callback?preview=reauth'],
+  ['Platform · SSO re-authentication pop-up returning', '#/platform/ui/callback?preview=popup'],
   ['Console · overview', '#/platform/ui'],
   ['Console · re-authenticate with password', '#/platform/ui?preview=reauth'],
   ['Console · re-authenticate with platform SSO', '#/platform/ui?preview=reauth&method=oidc'],

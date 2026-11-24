@@ -1,4 +1,5 @@
-<!-- #/signup/workspace: after provider proof, name the workspace and choose its URL slug. -->
+<!-- #/signup/workspace: after provider proof, name the workspace and choose its URL slug. GET /auth/signup/proof
+     names only the proof method, so the page says which provider and never which address. -->
 <script>
   import Entry from './Entry.svelte';
   import CheckEmail from './CheckEmail.svelte';
@@ -91,6 +92,8 @@
 <Entry heading="Name your workspace" {issue}>
   {#if ended}
     <a class="app-control primary wide" href={issue === PROBLEMS.disabled ? '#/' : '#/signup'}>{issue === PROBLEMS.disabled ? 'Sign in to an existing workspace' : 'Start again'}</a>
+  {:else if preview === 'checking'}
+    <p class="identity" role="status" aria-busy="true" data-testid="checking">Checking this browser’s sign-in…</p>
   {:else}
     {#if issue === PROBLEMS.contact}
       {#if contactSent}
@@ -107,7 +110,7 @@
     {/if}
     {#if contactProven}<p class="identity done" role="status" data-testid="contact-proven"><span class="ok">✓</span> Email confirmed. Create the workspace again.</p>{/if}
     <p class="identity" data-testid="identity">
-      {#if local}Email confirmed in this browser. Choose the username and password you will sign in with.{:else}Signed in with {PROVIDERS[identity.provider]}{#if identity.email}{' '}as <b>{identity.email}</b>{/if}.{/if}
+      {#if local}Email confirmed in this browser. Choose the username and password you will sign in with.{:else}Signed in with {PROVIDERS[identity.provider]}.{/if}
     </p>
     <form class="fields" novalidate onsubmit={create}>
       <label for="display-name">Workspace name</label>

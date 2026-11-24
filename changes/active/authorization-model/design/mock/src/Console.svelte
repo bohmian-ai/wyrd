@@ -101,19 +101,23 @@
   // Mail relay: GET/PUT /platform/mail; POST /platform/mail/test {recipient} -> {accepted, error}.
   const stored = preview === 'none' ? null : RELAY;
   let relay = $state(stored && { ...stored });
-  const draft = $state({ host: stored?.host ?? '', port: stored?.port ?? 587, tls: stored?.tls ?? 'starttls', username: stored?.username ?? '', password: '', sender: stored?.sender ?? '' });
+  const draft = $state({ host: stored?.host ?? '', port: stored?.port ?? 587, tls: stored?.tls ?? 'starttls', username: stored?.username ?? '', password: '', remove: false, sender: stored?.sender ?? '' });
   let recipient = $state('ops@example.test');
   let testResult = $state.raw(preview === 'test-failed' ? { accepted: false, error: '535 5.7.8 Authentication credentials invalid' } : null);
   let testing = $state(false);
   function saveRelay(event) {
     event.preventDefault();
-    if (!draft.host.trim() || !draft.sender.includes('@') || (draft.password && !draft.username.trim())) {
-      issue = { status: 400, code: 'WYRD_SPEC_400_VALIDATION', title: 'Check the relay settings', remediation: 'Enter a host and a sender address. A password needs a username.' };
+    const newUser = !draft.remove && !!draft.username.trim() && draft.username.trim() !== relay?.username;
+    if (!draft.host.trim() || !draft.sender.includes('@') || (draft.password && !draft.username.trim() && !draft.remove) || (newUser && !draft.password)) {
+      issue = { status: 400, code: 'WYRD_SPEC_400_VALIDATION', title: 'Check the relay settings', remediation: 'Enter a host and a sender address. A password needs a username, and a new username needs its password.' };
       return;
     }
     attempt('Replacing the mail relay', () => {
-      relay = { host: draft.host.trim(), port: draft.port, tls: draft.tls, username: draft.username.trim() || null, password_set: !!draft.password, sender: draft.sender.trim() };
-      draft.password = '';
+      // A blank password keeps the stored one; removal drops the username and the password sealed to it.
+      const username = draft.remove ? null : draft.username.trim() || null;
+      const password_set = !!username && (!!draft.password || !!relay?.password_set);
+      relay = { host: draft.host.trim(), port: draft.port, tls: draft.tls, username, password_set, sender: draft.sender.trim() };
+      Object.assign(draft, { username: username ?? '', password: '', remove: false });
       notice = 'Mail relay saved.';
     });
   }
@@ -208,7 +212,7 @@
             </tbody>
           </table>
         </div>
-        <p>Suspending keeps every row, grant and credential; resuming restores them. Provisioning and failed workspaces change only by provisioning.</p>
+        <p>Suspending keeps every row, grant and credential; resuming restores them. Provisioning and failed workspaces change only by provisioning; the platform's own <code>wyrd-system</code> workspace never suspends.</p>
       </section>
     {:else if view === 'providers'}
       <p class="lead">Shared Google and GitHub.com sign-in for every workspace. Register the client in the provider console first. A saved client is a new, untested revision that no page offers until a real sign-in tests it and you enable it.</p>
@@ -263,7 +267,10 @@
           </select>
           <label for="relay-user">Username</label><input id="relay-user" class="app-input mono" autocomplete="off" bind:value={draft.username} />
           <label for="relay-password">Password</label><input id="relay-password" class="app-input mono" type="password" autocomplete="off" bind:value={draft.password} />
-          <p>Saving replaces the whole relay. The stored password is never shown; enter it again to keep one.</p>
+          <p>The stored password is never shown. Leave it blank to keep it; a new username needs its password.</p>
+          {#if relay?.username}
+            <label class="check"><input type="checkbox" bind:checked={draft.remove} /> Remove the stored username and password</label>
+          {/if}
           <label for="sender">Sender address</label><input id="sender" class="app-input" type="email" autocomplete="off" bind:value={draft.sender} />
           <button class="app-control primary" type="submit">Save relay</button>
         </form>

@@ -180,6 +180,22 @@ Repeat steps 3 to 5 with the new `revision` the stage call returns. Only a conne
 
 Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Bindings you grant with `wyrd principal access grant` are separate: sign-in never adds or removes them.
 
+## Require company sign-in
+
+Once the connection is active, you can make it the only way people sign in to the tenant. Password and Google or GitHub sign-in then stop, and so do the sessions and CLI sign-ins they started. API keys keep working.
+
+1. Sign in to the UI through your company provider, as an account that holds `admin`.
+2. Open **Settings**. **Require company SSO** shows how many active accounts cannot sign in through your company.
+3. Check **Require company SSO for every person** and select **Enable**.
+
+The page then reads `✓ Required`, and the sign-in page offers only your company provider. **Disable** works the same way. Disabling lets password and social sign-in start again, but every session and CLI sign-in that enabling ended stays ended.
+
+<Aside type="caution" title="Wyrd never links accounts">
+A password, Google or GitHub account and a company account are separate accounts, even with the same email. Requiring company sign-in moves no roles, keys or history to the company account. Grant the company accounts their roles before you enable it. The warning count tells you how many accounts this leaves out.
+</Aside>
+
+Enabling and disabling need a company sign-in from the last five minutes. An API key or a recovery session cannot change the policy. If your provider is down while company sign-in is required, people cannot sign in until it returns or you activate a replacement connection with the recovery key, as in step 5.
+
 ## Without an identity provider
 
 Wyrd keeps local Users of its own, so a team can sign in before or without connecting a provider. As the administrator, invite a person with the grants their account receives:
@@ -230,6 +246,7 @@ From then on, Wyrd emails each new or resent link separately to its recipient an
 | The provider says the redirect URI is invalid | Register the exact `callback_url` from step 1. Call the API at the public address, not an internal one |
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` from activate | The test expired after 15 minutes, or you staged a new revision since. Rerun step 4 |
 | `WYRD_AUTH_409_CONNECTION_CONFLICT` | `expected_revision` is stale, or the recovery key is not an admin key of this tenant. Read the current revision with the step 1 call |
+| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` when you enable or disable company sign-in | Sign in through your company again, return to **Settings**, and confirm again |
 | A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no grant yet. Bind one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
 
 ## Next

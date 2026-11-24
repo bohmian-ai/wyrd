@@ -433,6 +433,28 @@ Unavailable provider access is a material verification limitation: finish
 unaffected work, disclose it and leave this entry unfinished, never claim smoke
 or complete task acceptance.
 
+Evidence:
+
+- Docs (content review, plus `mise run docs:check`, which passes including
+  a11y on 48 pages).
+  - `docs/src/content/docs/operate/add-people.md` § Require company sign-in
+    gives the actual UI steps (Settings › Require company SSO, confirmation
+    checkbox, Enable/Disable).
+  - It states that disabling revives no ended credential.
+  - A caution states the no-linking limitation: separate accounts, no
+    transfer of roles, keys or history.
+  - It states the five-minute company sign-in requirement, and that an API
+    key or recovery session cannot change the policy.
+  - It covers outage recovery through recovery-key activation of a
+    replacement connection.
+  - A new `If it fails` row covers `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED`.
+  - The generated `api/errors.md` and `llms-full.txt` were regenerated for
+    the remediation wording.
+- FAIL / unfinished: no operator-configured deployment or real Google/GitHub
+  credentials were available. Real Google and GitHub sign-in/signup,
+  consent, callback and account selection were not observed. Material
+  verification limitation; no smoke is claimed.
+
 ## Verification and handoff
 
 Test owners: `wyrd-server/tests/integration/{identity_e2e.rs,identity_ui_e2e.rs,

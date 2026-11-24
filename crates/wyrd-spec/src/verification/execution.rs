@@ -336,6 +336,22 @@ pub struct ApprovalOccurrenceState {
     pub reason: Option<String>,
 }
 
+/// One declared step or whole-Verifier requirement held before dispatch
+/// because deferred inputs it reads directly have not been consumed. An
+/// attached requirement's inputs count for its step; a task only downstream
+/// of a waiting one is not listed. No invocation exists for it yet.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct InputWait {
+    /// The waiting step or whole-Verifier requirement.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub task_id: TaskId,
+    /// The missing deferred inputs it reads; never empty.
+    #[cfg_attr(feature = "server", schema(value_type = Vec<String>))]
+    pub slots: BTreeSet<SlotName>,
+}
+
 /// How to upload one missing file through the shared storage lifecycle.
 ///
 /// Transfer the bytes by `plan`, then finish with
@@ -414,6 +430,12 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// decided, in step order; empty when it reached none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<ApprovalOccurrenceState>,
+    /// Every declared task an unfinished execution holds because a deferred
+    /// input it reads has not been consumed, one per task in task order,
+    /// reported while independent work still runs; empty otherwise. It never
+    /// decides [`Self::status`] and never implies a verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_waits: Vec<InputWait>,
     /// How far GitHub delivery of a `pull_request` execution's current
     /// state got; absent for every other origin. Delivery never changes the
     /// verdict, and its failure never fails the execution.
@@ -1374,6 +1396,7 @@ impl VerificationExecutionState {
             pull_request,
             waiting,
             approvals,
+            input_waits,
             github_delivery,
         } = self;
         Ok(VerificationExecutionState {
@@ -1388,6 +1411,7 @@ impl VerificationExecutionState {
             pull_request,
             waiting,
             approvals,
+            input_waits,
             github_delivery,
         })
     }

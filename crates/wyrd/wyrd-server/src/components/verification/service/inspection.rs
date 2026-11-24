@@ -307,6 +307,29 @@ impl Retained {
         }
     }
 
+    /// Whether the execution is unfinished: pending, retrying, running, or
+    /// waiting.
+    fn open(&self) -> bool {
+        matches!(
+            self.status(),
+            VerificationExecutionStatus::Pending
+                | VerificationExecutionStatus::Retrying
+                | VerificationExecutionStatus::Running
+                | VerificationExecutionStatus::Waiting
+        )
+    }
+
+    /// The tasks an unfinished execution holds for deferred inputs not yet
+    /// consumed; empty once it ended, however it ended, so a cancelled or
+    /// superseded execution never reports a wait its engine left behind.
+    pub(super) fn input_waits(&self) -> Vec<wyrd_spec::verification::execution::InputWait> {
+        if self.open() {
+            self.state.input_waits.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Whether an approval occurrence the execution recorded has no
     /// accepted decision and may still get one.
     fn undecided(&self) -> bool {
@@ -329,13 +352,7 @@ impl Retained {
     /// `pending` while the execution is unfinished and its step was not
     /// withdrawn, and otherwise `expired`, with no actor.
     pub(super) fn approvals(&self) -> Vec<ApprovalOccurrenceState> {
-        let open = matches!(
-            self.status(),
-            VerificationExecutionStatus::Pending
-                | VerificationExecutionStatus::Retrying
-                | VerificationExecutionStatus::Running
-                | VerificationExecutionStatus::Waiting
-        );
+        let open = self.open();
         self.state
             .approvals
             .iter()

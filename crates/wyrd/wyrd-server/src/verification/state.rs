@@ -45,7 +45,7 @@ use wyrd_spec::storage::StoredObjectRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    ExecutedOutcome, InvocationSettlement, Producer, Publication, PublicationKind,
+    ExecutedOutcome, InputWait, InvocationSettlement, Producer, Publication, PublicationKind,
 };
 use wyrd_spec::verification::state::{
     AcceptedPublication, ApprovalOccurrence, ControlRecord, ExecutionIdentity, ExecutionState,
@@ -763,6 +763,7 @@ impl RunState {
             Decision::Selected(selected) => held.state.terminal = Some(selected),
             Decision::Failed(failure) => held.state.failure = Some(failure),
         }
+        held.state.input_waits.clear();
         self.writer.changed(&mut held);
         Ok(held
             .decision()
@@ -804,8 +805,9 @@ impl RunState {
     }
 
     /// Record that deferred input `slot` was supplied from published
-    /// evidence `evidence`, which also ends any wait for it, so a
-    /// resumption reads exactly that evidence.
+    /// evidence `evidence`, which also ends any wait for it, removing it from
+    /// every task waiting for it and dropping a task left waiting for
+    /// nothing, so a resumption reads exactly that evidence.
     ///
     /// # Errors
     /// Returns [`StateError::Stale`] once the writer broke or lost its
@@ -815,7 +817,11 @@ impl RunState {
         if !self.writer.current(&held) {
             return Err(StateError::Stale);
         }
-        let waited = held.state.waiting.remove(slot);
+        let mut waited = held.state.waiting.remove(slot);
+        for wait in &mut held.state.input_waits {
+            waited |= wait.slots.remove(slot);
+        }
+        held.state.input_waits.retain(|wait| !wait.slots.is_empty());
         if held.state.evidence.insert(slot.clone(), evidence) != Some(evidence) || waited {
             self.writer.changed(&mut held);
         }
@@ -1101,6 +1107,21 @@ impl vala_verify::blocks::Checkpoints for RunState {
     async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String> {
         let execution = self.writer.row.execution_id;
         self.change(|state| Ok(record_approval(state, execution, occurrence.clone())))
+    }
+
+    /// Replace the live state's task input waits with `waits`; the same
+    /// snapshot again changes nothing, so it stages no new revision.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the writer broke or lost its lease.
+    fn waits(&self, waits: &[InputWait]) -> Result<(), String> {
+        self.change(|state| {
+            if state.input_waits == waits {
+                return Ok(false);
+            }
+            waits.clone_into(&mut state.input_waits);
+            Ok(true)
+        })
     }
 }
 
@@ -1523,6 +1544,70 @@ mod tests {
         assert!(state.snapshot().terminal.is_none());
         settled(&state).await.expect("the failure is accepted");
         assert_eq!(revisions(&scribe).len(), 1);
+    }
+
+    /// Proves task input waits are the engine's latest snapshot: the same
+    /// snapshot stages no new revision, consumed evidence leaves every task
+    /// and drops a task left waiting for nothing, a terminal decision clears
+    /// them, and a writer that lost its lease changes nothing.
+    ///
+    /// # Panics
+    /// Panics when a repeated snapshot stages a revision, consumption or a
+    /// decision leaves the wrong waits, or a stale writer records one.
+    #[tokio::test]
+    async fn input_waits_follow_the_snapshot_consumption_and_decision() {
+        use wyrd_spec::ids::{EvidenceId, SlotName};
+        use wyrd_spec::verification::execution::InputWait;
+        let wait = |name: &str, slots: &[&str]| InputWait {
+            task_id: task(name),
+            slots: slots
+                .iter()
+                .map(|slot| SlotName::new(*slot).expect("slot"))
+                .collect(),
+        };
+        let (state, scribe) = held_state();
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        let snapshot = vec![wait("green", &["ci"]), wait("read-ci", &["ci", "later"])];
+        state.waits(&snapshot).expect("recorded");
+        settled(&state).await.expect("the snapshot is accepted");
+        state.waits(&snapshot).expect("recorded again");
+        settled(&state).await.expect("nothing new to accept");
+        assert_eq!(
+            revisions(&scribe).len(),
+            1,
+            "the same snapshot stages nothing"
+        );
+        assert_eq!(state.snapshot().input_waits, snapshot);
+
+        state
+            .accept_evidence(&SlotName::new("ci").expect("slot"), EvidenceId::new_v7())
+            .expect("accepted");
+        assert_eq!(
+            state.snapshot().input_waits,
+            vec![wait("read-ci", &["later"])]
+        );
+        settled(&state).await.expect("the consumption is accepted");
+        assert_eq!(revisions(&scribe).len(), 2);
+
+        let error = wyrd_spec::verification::VerificationError {
+            code: "cancelled".to_owned(),
+            message: "cancelled".to_owned(),
+        };
+        state
+            .fail(
+                wyrd_spec::verification::VerificationExecutionStatus::Cancelled,
+                &error,
+            )
+            .expect("decided");
+        assert!(state.snapshot().input_waits.is_empty());
+
+        let lost = CancellationToken::new();
+        let (stale, _scribe) = held_at(ExecutionState::fresh(), 0, lost.clone());
+        lost.cancel();
+        assert!(stale.waits(&snapshot).is_err());
+        assert!(stale.snapshot().input_waits.is_empty());
     }
 
     /// Proves a refused revision breaks a queued writer: its persistence

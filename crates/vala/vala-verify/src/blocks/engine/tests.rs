@@ -3053,6 +3053,8 @@ struct Ledger {
     controls: Mutex<Vec<ControlRecord>>,
     /// Every reached approval occurrence, in order.
     reached: Mutex<Vec<ApprovalOccurrence>>,
+    /// Every input-wait snapshot reported, in order.
+    waits: Mutex<Vec<Vec<InputWait>>>,
 }
 
 impl Ledger {
@@ -3203,6 +3205,18 @@ impl Checkpoints for Ledger {
             .lock()
             .expect("ledger")
             .push(occurrence.clone());
+        Ok(())
+    }
+
+    /// Record the reported snapshot.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    fn waits(&self, waits: &[InputWait]) -> Result<(), String> {
+        self.waits.lock().expect("ledger").push(waits.to_vec());
         Ok(())
     }
 }
@@ -4893,6 +4907,66 @@ async fn deferred_inputs_hold_only_their_consumers_until_supplied() {
             ("later", RequirementOutcome::Passed),
         ])
     );
+}
+
+/// Before anything is dispatched, the engine reports exactly the tasks that
+/// read a missing deferred input directly, each with its own missing slots
+/// in task order: a step through its action or an attached requirement, a
+/// step still behind an unfinished dependency, and a whole-Verifier
+/// requirement. A task only downstream of a waiting one, and an unused
+/// deferred slot, report nothing, and no waiting task is invoked.
+///
+/// # Panics
+/// Panics when the reported snapshot differs, is reported more than once,
+/// or a waiting task records an invocation.
+#[tokio::test(start_paused = true)]
+async fn input_waits_report_only_direct_consumers_before_dispatch() {
+    let assert = |id: &str, path: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": "is_not_null"}});
+    let spec = verifier(json!({
+        "inputs": {
+            "answer": {"type": "json"},
+            "ci": {"type": "json", "deferred": true},
+            "later": {"type": "json", "deferred": true},
+            "unused": {"type": "json", "deferred": true}
+        },
+        "steps": [
+            {"id": "independent", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "read-ci", "action": code_action(json!({"ci": "inputs.ci", "later": "inputs.later"}))},
+            {"id": "checked", "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [assert("ci-green", "inputs.ci")]},
+            {"id": "behind", "depends_on": ["independent"], "action": code_action(json!({"ci": "inputs.ci"}))},
+            {"id": "after-ci", "action": code_action(json!({"r": "steps.read-ci.output"}))}
+        ],
+        "requirements": [assert("green", "inputs.ci"), assert("done", "steps.after-ci.output")]
+    }));
+    let ledger = Arc::new(Ledger::default());
+    let script = Arc::new(Script::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let waiting = run(&engine, &spec, json!({"answer": 1})).await;
+    assert!(
+        matches!(waiting, Err(EngineError::Waiting { .. })),
+        "{waiting:?}"
+    );
+    let wait = |task: &str, slots: &[&str]| InputWait {
+        task_id: TaskId::new(task).expect("task id"),
+        slots: slots
+            .iter()
+            .map(|slot| SlotName::new(*slot).expect("slot"))
+            .collect(),
+    };
+    assert_eq!(
+        *ledger.waits.lock().expect("ledger"),
+        vec![vec![
+            wait("behind", &["ci"]),
+            wait("checked", &["ci"]),
+            wait("green", &["ci"]),
+            wait("read-ci", &["ci", "later"]),
+        ]]
+    );
+    assert_eq!(ledger.attempts(), vec![("independent".to_owned(), 1, true)]);
 }
 
 /// A reached approval is recorded at once, while an independent step is

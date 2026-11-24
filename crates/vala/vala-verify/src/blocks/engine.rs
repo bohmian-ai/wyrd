@@ -45,7 +45,7 @@ use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::ApprovalReceipt;
 use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, ExecutedOutcome, ExecutedRequirement, InputDeclaration,
+    CallProvenance, Citation, ExecutedOutcome, ExecutedRequirement, InputDeclaration, InputWait,
     InvocationSettlement, Locator, Producer, ProducerInvocation, RequirementDetail,
     RequirementDetails, RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
     ToolCallRecord,
@@ -734,6 +734,21 @@ impl VerificationEngine {
         }
     }
 
+    /// Record `waits`, the complete snapshot of tasks held for deferred
+    /// inputs, so a queued host reports them while independent work runs.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Checkpoint`] when the host cannot record it.
+    fn waits(&self, waits: &[InputWait]) -> Result<(), EngineError> {
+        match &self.checkpoints {
+            Some(checkpointed) => checkpointed
+                .store
+                .waits(waits)
+                .map_err(EngineError::Checkpoint),
+            None => Ok(()),
+        }
+    }
+
     /// Record that the approval `occurrence` was reached, so a queued host
     /// offers it for a decision while independent work continues.
     ///
@@ -1043,7 +1058,11 @@ impl VerificationEngine {
     /// A block reading a `waiting` deferred slot is never released, so it and
     /// everything downstream of it stay pending while independent blocks
     /// run; once nothing runs and such a block is still pending, the drive
-    /// returns [`EngineError::Waiting`] naming the slots it waits for.
+    /// returns [`EngineError::Waiting`] naming the slots it waits for. Before
+    /// anything is dispatched, the drive reports every such direct consumer
+    /// and its missing slots through [`Checkpoints::waits`]: the snapshot
+    /// stays the same for the whole drive, since its waiting slots are fixed
+    /// and a block reading one is never released.
     ///
     /// # Errors
     /// Returns [`EngineError::Capture`], [`EngineError::Join`],
@@ -1079,6 +1098,18 @@ impl VerificationEngine {
             .map(Node::Step)
             .chain((0..spec.requirements.len()).map(Node::Requirement))
             .collect();
+        let mut waits: Vec<InputWait> = pending
+            .iter()
+            .filter_map(|&node| {
+                let slots = waited(node);
+                (!slots.is_empty()).then(|| InputWait {
+                    task_id: node.id(spec).clone(),
+                    slots,
+                })
+            })
+            .collect();
+        waits.sort();
+        self.waits(&waits)?;
         let mut tasks: Tasks<'_, Node, Arc<Done>, EngineError> = Tasks::default();
         let mut disposed = BTreeSet::new();
         // Steps holding an undecided approval occurrence, by step index:

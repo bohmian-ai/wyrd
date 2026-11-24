@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::TaskId;
-use super::execution::{ExecutedOutcome, InvocationSettlement, Producer, Publication, Speculation};
+use super::execution::{
+    ExecutedOutcome, InputWait, InvocationSettlement, Producer, Publication, Speculation,
+};
 use super::{VerificationError, VerificationExecutionStatus};
 use crate::auth::Sha256Hex;
 use crate::ids::{ApprovalId, CardUid, EvidenceId, GroupId, SlotName, VerificationResultId};
@@ -35,8 +37,9 @@ use crate::storage::StoredObjectRef;
 /// execution waits for and the deferred evidence it accepted; a format 3
 /// state is a format 4 state holding neither, so it still decodes. Format 5
 /// added the approval occurrences an execution reached; a format 3 or 4
-/// state holds none.
-pub const EXECUTION_STATE_FORMAT: u32 = 5;
+/// state holds none. Format 6 added the tasks waiting for deferred inputs;
+/// an earlier state holds none, and resuming it reports them again.
+pub const EXECUTION_STATE_FORMAT: u32 = 6;
 
 /// The oldest stored format that decodes as [`EXECUTION_STATE_FORMAT`].
 const OLDEST_READABLE_FORMAT: u32 = 3;
@@ -84,6 +87,10 @@ pub struct ExecutionState {
     /// once recorded; its decision is accepted beside the state, never in it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<RecordedApproval>,
+    /// The tasks the engine last reported holding for deferred inputs not
+    /// yet consumed, in task order; empty once decided.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_waits: Vec<InputWait>,
 }
 
 /// One logical approval occurrence: an approval step, with its fanout item
@@ -312,8 +319,8 @@ impl ExecutionState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlRecord, EXECUTION_STATE_FORMAT, ExecutionState, ExecutionStateError, Speculation,
-        TaskId,
+        ControlRecord, EXECUTION_STATE_FORMAT, ExecutionState, ExecutionStateError, InputWait,
+        Speculation, TaskId,
     };
 
     /// A step's recorded disposition is what inspection reports; a step
@@ -338,8 +345,9 @@ mod tests {
         assert_eq!(state.speculation(&reader), Speculation::None);
     }
 
-    /// Only [`EXECUTION_STATE_FORMAT`] and format 3 decode, format 3 as the
-    /// current format: a newer, missing, or earlier format is incompatible and a state that does not decode is
+    /// Only [`EXECUTION_STATE_FORMAT`] and formats 3 to 5 decode, the earlier
+    /// ones as the current format with no input waits, and format 6 round
+    /// trips its input waits: a newer, missing, or earlier format is incompatible and a state that does not decode is
     /// malformed, never fresh.
     ///
     /// # Panics
@@ -360,11 +368,28 @@ mod tests {
             ExecutionState::decode(serde_json::json!({})),
             Err(ExecutionStateError::Incompatible { found: 0 })
         ));
-        let previous = serde_json::json!({ "format": 3, "sequence": 0, "invocations": [], "publications": [] });
+        for previous in 3..EXECUTION_STATE_FORMAT {
+            let stored = serde_json::json!({ "format": previous, "sequence": 0, "invocations": [], "publications": [] });
+            assert_eq!(
+                ExecutionState::decode(stored),
+                Ok(ExecutionState::fresh()),
+                "format {previous} decodes with no input waits"
+            );
+        }
+        let waiting = ExecutionState {
+            input_waits: vec![InputWait {
+                task_id: TaskId::new("ci-review").expect("valid step id"),
+                slots: [crate::ids::SlotName::new("ci").expect("valid slot")].into(),
+            }],
+            ..ExecutionState::fresh()
+        };
+        let stored = serde_json::to_value(&waiting).expect("state serializes");
+        assert_eq!(stored["format"], 6);
         assert_eq!(
-            ExecutionState::decode(previous),
-            Ok(ExecutionState::fresh())
+            stored["input_waits"],
+            serde_json::json!([{ "task_id": "ci-review", "slots": ["ci"] }])
         );
+        assert_eq!(ExecutionState::decode(stored), Ok(waiting));
         for earlier in 1..super::OLDEST_READABLE_FORMAT {
             assert_eq!(
                 ExecutionState::decode(serde_json::json!({ "format": earlier, "sequence": 0 })),

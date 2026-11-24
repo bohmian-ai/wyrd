@@ -39,8 +39,8 @@ use tokio::time::Instant;
 use wyrd_spec::card::verifier::{Action, Check, PathSegment};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
-    RequirementDetail, Verdict,
+    CallProvenance, InputDeclaration, InputWait, InvocationSettlement, Producer,
+    PublicationCollection, RequirementDetail, Verdict,
 };
 use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord};
 use wyrd_spec::verification::{PublicationName, TaskId};
@@ -418,6 +418,16 @@ pub trait Checkpoints: Send + Sync {
     /// Returns a bounded reason when the occurrence cannot be recorded, such
     /// as a lost lease; nothing downstream of it then runs.
     async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String>;
+
+    /// Record `waits`, every declared task the engine holds before dispatch
+    /// for deferred inputs not yet supplied, in task order, as the complete
+    /// current snapshot while independent work may still run. Recording the
+    /// same snapshot again changes nothing. Nothing waits for it to persist.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the snapshot cannot be recorded, such
+    /// as a lost lease; the drive then stops as for any checkpoint failure.
+    fn waits(&self, waits: &[InputWait]) -> Result<(), String>;
 }
 
 /// Decodes a check's raw `response` as the Verdict its declared `schema`

@@ -295,12 +295,14 @@ impl<'a> VerificationControl<'a> {
                 pull_request: None,
                 waiting: std::collections::BTreeSet::new(),
                 approvals: Vec::new(),
+                input_waits: Vec::new(),
                 github_delivery: None,
             },
         };
         state.status = retained.status();
         state.waiting = retained.waiting();
         state.approvals = retained.approvals();
+        state.input_waits = retained.input_waits();
         if state.pull_request.is_some() {
             let recorded = GithubDeliveries::new(self.state, caller.data_tenant_id)
                 .recorded(&records, execution_id, retained.revision, state.status)

@@ -50,7 +50,7 @@ pub use wyrd_spec::storage::DownloadInitResponse;
 /// The wire shapes [`Execution`]'s inspection and cancellation exchange.
 pub use wyrd_spec::verification::execution::{
     ApprovalDecision, ApprovalOccurrenceState, ApprovalReceipt, ApprovalStatus,
-    CancelExecutionResponse, ExecutionInvocation, ExecutionPageQuery, HistoryProjection,
+    CancelExecutionResponse, ExecutionInvocation, ExecutionPageQuery, HistoryProjection, InputWait,
     InvocationPage, InvocationProgress, Producer, Publication, PublicationContent, PublicationFile,
     PublicationKind, PublicationManifest, PublicationPage, PublicationSelector, PublicationSummary,
     Speculation,

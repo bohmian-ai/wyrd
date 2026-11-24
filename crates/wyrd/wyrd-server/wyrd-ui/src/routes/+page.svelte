@@ -242,6 +242,7 @@
   }
   .links a {
     color: var(--muted);
+    text-decoration: underline;
   }
   .access-help {
     text-align: center;

@@ -203,6 +203,12 @@ In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email 
 
 Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
 
+## Recovery email and password reset
+
+A person with a password resets it on the sign-in page with **Reset your password**. With a mail relay, they enter their username and Wyrd emails a one-time code to the account's verified recovery email; the page answers every username the same, so it never says whether an account exists. Without a relay, or when the account has no verified recovery email, an administrator issues the code with `POST /v1/principals/users/{principal_id}/password-reset` and gives it to the person. A code works once, for fifteen minutes. Setting the new password signs the person out everywhere and ends their CLI sign-ins; API keys keep working.
+
+Each person verifies their own recovery email under **Settings**, then **Account**, then **Recovery email**. The section appears only when the deployment has a mail relay, needs a sign-in from the last five minutes, and never shows the current address. Wyrd emails a link to the new address; opening it in the same browser while signed in finishes the change, and the previous address is told. A verified recovery email is also what **Find my workspaces** uses to list the workspaces that address can sign in to; an unverified profile email is never used for either.
+
 ## Email invitations
 
 Wyrd can also email each invitation link through an SMTP relay you already use: your company's mail server or a transactional mail service such as Resend. Set up the sending account and domain with that service first. As a platform administrator, store the relay. The password is sealed and never returned, and tenant administrators can neither read nor change it:

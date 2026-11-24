@@ -220,12 +220,15 @@ export class BrowserSessions {
     return begun.authorization_url;
   }
 
-  /** The sign-in methods Rust allows on this tenant's pages; rendering only, never enforcement. */
-  async methods(tenantKey: string, url: URL): Promise<LoginMethods> {
-    this.cookieName(tenantKey);
-    const response = await call(`/auth/browser/methods?tenant=${encodeURIComponent(tenantKey)}`, url, {
-      method: 'GET'
-    });
+  /**
+   * The sign-in methods Rust allows on this tenant's pages, or with no tenant
+   * on the deployment's root pages (creation and discovery); rendering only,
+   * never enforcement.
+   */
+  async methods(tenantKey: string | null, url: URL): Promise<LoginMethods> {
+    if (tenantKey !== null) this.cookieName(tenantKey);
+    const query = tenantKey === null ? '' : `?tenant=${encodeURIComponent(tenantKey)}`;
+    const response = await call(`/auth/browser/methods${query}`, url, { method: 'GET' });
     if (!response.ok) await refuse(response);
     return (await response.json()) as LoginMethods;
   }
@@ -270,6 +273,20 @@ export class BrowserSessions {
   }
 
   /** Set a new password with an operator-issued reset code; signs nothing in. */
+  /**
+   * Ask Rust to mail a reset code to the verified recovery email of
+   * `username`; every account gets the same answer, so nothing here says
+   * whether one exists.
+   */
+  async requestReset(tenantKey: string, username: string, url: URL): Promise<void> {
+    this.cookieName(tenantKey);
+    const response = await call('/auth/browser/password/reset/request', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, username }
+    });
+    if (!response.ok) await refuse(response);
+  }
+
   async resetPassword(tenantKey: string, resetCode: string, newPassword: string, url: URL): Promise<void> {
     this.cookieName(tenantKey);
     const response = await call('/auth/browser/password/reset', url, {

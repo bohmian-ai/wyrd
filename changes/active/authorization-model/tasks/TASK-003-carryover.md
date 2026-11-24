@@ -1264,6 +1264,129 @@ fixtures and actual CLI/client consumers. New page/journey missing-flow assertio
 must fail before production edits; existing signup server evidence is reused, not
 claimed as new RED. Documentation/contract checks complement journeys.
 
+#### Cycle 16 evidence (Part B: tenant onboarding pages)
+
+Journey host: `identity_ui_e2e::onboarding_ui_journey` (one bound server over
+repository Postgres, a production `node build` BFF at a public origin, the
+repository Mailpit as relay) runs `src/lib/server/auth/onboarding.integration.test.ts`
+in real Chromium; it joins `test:identity:ui:suite`. Command:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E "test(=identity_ui_e2e::onboarding_ui_journey)"'`
+after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
+
+1. **Root offers create/find only when usable.** RED before production edits:
+   with mail and signup enabled, `getByRole('link', { name: 'Create a workspace' })`
+   timed out (no link). The same run also showed `/readyz` 503
+   (`forge_coordinator_unavailable` right after bind), which the pages read as
+   "server down"; the journey now waits for readiness before its first page, as
+   an operator would. GREEN: private defaults show neither link and keep the
+   tenant entry; after the operator configures the relay and signup the root
+   page links `/signup` and `/workspaces`. The root load reads the no-tenant
+   `/auth/browser/methods` (`signup`, `email_discovery`).
+2. **Email signup creates a workspace and signs its administrator in.** Merged
+   teammate A's `GET /auth/signup/proof` first. RED before production edits:
+   `/signup` rendered the 404 page ("Unable to open this workspace", not
+   "Create a workspace"). GREEN: the visitor types an address on `/signup`
+   and sees "Check your email"; the Mailpit message links `/signup/verify#proof=…`;
+   opening it POSTs the proof and the address bar ends at `/signup/verify`
+   with no fragment; "Name your workspace" reads the proof method (`email`)
+   and asks for username and password; the reserved slug `platform` answers
+   "That URL is already taken"; retrying with a new slug sends no second
+   message (one message in the mailbox) and lands signed in on `/t/<slug>`;
+   a fresh browser signs in with the passphrase "correct horse battery
+   staple". The pages call `/auth/*` from the browser, so the BFF forwarder
+   now passes the four Rust flow cookies (`wyrd_signup`, `wyrd_signup_email`,
+   `wyrd_discovery`, `wyrd_contact`). Journey fix during GREEN: Playwright
+   request interception cannot follow a fulfilled 303 for a POST navigation
+   (`chrome-error://`), so Chromium now maps the public origin to the BFF with
+   `--host-rules` and nothing is intercepted. Added after GREEN, not a RED:
+   scenario 1 also asserts `/signup` shows the turned-off state by default.
+   Not journey-proven here (no provider fixture in this host): provider
+   signup buttons, the GitHub contact branch and the challenge refusal; the
+   server evidence in `platform_admin_e2e/signup.rs` covers their Rust side.
+3. **Discovery lists the workspace by link or pasted code.** RED before
+   production edits: `/workspaces` rendered the 404 page. GREEN: the signup
+   address asks on `/workspaces` ("Email me a link", "Check your email"); the
+   mailed `/workspaces/verify#proof=…` link lists exactly one workspace,
+   "Journey Research", linking `<origin>/t/<slug>/login`, with no fragment
+   left; a second browser pastes the mailed code on the request page, which
+   opens the same verify page with that code as its fragment, and follows the
+   listed link to the workspace sign-in. Signup's pasted code now takes the
+   same path (`/signup/verify#proof=<code>`). Two test-side corrections during
+   GREEN, diagnosed from the page text and a temporary directory/contact count
+   (directory 1, contact 1, tenant active): Playwright's heading name match
+   is substring by default ("Find your workspaces" matched "Your workspaces"),
+   now `exact`; and Rust answers `login_url` as an absolute same-origin URL.
+4. **Mailed reset code and advertised-only sign-in.** RED before production
+   edits: the signup-created password workspace's login page showed
+   "Sign in with SSO" (count 1, expected 0). GREEN: the login page renders the
+   password form and the "Reset your password" link only when `password` is
+   advertised and the SSO button only for `company_sso`; the reset page asks
+   for a username ("Email me a code") when `password_reset` is advertised,
+   answers every account the same ("If <slug> has a password account named
+   owner…"), takes the mailed code, sets "a brand new passphrase for owner",
+   lands on `login?reset=done` with "Password set.", and that passphrase
+   signs in. Without `password` the reset page shows "Password reset is not
+   available" and no form; without a relay only the pasted-code form shows.
+   The OIDC-off tenant assertion in `production-auth.integration.test.ts`
+   expected an SSO button its tenant does not advertise; it now asserts the
+   button is absent (the `?/sso` refusal it then posts is unchanged).
+   `mise run test:identity:ui` then passed `production_ui_bff_journey`.
+5. **Recovery email from the Account page.** TDD violation, recorded
+   honestly: the Account section and contact verify page were written in the
+   same step as the test, before RED was observed. The first run
+   (`mise run test:identity:ui`, whose UI build predated the contact verify
+   page) failed at the "Recovery email verified" heading; a fresh build is
+   GREEN. The signed-in owner (passphrase sign-in, so recent) opens
+   `/settings/account`, sees the "Recovery email" region only because
+   `email_discovery` is advertised, with no current address shown, sends a
+   verification link, opens the mailed `/t/<slug>/contact/verify` link, and
+   sees "Recovery email verified" with the fragment cleared; a signed-out
+   browser opening a contact link sees "You are signed out" with a "Sign in to
+   <slug>" link instead of a redirect. Scenarios 4 and 5 share one commit
+   because they edit the same wording module and journey file. The commit
+   hook flagged the combined signed-in/signed-out test as hard to read; the
+   signed-out case is now its own test.
+6. **Teammate invitation, enrollment and CLI device approval.** No
+   production change was needed, so there is no production RED; the two
+   failing runs were test mistakes (the invitation mail carries
+   `#invitation=`, not `#proof=`; a bearer token goes in
+   `x-wyrd-access-token`). GREEN: the signup-created owner signs in, invites
+   a teammate from Access → Invite users with a Role and the "all" scope, and
+   sees the pending invitation; the teammate opens the mailed
+   `/t/<slug>/signup#invitation=…` link in a fresh browser, creates
+   `teammate` with a passphrase and lands in the workspace; a `wyrd-cli`
+   device authorization started from that origin is approved on
+   `/auth/device` ("Login approved"), the device code redeems, and the
+   redeemed token reads `/v1/principals/me` as `teammate`. All 7 onboarding
+   journey tests pass.
+7. **Mock alignment sweep.** Every onboarding page and state was screenshotted
+   from the production BFF over the real journey host (dark and light, 1280
+   and 390 wide) beside the mock's `selfcheck.mjs --shots` captures. Fixed:
+   the entry card's narrow-screen padding, underlined footer links, `<b>` and
+   inline `<code>` styling, and the shared field-refusal rules (invalid
+   border, read-only fade, `p.field-error`/`p.done`, `.ok`) now live once in
+   `app.css` as the mock defines them; the problem carries `id="problem"` so a
+   taken slug points at it; the workspace page's password hint is the mock's
+   words, its contact-email field shows its own refusal, and its submit button
+   has the mock's spacing; the reset page checks the new password's length in
+   place and shows "Setting password…"; the expired workspace list shows its
+   refusal in the card's problem slot; the Account section's "Sign in again"
+   state links to sign-in. Remaining deviations, each with its reason:
+   - "Signed in with GitHub as <email>" shows no address: `GET
+     /auth/signup/proof` reports only the method (approved reading 1).
+   - The workspace page shows "Checking this browser's sign-in…" while that
+     read is in flight; the mock knows the method synchronously.
+   - No Turnstile widget and no "below" in the challenge remediation, and the
+     workspace-limit remediation names no number: the public methods answer
+     carries no challenge site key and the refusal carries no cap.
+   - Password fields use the existing `PasswordInput` (with Show), the
+     component every production password field uses.
+   - A 5xx keeps the existing entry card's "✕ Sign-in unavailable" state; the
+     mock defines no server-failure state.
+   - The card sits 33px higher: the mock reserves that for its preview strip.
+   - The Recovery email section is as wide as the Account page's other
+     sections; the mock shows it alone on a placeholder page.
+
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and
 same-operator re-authentication using cycle 14's Rust-owned session and safe

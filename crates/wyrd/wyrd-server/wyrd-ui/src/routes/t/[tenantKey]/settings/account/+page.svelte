@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/state';
   import PasswordInput from '$lib/PasswordInput.svelte';
+  import RecoveryEmail from '$lib/RecoveryEmail.svelte';
   import { guidance } from '$lib/Entry.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
@@ -70,6 +71,8 @@
         </form>
       </section>
     {/if}
+
+    {#if data.recovery}<RecoveryEmail tenant={profile.tenant} />{/if}
 
     <section aria-labelledby="keys">
       <h2 id="keys">API keys</h2>

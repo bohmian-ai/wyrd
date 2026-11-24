@@ -764,7 +764,7 @@ env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DE
 run = "scripts/identity/with-identity-providers.sh -- mise run test:identity:ui:suite"
 [tasks."test:identity:ui:suite"]
 hide = true
-description = "Build the UI and run the production UI journey against already-running Postgres, Keycloak, and Dex."
+description = "Build the UI and run the production sign-in and onboarding UI journeys against already-running Postgres, Mailpit, Keycloak, and Dex."
 depends = ["ts:build"]
 env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
@@ -772,7 +772,7 @@ set -e
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec playwright install --only-shell chromium
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
-cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'
+cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey) | test(=identity_ui_e2e::onboarding_ui_journey)'
 """
 [tasks."test:identity:ui:container"]
 description = """Official Debian image: real Keycloak sign-in, session use on pages and /v1, refusals, restart

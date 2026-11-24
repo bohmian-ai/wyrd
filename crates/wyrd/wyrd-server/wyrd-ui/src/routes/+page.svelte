@@ -56,6 +56,12 @@
         <input id="tenant-key" class="app-input mono" name="tenantKey" required autocomplete="organization" placeholder="acme" pattern={'[a-z0-9][a-z0-9_\\-]{0,62}'} />
         <button class="app-control primary sign-in" type="submit">Continue to sign-in</button>
       </form>
+      {#if data.create || data.discover}
+        <nav class="links" aria-label="Other ways in">
+          {#if data.create}<a href="/signup">Create a workspace</a>{/if}
+          {#if data.discover}<a href="/workspaces">Find my workspaces</a>{/if}
+        </nav>
+      {/if}
     {:else if !data.session}
       <form method="POST" action="?/login"><button class="app-control primary sign-in" type="submit">Sign in with SSO</button></form>
     {:else if reauthentication}
@@ -226,6 +232,16 @@
   }
   .tenant-entry label {
     font: 700 11px var(--font-mono);
+  }
+  .links {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px 16px;
+    font: 12px var(--font-sans);
+  }
+  .links a {
+    color: var(--muted);
   }
   .access-help {
     text-align: center;

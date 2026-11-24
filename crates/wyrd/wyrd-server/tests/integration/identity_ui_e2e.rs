@@ -639,6 +639,111 @@ async fn production_ui_bff_journey() {
     );
 }
 
+/// Establish the deployment's platform root and exchange its disclosed
+/// credential for an operator bearer token at the bound `server`, as an
+/// operator does once after installing.
+///
+/// # Panics
+/// Panics when initialization discloses no credential or the exchange fails.
+async fn operator_token(srv: &WyrdTestServer, server: &str) -> String {
+    let mut disclosure = Vec::new();
+    wyrd_server::boot::init::initialize_platform_root(&srv.operator_pool(), &mut disclosure)
+        .await
+        .expect("the deployment initializes");
+    let disclosed = String::from_utf8(disclosure).expect("the disclosure is UTF-8");
+    let root = disclosed
+        .lines()
+        .find(|line| line.starts_with("wyrd_global_"))
+        .expect("initialization discloses its credential");
+    let body: Value = reqwest::Client::new()
+        .post(format!("{server}/auth/platform/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", root),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+        ])
+        .send()
+        .await
+        .expect("token endpoint answers")
+        .json()
+        .await
+        .expect("token body is JSON");
+    body["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the platform credential exchanges: {body}"))
+        .to_owned()
+}
+
+/// The production onboarding UI journey: a real Chromium at the public
+/// origin of a production BFF in front of one bound Wyrd server, with the
+/// repository Mailpit as the deployment's mail relay.
+///
+/// The Vitest journey `src/lib/server/auth/onboarding.integration.test.ts`
+/// configures the relay and signup through the platform API with the
+/// operator token, then drives the root, signup, email-proof, workspace,
+/// discovery, recovery-contact and reset pages as a visitor would, reading
+/// each mailed link or code from Mailpit. Rust owns every proof, cookie and
+/// session; the pages only render and call the browser's `/auth/*` leg.
+///
+/// # Panics
+/// Panics when setup fails, Mailpit is not provisioned, or the Vitest
+/// journey does not pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Mailpit and a built UI; run via `mise run test:identity:ui`"]
+async fn onboarding_ui_journey() {
+    let smtp = std::env::var("WYRD_TEST_MAILPIT_SMTP")
+        .expect("WYRD_TEST_MAILPIT_SMTP is set by scripts/postgres/with-test-postgres.sh");
+    let mail_api = std::env::var("WYRD_TEST_MAILPIT_API").expect("WYRD_TEST_MAILPIT_API is set");
+    let (smtp_host, smtp_port) = smtp.rsplit_once(':').expect("Mailpit SMTP is host:port");
+    let host = format!("localhost:{}", free_port());
+    let origin = format!("http://{host}");
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("server starts");
+    let server = srv.base_url().expect("bound server has a URL").to_owned();
+    let operator = operator_token(&srv, &server).await;
+    let bff = start_bff(&server, &origin, None, &[]).await;
+    let fixture = json!({
+        "origin": origin,
+        "bff": bff.url,
+        "server": server,
+        "operator": operator,
+        "mail": {
+            "host": smtp_host,
+            "port": smtp_port.parse::<u16>().expect("Mailpit SMTP port"),
+            "api": mail_api,
+        },
+    });
+    let mut vitest = Command::new("pnpm");
+    vitest
+        .current_dir(ui_dir())
+        .args([
+            "exec",
+            "vitest",
+            "run",
+            "src/lib/server/auth/onboarding.integration.test.ts",
+        ])
+        .env("WYRD_UI_INTEGRATION", "1")
+        .env("WYRD_UI_ONBOARDING", fixture.to_string());
+    if let Ok(filter) = std::env::var("WYRD_UI_FILTER") {
+        vitest.args(["-t", &filter]);
+    }
+    let status = tokio::task::spawn_blocking(move || vitest.status())
+        .await
+        .expect("vitest task joins")
+        .expect("vitest runs");
+    drop(bff);
+    srv.shutdown().await.expect("server shuts down");
+    assert!(
+        status.success(),
+        "the onboarding UI journey failed: {status}"
+    );
+}
+
 /// One answer a [`NginxBrowser`] observed, redirects unfollowed.
 struct Visit {
     /// The response status.

@@ -928,6 +928,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
 import { readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
 import { load as loadRepositories } from '../routes/t/[tenantKey]/repositories/+page.server';
 import { load as loadAccount } from '../routes/t/[tenantKey]/settings/account/+page.server';
+import { browserSessions, type LoginMethods } from '$lib/server/auth/browser-sessions';
 import type { RepositoryIndexProps } from 'wyrd-ai-ui/loaders';
 import RepositoriesPage from '../routes/t/[tenantKey]/repositories/+page.svelte';
 import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[name]/+page.server';
@@ -1231,8 +1232,10 @@ test('the Repositories workspace keeps its index state, opens exact versions and
 test('account settings reads the profile and the own key page at once, for the session principal', async () => {
   const requested: string[] = [];
   let profiled = false;
+  vi.spyOn(browserSessions, 'methods').mockResolvedValueOnce({ email_discovery: true } as LoginMethods);
   const browserSession = {
     principalId: 'p-1',
+    tenantKey: 'acme',
     api: async (_method: string, path: string) => {
       requested.push(`${path} (profile answered: ${profiled})`);
       if (path !== '/principals/me') return Response.json({ items: [], next_cursor: null });
@@ -1244,7 +1247,7 @@ test('account settings reads the profile and the own key page at once, for the s
   const url = new URL('http://ui.test/t/acme/settings/account?after=k-9');
   const data = await loadAccount({ locals: { browserSession }, url } as never);
 
-  expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, problem: null });
+  expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, recovery: true, problem: null });
   expect(requested).toEqual(['/principals/me (profile answered: false)', '/principals/p-1/credentials?limit=50&cursor=k-9 (profile answered: false)']);
 });
 

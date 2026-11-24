@@ -30,7 +30,7 @@
     <h1>{heading}</h1>
     {#if issue}
       <div role="alert">
-        <div class="app-problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
+        <div class="app-problem" id="problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
           <strong>{issue.status >= 500 ? '✕ Sign-in unavailable' : `⊘ ${issue.title}`}</strong>
           <p>{issue.status >= 500 ? 'Please try again later.' : guidance(issue)}</p>
           <code>{issue.code}</code>
@@ -110,5 +110,37 @@
   }
   .card :global(.links a) {
     color: var(--muted);
+    text-decoration: underline;
+  }
+  .card :global(.or) {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 10px;
+    font: 11px var(--font-mono);
+    color: var(--muted);
+  }
+  .card :global(.or)::before,
+  .card :global(.or)::after {
+    content: '';
+    border-top: 1px solid var(--border-soft);
+  }
+  @media (max-width: 767px) {
+    .entry {
+      padding: 32px 16px;
+    }
+    .card {
+      padding: 28px 20px;
+    }
+  }
+  .card :global(b) {
+    color: var(--text);
+    font-weight: var(--weight-strong);
+    overflow-wrap: anywhere;
+  }
+  .card :global(:not(.app-problem) > code) {
+    font: 11px var(--font-mono);
+    color: var(--text);
+    overflow-wrap: anywhere;
   }
 </style>

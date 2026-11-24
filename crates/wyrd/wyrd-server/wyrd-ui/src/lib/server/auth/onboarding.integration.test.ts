@@ -6,13 +6,17 @@
  * this file with the `WYRD_UI_ONBOARDING` fixture. The repository Mailpit is
  * the deployment's relay: every link and code a page asks for is read from
  * the mailbox it was sent to, as a person would. Nothing here mocks the BFF,
- * the server or the mail.
+ * the server or the mail. The deployment's Google is this file's fake Google,
+ * and its Turnstile Siteverify this file's fake, at the endpoints the server
+ * was started with; the browser loads a stand-in Turnstile widget.
  *
  * The platform API, called with the operator token, stands in for the
  * operator's console; every visitor step goes through the pages.
  */
+import { createServer } from 'node:http';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { afterAll, beforeAll, expect, test } from 'vitest';
+import { startFakeGoogle, type GoogleAccount } from '$lib/fake-google.integration';
 
 type Onboarding = {
   origin: string;
@@ -20,15 +24,36 @@ type Onboarding = {
   server: string;
   operator: string;
   mail: { host: string; port: number; api: string };
+  google: string;
+  siteverify: string;
 };
 
 const journey = JSON.parse(process.env.WYRD_UI_ONBOARDING ?? 'null') as Onboarding;
 const journeyTimeout = 120_000;
 let chrome: Browser;
+let google: { issuer: string; account: GoogleAccount };
+/** Every `(secret, token)` the fake Siteverify was asked about, in order. */
+const siteverified: { secret: string; token: string }[] = [];
 
 beforeAll(async () => {
   // The public origin is the load balancer: Chromium connects every request for it to the BFF.
   chrome = await chromium.launch({ args: [`--host-rules=MAP ${new URL(journey.origin).host} ${new URL(journey.bff).host}`] });
+  google = await startFakeGoogle(Number(new URL(journey.google).port));
+  // Siteverify passes only tokens the stand-in widget issued as passing, solved on the public host for signup.
+  const siteverify = createServer((request, response) => {
+    let form = '';
+    request.on('data', (chunk: Buffer) => (form += chunk.toString()));
+    request.on('end', () => {
+      const fields = new URLSearchParams(form);
+      const token = fields.get('response') ?? '';
+      siteverified.push({ secret: fields.get('secret') ?? '', token });
+      const success = token.startsWith('pass-');
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ success, hostname: new URL(journey.origin).hostname, action: 'signup', 'error-codes': success ? [] : ['invalid-input-response'] }));
+    });
+  });
+  await new Promise<void>((resolve) => siteverify.listen(Number(new URL(journey.siteverify).port), '127.0.0.1', resolve));
+  siteverify.unref();
   // The pages treat a server that is not ready as down; Forge joins shortly after bind.
   for (let attempt = 0; (await fetch(`${journey.server}/readyz`)).status !== 200; attempt++) {
     if (attempt === 240) throw new Error('the server never became ready');
@@ -437,4 +462,172 @@ test('the administrator invites a teammate who enrolls and approves a CLI sign-i
   } finally {
     await context.close();
   }
+}, journeyTimeout);
+
+let googleEnabled = false;
+
+/** The operator configures, tests and enables the deployment's Google sign-in, once. */
+async function enableGoogle(): Promise<void> {
+  if (googleEnabled) return;
+  const { revision } = (await platform('PUT', '/platform/social/providers/google', { client_id: 'wyrd-google', client_secret: 'google-secret' })) as { revision: number };
+  const { authorization_url: authorize } = (await platform('POST', '/platform/social/providers/google/test', { expected_revision: revision })) as { authorization_url: string };
+  const signedIn = await fetch(authorize, { redirect: 'manual' });
+  const tested = await fetch(signedIn.headers.get('location') ?? '');
+  expect(tested.status, 'the provider test passes').toBe(200);
+  await platform('PUT', '/platform/social/providers/google/enabled', { enabled: true, expected_revision: revision });
+  googleEnabled = true;
+}
+
+/** The slugs of every workspace the deployment holds. */
+async function workspaceSlugs(): Promise<string[]> {
+  const { tenants } = (await platform('GET', '/platform/tenants')) as { tenants: { slug: string }[] };
+  return tenants.map((tenant) => tenant.slug);
+}
+
+/** Sign `account` in with Google from the signup page, landing on the workspace form. */
+async function googleSignup(page: Page, account: GoogleAccount): Promise<void> {
+  google.account = account;
+  await page.goto(`${journey.origin}/signup`);
+  await page.getByRole('button', { name: 'Continue with Google' }).click();
+  await page.waitForURL(`${journey.origin}/signup/workspace`);
+  await expect.poll(() => page.getByTestId('identity').textContent()).toContain('Signed in with Google');
+}
+
+test('a Google proof creates a workspace its creator signs in to with Google', async () => {
+  await enableMailAndSignup();
+  await enableGoogle();
+  const slug = `google-${run}`;
+  const account = { sub: `google-${run}`, email: `google-${run}@gmail.test` };
+  const { context, page } = await visitor();
+  try {
+    await googleSignup(page, account);
+    // A provider proof sets no password.
+    expect(await page.getByLabel('Your username').count()).toBe(0);
+    expect(await page.getByLabel('Your password', { exact: true }).count()).toBe(0);
+    await page.getByLabel('Workspace name').fill('Google journey');
+    await page.getByLabel('URL slug').fill(slug);
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+  } finally {
+    await context.close();
+  }
+  expect((await workspaceSlugs()).filter((each) => each === slug)).toHaveLength(1);
+
+  // The creator returns with Google alone.
+  const returning = await visitor();
+  try {
+    google.account = account;
+    await returning.page.goto(`${journey.origin}/t/${slug}/login`);
+    await returning.page.getByRole('button', { name: 'Continue with Google' }).click();
+    await returning.page.waitForURL(`${journey.origin}/t/${slug}`);
+  } finally {
+    await returning.context.close();
+  }
+}, journeyTimeout);
+
+test('a Google proof without a verified email confirms one by mail and creates the same attempt', async () => {
+  await enableMailAndSignup();
+  await enableGoogle();
+  const slug = `unverified-${run}`;
+  const contact = `unverified-${run}@example.test`;
+  const { context, page } = await visitor();
+  try {
+    await googleSignup(page, { sub: `unverified-${run}`, email: `unverified-${run}@gmail.test`, email_verified: false });
+    await page.getByLabel('Workspace name').fill('Unverified journey');
+    await page.getByLabel('URL slug').fill(slug);
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.getByRole('alert').getByText('Confirm an email address to continue').waitFor();
+    expect(await workspaceSlugs()).not.toContain(slug);
+
+    await page.getByLabel('Email to confirm').fill(contact);
+    await page.getByRole('button', { name: 'Send a link' }).click();
+    await page.getByTestId('check-email').waitFor();
+    const code = new URL(mailedLink(await newestMail(contact))).hash.slice('#proof='.length);
+    await page.getByLabel('Code from the email').fill(code);
+    await page.getByRole('button', { name: 'Verify' }).click();
+    await page.getByText('Email confirmed. Create the workspace again.').waitFor();
+    // The same attempt and form create the workspace, still with no password.
+    expect(await page.getByLabel('URL slug').inputValue()).toBe(slug);
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+  } finally {
+    await context.close();
+  }
+  expect((await workspaceSlugs()).filter((each) => each === slug)).toHaveLength(1);
+  expect(await mailCount(contact)).toBe(1);
+}, journeyTimeout);
+
+/**
+ * A stand-in for Cloudflare's Turnstile script: each widget's first token is
+ * one the fake Siteverify refuses, and every token after a reset passes.
+ */
+const STAND_IN_TURNSTILE = `window.turnstile = (() => {
+  let issued = 0;
+  const widgets = {};
+  const issue = (id) => setTimeout(() => {
+    const widget = widgets[id];
+    if (!widget) return;
+    widget.callback((issued++ ? 'pass-' : 'fail-') + issued + '-' + Math.random().toString(36).slice(2));
+    widget.element.dataset.issued = String(issued);
+  });
+  return {
+    render(element, options) {
+      const id = 'widget-' + Object.keys(widgets).length;
+      element.dataset.sitekey = options.sitekey;
+      element.dataset.action = options.action;
+      widgets[id] = { callback: options.callback, element };
+      issue(id);
+      return id;
+    },
+    reset: issue,
+    remove(id) { delete widgets[id]; }
+  };
+})();`;
+
+test('a configured challenge refuses a failed token, and the fresh token creates one workspace', async () => {
+  await enableMailAndSignup();
+  await platform('PUT', '/platform/login-settings', {
+    password_enabled: true,
+    signup_enabled: true,
+    signup_challenge: { site_key: 'journey-site-key', secret: 'journey-turnstile-secret' }
+  });
+  const owner = `challenged-${run}@example.test`;
+  const slug = `challenged-${run}`;
+  const { context, page } = await visitor();
+  await context.route('https://challenges.cloudflare.com/turnstile/**', (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: STAND_IN_TURNSTILE })
+  );
+  const asked = siteverified.length;
+  try {
+    await page.goto(`${journey.origin}/signup`);
+    await page.getByLabel('Email').fill(owner);
+    await page.getByRole('button', { name: 'Continue with email' }).click();
+    await page.getByRole('heading', { name: 'Check your email' }).waitFor();
+    await page.goto(mailedLink(await newestMail(owner)));
+    await page.getByRole('link', { name: 'Name your workspace' }).click();
+    const widget = page.getByTestId('turnstile');
+    await expect.poll(() => widget.getAttribute('data-issued')).toBe('1');
+    expect(await widget.getAttribute('data-sitekey')).toBe('journey-site-key');
+    expect(await widget.getAttribute('data-action')).toBe('signup');
+    await page.getByLabel('Workspace name').fill('Challenged journey');
+    await page.getByLabel('URL slug').fill(slug);
+    await page.getByLabel('Your username').fill('owner');
+    await page.getByLabel('Your password', { exact: true }).fill('correct horse battery staple');
+
+    // Rust asks Siteverify about the widget's token and refuses it; the page resets the widget.
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.getByRole('alert').getByText('Challenge not passed').waitFor();
+    expect(await workspaceSlugs()).not.toContain(slug);
+    // The reset issues a fresh token; the same form then creates the workspace.
+    await expect.poll(() => widget.getAttribute('data-issued')).toBe('2');
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+  } finally {
+    await context.close();
+  }
+  const tokens = siteverified.slice(asked);
+  expect(tokens.map(({ token }) => token.split('-')[0])).toEqual(['fail', 'pass']);
+  expect(new Set(tokens.map(({ token }) => token)).size).toBe(2);
+  expect(tokens.every(({ secret }) => secret === 'journey-turnstile-secret')).toBe(true);
+  expect((await workspaceSlugs()).filter((each) => each === slug)).toHaveLength(1);
 }, journeyTimeout);

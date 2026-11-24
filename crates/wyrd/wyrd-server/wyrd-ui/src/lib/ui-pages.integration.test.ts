@@ -4024,3 +4024,61 @@ withConsole('the console keeps a relay password unless the operator removes it',
     bff.stop();
   }
 });
+
+/**
+ * The Signup view reads and saves Rust's login settings: public signup, the
+ * per-identity workspace limit and a Turnstile challenge whose secret is
+ * never shown, kept when left blank and removed with the challenge. A save
+ * on a stale session asks the operator to confirm it is them first.
+ */
+withConsole('the console saves signup settings and keeps the challenge secret', async ({ server }) => {
+  const api = await platformApi(server.baseUrl, server.initializePlatformRoot());
+  await registerOperator(api, 'ops-oncall', OPERATOR_PASSWORD);
+  const settings = async () => (await api('GET', '/platform/login-settings')).body;
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
+    await page.getByRole('navigation', { name: 'Console' }).getByRole('link', { name: 'Signup' }).click();
+    await page.waitForURL(`${bff.url}/platform/ui/signup`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Signup');
+    expect(await page.getByLabel('Password sign-in for workspaces').isChecked()).toBe(true);
+    expect(await page.getByLabel('Public workspace signup').isChecked()).toBe(false);
+    expect(await page.getByLabel('Workspaces one identity may create').inputValue()).toBe('3');
+    const notice = page.getByRole('status');
+
+    await page.getByLabel('Public workspace signup').check();
+    await page.getByLabel('Workspaces one identity may create').fill('2');
+    await page.getByLabel('Require a challenge for browser workspace creation').check();
+    await page.getByLabel('Site key').fill('turnstile-site-key');
+    await page.getByLabel('Secret key').fill('turnstile-secret-value');
+    await page.getByRole('button', { name: 'Save settings' }).click();
+    await expect.poll(() => notice.textContent()).toContain('Login and signup settings saved.');
+    expect(await settings()).toMatchObject({ password_enabled: true, signup_enabled: true, signup_workspace_cap: 2, signup_challenge: { site_key: 'turnstile-site-key' } });
+    expect(await page.getByLabel('Secret key').inputValue()).toBe('');
+    expect(await serverHtml(page, `${bff.url}/platform/ui/signup`)).not.toContain('turnstile-secret-value');
+
+    // A stale session confirms first; a blank secret keeps the stored one.
+    server.staleConsoleProof();
+    await page.reload();
+    await page.getByLabel('Workspaces one identity may create').fill('4');
+    await page.getByRole('button', { name: 'Save settings' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
+    expect(await dialog.textContent()).toContain('Changing login and signup settings is a destructive platform change.');
+    expect((await settings()).signup_workspace_cap).toBe(2);
+    await dialog.getByLabel('Your password').fill(OPERATOR_PASSWORD);
+    await dialog.getByRole('button', { name: 'Confirm' }).click();
+    await expect.poll(async () => (await settings()).signup_workspace_cap).toBe(4);
+    expect((await settings()).signup_challenge).toEqual({ site_key: 'turnstile-site-key' });
+
+    // Turning the challenge off removes it.
+    await page.getByLabel('Require a challenge for browser workspace creation').uncheck();
+    await page.getByRole('button', { name: 'Save settings' }).click();
+    await expect.poll(async () => (await settings()).signup_challenge ?? null).toBeNull();
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});

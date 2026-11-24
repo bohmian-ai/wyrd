@@ -1345,6 +1345,15 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   `username: null, password_set: false`); a test send reports Mailpit's
   acceptance as "not proof it reached the inbox"; a refused connection reports
   "✕ The relay did not accept the message." with its error. TDD: PASS.
+- **S6 signup settings view**
+  (`the console saves signup settings and keeps the challenge secret`).
+  RED: `/platform/ui/signup` had no settings form. GREEN: 1 passed. Proves
+  the view reads Rust's defaults (password on, signup off, limit 3); a save
+  sets signup, the limit and a Turnstile site key with a secret that never
+  reaches the page or stays in its field; on a stale session the save opens
+  "Confirm it is you" and changes nothing until the operator's password
+  confirms; a blank secret keeps the stored challenge; turning the challenge
+  off removes it (`signup_challenge: null`). TDD: PASS.
 
 ### 17. An existing User explicitly connects another sign-in method
 

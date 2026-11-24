@@ -3,6 +3,7 @@ import { error, redirect, type Handle, type HandleServerError } from '@sveltejs/
 import { localAuthEnabled } from '$lib/server/development';
 import { sessionCookie, sessions } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
+import { platformConsole } from '$lib/server/auth/platform-sessions';
 import { problem } from '$lib/server/problem';
 
 const loginRoutes = [
@@ -17,6 +18,18 @@ export const handle: Handle = async ({ event, resolve }) => {
   // The browser's leg of Wyrd's authorization server, served on this public origin.
   if (event.url.pathname.startsWith('/auth/')) return forwardAuth(event.request, event.url);
   event.setHeaders({ 'cache-control': 'private, no-store' });
+  const { pathname } = event.url;
+  // The platform console: every page but the SSO return needs Rust's platform session, never a tenant one.
+  if ((pathname === '/platform/ui' || pathname.startsWith('/platform/ui/')) && pathname !== '/platform/ui/callback') {
+    const session = await platformConsole.read(event.url, event.cookies);
+    if (!session) {
+      if (event.request.method === 'GET' && !event.isDataRequest) redirect(303, '/platform');
+      const value = problem('unauthenticated');
+      error(value.status, { ...value, message: value.title });
+    }
+    event.locals.platformSession = session;
+    return resolve(event);
+  }
   const tenantKey = loginRoutes.includes(event.route.id ?? '') ? undefined : event.params.tenantKey;
   if (!localAuthEnabled()) {
     event.locals.session = null;

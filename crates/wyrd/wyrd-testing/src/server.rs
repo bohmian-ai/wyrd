@@ -3129,6 +3129,27 @@ impl WyrdTestServer {
             })
     }
 
+    /// Move the last fresh proof of every platform console session ten
+    /// minutes into the past, as if the shared five-minute proof window had
+    /// passed since its sign-in or re-authentication.
+    ///
+    /// Test-support for browser journeys that must reach a destructive
+    /// console change asking for fresh proof without waiting out the window.
+    /// Sessions stay live: only their proof ages, never their idle or
+    /// absolute deadlines.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the update fails.
+    pub async fn stale_platform_console_proof(&self) -> Result<(), WyrdTestServerError> {
+        sqlx::query(
+            "UPDATE platform.browser_sessions SET fresh_at = fresh_at - interval '10 minutes'",
+        )
+        .execute(self.operator_pool().pool())
+        .await
+        .map(drop)
+        .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
+    }
+
     /// Mint the session a registered administrator gets after federated login.
     ///
     /// Stands in for the provider round trip, not for anything the server

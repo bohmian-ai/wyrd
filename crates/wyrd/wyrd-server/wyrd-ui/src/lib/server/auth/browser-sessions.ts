@@ -36,16 +36,16 @@ type View = {
   expires_at: string;
 };
 
-type Call = { method: 'GET' | 'POST' | 'DELETE'; cookie?: string; body?: unknown };
+type Call = { method: 'GET' | 'POST' | 'PUT' | 'DELETE'; cookie?: string; body?: unknown };
 
 /**
- * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
+ * Call one Rust `/auth/browser/*`, `/platform/*` or `/v1` operation server to server as the
  * browser at `url`: the trusted public origin goes as `Origin` and the
  * forwarded host and scheme, the visitor's address as `stateSource` states it,
  * and only the cookie the caller selected is sent.
  * An unreachable server is the stable `upstream` problem.
  */
-async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
+export async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
   const headers = new Headers({
     origin: url.origin,
     'x-forwarded-host': url.host,
@@ -68,7 +68,7 @@ async function call(path: string, url: URL, { method, cookie, body }: Call): Pro
 }
 
 /** Refuse with the safe problem a non-2xx Wyrd answer maps to. */
-async function refuse(response: Response): Promise<never> {
+export async function refuse(response: Response): Promise<never> {
   reject(await upstreamProblem(response));
 }
 

@@ -1411,7 +1411,7 @@ Focused runner: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db
 
 **Maintainer decisions (2026-11-23, cycle 16 part A):** approved — a relay save that changes the username without a password is refused with 400 rather than dropping the stored password; `oidc: true` means a platform OIDC connection row exists (no secret decryption on the anonymous read).
 
-#### Cycle 16 evidence (Part C: challenge site key and mock server failure)
+#### Cycle 16 evidence (challenge site key and mock server failure)
 
 Maintainer-approved 2026-11-23: publish the Turnstile site key on the public methods answer; add a server-failure state to the mock.
 
@@ -1420,6 +1420,137 @@ Maintainer-approved 2026-11-23: publish the Turnstile site key on the public met
 - **Mock server-failure state.** RED: the new `selfcheck.mjs` check 'a server failure (5xx) shows the production "Sign-in unavailable" state and hides the form' timed out waiting for `[data-testid=problem]` on `#/signup/workspace?preview=unavailable`. GREEN: the mock's `Entry.svelte` now renders any 5xx exactly as wyrd-ui's `src/lib/Entry.svelte`: "✕ Sign-in unavailable", "Please try again later.", the code (`502 WYRD_SPEC_502_UPSTREAM_FAILURE`, production's `PROBLEMS.unavailable`), `data-state="error"` and no page form; the state is in the State menu ("Workspace · server failure (5xx)") and the README routes table. One test-side fix during GREEN: `innerText` separates the block paragraphs with blank lines, so the check matches by pattern as the other problem checks do. `node build.mjs` and `node selfcheck.mjs` pass (every state in both modes, plus every functional check). This resolves Part B's "the mock defines no server-failure state" deviation. TDD: PASS.
 
 **Onboarding UI journey independence (commit-hook finding, preference #5).** The discovery, reset, recovery-email, signed-out and invitation journeys in `wyrd-ui/src/lib/server/auth/onboarding.integration.test.ts` reused the workspace, address and reset password created by earlier tests. Each now sets up its own workspace through `signedUpWorkspace(label)` (email signup through the pages). Full suite: `mise run test:identity:ui` 2/2 pass. Each fixed journey alone (`WYRD_UI_FILTER=<name> mise run test:identity:ui`): discovery, reset and recovery-email pass; invitation failed twice and then passed 4/4. The two failures happened while another teammate was building the same UI tree at the same time, and their Vitest output was not captured, so the cause is unproven and recorded as an unreproduced one-off.
+
+#### Cycle 16 evidence (Part C: platform console)
+
+Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
+(production BFF build → native `WyrdTestServer` → repository Postgres), via
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd crates/wyrd/wyrd-server/wyrd-ui && WYRD_UI_INTEGRATION=1 pnpm exec vitest run src/lib/ui-pages.integration.test.ts -t "<name>"'`.
+
+- **S1 password sign-in, overview, cookie isolation**
+  (`a platform operator signs in to the console with a password`).
+  RED: `page.waitForURL(/platform)` timed out; `/platform/ui` had no
+  production page. GREEN: 1 passed. Proves the **Platform admin** entry; an
+  unknown name, a wrong password and the root key each refuse with
+  `WYRD_AUTH_401_UNAUTHENTICATED` and set no cookie; the overview shows only
+  Rust's safe session metadata and the workspaces; the cookie is host-only on
+  `/platform`, HttpOnly, SameSite=Lax; no page carries it, a token or a key;
+  a recording hop shows every BFF call to Rust's `/platform/*` carried only
+  `wyrd_platform_*` cookies although the browser held a tenant session; a
+  tenant session alone opens no console page; sign-out ends the session at
+  Rust.
+- **S2 same-operator re-authentication before Suspend/Resume**
+  (`a stale console session confirms the operator before suspending a workspace`).
+  Adds one native test control, `staleConsoleProof` (ages `fresh_at` of every
+  platform browser session by ten minutes through the operator pool).
+  RED: no Suspend control on the overview (`locator.click` timeout); the
+  stale-proof assertion itself passed. GREEN: 1 passed. Proves a stale
+  session's Suspend opens "Confirm it is you" naming the change while Rust's
+  tenant stays active; another operator's password and a wrong one refuse
+  with `WYRD_AUTH_401_UNAUTHENTICATED`; a confirmation held in flight and
+  released after Cancel answers 204 yet applies nothing (Rust still
+  `active`); the own password applies the suspension (Rust `suspended`) and
+  the session shows fresh; Resume then applies at once without a prompt.
+- **S3 platform SSO sign-in and forced-fresh IdP re-authentication**
+  (`a platform SSO operator confirms a suspension at the identity provider`),
+  on part A's `GET /platform/browser/methods`. The loopback fake IdP's ID
+  token now carries `auth_time`. RED: the IdP returned to
+  `/platform/ui/callback`, which had no page (`waitForURL(/platform/ui)`
+  timeout); the entry already hid the SSO button while `oidc` was false.
+  GREEN: 1 passed. Proves the SSO button appears only once a connection
+  exists; a registered operator signs in by platform SSO (`Platform SSO`,
+  same cookie attributes); a stale session's Suspend offers only the IdP
+  route; another registered operator's IdP return in the pop-up refuses with
+  `WYRD_AUTH_401_UNAUTHENTICATED` and changes nothing; the same operator's
+  return applies the suspension and the session shows fresh.
+  **TDD violation:** the callback page, SSO begin route and pop-up flow were
+  written before this test. They were set aside (files moved out, edited files
+  restored) to record the RED above against the S1–S2 code, then restored.
+- **S4 social providers view**
+  (`the console tests a provider revision before enabling it`).
+  RED: `/platform/ui/providers` had no page (h1 assertion failed). GREEN:
+  1 passed. Proves the view shows each provider's callback URL and
+  instructions; a saved client becomes an untested revision whose Enable is
+  disabled with "Test revision 1 before enabling it."; the secret is never in
+  the page or the field after save; a test of revision 1 held at the IdP and
+  finished after revision 2 was saved leaves revision 2 untested with no
+  "tested" notice; a test of the current revision shows it tested; an Enable
+  against a revision replaced through the API refuses as "This provider
+  changed" (`WYRD_SPEC_409_CONFLICT`); the current revision tested then
+  enables to "✓ enabled · offered". TDD: PASS.
+- **S5 mail relay view**
+  (`the console keeps a relay password unless the operator removes it`),
+  on part A's kept-password `PUT /platform/mail`, against the lane's Mailpit.
+  RED: `/platform/ui/mail` had no page. GREEN: 1 passed (after two
+  diagnosed fixes: a form reset blanked `value=` fields, so they use
+  `defaultValue`; `field()` refuses an empty optional username/password).
+  Proves the no-relay state and no test form; a saved relay shows
+  "✓ stored, never shown" and the password never reaches the page; a save
+  with a blank password keeps it (Rust `password_set: true`); the explicit
+  "Remove the stored username and password" control removes both (Rust
+  `username: null, password_set: false`); a test send reports Mailpit's
+  acceptance as "not proof it reached the inbox"; a refused connection reports
+  "✕ The relay did not accept the message." with its error. TDD: PASS.
+- **S6 signup settings view**
+  (`the console saves signup settings and keeps the challenge secret`).
+  RED: `/platform/ui/signup` had no settings form. GREEN: 1 passed. Proves
+  the view reads Rust's defaults (password on, signup off, limit 3); a save
+  sets signup, the limit and a Turnstile site key with a secret that never
+  reaches the page or stays in its field; on a stale session the save opens
+  "Confirm it is you" and changes nothing until the operator's password
+  confirms; a blank secret keeps the stored challenge; turning the challenge
+  off removes it (`signup_challenge: null`). TDD: PASS.
+- **S7 official host routes the console to the BFF.** RED: with the
+  shipped `nginx.conf.template` rendered in `nginx:stable` and each
+  upstream replaced by a stub that answers its own name, `/platform`,
+  `/platform/ui`, `/platform/ui/`, `/platform/ui/providers` and
+  `/platform/ui/callback` all answered `rust`. GREEN: after the exact
+  `/platform`, `/platform/__data.json` and `/platform/ui` locations and the
+  `^~ /platform/ui/` prefix, those answer `ui`, while
+  `/platform/browser/methods`, `/platform/browser/session`,
+  `/platform/tenants` and `/platform/uix` still answer `rust` and `/` and
+  `/platformx` stay `ui`. `/platform/__data.json` is the entry's page data,
+  so client-side navigation back to `/platform` reaches the BFF. The cookie
+  side was proven in S1: through a recording hop, every BFF call to Rust
+  carried only `wyrd_platform_session` or `wyrd_platform_login`, although the
+  browser also held a tenant session. `test:server:startup:dev` gained
+  `platform_console_routes` (entry HTML headed Platform admin, 303 to
+  `/platform` for the console subtree without a session, Rust's methods and
+  401 problem+json for `/platform/browser/session` and `/platform/tenants`).
+  That lane did not run here: the release `rustc` for `wyrd-server` was
+  SIGKILLed three times while the official image was building, once with
+  `CARGO_BUILD_JOBS=2`. TDD: the routing scenario went RED to GREEN with
+  the stub probe; the startup lane check is unrun.
+- **Mock alignment sweep.** Each production page and state was captured in
+  light and dark at 1280 and 390 wide (entry, refused sign-in, ended session,
+  refused SSO return, overview, password and SSO re-auth, refused re-auth,
+  providers, provider conflict, mail with and without a relay, refused mail
+  test, signup) and compared with `node selfcheck.mjs --shots`. Fixed: plain
+  password fields in place of the Show/Hide control; the entry's "Signing in…"
+  busy state with read-only fields; the SSO button always shown and disabled
+  without platform SSO; "Too many sign-in attempts" for the 429; notices as
+  `.done` with a green `.ok` tick, and the mail test result the same way;
+  the mail "Sending…" busy state; problem block spacing inside the console;
+  the workspaces table as a labelled scroll region; the hidden provider test
+  and enable forms no longer adding a gap. The six journeys pass after the
+  sweep (S3's no-SSO check now expects the disabled button). Remaining
+  deviations and why:
+  - Mail password copy and the "Remove the stored username and password"
+    box: Part A's `PUT /platform/mail` contract keeps an omitted password.
+  - Provider registration text, callback URLs and revisions come from Rust's
+    provider view, not the mock's sample text.
+  - The SSO return has no "Finishing platform SSO sign-in…" state: the
+    callback load finishes with Rust before the page renders. A pop-up
+    re-auth shows "Returning to the console…" instead, which the mock's
+    simulated re-auth has no page for.
+  - The password form is hidden when Rust's `methods.password` is false.
+  - Fields use native `required` rather than the mock's focus-on-empty
+    script, so the forms work as plain posts.
+  - The entry card's 390-wide side margin comes from the shared
+    `Entry.svelte`, which the tenant pages also use.
+  - No preview bar, so pages start 33px higher.
+
+**Part C merge verification.** Right after the merge, all six console journeys failed. Five got the text "Failed to …" where JSON was expected, from `POST /platform/admins`; the sixth (SSO) timed out on a click. A read-only diagnostician found the cause: the `@wyrd/testing` napi addon (`sdks/wyrd-sdk-ts/testing/wyrd_testing.linux-x64-gnu.node`) was built before d9349c026. That build still requires `match_claim`, and axum answered with a plain-text 422. No code changed. After `mise run ts:build:testing`, the console journeys pass 6/6, `platform_admin_e2e` passes 97/97 and `test:identity:ui` passes 2/2. Clippy, `ui:check` and `check:tenant-isolation` are clean.
 
 ### 17. An existing User explicitly connects another sign-in method
 

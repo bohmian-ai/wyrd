@@ -239,12 +239,14 @@ impl Sandbox {
     /// Report one worker committing more memory than the process ceiling
     /// until the returned observation drops, so every pressure sample is
     /// critical while the byte ledger keeps its room for the stores and
-    /// queries a run needs before and after Python.
+    /// queries a run needs before and after Python. Pressure is sampled
+    /// before this returns, so work submitted next already sees it critical.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn overcommit_for_test(&self) -> wyrd_runtime::resources::CommitObservation {
         let observation = self.workloads.observe_commitment();
         observation.set(u64::MAX);
+        self.workloads.sample(0);
         observation
     }
 

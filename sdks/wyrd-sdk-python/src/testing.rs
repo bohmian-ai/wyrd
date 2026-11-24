@@ -241,44 +241,48 @@ impl WyrdTestServer {
             .map(Duration::try_from_secs_f64)
             .transpose()
             .map_err(|error| harness_error(format!("invalid verify_timeout_seconds: {error}")))?;
-        let (server, api_key) = wyrd_runtime::runtime()
-            .block_on(async {
-                let mut builder = TestServer::builder();
-                if verification_runtime {
-                    builder = builder.with_verification_runtime_for_test();
-                }
-                if let Some(capacity) = scribe_outbox_capacity {
-                    builder = builder.with_scribe_outbox_capacity_for_test(capacity);
-                }
-                if let Some(timeout) = verify_timeout {
-                    builder = builder.with_verify_timeout_for_test(timeout);
-                }
-                if let Some(seconds) = access_ttl_seconds {
-                    builder = builder
-                        .with_access_ttl(chrono::Duration::seconds(seconds))
-                        .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
-                            allowed_clock_skew: std::time::Duration::ZERO,
+        let (server, api_key) = slf
+            .py()
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(async {
+                    let mut builder = TestServer::builder();
+                    if verification_runtime {
+                        builder = builder.with_verification_runtime_for_test();
+                    }
+                    if let Some(capacity) = scribe_outbox_capacity {
+                        builder = builder.with_scribe_outbox_capacity_for_test(capacity);
+                    }
+                    if let Some(timeout) = verify_timeout {
+                        builder = builder.with_verify_timeout_for_test(timeout);
+                    }
+                    if let Some(seconds) = access_ttl_seconds {
+                        builder = builder
+                            .with_access_ttl(chrono::Duration::seconds(seconds))
+                            .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                                allowed_clock_skew: std::time::Duration::ZERO,
+                            });
+                    }
+                    if let Some(mock) = &github {
+                        builder = builder.with_github_app_for_test(mock);
+                    }
+                    if let Some(root) = root {
+                        builder = builder.with_gateway_provider_root_for_test(root);
+                    } else if live_providers {
+                        builder = builder.with_live_gateway_providers_for_test();
+                    }
+                    let server = Box::pin(builder.start_bound()).await?;
+                    let bootstrap = server
+                        .bootstrap_service("python-integration-writer", &["admin"])
+                        .await?;
+                    let Bootstrap::Machine { api_key, .. } = bootstrap else {
+                        return Err(WyrdError::HarnessStart {
+                            message: "Python test server writer bootstrap returned a user"
+                                .to_owned(),
+                            details: serde_json::json!({}),
                         });
-                }
-                if let Some(mock) = &github {
-                    builder = builder.with_github_app_for_test(mock);
-                }
-                if let Some(root) = root {
-                    builder = builder.with_gateway_provider_root_for_test(root);
-                } else if live_providers {
-                    builder = builder.with_live_gateway_providers_for_test();
-                }
-                let server = Box::pin(builder.start_bound()).await?;
-                let bootstrap = server
-                    .bootstrap_service("python-integration-writer", &["admin"])
-                    .await?;
-                let Bootstrap::Machine { api_key, .. } = bootstrap else {
-                    return Err(WyrdError::HarnessStart {
-                        message: "Python test server writer bootstrap returned a user".to_owned(),
-                        details: serde_json::json!({}),
-                    });
-                };
-                Ok((server, api_key.expose_secret().to_owned()))
+                    };
+                    Ok((server, api_key.expose_secret().to_owned()))
+                })
             })
             .map_err(WyrdPyError::from)?;
         let base_url = server.base_url().unwrap_or("").to_owned();
@@ -324,8 +328,10 @@ impl WyrdTestServer {
             snapshot.restore(py)?;
         }
         if let Some(server) = self.server.take() {
-            wyrd_runtime::runtime().block_on(async {
-                let _ = server.shutdown().await;
+            py.detach(|| {
+                wyrd_runtime::runtime().block_on(async {
+                    let _ = server.shutdown().await;
+                });
             });
         }
         Ok(false)
@@ -386,12 +392,11 @@ impl WyrdTestServer {
     ///
     /// Raises the harness error when the context manager is inactive, and a
     /// Wyrd Python error when the exchange route refuses the key.
-    fn access_token(&self) -> WyrdPyResult<String> {
+    fn access_token(&self, py: Python<'_>) -> WyrdPyResult<String> {
         let server = self.started()?;
         let api_key = self.api_key.as_ref().ok_or_else(not_started)?;
         let key = SecretString::from(api_key.clone());
-        wyrd_runtime::runtime()
-            .block_on(server.exchange_api_key(&key))
+        py.detach(|| wyrd_runtime::runtime().block_on(server.exchange_api_key(&key)))
             .map_err(py_error)
     }
 
@@ -405,11 +410,16 @@ impl WyrdTestServer {
     /// Raises a Wyrd Python error when the context manager is inactive or
     /// bootstrap fails or yields a user.
     #[pyo3(signature = (roles, name = "svc"))]
-    fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
+    fn bootstrap_service(
+        &self,
+        py: Python<'_>,
+        roles: Vec<String>,
+        name: &str,
+    ) -> WyrdPyResult<String> {
         let server = self.started()?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
-        let bootstrap = wyrd_runtime::runtime()
-            .block_on(server.bootstrap_service(name, &roles))
+        let bootstrap = py
+            .detach(|| wyrd_runtime::runtime().block_on(server.bootstrap_service(name, &roles)))
             .map_err(py_error)?;
         machine_key(
             bootstrap,
@@ -425,10 +435,10 @@ impl WyrdTestServer {
     /// # Errors
     /// Raises a Wyrd Python error when the context manager is inactive or the
     /// key cannot be issued.
-    fn tenant_admin_key(&self) -> WyrdPyResult<String> {
+    fn tenant_admin_key(&self, py: Python<'_>) -> WyrdPyResult<String> {
         let server = self.started()?;
-        let key = wyrd_runtime::runtime()
-            .block_on(server.tenant_admin_key())
+        let key = py
+            .detach(|| wyrd_runtime::runtime().block_on(server.tenant_admin_key()))
             .map_err(py_error)?;
         Ok(key.expose_secret().to_owned())
     }
@@ -444,11 +454,16 @@ impl WyrdTestServer {
     /// Raises a Wyrd Python error when the context manager is inactive or
     /// bootstrap fails.
     #[pyo3(signature = (roles, name))]
-    fn bootstrap_user(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
+    fn bootstrap_user(
+        &self,
+        py: Python<'_>,
+        roles: Vec<String>,
+        name: &str,
+    ) -> WyrdPyResult<String> {
         let server = self.started()?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
-        let bootstrap = wyrd_runtime::runtime()
-            .block_on(server.bootstrap_user(name, &roles))
+        let bootstrap = py
+            .detach(|| wyrd_runtime::runtime().block_on(server.bootstrap_user(name, &roles)))
             .map_err(py_error)?;
         Ok(bootstrap.id().to_string())
     }
@@ -464,6 +479,7 @@ impl WyrdTestServer {
     #[pyo3(signature = (roles, name, ceiling))]
     fn bootstrap_user_key(
         &self,
+        py: Python<'_>,
         roles: Vec<String>,
         name: &str,
         ceiling: Vec<String>,
@@ -471,8 +487,10 @@ impl WyrdTestServer {
         let server = self.started()?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
         let ceiling: Vec<&str> = ceiling.iter().map(String::as_str).collect();
-        let (id, key) = wyrd_runtime::runtime()
-            .block_on(server.bootstrap_user_key(name, &roles, &ceiling))
+        let (id, key) = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(server.bootstrap_user_key(name, &roles, &ceiling))
+            })
             .map_err(py_error)?;
         Ok((id.to_string(), key.expose_secret().to_owned()))
     }
@@ -483,13 +501,18 @@ impl WyrdTestServer {
     /// # Errors
     /// Raises a harness error for an invalid principal id, and a Wyrd
     /// Python error when the context manager is inactive or the write fails.
-    fn seed_user_keys(&self, user: &str, count: usize) -> WyrdPyResult<Vec<String>> {
+    fn seed_user_keys(
+        &self,
+        py: Python<'_>,
+        user: &str,
+        count: usize,
+    ) -> WyrdPyResult<Vec<String>> {
         let server = self.started()?;
         let user = user
             .parse::<wyrd_runtime::PrincipalId>()
             .map_err(|error| harness_error(format!("invalid principal id: {error}")))?;
-        let ids = wyrd_runtime::runtime()
-            .block_on(server.seed_user_keys(user, count))
+        let ids = py
+            .detach(|| wyrd_runtime::runtime().block_on(server.seed_user_keys(user, count)))
             .map_err(py_error)?;
         Ok(ids.iter().map(ToString::to_string).collect())
     }
@@ -504,6 +527,7 @@ impl WyrdTestServer {
     /// Raises a harness error for an invalid Card identity or a failed write.
     fn credential_registered_service(
         &self,
+        py: Python<'_>,
         card_ref: &str,
         roles: Vec<String>,
     ) -> WyrdPyResult<String> {
@@ -512,8 +536,11 @@ impl WyrdTestServer {
             .parse::<wyrd_spec::reference::CardRef>()
             .map_err(|error| harness_error(format!("invalid card identity: {error}")))?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
-        let bootstrap = wyrd_runtime::runtime()
-            .block_on(server.credential_registered_service(&card_ref, &roles))
+        let bootstrap = py
+            .detach(|| {
+                wyrd_runtime::runtime()
+                    .block_on(server.credential_registered_service(&card_ref, &roles))
+            })
             .map_err(py_error)?;
         machine_key(bootstrap, "expected a machine bootstrap")
     }
@@ -561,10 +588,12 @@ impl WyrdTestServer {
                 serde_json::from_str::<serde_json::Value>(&json).map_err(harness_error)
             })
             .collect::<WyrdPyResult<Vec<_>>>()?;
-        let bootstrap = wyrd_runtime::runtime()
-            .block_on(async {
-                server.seed_role(role, &parsed).await?;
-                server.bootstrap_service(role, &[role]).await
+        let bootstrap = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(async {
+                    server.seed_role(role, &parsed).await?;
+                    server.bootstrap_service(role, &[role]).await
+                })
             })
             .map_err(py_error)?;
         self.scoped_principals
@@ -584,7 +613,7 @@ impl WyrdTestServer {
     /// Raises the harness error when `scoped_api_key` never seeded `role`, and
     /// a Wyrd Python error when the context manager is inactive or the
     /// revocation write fails.
-    fn revoke_scoped_role(&self, role: &str) -> WyrdPyResult<()> {
+    fn revoke_scoped_role(&self, py: Python<'_>, role: &str) -> WyrdPyResult<()> {
         let server = self.started()?;
         let principal = self
             .scoped_principals
@@ -593,8 +622,7 @@ impl WyrdTestServer {
             .get(role)
             .cloned()
             .ok_or_else(|| harness_error(format!("no scoped principal holds role `{role}`")))?;
-        wyrd_runtime::runtime()
-            .block_on(server.revoke_role(&principal, role))
+        py.detach(|| wyrd_runtime::runtime().block_on(server.revoke_role(&principal, role)))
             .map_err(py_error)
     }
 
@@ -609,10 +637,10 @@ impl WyrdTestServer {
     /// Raises a Wyrd Python error when the context manager is inactive or the
     /// tenant cannot be seeded.
     #[pyo3(signature = (slug))]
-    fn seed_tenant(&self, slug: &str) -> WyrdPyResult<String> {
+    fn seed_tenant(&self, py: Python<'_>, slug: &str) -> WyrdPyResult<String> {
         let server = self.started()?;
-        let tenant_id = wyrd_runtime::runtime()
-            .block_on(server.seed_tenant(slug))
+        let tenant_id = py
+            .detach(|| wyrd_runtime::runtime().block_on(server.seed_tenant(slug)))
             .map_err(py_error)?;
         Ok(tenant_id.to_string())
     }
@@ -631,6 +659,7 @@ impl WyrdTestServer {
     #[pyo3(signature = (tenant_id, roles, name = "svc"))]
     fn bootstrap_service_in_tenant(
         &self,
+        py: Python<'_>,
         tenant_id: &str,
         roles: Vec<String>,
         name: &str,
@@ -640,8 +669,11 @@ impl WyrdTestServer {
             .parse::<DataTenantId>()
             .map_err(|error| harness_error(format!("invalid tenant id: {error}")))?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
-        let bootstrap = wyrd_runtime::runtime()
-            .block_on(server.bootstrap_service_in_tenant(tenant_id, name, &roles))
+        let bootstrap = py
+            .detach(|| {
+                wyrd_runtime::runtime()
+                    .block_on(server.bootstrap_service_in_tenant(tenant_id, name, &roles))
+            })
             .map_err(py_error)?;
         machine_key(
             bootstrap,
@@ -672,17 +704,17 @@ impl WyrdTestServer {
     /// is inactive, the production Scribe path cannot commit its buffered
     /// rows, or a step does not settle within the harness bound.
     #[pyo3(signature = (to = "published"))]
-    fn flush_bifrost(&self, to: &str) -> WyrdPyResult<()> {
+    fn flush_bifrost(&self, py: Python<'_>, to: &str) -> WyrdPyResult<()> {
         let server = self.started()?;
         let runtime = wyrd_runtime::runtime();
         match to {
-            "published" => runtime.block_on(server.flush_bifrost()).map_err(py_error),
+            "published" => py
+                .detach(|| runtime.block_on(server.flush_bifrost()))
+                .map_err(py_error),
             "staged" => {
-                runtime
-                    .block_on(server.settle_bifrost_outbox())
+                py.detach(|| runtime.block_on(server.settle_bifrost_outbox()))
                     .map_err(py_error)?;
-                runtime
-                    .block_on(server.stage_bifrost_writable_for_test())
+                py.detach(|| runtime.block_on(server.stage_bifrost_writable_for_test()))
                     .map_err(py_error)?;
                 let found = hot_authorities(server)?;
                 if found.is_empty() || found.iter().any(|label| *label != "staged_run") {
@@ -693,8 +725,7 @@ impl WyrdTestServer {
                 Ok(())
             }
             "memtable" => {
-                runtime
-                    .block_on(server.settle_bifrost_outbox())
+                py.detach(|| runtime.block_on(server.settle_bifrost_outbox()))
                     .map_err(py_error)?;
                 // Scribe lists a generation only once it freezes, so an empty
                 // list means every row is still in the writable memtable.
@@ -718,11 +749,10 @@ impl WyrdTestServer {
     /// # Errors
     /// Raises a harness error for an invalid binding ID, and a Wyrd Python
     /// error when the context manager is inactive or the update fails.
-    fn make_binding_due(&self, binding_id: &str) -> WyrdPyResult<()> {
+    fn make_binding_due(&self, py: Python<'_>, binding_id: &str) -> WyrdPyResult<()> {
         let server = self.started()?;
         let binding = binding_id.parse().map_err(harness_error)?;
-        wyrd_runtime::runtime()
-            .block_on(server.make_binding_due(binding))
+        py.detach(|| wyrd_runtime::runtime().block_on(server.make_binding_due(binding)))
             .map_err(py_error)
     }
 
@@ -733,12 +763,13 @@ impl WyrdTestServer {
     /// Raises a harness error for an invalid execution ID, and a Wyrd Python
     /// error when the context manager is inactive, the execution has no
     /// settled row, or the delete fails.
-    fn remove_settled_execution_row(&self, execution_id: &str) -> WyrdPyResult<()> {
+    fn remove_settled_execution_row(&self, py: Python<'_>, execution_id: &str) -> WyrdPyResult<()> {
         let server = self.started()?;
         let execution = execution_id.parse().map_err(harness_error)?;
-        wyrd_runtime::runtime()
-            .block_on(server.remove_settled_execution_row(execution))
-            .map_err(py_error)
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(server.remove_settled_execution_row(execution))
+        })
+        .map_err(py_error)
     }
 
     /// Admit one execution of a fresh Drift Verifier named `name` and hold it
@@ -1012,8 +1043,9 @@ impl UnmigratedDatabase {
     /// Raises the harness error when the repository-managed test Postgres
     /// variables are unset or the database cannot be created.
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
-        let database = wyrd_runtime::runtime()
-            .block_on(EmptyDatabase::create())
+        let database = slf
+            .py()
+            .detach(|| wyrd_runtime::runtime().block_on(EmptyDatabase::create()))
             .map_err(harness_error)?;
         slf.url = Some(database.url().map_err(harness_error)?);
         slf.database = Some(database);

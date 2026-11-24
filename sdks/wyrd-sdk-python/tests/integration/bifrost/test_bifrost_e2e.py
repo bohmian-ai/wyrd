@@ -7,11 +7,13 @@ the session ``WyrdTestServer`` exports; each story writes its own fixed
 
 import asyncio
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import pairwise
 from pathlib import Path
 
 import pyarrow
@@ -121,6 +123,38 @@ def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bi
         Item(id=4, value="fourth"),
         Item(id=5, value="fifth"),
     ]
+
+
+def test_flush_lets_other_python_threads_run(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.flush_threads"))
+    assert writer.register() == "created"
+    for id in range(100):
+        writer.insert(Item(id=id, value="row"))
+    writer.shutdown()
+    ticks: list[float] = []
+    stop = threading.Event()
+
+    def tick() -> None:
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0)
+
+    worker = threading.Thread(target=tick)
+    worker.start()
+    try:
+        time.sleep(0.05)
+        started = time.monotonic()
+        wyrd_server.flush_bifrost()
+        finished = time.monotonic()
+    finally:
+        stop.set()
+        worker.join()
+
+    # A flush holding the interpreter lock stalls the worker for its whole
+    # window; one that releases it lets the worker run during it.
+    edges = [started, *(at for at in ticks if started < at < finished), finished]
+    assert max(b - a for a, b in pairwise(edges)) < 0.9 * (finished - started)
+    assert len(items(bifrost, "bifrost.datasets.flush_threads")) == 100
 
 
 def test_swapped_away_table_still_drains(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:

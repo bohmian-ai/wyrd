@@ -11,16 +11,15 @@
 #   example-app.sh test ARGS    the app's pytest suite with the testing-enabled wheel,
 #                               in an environment kept apart from the development one
 #
-# The checkout at target/dev/wyrd-example-py is the pinned upstream commit
-# (wyrd-example-py's dev-workload branch). A checkout holding uncommitted
-# changes is refused, never overwritten. The wheel is built from this repository
+# The checkout at target/dev/wyrd-example-py is the pinned upstream commit.
+# A checkout holding uncommitted changes is refused, never overwritten. The wheel is built from this repository
 # without the testing feature, is the only file in the app's vendor index, and
 # the installed native module must match its digest.
 set -Eeuo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo=https://github.com/bohmian-ai/wyrd-example-py
-readonly base=90fb879c4d02fb170efa4106a00be925648cc0e3
+readonly base=06b8f395c9d691c76f53e817ca7c96f8e62a7b3e
 readonly app="$root/target/dev/wyrd-example-py"
 readonly port=${WYRD_EXAMPLE_PORT:-8000}
 

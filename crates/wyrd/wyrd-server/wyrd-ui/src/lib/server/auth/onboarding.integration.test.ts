@@ -226,3 +226,72 @@ test('a verified address finds its workspaces by link or pasted code', async () 
     await context.close();
   }
 }, journeyTimeout);
+
+test('a password account resets its password with a mailed code', async () => {
+  const { context, page } = await visitor();
+  try {
+    // A password-only workspace offers no company SSO, and points to reset.
+    await page.goto(`${journey.origin}/t/${slug}/login`);
+    await page.getByLabel('Username').waitFor();
+    expect(await page.getByRole('button', { name: 'Sign in with SSO' }).count()).toBe(0);
+    await page.getByRole('link', { name: 'Reset your password' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}/reset`);
+
+    const before = await mailCount(owner);
+    await page.getByLabel('Username').fill('owner');
+    await page.getByRole('button', { name: 'Email me a code' }).click();
+    await page.getByText(`If ${slug} has a password account named owner`).waitFor();
+    await expect.poll(() => mailCount(owner)).toBe(before + 1);
+    const code = /paste this code there:\s+(\S+)/.exec(await newestMail(owner))?.[1];
+    expect(code, 'the message carries the reset code').toBeDefined();
+
+    await page.getByLabel('Reset code').fill(code!);
+    await page.getByLabel('New password', { exact: true }).fill('a brand new passphrase for owner');
+    await page.getByRole('button', { name: 'Set password' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}/login?reset=done`);
+    await page.getByText('Password set. Sign in with your new password.').waitFor();
+    await page.getByLabel('Username').fill('owner');
+    await page.getByLabel('Password', { exact: true }).fill('a brand new passphrase for owner');
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+  } finally {
+    await context.close();
+  }
+}, journeyTimeout);
+
+test('a signed-in administrator verifies a recovery email from the account page', async () => {
+  const { context, page } = await visitor();
+  const recovery = `recovery-${run}@example.test`;
+  try {
+    await page.goto(`${journey.origin}/t/${slug}/login`);
+    await page.getByLabel('Username').fill('owner');
+    await page.getByLabel('Password', { exact: true }).fill('a brand new passphrase for owner');
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+
+    await page.goto(`${journey.origin}/t/${slug}/settings/account`);
+    const section = page.getByRole('region', { name: 'Recovery email' });
+    await section.getByLabel('Email').fill(recovery);
+    await section.getByRole('button', { name: 'Send verification link' }).click();
+    await section.getByText(`If mail reaches ${recovery}, it holds a link.`).waitFor();
+
+    const link = mailedLink(await newestMail(recovery));
+    expect(new URL(link).pathname).toBe(`/t/${slug}/contact/verify`);
+    await page.goto(link);
+    await page.getByRole('heading', { name: 'Recovery email verified', exact: true }).waitFor();
+    expect(page.url()).toBe(`${journey.origin}/t/${slug}/contact/verify`);
+    await page.getByText(`Password reset codes for your ${slug} account now go to this address.`).waitFor();
+  } finally {
+    await context.close();
+  }
+
+  // Signed out, the same kind of link explains how to finish instead of failing silently.
+  const signedOut = await visitor();
+  try {
+    await signedOut.page.goto(`${journey.origin}/t/${slug}/contact/verify#proof=not-a-proof`);
+    await signedOut.page.getByRole('alert').getByText('You are signed out').waitFor();
+    expect(await signedOut.page.getByRole('link', { name: `Sign in to ${slug}` }).getAttribute('href')).toBe(`/t/${slug}/login`);
+  } finally {
+    await signedOut.context.close();
+  }
+}, journeyTimeout);

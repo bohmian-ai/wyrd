@@ -273,6 +273,20 @@ export class BrowserSessions {
   }
 
   /** Set a new password with an operator-issued reset code; signs nothing in. */
+  /**
+   * Ask Rust to mail a reset code to the verified recovery email of
+   * `username`; every account gets the same answer, so nothing here says
+   * whether one exists.
+   */
+  async requestReset(tenantKey: string, username: string, url: URL): Promise<void> {
+    this.cookieName(tenantKey);
+    const response = await call('/auth/browser/password/reset/request', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, username }
+    });
+    if (!response.ok) await refuse(response);
+  }
+
   async resetPassword(tenantKey: string, resetCode: string, newPassword: string, url: URL): Promise<void> {
     this.cookieName(tenantKey);
     const response = await call('/auth/browser/password/reset', url, {

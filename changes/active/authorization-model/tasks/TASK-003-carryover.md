@@ -1303,6 +1303,34 @@ after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
    (directory 1, contact 1, tenant active): Playwright's heading name match
    is substring by default ("Find your workspaces" matched "Your workspaces"),
    now `exact`; and Rust answers `login_url` as an absolute same-origin URL.
+4. **Mailed reset code and advertised-only sign-in.** RED before production
+   edits: the signup-created password workspace's login page showed
+   "Sign in with SSO" (count 1, expected 0). GREEN: the login page renders the
+   password form and the "Reset your password" link only when `password` is
+   advertised and the SSO button only for `company_sso`; the reset page asks
+   for a username ("Email me a code") when `password_reset` is advertised,
+   answers every account the same ("If <slug> has a password account named
+   owner…"), takes the mailed code, sets "a brand new passphrase for owner",
+   lands on `login?reset=done` with "Password set.", and that passphrase
+   signs in. Without `password` the reset page shows "Password reset is not
+   available" and no form; without a relay only the pasted-code form shows.
+   The OIDC-off tenant assertion in `production-auth.integration.test.ts`
+   expected an SSO button its tenant does not advertise; it now asserts the
+   button is absent (the `?/sso` refusal it then posts is unchanged).
+   `mise run test:identity:ui` then passed `production_ui_bff_journey`.
+5. **Recovery email from the Account page.** TDD violation, recorded
+   honestly: the Account section and contact verify page were written in the
+   same step as the test, before RED was observed. The first run
+   (`mise run test:identity:ui`, whose UI build predated the contact verify
+   page) failed at the "Recovery email verified" heading; a fresh build is
+   GREEN. The signed-in owner (passphrase sign-in, so recent) opens
+   `/settings/account`, sees the "Recovery email" region only because
+   `email_discovery` is advertised, with no current address shown, sends a
+   verification link, opens the mailed `/t/<slug>/contact/verify` link, and
+   sees "Recovery email verified" with the fragment cleared; a signed-out
+   browser opening a contact link sees "You are signed out" with a "Sign in to
+   <slug>" link instead of a redirect. Scenarios 4 and 5 share one commit
+   because they edit the same wording module and journey file.
 
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and

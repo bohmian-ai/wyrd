@@ -50,13 +50,19 @@ export const PROBLEMS = {
   readExpired: worded(400, 'WYRD_AUTH_400_INVALID_STATE', 'This list expired', 'The list stays readable for five minutes. Request a new link to see it again.'),
   discoveryOff: worded(403, 'WYRD_AUTH_403_METHOD_UNAVAILABLE', 'Finding workspaces by email is not available', 'This deployment does not send email. Use a saved workspace URL, an invitation link, or ask your administrator.'),
   proofExpired: worded(400, 'WYRD_AUTH_400_INVALID_STATE', 'This link expired', 'Links last fifteen minutes. Start again to get a new one.'),
+  recent: worded(403, 'WYRD_AUTH_403_RECENT_LOGIN_REQUIRED', 'Sign in again first', 'Changing your recovery email needs a password or provider sign-in from the last five minutes.'),
+  contactOff: worded(403, 'WYRD_AUTH_403_METHOD_UNAVAILABLE', 'Recovery email is not available', 'This deployment does not send email. An administrator can still issue you a reset code.'),
+  signedOut: worded(401, 'WYRD_AUTH_401_INVALID_TOKEN', 'You are signed out', 'Sign in to this workspace in this browser, then open the link again.'),
+  resetCode: worded(401, 'WYRD_AUTH_401_ONE_TIME_CODE_INVALID', 'Reset code not accepted', 'A code works once, for fifteen minutes, and a newer request replaces it. Request a new code, or ask an administrator for one.'),
+  resetOff: worded(403, 'WYRD_AUTH_403_METHOD_UNAVAILABLE', 'Password reset is not available', 'This workspace does not offer password sign-in. Sign in with SSO from the sign-in page.'),
   unavailable: worded(502, 'WYRD_SPEC_502_UPSTREAM_FAILURE', 'Upstream dependency failed', 'Please try again later.')
 };
 
 /** Throttle titles by server code; Entry tells the person when to retry. */
 const THROTTLES: Record<string, string> = {
   WYRD_AUTH_429_SIGNUP_ATTEMPTS: 'Too many workspace signups',
-  WYRD_AUTH_429_EMAIL_ATTEMPTS: 'Too many email requests'
+  WYRD_AUTH_429_EMAIL_ATTEMPTS: 'Too many email requests',
+  WYRD_AUTH_429_PASSWORD_ATTEMPTS: 'Too many reset requests'
 };
 
 /**

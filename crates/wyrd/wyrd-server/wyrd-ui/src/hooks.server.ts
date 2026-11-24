@@ -9,7 +9,8 @@ const loginRoutes = [
   '/t/[tenantKey]/login',
   '/t/[tenantKey]/login/api-key',
   '/t/[tenantKey]/signup',
-  '/t/[tenantKey]/reset'
+  '/t/[tenantKey]/reset',
+  '/t/[tenantKey]/contact/verify'
 ];
 
 export const handle: Handle = async ({ event, resolve }) => {

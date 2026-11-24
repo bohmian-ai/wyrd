@@ -1,7 +1,7 @@
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { localAuthEnabled } from '$lib/server/development';
 import { reject } from '$lib/server/auth/session';
-import { browserSessions, type SocialProvider } from '$lib/server/auth/browser-sessions';
+import { browserSessions, type LoginMethods } from '$lib/server/auth/browser-sessions';
 import { field } from '$lib/server/form';
 import { problem, retryAfter, safeProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad } from './$types';
@@ -14,23 +14,33 @@ export const load: PageServerLoad = async ({ params, cookies, url }) => {
   const login = url.searchParams.get('login');
   // Rust's own refusal reasons for a verified provider identity.
   const notice = login === 'no_account' || login === 'account_exists' ? login : null;
-  let providers: SocialProvider[] = [];
+  // Only the methods Rust advertises render; a failed read renders none.
+  let methods: Pick<LoginMethods, 'password' | 'company_sso' | 'providers'> = {
+    password: false,
+    company_sso: false,
+    providers: []
+  };
   try {
     if (await browserSessions.read(params.tenantKey, url, cookies))
       redirect(303, `/t/${encodeURIComponent(params.tenantKey)}`);
-    providers = (await browserSessions.methods(params.tenantKey, url)).providers;
+    methods = await browserSessions.methods(params.tenantKey, url);
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
-    return { tenant, reset, notice, providers, problem: safeProblem(cause) };
+    return { tenant, reset, notice, ...pick(methods), problem: safeProblem(cause) };
   }
   return {
     tenant,
     reset,
     notice,
-    providers,
+    ...pick(methods),
     problem: login === 'failed' ? problem('unauthenticated') : null
   };
 };
+
+/** The sign-in methods the page renders. */
+function pick({ password, company_sso, providers }: Pick<LoginMethods, 'password' | 'company_sso' | 'providers'>) {
+  return { password, companySso: company_sso, providers };
+}
 
 /**
  * The safe problem a refused sign-in action answers, telling the browser

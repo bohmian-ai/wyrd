@@ -164,6 +164,16 @@ impl PlatformLogin {
         Ok((decode_connection(row, self.kms.as_deref()).await?, revision))
     }
 
+    /// Whether a platform OIDC connection exists, the condition under which
+    /// a begin is not [`PlatformLoginError::NotConfigured`]. Reads the row
+    /// only; the client secret is not opened.
+    ///
+    /// # Errors
+    /// Returns [`PlatformLoginError::Store`] when the read fails.
+    pub async fn configured(&self) -> Result<bool, PlatformLoginError> {
+        Ok(platform_oidc_connection(&self.pool).await?.is_some())
+    }
+
     /// Begin a platform login and return the provider authorization URL.
     ///
     /// The entry point selects the connection: there is exactly one, so nothing

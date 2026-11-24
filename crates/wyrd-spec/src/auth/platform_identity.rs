@@ -145,6 +145,19 @@ pub enum PlatformBrowserMethod {
     Oidc,
 }
 
+/// Response of `GET /platform/browser/methods`: the sign-in methods the
+/// signed-out platform entry may offer. Hiding a method enforces nothing;
+/// each sign-in path still decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PlatformSignInMethods {
+    /// Whether platform-user password sign-in is available.
+    pub password: bool,
+    /// Whether a platform OIDC connection exists, so OIDC sign-in can begin.
+    pub oidc: bool,
+}
+
 /// Safe metadata of the platform browser session a request presents. It
 /// carries no session identifier, API token, bootstrap key or provider token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

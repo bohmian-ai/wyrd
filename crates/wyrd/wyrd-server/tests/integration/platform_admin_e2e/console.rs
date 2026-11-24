@@ -1315,3 +1315,70 @@ async fn maintenance_removes_ended_platform_sessions() {
     assert_eq!(remaining, 1, "only the live session remains");
     assert_eq!(session_status(&srv, &live).await, StatusCode::OK);
 }
+
+/// The signed-out platform entry reads which sign-in methods it may offer:
+///   1. `GET /platform/browser/methods` needs no session or Origin and
+///      answers `{"password": true, "oidc": false}` while no platform OIDC
+///      connection exists, exactly when OIDC begin answers `404`;
+///   2. once a connection is configured it answers `"oidc": true` and
+///      begin succeeds;
+///   3. removing the connection withdraws it again.
+///
+/// # Panics
+/// Panics when the read disagrees with what platform sign-in accepts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_platform_entry_reads_its_sign_in_methods() {
+    let (srv, _root, api) = console_server().await;
+    let methods = || async {
+        let reply = browser(
+            &srv,
+            Method::GET,
+            "/platform/browser/methods",
+            &[],
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        assert!(reply.set_cookies.is_empty(), "the read sets no cookie");
+        reply.body
+    };
+
+    // 1. No connection: password only, and OIDC begin is 404.
+    assert_eq!(methods().await, json!({ "password": true, "oidc": false }));
+    let begun = browser(
+        &srv,
+        Method::POST,
+        "/platform/browser/oidc/login",
+        &[],
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(begun.status, StatusCode::NOT_FOUND, "{}", begun.body);
+
+    // 2. A configured connection is offered, and begin works.
+    let provider = wiremock::MockServer::start().await;
+    super::mount_platform_provider(
+        &provider,
+        super::platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    configure_platform_oidc(&srv, &api, &provider.uri()).await;
+    assert_eq!(methods().await, json!({ "password": true, "oidc": true }));
+    begin_oidc(&srv).await;
+
+    // 3. Removing it withdraws the button again.
+    let resp = srv
+        .oneshot(super::platform_request(
+            Method::DELETE,
+            "/platform/oidc/connection",
+            &api,
+            None,
+        ))
+        .await
+        .expect("delete responds");
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert_eq!(methods().await, json!({ "password": true, "oidc": false }));
+}

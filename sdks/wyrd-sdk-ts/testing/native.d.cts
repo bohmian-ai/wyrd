@@ -69,8 +69,10 @@ export declare class NativeHeldMemory {
  * Journeys steer the server through exactly six test controls, each backed
  * by the production code path: `flushBifrost`, `waitForBaseline`,
  * `makeBindingDue`, `holdPublications`, and, for contended process memory,
- * `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
- * start, address, or credential the server.
+ * `occupyHostedMemory` and `waitForHostedWaiters`. One more,
+ * `removeSettledExecutionRow`, stands in for cleanup of terminal
+ * coordination state, which no production owner performs yet. The remaining
+ * members start, address, or credential the server.
  */
 export declare class NativeWyrdTestServer {
   /** Returns the bound HTTP base URL. */
@@ -120,6 +122,17 @@ export declare class NativeWyrdTestServer {
    * `binding_id` is not a binding ID, or the update fails.
    */
   makeBindingDue(bindingId: string): void
+  /**
+   * Remove settled execution `execution_id`'s scheduling row, so a journey
+   * reads the execution from its retained records alone.
+   *
+   * # Errors
+   *
+   * Throws a `WyrdError`-shaped error when the harness is closed,
+   * `execution_id` is not an execution ID, the execution has no settled
+   * row, or the delete fails.
+   */
+  removeSettledExecutionRow(executionId: string): void
   /**
    * Wait until Drift Verifier `verifier`'s fitted baseline is ready.
    *

@@ -634,6 +634,39 @@ class PullRequestActivation(TypedDict):
     members: NotRequired[list[str]]
     """Every execution ID the generation admitted."""
 
+class AnchorProblem(TypedDict):
+    """A report finding anchor the retained source does not hold."""
+
+    finding: str
+    reason: Literal[
+        "anchor_commit_mismatch",
+        "anchor_path_unknown",
+        "anchor_source_unavailable",
+        "anchor_out_of_range",
+    ]
+
+class GithubDelivery(TypedDict):
+    """How far GitHub delivery of a ``pull_request`` execution's current state got.
+
+    Delivery never changes the verdict, and its failure never fails the
+    execution. ``reason`` says why a ``skipped`` or ``failed`` delivery did not
+    finish, or why a ``delivered`` Check shows no report.
+    """
+
+    status: Literal["pending", "delivered", "skipped", "failed"]
+    reason: NotRequired[
+        Literal[
+            "superseded",
+            "access_removed",
+            "github_refused",
+            "github_unavailable",
+            "report_ambiguous",
+            "report_invalid",
+        ]
+    ]
+    problems: NotRequired[list[AnchorProblem]]
+    """Findings listed in the Check summary because their anchors were refused."""
+
 ApprovalStatus: TypeAlias = Literal["pending", "approved", "rejected", "expired"]
 """Where one approval occurrence stands; ``expired`` ends with its execution."""
 
@@ -696,6 +729,8 @@ class ExecutionState(TypedDict, Generic[DataT]):
     """Every approval occurrence the execution reached, in step order."""
     input_waits: NotRequired[list[InputWait]]
     """Each task an unfinished execution holds for deferred inputs, in task order; never decides ``status``."""
+    github_delivery: NotRequired[GithubDelivery]
+    """A ``pull_request`` execution's GitHub delivery; absent for every other origin."""
 
 class EvidenceRepository(TypedDict):
     """The connected repository a publication's slug resolved to."""

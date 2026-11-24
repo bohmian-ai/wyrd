@@ -4467,6 +4467,28 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
     }
 
+    /// Remove settled `execution`'s scheduling row, so a journey reads the
+    /// execution from its retained records alone.
+    ///
+    /// Delegates to [`VerificationFixture::remove_settled_execution_row`];
+    /// no production owner removes these rows yet, so this stands in for
+    /// cleanup of terminal coordination state.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the fixture tenant cannot be
+    /// opened, the execution has no settled row, or the delete fails.
+    pub async fn remove_settled_execution_row(
+        &self,
+        execution: wyrd_spec::ids::ExecutionId,
+    ) -> Result<(), WyrdTestServerError> {
+        self.verification_fixture()
+            .await
+            .map_err(|error| WyrdTestServerError::Sql(error.to_string()))?
+            .remove_settled_execution_row(execution)
+            .await
+            .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
+    }
+
     /// Admit one execution of a fresh Drift Verifier named `name` and hold it
     /// unfinished with four accepted publications, so a language journey can
     /// read successful publications through its public SDK without a

@@ -726,6 +726,21 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
+    /// Remove a settled execution's scheduling row, so a journey reads the
+    /// execution from its retained records alone.
+    ///
+    /// # Errors
+    /// Raises a harness error for an invalid execution ID, and a Wyrd Python
+    /// error when the context manager is inactive, the execution has no
+    /// settled row, or the delete fails.
+    fn remove_settled_execution_row(&self, execution_id: &str) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        let execution = execution_id.parse().map_err(harness_error)?;
+        wyrd_runtime::runtime()
+            .block_on(server.remove_settled_execution_row(execution))
+            .map_err(py_error)
+    }
+
     /// Admit one execution of a fresh Drift Verifier named `name` and hold it
     /// running with the harness's four fixed publications.
     ///

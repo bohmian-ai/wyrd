@@ -19,6 +19,7 @@ mod pg_tests {
         ApprovalDecision, ApprovalStatus, Evidence, EvidenceStatus, Execution, File, InputWait,
     };
     use wyrd_spec::ids::SlotName;
+    use wyrd_spec::verification::execution::GithubDeliveryStatus;
     use wyrd_spec::verification::{VerificationExecutionStatus, VerificationVerdict};
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
@@ -313,11 +314,14 @@ mod pg_tests {
     /// execution as unknown and cannot decide it; with a separate read of the
     /// Repository family it reads the pending approval, and its approval
     /// returns the durable receipt, replays on retry, and the execution passes
-    /// under its original ID with the decision listed.
+    /// under its original ID with the decision listed. Once its settled
+    /// scheduling row is removed, a Repository reader still reads the same PR
+    /// source, result and GitHub delivery, and a shared-Verifier reader still
+    /// reads it as unknown.
     ///
     /// # Panics
     /// Panics when the occurrence is not pending, a decision or refusal
-    /// differs, or the execution does not pass.
+    /// differs, the execution does not pass, or the retained read differs.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the repository-managed Postgres journey lifecycle"]
     async fn a_person_approves_the_pending_signoff() {
@@ -356,14 +360,14 @@ mod pg_tests {
                 .await
                 .expect("the execution handle connects")
         };
-        let seen = reader("signoff_repository_reader", "Repository", "web")
-            .await
+        let repository_reader = reader("signoff_repository_reader", "Repository", "web").await;
+        let seen = repository_reader
             .status()
             .await
             .expect("the Repository reader reads the execution");
         assert_eq!(named(&seen.input_waits), [("green", vec!["ci"])]);
-        let unseen = reader("signoff_verifier_reader", "Verifier", "signoff")
-            .await
+        let verifier_reader = reader("signoff_verifier_reader", "Verifier", "signoff").await;
+        let unseen = verifier_reader
             .status()
             .await
             .expect_err("a reader of another parent learns nothing");
@@ -490,6 +494,47 @@ mod pg_tests {
             .expect("the execution reads");
         assert_eq!(state.approvals[0].status, ApprovalStatus::Approved);
         assert_eq!(state.approvals[0].actor_id, receipt.actor_id);
+
+        // Once its GitHub delivery is recorded and its settled scheduling row
+        // is removed, the Repository reader reads the same PR source, result
+        // and delivery from the retained records; the shared-Verifier reader
+        // still reads it as unknown.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let before = loop {
+            let state = repository_reader
+                .status()
+                .await
+                .expect("the execution reads");
+            if state
+                .github_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.status != GithubDeliveryStatus::Pending)
+            {
+                break state;
+            }
+            assert!(Instant::now() < deadline, "{state:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(before.pull_request.is_some(), "{before:?}");
+        opened
+            .deployment
+            .server()
+            .remove_settled_execution_row(id)
+            .await
+            .expect("the settled row is removed");
+        let after = repository_reader
+            .status()
+            .await
+            .expect("the retained execution reads");
+        assert_eq!(after.status, VerificationExecutionStatus::Completed);
+        assert_eq!(after.pull_request, before.pull_request);
+        assert_eq!(after.result, before.result);
+        assert_eq!(after.github_delivery, before.github_delivery);
+        let unseen = verifier_reader
+            .status()
+            .await
+            .expect_err("the retained execution stays unseen");
+        assert_eq!(unseen.code(), "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
         opened.deployment.shutdown().await;
     }
 }

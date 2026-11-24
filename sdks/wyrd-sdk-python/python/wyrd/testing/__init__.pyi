@@ -7,7 +7,9 @@ class WyrdTestServer:
     Journeys steer the server through exactly six test controls, each backed
     by the production code path: ``flush_bifrost``, ``wait_for_baseline``,
     ``make_binding_due``, ``hold_publications``, and, for contended process
-    memory, ``occupy_hosted_memory`` and ``wait_for_hosted_waiters``. Keys
+    memory, ``occupy_hosted_memory`` and ``wait_for_hosted_waiters``. One
+    more, ``remove_settled_execution_row``, stands in for cleanup of terminal
+    coordination state, which no production owner performs yet. Keys
     that need Roles come from the credential fixtures, which stand in for the
     operator who grants Roles in a deployment: ``bootstrap_service``,
     ``bootstrap_service_in_tenant``, and ``credential_registered_service``.
@@ -302,6 +304,22 @@ class WyrdTestServer:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
                 ``card_ref``; ``WYRD_TESTING_500_HARNESS_BOOTSTRAP`` when the
                 Card is not a Service or Agent or a write fails.
+
+        """
+        ...
+
+    def remove_settled_execution_row(self, execution_id: str) -> None:
+        """Remove a settled execution's scheduling row.
+
+        Inspection then reads the execution from its retained records alone,
+        as after cleanup of terminal coordination state.
+
+        Args:
+            execution_id: the settled execution's UUIDv7.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an invalid ID, an
+                execution with no settled row, or a failed delete.
 
         """
         ...

@@ -737,7 +737,8 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when the occurrence is not pending, a decision or refusal
-    /// differs, or the execution does not pass.
+    /// differs, the execution does not pass, or its read after its settled
+    /// scheduling row is removed differs.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn an_agent_approves_a_pending_signoff() -> Result<(), McpJourneyError> {
@@ -828,6 +829,26 @@ mod pg_tests {
         assert_eq!(completed["result"]["outcome"]["verdict"], "passed");
         assert_eq!(completed["approvals"][0]["status"], "approved");
         assert_eq!(completed["approvals"][0]["actor_id"], receipt["actor_id"]);
+
+        // Once its GitHub delivery is recorded and its settled scheduling row
+        // is removed, the same PR source, result and delivery read back.
+        let before = opened
+            .until(|state| {
+                state["github_delivery"]["status"].is_string()
+                    && state["github_delivery"]["status"] != "pending"
+            })
+            .await?;
+        let execution: wyrd_spec::ids::ExecutionId =
+            serde_json::from_value(opened.execution.clone())?;
+        opened
+            .server
+            .remove_settled_execution_row(execution)
+            .await?;
+        let after = opened.until(|_| true).await?;
+        assert_eq!(after["status"], "completed");
+        for field in ["pull_request", "result", "github_delivery"] {
+            assert_eq!(after[field], before[field], "{field}: {after}");
+        }
         opened.stop().await
     }
 }

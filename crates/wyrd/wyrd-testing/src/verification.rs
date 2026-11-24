@@ -74,6 +74,9 @@ pub enum VerificationFixtureError {
     /// accept.
     #[error("submission was not accepted: {0}")]
     NotEnqueued(String),
+    /// The execution has no settled scheduling row to remove.
+    #[error("execution {0} has no settled scheduling row")]
+    NotSettled(ExecutionId),
 }
 
 /// Content [`VerificationFixture::publish`] accepts under one name.
@@ -584,6 +587,34 @@ impl VerificationFixture {
         .execute(&mut **conn.transaction())
         .await?;
         conn.commit().await?;
+        Ok(())
+    }
+
+    /// Remove settled `execution`'s scheduling row, standing in for cleanup
+    /// of terminal coordination state, so inspection must read the execution
+    /// from its retained Bifrost records alone.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError::NotSettled`] when the execution has
+    /// no completed, errored, cancelled or timed-out row, or a connection or
+    /// statement error.
+    pub async fn remove_settled_execution_row(
+        &self,
+        execution: ExecutionId,
+    ) -> Result<(), VerificationFixtureError> {
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let deleted = sqlx::query(
+            "DELETE FROM wyrd.verifier_executions WHERE execution_id = $1 \
+                AND status IN ('completed', 'errored', 'cancelled', 'timed_out')",
+        )
+        .bind(execution.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await?
+        .rows_affected();
+        conn.commit().await?;
+        if deleted == 0 {
+            return Err(VerificationFixtureError::NotSettled(execution));
+        }
         Ok(())
     }
 

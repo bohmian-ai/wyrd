@@ -6,6 +6,8 @@ repository and commit explicitly or through ``WYRD_REPOSITORY`` /
 also wait for a person: another principal approves the pending signoff with
 ``Execution.decide`` and the same execution passes. An approver bound only on
 the shared Verifier is refused until it may also read the owning Repository.
+Once the settled execution's scheduling row is removed, a Repository reader
+still reads the same pull request, result and GitHub delivery.
 """
 
 import time
@@ -154,10 +156,12 @@ def test_a_person_approves_the_pending_signoff(
         )
         return verify.Execution(execution_id, client)
 
-    seen = reader("signoff-repository-reader", "Repository", "web").status()
+    repository_reader = reader("signoff-repository-reader", "Repository", "web")
+    seen = repository_reader.status()
     assert seen["input_waits"] == [{"task_id": "green", "slots": ["ci"]}]
+    verifier_reader = reader("signoff-verifier-reader", "Verifier", "signoff")
     with pytest.raises(WyrdError) as unseen:
-        reader("signoff-verifier-reader", "Verifier", "signoff").status()
+        verifier_reader.status()
     assert unseen.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
 
     verify.Evidence(admin).publish("ci", {"status": "green"}, repository="acme/web", commit=HEAD)
@@ -217,3 +221,20 @@ def test_a_person_approves_the_pending_signoff(
     [approved] = execution.status()["approvals"]
     assert approved["status"] == "approved"
     assert approved["actor_id"] == decided["actor_id"]
+
+    deadline = time.monotonic() + 30
+    while (before := repository_reader.status()).get("github_delivery", {}).get("status") in (
+        None,
+        "pending",
+    ):
+        assert time.monotonic() < deadline, before
+        time.sleep(0.1)
+    assert before["pull_request"]["members"] == [execution_id]
+    server.remove_settled_execution_row(execution_id)
+    after = repository_reader.status()
+    assert after["status"] == "completed"
+    for field in ("pull_request", "result", "github_delivery"):
+        assert after[field] == before[field], field
+    with pytest.raises(WyrdError) as unseen:
+        verifier_reader.status()
+    assert unseen.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"

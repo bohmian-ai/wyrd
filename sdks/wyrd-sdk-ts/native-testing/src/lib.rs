@@ -29,8 +29,10 @@ pub mod github;
 /// Journeys steer the server through exactly six test controls, each backed
 /// by the production code path: `flushBifrost`, `waitForBaseline`,
 /// `makeBindingDue`, `holdPublications`, and, for contended process memory,
-/// `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
-/// start, address, or credential the server.
+/// `occupyHostedMemory` and `waitForHostedWaiters`. One more,
+/// `removeSettledExecutionRow`, stands in for cleanup of terminal
+/// coordination state, which no production owner performs yet. The remaining
+/// members start, address, or credential the server.
 #[napi]
 pub struct NativeWyrdTestServer {
     /// Owned Rust harness dropped only after explicit asynchronous shutdown.
@@ -130,6 +132,28 @@ impl NativeWyrdTestServer {
             .and_then(|binding| {
                 self.control(|server| {
                     wyrd_runtime::runtime().block_on(server.make_binding_due(binding))
+                })
+            })
+            .map_err(|error| thrown(env, &error))
+    }
+
+    /// Remove settled execution `execution_id`'s scheduling row, so a journey
+    /// reads the execution from its retained records alone.
+    ///
+    /// # Errors
+    ///
+    /// Throws a `WyrdError`-shaped error when the harness is closed,
+    /// `execution_id` is not an execution ID, the execution has no settled
+    /// row, or the delete fails.
+    #[napi]
+    pub fn remove_settled_execution_row(&self, env: Env, execution_id: String) -> Result<()> {
+        let parsed = execution_id.parse::<wyrd_spec::ids::ExecutionId>();
+        drop(execution_id);
+        parsed
+            .map_err(harness)
+            .and_then(|execution| {
+                self.control(|server| {
+                    wyrd_runtime::runtime().block_on(server.remove_settled_execution_row(execution))
                 })
             })
             .map_err(|error| thrown(env, &error))

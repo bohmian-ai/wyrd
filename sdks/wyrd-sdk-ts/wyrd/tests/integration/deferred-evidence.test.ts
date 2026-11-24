@@ -143,8 +143,10 @@ test("another principal approves the pending signoff and the same execution pass
     });
     return verify.Execution.connect(id, { client: WyrdClient.connect({ credential }) });
   };
-  expect((await (await reader("signoff-repository-reader", "Repository", "web")).status()).input_waits).toEqual(ciWait);
-  await expect((await reader("signoff-verifier-reader", "Verifier", "signoff")).status()).rejects.toMatchObject({
+  const repositoryReader = await reader("signoff-repository-reader", "Repository", "web");
+  expect((await repositoryReader.status()).input_waits).toEqual(ciWait);
+  const verifierReader = await reader("signoff-verifier-reader", "Verifier", "signoff");
+  await expect(verifierReader.status()).rejects.toMatchObject({
     code: "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
   });
 
@@ -200,4 +202,26 @@ test("another principal approves the pending signoff and the same execution pass
   expect((await execution.wait({ timeoutMs: 30_000 })).outcome.verdict).toBe("passed");
   const [settled] = (await execution.status()).approvals ?? [];
   expect(settled).toMatchObject({ status: "approved", actor_id: decided.actor_id });
+
+  // Once its GitHub delivery is recorded and its settled scheduling row is removed, the Repository reader reads the
+  // same pull request, result and delivery from the retained records; the shared-Verifier reader still learns nothing.
+  const recorded = Date.now() + 30_000;
+  let before = await repositoryReader.status();
+  while ((before.github_delivery?.status ?? "pending") === "pending") {
+    expect(Date.now(), JSON.stringify(before)).toBeLessThan(recorded);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    before = await repositoryReader.status();
+  }
+  expect(before.pull_request?.members).toEqual([id]);
+  server.removeSettledExecutionRow(id);
+  const after = await repositoryReader.status();
+  expect(after.status).toBe("completed");
+  expect([after.pull_request, after.result, after.github_delivery]).toEqual([
+    before.pull_request,
+    before.result,
+    before.github_delivery,
+  ]);
+  await expect(verifierReader.status()).rejects.toMatchObject({
+    code: "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+  });
 });

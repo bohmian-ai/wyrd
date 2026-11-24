@@ -738,7 +738,10 @@ async fn onboarding_ui_journey() {
         .expect("vitest runs");
     drop(bff);
     srv.shutdown().await.expect("server shuts down");
-    assert!(status.success(), "the onboarding UI journey failed: {status}");
+    assert!(
+        status.success(),
+        "the onboarding UI journey failed: {status}"
+    );
 }
 
 /// One answer a [`NginxBrowser`] observed, redirects unfollowed.

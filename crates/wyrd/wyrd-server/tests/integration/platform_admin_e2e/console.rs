@@ -1382,3 +1382,105 @@ async fn the_platform_entry_reads_its_sign_in_methods() {
     assert!(resp.status().is_success(), "{}", resp.status());
     assert_eq!(methods().await, json!({ "password": true, "oidc": false }));
 }
+
+/// A relay save without a password keeps the stored one, as the signup
+/// challenge keeps its secret; removing the username removes it:
+///   1. a relay with a username and password stores the sealed password;
+///   2. a save that omits the password, with the same username, keeps
+///      exactly the stored envelope;
+///   3. a save that changes the username without a password is refused
+///      and changes nothing, since the password belongs to its username;
+///   4. without fresh proof, even a removal changes nothing;
+///   5. after re-authentication a save without a username removes the
+///      stored password.
+///
+/// # Panics
+/// Panics when a save keeps, removes or refuses the password differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_save_without_a_password_keeps_the_stored_one() {
+    let (srv, _root, api) = console_server().await;
+    register_password_operator(&srv, &api, "ops").await;
+    let cookie = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    let save = |body: Value| {
+        let srv = &srv;
+        let cookie = cookie.clone();
+        async move {
+            browser(
+                srv,
+                Method::PUT,
+                "/platform/mail",
+                &[&cookie],
+                true,
+                Some(&body),
+            )
+            .await
+        }
+    };
+    let sealed = || async {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "SELECT smtp_password_enc FROM platform.login_settings",
+        )
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("relay reads")
+    };
+
+    // 1. The first save stores the password.
+    let reply = save(json!({ "host": "relay.wyrd.test", "port": 2525, "tls": "none",
+        "username": "relay-user", "password": "relay-password-plaintext",
+        "sender": "invites@wyrd.test" }))
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["relay"]["password_set"], true);
+    let stored = sealed().await.expect("a sealed password");
+
+    // 2. Omitting it keeps the same envelope.
+    let reply = save(json!({ "host": "relay2.wyrd.test", "port": 587, "tls": "starttls",
+        "username": "relay-user", "sender": "invites@wyrd.test" }))
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["relay"]["password_set"], true, "{}", reply.body);
+    assert_eq!(reply.body["relay"]["host"], "relay2.wyrd.test");
+    assert_eq!(sealed().await.as_ref(), Some(&stored), "the password is kept");
+
+    // 3. A new username needs its own password.
+    let reply = save(json!({ "host": "relay3.wyrd.test", "port": 587, "tls": "starttls",
+        "username": "someone-else", "sender": "invites@wyrd.test" }))
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.body["code"], "WYRD_SPEC_400_VALIDATION", "{}", reply.body);
+    let (status, read) = social_call(
+        &srv,
+        social_request(Method::GET, "/platform/mail", Some(&api), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["relay"]["host"], "relay2.wyrd.test", "nothing changed");
+    assert_eq!(read["relay"]["username"], "relay-user");
+    assert_eq!(sealed().await.as_ref(), Some(&stored));
+
+    // 4. Without fresh proof, removal changes nothing.
+    let removal = json!({ "host": "relay2.wyrd.test", "port": 587, "tls": "starttls",
+        "sender": "invites@wyrd.test" });
+    stale_proof(&srv, &cookie).await;
+    let reply = save(removal.clone()).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+    assert_eq!(sealed().await.as_ref(), Some(&stored));
+
+    // 5. Re-authenticated, a save without a username removes it.
+    let reauth = browser(
+        &srv,
+        Method::POST,
+        "/platform/browser/password/reauth",
+        &[&cookie],
+        true,
+        Some(&json!({ "password": OPERATOR_PASSWORD })),
+    )
+    .await;
+    assert_eq!(reauth.status, StatusCode::OK, "{}", reauth.body);
+    let reply = save(removal).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["relay"]["password_set"], false, "{}", reply.body);
+    assert_eq!(reply.body["relay"]["username"], Value::Null);
+    assert_eq!(sealed().await, None, "the password is removed");
+}

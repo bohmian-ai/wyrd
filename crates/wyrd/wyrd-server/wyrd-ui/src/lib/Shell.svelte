@@ -54,7 +54,7 @@
 <div class="shell" class:collapsed>
   <aside aria-label="Primary">
     <div class="top">
-      <a class="brand" href={home}><img src={logo} alt="" width="22" height="22" /><span class="label">Wyrd{#if plane}<span class="plane"> {plane}</span>{/if}</span></a>
+      <a class="brand" href={home}><img src={logo} alt="" width="22" height="22" /><span class="label">Wyrd{#if plane}{' '}<span class="plane">{plane}</span>{/if}</span></a>
       <button type="button" class="collapse" aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'} aria-expanded={!collapsed} onclick={() => (collapsed = !collapsed)}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d={collapsed ? 'M9 6l6 6-6 6' : 'M15 6l-6 6 6 6'} /></svg>
       </button>

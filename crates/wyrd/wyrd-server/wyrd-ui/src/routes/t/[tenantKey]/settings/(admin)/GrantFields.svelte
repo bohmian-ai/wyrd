@@ -98,4 +98,8 @@
   .choice.on {
     border-color: var(--declare);
   }
+  /* The browser's own radio margin, which the reset removes, aligns it with the role name. */
+  .choice input {
+    margin: 3px 3px 0 5px;
+  }
 </style>

@@ -17,7 +17,7 @@
       {#each data.admins as admin (admin.principal_id)}
         {@const you = admin.principal_id === data.session.principal_id}
         <tr>
-          <td><b data-testid={you ? 'operator' : undefined}>{admin.name}</b>{#if you} <span class="muted">(you)</span>{/if}</td>
+          <td><b data-testid={you ? 'operator' : undefined}>{admin.name}</b>{#if you}{' '}<span class="muted">(you)</span>{/if}</td>
           <td>{method(admin)}</td>
           <td><Pill tone={admin.status === 'active' ? 'ok' : 'off'} label={admin.status === 'active' ? 'Active' : 'Suspended'} /></td>
           <td class="right">

@@ -87,7 +87,7 @@
     margin-bottom: 20px;
     font-size: 13px;
   }
-  .work :global(.ok) {
+  .work :global(.ok:not(.pill)) {
     color: var(--ok);
   }
   .work :global(.bad) {

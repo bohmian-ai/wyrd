@@ -145,7 +145,7 @@
           </table>
         </div>
       {:else}
-        <div class="row"><span class="muted">– No keys yet</span></div>
+        <div class="empty"><b>No keys yet</b></div>
       {/if}
       {#if page.url.searchParams.has('after') || data.keys.next_cursor}
         <div class="row">

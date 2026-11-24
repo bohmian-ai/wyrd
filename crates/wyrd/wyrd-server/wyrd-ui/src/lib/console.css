@@ -67,13 +67,13 @@
   td.right, th.right { text-align: right; }
   .person { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .person b { display: block; font-size: 14px; }
-  .person span { display: block; font-size: 12px; color: var(--muted); }
+  .person span:not(.avatar) { display: block; font-size: 12px; color: var(--muted); }
   .role { display: inline-block; white-space: nowrap; padding: 1px 8px; margin: 2px 4px 2px 0; border: 1px solid var(--border); border-radius: var(--r); background: var(--surface-2); font-size: 12px; }
   .method { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
   .method i { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); font: 600 10px var(--font-sans); font-style: normal; }
 
   /* Status pill: glyph + word + 2px coloured border (DESIGN.md § Never colour alone). */
-  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border: 1px solid var(--border); border-left-width: 2px; border-radius: var(--r); font-size: 12px; white-space: nowrap; background: var(--surface); }
+  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border: 1px solid var(--border); border-left-width: 2px; border-radius: var(--r); font-size: 12px; white-space: nowrap; background: var(--surface); color: var(--text); }
   .pill.ok { border-left-color: var(--ok); }
   .pill.warn { border-left-color: var(--warn); }
   .pill.danger { border-left-color: var(--danger); }
@@ -93,9 +93,12 @@
   .row .label { flex: 1; min-width: 0; }
   .row .label b { display: block; font-size: 14px; }
   .row .label span { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
-  .row .ctl { flex: none; display: flex; align-items: center; gap: 8px; }
+  .row .ctl { flex: none; display: flex; align-items: center; gap: 8px; margin-left: auto; }
   .copyfield { display: flex; align-items: center; gap: 0; }
-  .copyfield .app-input { border-top-right-radius: 0; border-bottom-right-radius: 0; width: 360px; background: var(--surface-2); }
+  .copyfield { min-width: 0; }
+  /* A copy field is read-only but meant to be read: full contrast, not dimmed. */
+  .copyfield .app-input[readonly] { opacity: 1; }
+  .copyfield .app-input { min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; width: 360px; background: var(--surface-2); }
   .copyfield .app-control { border-left: 0; border-top-left-radius: 0; border-bottom-left-radius: 0; }
 
   /* Switch: a real checkbox with a word beside it. */
@@ -145,6 +148,8 @@
 
   /* Drawer and dialog: restrained scrim (DESIGN.md § Geometry). */
   .scrim { position: fixed; inset: 0; background: color-mix(in srgb, var(--bg) 72%, transparent); z-index: 5; }
+  /* Focus starts on the overlay itself for keyboard users; its edge needs no ring. */
+  .drawer:focus, .dialog:focus { outline: none; }
   .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(480px, 100vw); background: var(--surface); border-left: 1px solid var(--border); z-index: 6; display: flex; flex-direction: column; }
   .drawer > header { display: flex; align-items: center; gap: 12px; padding: 18px 24px; border-bottom: 1px solid var(--border-soft); }
   .drawer > header h2 { font-size: 18px; font-weight: var(--weight-strong); }
@@ -176,6 +181,8 @@
     .pagehead { flex-wrap: wrap; }
     .pagehead .actions { margin-left: 0; }
     .row { flex-wrap: wrap; }
+    .row .label { flex-basis: 200px; }
+    .row .ctl:has(.copyfield) { flex: 1 1 100%; }
     .copyfield .app-input { width: 100%; }
     .steps { grid-template-columns: 1fr 1fr; }
     .toolbar .app-input { width: 100%; margin-left: 0; }

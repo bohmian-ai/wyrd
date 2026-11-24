@@ -158,6 +158,29 @@ UI → Rust → repository Postgres, including a second replica; tier 2 pins mut
 atomicity and revision conflict. Preserve existing connection activation recovery
 checks rather than bypassing them for the fixture or UI.
 
+Evidence (Rust/HTTP):
+
+- Selector: scenario 1's runner with
+  `-E 'test(=platform_admin_e2e::company_sso::a_company_administrator_enables_and_disables_required_sso)'`.
+- TDD VIOLATED: `HumanConnections::set_login_policy` and
+  `PUT /v1/identity/login-policy` were written with scenario 1, before this
+  test existed. Its first run passed, so there is no RED.
+- GREEN: 1 passed. Refusals that change neither the policy nor the password
+  session: company member (403 RBAC); headless bearer, API-key recovery
+  session and password admin session (403 `RECENT_LOGIN_REQUIRED`); stale
+  policy revision (409 `policy_changed`); changed connection revision (409
+  `connection_changed`); a company proof aged past five minutes (403).
+  Accepted changes: a fresh group-mapped company admin enables while 2
+  unlinked Users remain; a second replica reads the identical view; the
+  methods report offers `company_sso` only. A stale proof cannot disable. A
+  new sign-in alone leaves the policy unchanged. A confirmed Disable moves to
+  revision 2, and password sign-in works again.
+- Mutation atomicity: `set_login_policy` checks proof, connection, revision
+  and readiness under `lock_human_connection_slot` plus the policy row
+  `FOR UPDATE`, then writes and sweeps in one transaction. A refusal commits
+  only its audit decision.
+- Missing/unusable connection: see scenario 5. Production settings UI: pending.
+
 ### 3. Required SSO cannot be bypassed at a later login step
 
 Maps to REQ-002/011/012/013/016/020; AC-006/011/015. Start password/social

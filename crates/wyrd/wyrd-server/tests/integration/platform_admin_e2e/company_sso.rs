@@ -489,3 +489,192 @@ async fn a_company_administrator_reads_the_policy_and_its_account_warning() {
         assert!(methods.get(leaked).is_none(), "{leaked} in {methods}");
     }
 }
+
+impl Workspace {
+    /// Read the login policy as the browser holding `cookie`.
+    ///
+    /// # Panics
+    /// Panics when the read is refused.
+    async fn policy(&self, cookie: &str) -> Value {
+        let (status, policy) = self.browser(Method::GET, POLICY, cookie, None).await;
+        assert_eq!(status, StatusCode::OK, "policy reads: {policy}");
+        policy
+    }
+
+    /// Submit `require` against the revisions in `read`, as the browser
+    /// holding `cookie`.
+    async fn change(&self, cookie: &str, require: bool, read: &Value) -> (StatusCode, Value) {
+        self.browser(
+            Method::PUT,
+            POLICY,
+            cookie,
+            Some(change_body(require, read)),
+        )
+        .await
+    }
+
+    /// Whether the browser session `cookie` is still live.
+    async fn live(&self, cookie: &str) -> bool {
+        let uri = format!("/auth/browser/session?tenant={}", self.slug);
+        let (status, _) = self.browser(Method::GET, &uri, cookie, None).await;
+        status == StatusCode::OK
+    }
+
+    /// A browser session recovered with the headless administrator's API key.
+    ///
+    /// # Panics
+    /// Panics when recovery is refused.
+    async fn recovery_session(&self) -> String {
+        let resp = self
+            .srv
+            .oneshot(browser_post(
+                "/auth/browser/api-key",
+                None,
+                json!({ "tenant": self.slug, "api_key": self.recovery_key.expose_secret() }),
+            ))
+            .await
+            .expect("recovery responds");
+        assert_eq!(resp.status(), StatusCode::OK, "recovery sign-in");
+        session_cookie(&resp, &self.slug).expect("recovery sets a session")
+    }
+
+    /// Move every browser session of the tenant past the five-minute
+    /// recent-sign-in window.
+    async fn age_sessions(&self) {
+        sqlx::query(
+            "UPDATE wyrd.auth_browser_sessions \
+             SET created_at = created_at - interval '6 minutes', \
+                 expires_at = expires_at - interval '6 minutes'",
+        )
+        .execute(&self.superuser)
+        .await
+        .expect("sessions age");
+    }
+}
+
+/// A policy change body requiring `require` at the revisions `read` names.
+fn change_body(require: bool, read: &Value) -> Value {
+    json!({
+        "require_company_sso": require,
+        "expected_revision": read["revision"],
+        "expected_connection": read["connection"],
+    })
+}
+
+/// A company administrator enables and disables required company SSO:
+///   1. a company member, the headless bearer, an API-key recovery session,
+///      a password administrator, a stale company proof, a stale policy
+///      revision and a changed connection revision are each refused, and
+///      none changes the policy or ends a credential;
+///   2. a fresh company sign-in of a group-mapped administrator enables it
+///      although Users without a company identity remain; a second replica
+///      reads it and the methods report offers company SSO only;
+///   3. once the proof is stale, Disable is refused; signing in again does
+///      not change the policy until the administrator confirms, after which
+///      password sign-in works again.
+///
+/// # Panics
+/// Panics when any step differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_company_administrator_enables_and_disables_required_sso() {
+    let workspace = Workspace::start().await;
+    let admin = workspace.company_session("corp-admin", &[ADMINS]).await;
+    let member = workspace.company_session("corp-member", &[]).await;
+    let password_admin = workspace.password_session("pat-admin", "admin").await;
+    let recovery = workspace.recovery_session().await;
+    let read = workspace.policy(&admin).await;
+    assert_eq!(read["users_without_company_identity"], 2, "{read}");
+
+    // 1. Refusals that change nothing.
+    let (status, refused) = workspace.change(&member, true, &read).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "member: {refused}");
+    assert_eq!(refused["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    let (status, refused) = workspace
+        .bearer(Method::PUT, POLICY, Some(change_body(true, &read)))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "bearer: {refused}");
+    assert_eq!(refused["code"], "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED");
+    for (case, cookie) in [("recovery", &recovery), ("password", &password_admin)] {
+        let (status, refused) = workspace.change(cookie, true, &read).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{case}: {refused}");
+        assert_eq!(
+            refused["code"], "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
+            "{case}"
+        );
+    }
+    let mut stale = read.clone();
+    stale["revision"] = json!(7);
+    let (status, refused) = workspace.change(&admin, true, &stale).await;
+    assert_eq!(status, StatusCode::CONFLICT, "stale policy: {refused}");
+    assert_eq!(refused["details"]["reason"], "policy_changed");
+    let mut moved = read.clone();
+    moved["connection"]["revision"] = json!(99);
+    let (status, refused) = workspace.change(&admin, true, &moved).await;
+    assert_eq!(status, StatusCode::CONFLICT, "moved connection: {refused}");
+    assert_eq!(refused["details"]["reason"], "connection_changed");
+    workspace.age_sessions().await;
+    let (status, refused) = workspace.change(&admin, true, &read).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "stale proof: {refused}");
+    assert_eq!(refused["code"], "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED");
+    assert_eq!(workspace.policy(&admin).await, read, "nothing changed");
+    assert!(
+        workspace.live(&password_admin).await,
+        "password session kept"
+    );
+
+    // 2. A fresh company proof enables; a replica and the methods report agree.
+    let admin = workspace.company_session("corp-admin", &[ADMINS]).await;
+    let (status, enabled) = workspace.change(&admin, true, &read).await;
+    assert_eq!(status, StatusCode::OK, "enable: {enabled}");
+    assert_eq!(enabled["require_company_sso"], true);
+    assert_eq!(enabled["revision"], 1);
+    let replica = workspace
+        .srv
+        .start_replica(wyrd_testing::WyrdTestServerBuilder::default())
+        .await
+        .expect("replica boots");
+    let (status, replicated) = social_call(
+        &replica,
+        social_request(Method::GET, POLICY, Some(&workspace.admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "replica read: {replicated}");
+    assert_eq!(replicated, enabled, "the replica reads the same policy");
+    let methods = body_json(
+        workspace
+            .srv
+            .oneshot(browser_request(
+                Method::GET,
+                &format!("/auth/browser/methods?tenant={}", workspace.slug),
+                None,
+                None,
+            ))
+            .await
+            .expect("methods respond"),
+    )
+    .await;
+    assert_eq!(methods["company_sso"], true, "{methods}");
+    assert_eq!(methods["password"], false, "{methods}");
+    assert_eq!(methods["providers"], json!([]), "{methods}");
+
+    // 3. Disable needs fresh proof; signing in alone changes nothing.
+    workspace.age_sessions().await;
+    let (status, refused) = workspace.change(&admin, false, &enabled).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "stale disable: {refused}");
+    let admin = workspace.company_session("corp-admin", &[ADMINS]).await;
+    assert_eq!(
+        workspace.policy(&admin).await,
+        enabled,
+        "login alone mutates nothing"
+    );
+    let (status, disabled) = workspace.change(&admin, false, &enabled).await;
+    assert_eq!(status, StatusCode::OK, "disable: {disabled}");
+    assert_eq!(disabled["require_company_sso"], false);
+    assert_eq!(disabled["revision"], 2);
+    let resp = workspace.password_login("pat-admin").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "password sign-in works again"
+    );
+}

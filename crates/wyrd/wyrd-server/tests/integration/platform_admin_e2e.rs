@@ -25,8 +25,10 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::principal::within_propagation;
 
+mod console;
 mod contacts;
 mod methods;
+mod resets;
 mod setup;
 mod signup;
 
@@ -1384,13 +1386,24 @@ async fn mount_platform_provider(
     token_response: wiremock::ResponseTemplate,
 ) {
     server.reset().await;
+    mount_platform_discovery(server, key_set, &format!("{}/token", server.uri())).await;
+    mount_platform_token(server, token_response).await;
+}
+
+/// Answer `server`'s discovery, advertising RFC 9207 response issuers and
+/// `token_endpoint`, and its key set with `key_set`.
+async fn mount_platform_discovery(
+    server: &wiremock::MockServer,
+    key_set: wiremock::ResponseTemplate,
+    token_endpoint: &str,
+) {
     let issuer = server.uri();
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(PLATFORM_DISCOVERY))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
+            "token_endpoint": token_endpoint,
             "jwks_uri": format!("{issuer}/jwks"),
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
@@ -1404,7 +1417,6 @@ async fn mount_platform_provider(
         .respond_with(key_set)
         .mount(server)
         .await;
-    mount_platform_token(server, token_response).await;
 }
 
 /// A key set publishing [`PLATFORM_SIGNING_KEY`] under `kid`.
@@ -1488,6 +1500,30 @@ fn identity_token_reply_with(
     email: &str,
     email_verified: bool,
 ) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(identity_token_body(
+        issuer,
+        nonce,
+        audience,
+        kid,
+        subject,
+        email,
+        email_verified,
+    ))
+}
+
+/// The token-endpoint body [`identity_token_reply_with`] answers.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn identity_token_body(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> Value {
     let now = chrono::Utc::now().timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     header.kid = Some(kid.to_owned());
@@ -1508,11 +1544,11 @@ fn identity_token_reply_with(
         &key,
     )
     .expect("token signs");
-    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+    json!({
         "access_token": "provider-access",
         "token_type": "Bearer",
         "id_token": id_token,
-    }))
+    })
 }
 
 /// Begin a platform login and return its state and the nonce the provider
@@ -4878,6 +4914,16 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             ),
             StatusCode::NOT_FOUND,
             "suspending a tenant that does not exist",
+        ),
+        (
+            platform_request(
+                Method::PUT,
+                &format!("/platform/tenants/{}/status", DataTenantId::SYSTEM_OWNER),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+            StatusCode::NOT_FOUND,
+            "suspending the platform's own wyrd-system tenant",
         ),
         (
             platform_post(

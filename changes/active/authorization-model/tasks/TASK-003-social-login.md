@@ -10,6 +10,11 @@ depends_on: [TASK-001, TASK-002]
 
 # Social sign-in, workspace signup and team invitations
 
+**Revision-11 ownership update (2026-11-23):** original cycles 7–8 (carryover
+17–18) are deferred from launch; original cycles 9–10 (carryover 19–20) belong
+only to [TASK-004](TASK-004-company-sso-and-launch-verification.md). The carryover
+retains cycles 1–16. This file is historical evidence, not remaining-work authority.
+
 Remaining-work owner: [TASK-003-carryover](TASK-003-carryover.md), approved spec
 revision 6. Cycles 1–5 are completed/committed according to the maintainer; cycle
 6's server slice is staged, uncommitted evidence. All unchecked/open items and

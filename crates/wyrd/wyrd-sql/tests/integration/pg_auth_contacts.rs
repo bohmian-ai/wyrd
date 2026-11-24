@@ -6,8 +6,10 @@ mod pg_tests {
 
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::auth::Sha256Hex;
     use wyrd_sql::queries::auth::{
-        insert_local_user, replace_verified_contact, verified_contact_for_update,
+        consume_password_reset, insert_local_user, insert_password_reset, replace_verified_contact,
+        verified_contact_for_update,
     };
 
     /// Two verifications begun against no contact race: exactly one inserts
@@ -84,5 +86,188 @@ mod pg_tests {
             ("c@example.test", 2)
         );
         conn.commit().await.expect("commits");
+    }
+
+    /// A mailed reset replaces the User's earlier mailed resets but never an
+    /// operator-issued one, keeps the contact revision it was sent to, and
+    /// each code is consumed at most once, even by two racing redemptions.
+    ///
+    /// # Panics
+    /// Panics when a replaced code survives, an operator code is replaced,
+    /// the revision is lost, or a code is consumed twice.
+    #[tokio::test]
+    async fn mailed_resets_replace_mailed_codes_and_are_consumed_once() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let user = Uuid::now_v7();
+        let code = |n: u8| Sha256Hex::digest(&[n]);
+        let mut conn = fixture.tenant_conn().await.expect("conn opens");
+        insert_local_user(
+            &mut conn,
+            user,
+            "ada",
+            "$argon2id$v=19$m=19456,t=2,p=1$x$y",
+            None,
+        )
+        .await
+        .expect("user inserts");
+        for (n, contact_revision) in [(1, None), (2, Some(1)), (3, Some(1))] {
+            insert_password_reset(
+                &mut conn,
+                Uuid::now_v7(),
+                &code(n),
+                user,
+                0,
+                user,
+                contact_revision,
+            )
+            .await
+            .expect("reset inserts");
+        }
+        conn.commit().await.expect("resets commit");
+
+        let mut conn = fixture.tenant_conn().await.expect("conn opens");
+        assert_eq!(
+            consume_password_reset(&mut conn, &code(2))
+                .await
+                .expect("consume runs"),
+            None,
+            "the newer mailed code replaced it"
+        );
+        conn.commit().await.expect("commits");
+
+        let mut first = fixture.tenant_conn().await.expect("conn opens");
+        let mut second = fixture.tenant_conn().await.expect("conn opens");
+        let won = consume_password_reset(&mut first, &code(3))
+            .await
+            .expect("first consume runs");
+        let (lost, ()) = tokio::join!(
+            async {
+                let lost = consume_password_reset(&mut second, &code(3))
+                    .await
+                    .expect("second consume runs");
+                second.commit().await.expect("second commits");
+                lost
+            },
+            async { first.commit().await.expect("first commits") },
+        );
+        assert_eq!(won.map(|row| row.contact_revision), Some(Some(1)));
+        assert_eq!(lost, None, "a code is consumed once");
+
+        let mut conn = fixture.tenant_conn().await.expect("conn opens");
+        let operator = consume_password_reset(&mut conn, &code(1))
+            .await
+            .expect("consume runs")
+            .expect("the operator code survives mailed codes");
+        assert_eq!(operator.contact_revision, None);
+        conn.commit().await.expect("commits");
+    }
+
+    /// The discovery tables hold no address, only keyed digests, force
+    /// row-level security, and refuse a tenant login outright with
+    /// permission denied while the platform owner writes them.
+    ///
+    /// # Panics
+    /// Panics when a column beyond the minimal projection exists, RLS is not
+    /// forced, or a tenant connection is not refused with SQLSTATE 42501.
+    #[tokio::test]
+    async fn discovery_tables_hold_only_digests_behind_forced_rls() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
+        let columns = |table: &'static str| {
+            let superuser = superuser.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT column_name::text FROM information_schema.columns
+                      WHERE table_schema = 'platform' AND table_name = $1
+                      ORDER BY ordinal_position",
+                )
+                .bind(table)
+                .fetch_all(&superuser)
+                .await
+                .expect("columns read")
+            }
+        };
+        assert_eq!(
+            columns("workspace_directory").await,
+            [
+                "data_tenant_id",
+                "user_id",
+                "address_key",
+                "contact_revision"
+            ]
+        );
+        assert_eq!(
+            columns("discovery_proofs").await,
+            [
+                "proof_hash",
+                "browser_binding_hash",
+                "read_until",
+                "expires_at"
+            ]
+        );
+        let forced: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT relname::text, relrowsecurity, relforcerowsecurity FROM pg_class
+              WHERE relnamespace = 'platform'::regnamespace
+                AND relname IN ('workspace_directory', 'discovery_proofs')
+              ORDER BY relname",
+        )
+        .fetch_all(&superuser)
+        .await
+        .expect("security reads");
+        assert_eq!(
+            forced,
+            [
+                ("discovery_proofs".to_owned(), true, true),
+                ("workspace_directory".to_owned(), true, true),
+            ]
+        );
+
+        let user = Uuid::now_v7();
+        let mut conn = fixture.tenant_conn().await.expect("conn opens");
+        insert_local_user(
+            &mut conn,
+            user,
+            "ada",
+            "$argon2id$v=19$m=19456,t=2,p=1$x$y",
+            None,
+        )
+        .await
+        .expect("user inserts");
+        conn.commit().await.expect("user commits");
+        sqlx::query(
+            "INSERT INTO platform.workspace_directory
+                 (data_tenant_id, user_id, address_key, contact_revision)
+             VALUES ($1, $2, sha256('key'::bytea), 1)",
+        )
+        .bind(fixture.data_tenant_id().as_uuid())
+        .bind(user)
+        .execute(&superuser)
+        .await
+        .expect("an entry inserts");
+        sqlx::query(
+            "INSERT INTO platform.discovery_proofs
+                 (proof_hash, browser_binding_hash, read_until, expires_at)
+             VALUES (sha256('p'::bytea), sha256('b'::bytea), now(), now())",
+        )
+        .execute(&superuser)
+        .await
+        .expect("a proof inserts");
+        for table in ["platform.workspace_directory", "platform.discovery_proofs"] {
+            let mut conn = fixture.tenant_conn().await.expect("conn opens");
+            let refused = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table}"
+            )))
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect_err("a tenant login cannot read the table");
+            assert_eq!(
+                refused
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref(),
+                Some("42501"),
+                "{table} refuses a tenant login with permission denied: {refused}"
+            );
+        }
     }
 }

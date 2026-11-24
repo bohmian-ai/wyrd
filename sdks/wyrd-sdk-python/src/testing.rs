@@ -886,8 +886,9 @@ impl WyrdTestServer {
     }
 
     /// Charge all process memory available now but `leave` bytes until the
-    /// returned hold is released, so a hosted verification whose session
-    /// does not fit waits and one whose request does not fit is refused.
+    /// returned hold is released, charged to Verification, so a hosted
+    /// verification waits while the hold keeps Verification over its
+    /// contended share and one whose request does not fit is refused.
     ///
     /// # Errors
     /// Raises the harness error outside the context manager or when the

@@ -8,6 +8,9 @@
 -- address in admission keys"; the creating identity's keyed pseudonym, so the
 -- owned-workspace cap survives attempt purge). The expiry indexes serve the
 -- bounded background purge ("Pseudonymous, bounded counters", REQ-014).
+-- 'reset' and 'reset_account' are password-reset request's separate source
+-- and account windows (revision 6, "Recovery and admission metadata": shared
+-- counters with email-purpose/source HMAC scopes).
 -- Email proofs follow "Proven email signup/discovery/contact proof and
 -- one-use redemption": no pre-proof row, one-use identifier digests.
 --
@@ -58,7 +61,9 @@ CREATE INDEX platform_signup_attempts_expires_at
     ON platform.signup_attempts (expires_at);
 
 CREATE TABLE platform.signup_admissions (
-    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'address', 'source', 'identity', 'sign_in')),
+    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'address', 'source', 'identity', 'sign_in',
+                                         'email_source', 'email_address', 'email_account',
+                                         'reset', 'reset_account')),
     key           BYTEA       NOT NULL CHECK (length(key) = 32),
     window_start  TIMESTAMPTZ NOT NULL,
     attempts      INTEGER     NOT NULL CHECK (attempts > 0),

@@ -23,7 +23,9 @@ use axum::http::HeaderMap;
 use axum::http::request::Parts;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use wyrd_auth::platform_sessions::{PlatformSessionError, PlatformSessions};
+use wyrd_auth::platform_sessions::{
+    PlatformBrowserSession, PlatformSessionError, PlatformSessions,
+};
 use wyrd_runtime::{AuthContext, Permission, PermissionSet, PlatformPrincipal, PrincipalId};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -51,6 +53,10 @@ pub struct PlatformCaller {
     /// presented an identity rather than a credential. Audit records the
     /// principal either way; only the credential column is left empty.
     pub credential_id: Option<Uuid>,
+    /// The platform browser session the request presented, when it was
+    /// authenticated by the platform console cookie rather than a platform
+    /// token.
+    pub browser: Option<PlatformBrowserSession>,
     /// Request correlator for audit and response headers.
     pub request_id: RequestId,
 }
@@ -60,6 +66,28 @@ impl PlatformCaller {
     #[must_use]
     pub fn principal_id(&self) -> PrincipalId {
         self.context.principal_id()
+    }
+
+    /// Refuse a destructive operation from a platform browser session that
+    /// holds no fresh human proof.
+    ///
+    /// A platform token is the separate CLI/API channel and passes; a browser
+    /// session passes only within the shared five-minute window after its
+    /// sign-in or its own principal's re-authentication.
+    ///
+    /// # Errors
+    /// Returns `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` for a browser session
+    /// without fresh proof.
+    pub fn require_recent_proof(&self) -> Result<(), WyrdErrorResponse> {
+        match &self.browser {
+            Some(session) if !session.view.recent => {
+                Err(WyrdErrorResponse::from(WyrdError::RecentLoginRequired {
+                    message: "re-authenticate before this platform change".to_owned(),
+                    details: serde_json::json!({ "plane": "platform" }),
+                }))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -157,7 +185,7 @@ impl FromRequestParts<AppState> for PlatformCaller {
             }));
         };
         let Some(token) = extract_platform_token(&parts.headers) else {
-            return Err(unauthenticated());
+            return browser_caller(parts, state, &pool).await;
         };
         let Some(verifier) = state.auth.token_verifier.clone() else {
             return Err(WyrdErrorResponse::from(WyrdError::Internal {
@@ -201,9 +229,77 @@ impl FromRequestParts<AppState> for PlatformCaller {
                     .with_credential_id(session.credential_id),
             ),
             credential_id: session.credential_id,
+            browser: None,
             request_id,
         })
     }
+}
+
+/// Authenticate a request by its platform console cookie.
+///
+/// Only the platform cookie is read; a tenant session cookie authenticates
+/// nothing here. A cookie-authenticated request that is not a read must
+/// carry this deployment's exact `Origin`. A store failure refuses access
+/// rather than reading as an invalid session.
+///
+/// # Errors
+/// Returns the unauthenticated refusal without a live platform cookie,
+/// `WYRD_AUTH_403_ORIGIN_REFUSED` for a foreign mutation,
+/// `WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the store fails, and the
+/// grant-read failures of [`resolve_grant`].
+async fn browser_caller(
+    parts: &Parts,
+    state: &AppState,
+    pool: &OperatorPool,
+) -> Result<PlatformCaller, WyrdErrorResponse> {
+    let Some(cookie) = crate::components::platform::console::platform_cookie(&parts.headers) else {
+        return Err(unauthenticated());
+    };
+    let Some(issuing_key) = state.auth.issuing_key.clone() else {
+        return Err(WyrdErrorResponse::from(WyrdError::Internal {
+            message: "platform session issuance is not configured".to_owned(),
+            details: serde_json::json!({ "plane": "platform" }),
+        }));
+    };
+    if !parts.method.is_safe() {
+        let origin = crate::auth::RequestOrigin::from_parts(
+            &parts.headers,
+            parts
+                .uri
+                .authority()
+                .map(axum::http::uri::Authority::as_str),
+        )
+        .ok_or_else(unauthenticated)?;
+        crate::auth::browser::require_same_origin(&parts.headers, &origin)?;
+    }
+    let sessions = PlatformSessions::new(
+        pool.clone(),
+        issuing_key,
+        std::sync::Arc::clone(state.bifrost.scribe_outbox()) as _,
+    );
+    let session = match sessions.resolve_browser(cookie).await {
+        Ok(session) => session,
+        Err(PlatformSessionError::Invalid) => return Err(unauthenticated()),
+        Err(error) => {
+            tracing::warn!(%error, "platform browser session could not be resolved");
+            return Err(WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+                message: "platform sessions are unavailable".to_owned(),
+                details: serde_json::json!({ "plane": "platform" }),
+            }));
+        }
+    };
+    let effective_permissions = resolve_grant(pool, session.principal_id).await?;
+    let request_id = token_extract::request_id(parts)?;
+    Ok(PlatformCaller {
+        context: AuthContext::from(PlatformPrincipal::new(
+            session.principal_id,
+            session.principal_kind,
+            effective_permissions,
+        )),
+        credential_id: None,
+        browser: Some(session),
+        request_id,
+    })
 }
 
 /// Token extraction and the caller shape the extractor hands a handler.
@@ -225,6 +321,7 @@ mod tests {
                 PermissionSet::new(),
             )),
             credential_id: Some(Uuid::now_v7()),
+            browser: None,
             request_id: wyrd_spec::request_id::RequestId::parse(&Uuid::now_v7().to_string())
                 .expect("generated UUIDv7 is a valid request id"),
         }

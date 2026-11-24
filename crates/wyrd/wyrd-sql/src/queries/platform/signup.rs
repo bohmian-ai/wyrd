@@ -51,6 +51,16 @@ pub enum SignupAdmissionScope {
     Identity,
     /// The trusted source of an unauthenticated sign-in start.
     SignIn,
+    /// The trusted source of an emailed discovery, contact or reset proof.
+    EmailSource,
+    /// The address such a proof is mailed to.
+    EmailAddress,
+    /// The signed-in account asking for such a proof.
+    EmailAccount,
+    /// The trusted source of a password-reset request.
+    Reset,
+    /// The tenant account a password-reset request names.
+    ResetAccount,
 }
 
 impl SignupAdmissionScope {
@@ -62,6 +72,11 @@ impl SignupAdmissionScope {
             Self::Source => "source",
             Self::Identity => "identity",
             Self::SignIn => "sign_in",
+            Self::EmailSource => "email_source",
+            Self::EmailAddress => "email_address",
+            Self::EmailAccount => "email_account",
+            Self::Reset => "reset",
+            Self::ResetAccount => "reset_account",
         }
     }
 }
@@ -300,7 +315,8 @@ pub async fn admit_signup(
 
 /// Delete at most `batch` admission windows that ended more than `window`
 /// ago and at most `batch` signup attempts whose completion expired more
-/// than `retain` ago, and return how many rows went.
+/// than `retain` ago, plus at most `batch` spent discovery proofs past their
+/// expiry, and return how many rows went.
 ///
 /// Spent email and state digests stay for `retain` past their completion
 /// window, so a proof replayed while its envelope lives is still recognized;
@@ -341,5 +357,16 @@ pub async fn purge_expired_signup_state(
     .execute(pool.pool())
     .await
     .map_err(SqlError::from)?;
-    Ok(windows.rows_affected() + attempts.rows_affected())
+    let discoveries = sqlx::query(
+        "DELETE FROM platform.discovery_proofs
+          WHERE ctid = ANY(ARRAY(
+                SELECT ctid FROM platform.discovery_proofs
+                 WHERE expires_at <= statement_timestamp()
+                 LIMIT $1))",
+    )
+    .bind(batch)
+    .execute(pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(windows.rows_affected() + attempts.rows_affected() + discoveries.rows_affected())
 }

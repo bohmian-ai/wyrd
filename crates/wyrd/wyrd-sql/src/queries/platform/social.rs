@@ -377,7 +377,14 @@ pub async fn mail_relay(pool: &OperatorPool) -> Result<Option<MailRelayRow>, Sql
     .map_err(SqlError::from)
 }
 
-/// Replace the SMTP relay on the audited operator `conn`.
+/// Replace the SMTP relay on the audited operator `conn`, returning the
+/// password envelope it now holds.
+///
+/// A relay without `password_enc` keeps the stored password when its
+/// username is unchanged, as a signup challenge keeps its secret; no
+/// username removes it. A changed username without a password writes
+/// nothing and answers `None`, since the stored envelope is bound to the
+/// old username.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the write fails, and a `409` constraint
@@ -385,11 +392,17 @@ pub async fn mail_relay(pool: &OperatorPool) -> Result<Option<MailRelayRow>, Sql
 pub async fn put_mail_relay(
     conn: &mut TenantConn<'_>,
     relay: &MailRelayRow,
-) -> Result<(), SqlError> {
-    sqlx::query(
+) -> Result<Option<Option<Vec<u8>>>, SqlError> {
+    sqlx::query_scalar(
         "UPDATE platform.login_settings
             SET smtp_host = $1, smtp_port = $2, smtp_tls = $3, smtp_username = $4,
-                smtp_password_enc = $5, smtp_sender = $6, updated_at = now()",
+                smtp_password_enc = CASE
+                    WHEN $4 IS NULL THEN NULL
+                    ELSE coalesce($5, smtp_password_enc) END,
+                smtp_sender = $6, updated_at = now()
+          WHERE $5 IS NOT NULL OR $4 IS NULL OR smtp_password_enc IS NULL
+                OR smtp_username = $4
+      RETURNING smtp_password_enc",
     )
     .bind(&relay.host)
     .bind(relay.port)
@@ -397,9 +410,8 @@ pub async fn put_mail_relay(
     .bind(relay.username.as_deref())
     .bind(relay.password_enc.as_deref())
     .bind(&relay.sender)
-    .execute(&mut **conn.transaction())
+    .fetch_optional(&mut **conn.transaction())
     .await
-    .map(|_| ())
     .map_err(SqlError::from)
 }
 

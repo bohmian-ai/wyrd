@@ -189,6 +189,7 @@ async fn configure_provider(
     Path(name): Path<String>,
     Json(request): Json<ConfigureSocialProviderRequest>,
 ) -> Result<Json<SocialProviderView>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let provider = provider(&name)?;
     let pool = operator(&state)?;
     let authz =
@@ -294,6 +295,7 @@ async fn enable_provider(
     Path(name): Path<String>,
     Json(request): Json<EnableSocialProviderRequest>,
 ) -> Result<Json<SocialProviderView>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let provider = provider(&name)?;
     let pool = operator(&state)?;
     let authz =
@@ -374,6 +376,7 @@ async fn write_login_settings(
     caller: PlatformCaller,
     settings: Result<Json<LoginSettings>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<LoginSettings>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let Json(settings) =
         settings.map_err(|rejection| crate::http::error::body_rejection(&rejection))?;
     let pool = operator(&state)?;
@@ -427,7 +430,8 @@ async fn read_mail(
 }
 
 /// Replace the application-mail relay; the password is sealed and never
-/// returned.
+/// returned. Omitting the password keeps the stored one while the username
+/// is unchanged; omitting the username removes it.
 ///
 /// # Errors
 /// Returns `400` for an invalid relay and a stable Wyrd error when the caller
@@ -439,7 +443,8 @@ async fn read_mail(
     responses(
         (status = 200, description = "The stored relay, without its password", body = MailSettings),
         (status = 400, description = "Empty host, zero port, invalid sender, a password without \
-          a username, or no sealing key (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+          a username, a changed username without its password, or no sealing key \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
@@ -454,6 +459,7 @@ async fn write_mail(
     caller: PlatformCaller,
     Json(request): Json<ConfigureMailRelayRequest>,
 ) -> Result<Json<MailSettings>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let pool = operator(&state)?;
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);

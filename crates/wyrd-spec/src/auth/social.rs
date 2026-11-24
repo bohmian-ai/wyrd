@@ -268,6 +268,9 @@ pub struct ConfigureMailRelayRequest {
     #[serde(default)]
     pub username: Option<String>,
     /// Password for `username`; sealed before storage and never returned.
+    /// Omit it to keep the stored password while `username` is unchanged;
+    /// a changed `username` needs its password. Omitting `username`
+    /// removes the stored password.
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub password: Option<SecretBearer>,
@@ -393,4 +396,9 @@ pub struct CreationMethods {
     pub email_verification_required: bool,
     /// Shared providers usable to create a workspace, in display order.
     pub signup_providers: Vec<SocialProvider>,
+    /// The public site key of the configured signup challenge (Cloudflare
+    /// Turnstile), for the signup page to render its widget; absent when no
+    /// challenge is configured. Never the Siteverify secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signup_challenge_site_key: Option<String>,
 }

@@ -28,22 +28,26 @@ const keysPath = (principalId: string, cursor: string | null) =>
 /**
  * The calling User's profile and one page of their own key metadata, both
  * for the principal the server-resolved session names; the target principal is never
- * taken from the page. No key secret is ever part of this page load.
+ * taken from the page. No key secret is ever part of this page load. The
+ * Recovery email section shows only when Rust offers email discovery, which
+ * needs a mail relay.
  */
 export const load: PageServerLoad = async (event) => {
-  if (!event.locals.browserSession) return { profile: null, keys: null, problem: problem('upstream') };
+  if (!event.locals.browserSession)
+    return { profile: null, keys: null, recovery: false, problem: problem('upstream') };
   try {
     const session = signedIn(event);
     // The session already names its principal, so the key page does not wait for the profile.
     const read = async <T>(path: string) => (await (await call(session, 'GET', path)).json()) as T;
-    const [profile, keys] = await Promise.all([
+    const [profile, keys, methods] = await Promise.all([
       read<CurrentUserProfile>('/principals/me'),
-      read<CredentialList>(keysPath(session.principalId, event.url.searchParams.get('after')))
+      read<CredentialList>(keysPath(session.principalId, event.url.searchParams.get('after'))),
+      browserSessions.methods(session.tenantKey, event.url)
     ]);
-    return { profile, keys, problem: null };
+    return { profile, keys, recovery: methods.email_discovery, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
-    return { profile: null, keys: null, problem: safeProblem(cause) };
+    return { profile: null, keys: null, recovery: false, problem: safeProblem(cause) };
   }
 };
 

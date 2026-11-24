@@ -153,7 +153,8 @@ pub fn wyrd_error_response_from_parts(
         // An exhausted admission window says exactly when it ends.
         WyrdError::PasswordAttempts { details, .. }
         | WyrdError::SignupAttempts { details, .. }
-        | WyrdError::SignInAttempts { details, .. } => details
+        | WyrdError::SignInAttempts { details, .. }
+        | WyrdError::EmailAttempts { details, .. } => details
             .get("retry_after_seconds")
             .and_then(serde_json::Value::as_u64)
             .map(|seconds| seconds.to_string()),

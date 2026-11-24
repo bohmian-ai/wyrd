@@ -1081,25 +1081,31 @@ impl WyrdTestServer {
         Ok(replica)
     }
 
-    /// Start the current-authority propagation worker of an unbound server,
-    /// leaving its other workers for [`Self::bind`].
+    /// Start the current-authority propagation and workspace-directory
+    /// workers of an unbound server, leaving its other workers for
+    /// [`Self::bind`].
     ///
-    /// Current authority reaches an unbound server's cache as it reaches a
-    /// bound one's, so a test observes access changes committed through
-    /// another replica within the propagation bound. Idempotent: the worker
-    /// leaves the pending set when it starts.
+    /// Current authority and the discovery directory reach an unbound
+    /// server as they reach a bound one, so a test observes access and
+    /// contact changes committed through any replica within their
+    /// propagation bound. Idempotent: each worker leaves the pending set when
+    /// it starts.
     fn propagate_authority(&self) {
-        let authority = {
+        let started: Vec<_> = {
             let mut workers = self
                 .workers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            workers
-                .iter()
-                .position(|(name, _)| *name == "authorization_cache")
-                .map(|at| workers.remove(at).1)
+            let (projections, rest) =
+                std::mem::take(&mut *workers)
+                    .into_iter()
+                    .partition(|(name, _)| {
+                        matches!(*name, "authorization_cache" | "workspace_directory")
+                    });
+            *workers = rest;
+            projections
         };
-        if let Some(worker) = authority {
+        for (_, worker) in started {
             wyrd_runtime::runtime().spawn(worker);
         }
     }
@@ -3121,6 +3127,27 @@ impl WyrdTestServer {
                     "initialization disclosed no platform credential".to_owned(),
                 )
             })
+    }
+
+    /// Move the last fresh proof of every platform console session ten
+    /// minutes into the past, as if the shared five-minute proof window had
+    /// passed since its sign-in or re-authentication.
+    ///
+    /// Test-support for browser journeys that must reach a destructive
+    /// console change asking for fresh proof without waiting out the window.
+    /// Sessions stay live: only their proof ages, never their idle or
+    /// absolute deadlines.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the update fails.
+    pub async fn stale_platform_console_proof(&self) -> Result<(), WyrdTestServerError> {
+        sqlx::query(
+            "UPDATE platform.browser_sessions SET fresh_at = fresh_at - interval '10 minutes'",
+        )
+        .execute(self.operator_pool().pool())
+        .await
+        .map(drop)
+        .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
     }
 
     /// Mint the session a registered administrator gets after federated login.

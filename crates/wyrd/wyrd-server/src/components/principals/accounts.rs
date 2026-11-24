@@ -750,7 +750,7 @@ pub(crate) async fn create_password_reset(
     let tenant = tenant_slug(&state, &caller).await?;
     let mut conn = tenant_conn(&state, &caller).await?;
     let issued =
-        issue_password_reset(&mut conn, caller.principal.id.as_uuid(), principal_id).await?;
+        issue_password_reset(&mut conn, caller.principal.id.as_uuid(), principal_id, None).await?;
     conn.commit().await.map_err(internal)?;
     let Some((row, code)) = issued else {
         return Err(WyrdErrorResponse::from(WyrdError::PrincipalNotFound {

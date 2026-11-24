@@ -6,6 +6,18 @@ import { problem, safeProblem } from '$lib/server/problem';
 import { serverReady } from '$lib/server/upstream';
 import type { Actions, PageServerLoad } from './$types';
 
+/** Whether the root page may offer workspace creation and discovery: only what Rust says is usable now. */
+async function entryLinks(url: URL): Promise<{ create: boolean; discover: boolean }> {
+  if (localAuthEnabled()) return { create: false, discover: false };
+  try {
+    const methods = await browserSessions.methods(null, url);
+    return { create: methods.signup, discover: methods.email_discovery };
+  } catch (cause) {
+    if (isHttpError(cause)) return { create: false, discover: false };
+    throw cause;
+  }
+}
+
 export const load: PageServerLoad = async ({ locals, request, fetch, url }) => {
   // Failed actions render their problem on the chooser instead of redirecting it away.
   const destination = locals.session && sessions.destination(locals.session);
@@ -20,6 +32,7 @@ export const load: PageServerLoad = async ({ locals, request, fetch, url }) => {
   // Sign-in is useless while Wyrd is down.
   const upstream = (await serverReady(fetch)) ? null : problem('upstream');
   return {
+    ...(upstream ? { create: false, discover: false } : await entryLinks(url)),
     session: locals.session ? sessions.metadata(locals.session) : null,
     problem: url.searchParams.get('login') === 'failed' ? problem('unauthenticated') :
       locals.sessionProblem?.code === 'WYRD_AUTH_401_UNAUTHENTICATED'

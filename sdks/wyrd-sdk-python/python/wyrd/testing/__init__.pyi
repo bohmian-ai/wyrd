@@ -99,9 +99,10 @@ class WyrdTestServer:
     def occupy_hosted_memory(self, leave: int) -> HeldMemory:
         """Hold all process memory available now but ``leave`` bytes.
 
-        While held, a hosted verification whose Python session does not fit
-        in ``leave`` waits for memory, and one whose request bytes do not fit
-        is refused as retryable ``503``.
+        The hold is charged to Verification, so while held a hosted
+        verification waits for memory when the hold keeps Verification over
+        its contended share, and one whose request bytes do not fit is
+        refused as retryable ``503``.
 
         Args:
             leave: Bytes left free.

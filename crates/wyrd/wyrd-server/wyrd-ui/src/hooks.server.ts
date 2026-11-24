@@ -3,6 +3,7 @@ import { error, json, redirect, type Handle, type HandleServerError } from '@sve
 import { localAuthEnabled } from '$lib/server/development';
 import { sessionCookie, sessions } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
+import { platformConsole } from '$lib/server/auth/platform-sessions';
 import { problem } from '$lib/server/problem';
 
 /** Methods that never change state; every other request is a mutation. */
@@ -12,7 +13,8 @@ const loginRoutes = [
   '/t/[tenantKey]/login',
   '/t/[tenantKey]/login/api-key',
   '/t/[tenantKey]/signup',
-  '/t/[tenantKey]/reset'
+  '/t/[tenantKey]/reset',
+  '/t/[tenantKey]/contact/verify'
 ];
 
 export const handle: Handle = async ({ event, resolve }) => {
@@ -24,6 +26,18 @@ export const handle: Handle = async ({ event, resolve }) => {
     return json(value, { status: value.status, headers: { 'content-type': 'application/problem+json', 'cache-control': 'private, no-store' } });
   }
   event.setHeaders({ 'cache-control': 'private, no-store' });
+  const { pathname } = event.url;
+  // The platform console: every page but the SSO return needs Rust's platform session, never a tenant one.
+  if ((pathname === '/platform/ui' || pathname.startsWith('/platform/ui/')) && pathname !== '/platform/ui/callback') {
+    const session = await platformConsole.read(event.url, event.cookies);
+    if (!session) {
+      if (event.request.method === 'GET' && !event.isDataRequest) redirect(303, '/platform');
+      const value = problem('unauthenticated');
+      error(value.status, { ...value, message: value.title });
+    }
+    event.locals.platformSession = session;
+    return resolve(event);
+  }
   const tenantKey = loginRoutes.includes(event.route.id ?? '') ? undefined : event.params.tenantKey;
   if (!localAuthEnabled()) {
     event.locals.session = null;

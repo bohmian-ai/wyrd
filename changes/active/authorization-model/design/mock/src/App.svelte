@@ -3,6 +3,12 @@
   import Signup from './Signup.svelte';
   import Workspace from './Workspace.svelte';
   import Entry from './Entry.svelte';
+  import Verify from './Verify.svelte';
+  import Workspaces from './Workspaces.svelte';
+  import Account from './Account.svelte';
+  import Reset from './Reset.svelte';
+  import PlatformEntry from './PlatformEntry.svelte';
+  import Console from './Console.svelte';
   import { STATES } from './data.js';
 
   let hash = $state(location.hash || '#/signup');
@@ -13,7 +19,9 @@
   });
   const path = $derived(hash.slice(1).split('?')[0]);
   const query = $derived(new URLSearchParams(hash.split('?')[1] ?? ''));
-  const tenant = $derived(path.match(/^\/t\/([a-z0-9-]+)$/)?.[1]);
+  const tenantPage = $derived(path.match(/^\/t\/([a-z0-9-]+)(?:\/(reset|login|settings\/account|contact\/verify))?$/));
+  const tenant = $derived(tenantPage?.[1]);
+  const consoleView = $derived(path.match(/^\/platform\/ui(?:\/(providers|mail|signup))?$/));
 
   let mode = $state(new URLSearchParams(location.search).get('mode') === 'light' ? 'light' : 'dark');
   $effect(() => { document.documentElement.dataset.mode = mode; });
@@ -41,13 +49,37 @@
     <Signup {query} />
   {:else if path === '/signup/workspace'}
     <Workspace {query} />
+  {:else if path === '/signup/verify'}
+    <Verify purpose="signup" {query} />
+  {:else if path === '/workspaces'}
+    <Workspaces {query} />
+  {:else if path === '/workspaces/verify'}
+    <Verify purpose="workspaces" {query} />
+  {:else if path === '/platform'}
+    <PlatformEntry {query} />
+  {:else if path === '/platform/ui/callback'}
+    <PlatformEntry callback {query} />
+  {:else if consoleView}
+    <Console view={consoleView[1] ?? ''} {query} />
+  {:else if tenantPage?.[2] === 'reset'}
+    <Reset {tenant} {query} />
+  {:else if tenantPage?.[2] === 'settings/account'}
+    <Account {tenant} {query} />
+  {:else if tenantPage?.[2] === 'contact/verify'}
+    <Verify purpose="contact" {tenant} {query} />
+  {:else if tenantPage?.[2] === 'login'}
+    <Entry heading="Sign in to {tenant}">
+      {#if query.get('reset') === 'done'}<p role="status" data-testid="reset-done">Password set. Sign in with your new password.</p>{/if}
+      <p class="placeholder">Placeholder for the existing tenant sign-in page. This mock does not redesign it.</p>
+      <nav class="links"><a href="#/t/{tenant}/reset">Reset your password</a></nav>
+    </Entry>
   {:else if tenant}
     <main class="entry landing" data-testid="landing">
       <h1>{tenant}</h1>
       <p>Placeholder for the workspace landing page at <code>/t/{tenant}</code>. The creator arrives signed in as its administrator.</p>
     </main>
   {:else if path === '/'}
-    <Entry heading="Welcome to Wyrd"><p class="placeholder">Placeholder for the existing sign-in page. This mock does not redesign it.</p><nav class="links"><a href="#/signup">Create a workspace</a></nav></Entry>
+    <Entry heading="Welcome to Wyrd"><p class="placeholder">Placeholder for the existing sign-in page. This mock does not redesign it.</p><nav class="links"><a href="#/signup">Create a workspace</a><a href="#/workspaces">Find my workspaces</a></nav></Entry>
   {:else}
     <Entry heading="Not found"><p class="placeholder" data-testid="missing">This preview has no page at <code>{path}</code>.</p><nav class="links"><a href="#/signup">Create a workspace</a></nav></Entry>
   {/if}
@@ -72,9 +104,5 @@
   }
   .placeholder {
     text-align: center;
-  }
-  code {
-    font: 11px var(--font-mono);
-    color: var(--text);
   }
 </style>

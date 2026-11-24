@@ -17,6 +17,15 @@
     "title": "Permission denied (RBAC)",
     "type": "https://wyrd.dev/problems/WYRD_PERMISSION_403_DENIED_RBAC"
   },
+  "emailAttempts": {
+    "code": "WYRD_AUTH_429_EMAIL_ATTEMPTS",
+    "detail": "Too many email requests",
+    "details": {},
+    "remediation": "Wait `details.retry_after_seconds` until the fixed email window ends, then ask again.",
+    "status": 429,
+    "title": "Too many email requests",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_429_EMAIL_ATTEMPTS"
+  },
   "expired": {
     "code": "WYRD_AUTH_401_TOKEN_EXPIRED",
     "detail": "Token expired",

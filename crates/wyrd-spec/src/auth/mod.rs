@@ -35,10 +35,11 @@ pub use attribution::Attribution;
 pub use browser::{
     BrowserApiKeyRequest, BrowserCredential, BrowserLoginRequest, BrowserLoginResponse,
     BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
-    ContactRequest, ContactVerifyRequest, LocalCredentials, PasswordChangeRequest,
-    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest, ProofStatus,
-    ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse,
-    SignupVerifyRequest,
+    ContactRequest, ContactVerifyRequest, DiscoveredWorkspace, DiscoveryPage, DiscoveryQuery,
+    DiscoveryRequest, DiscoveryVerifyRequest, LocalCredentials, PasswordChangeRequest,
+    PasswordLoginRequest, PasswordResetCodeRequest, PasswordResetRequest, PasswordSignupRequest,
+    ProofStatus, ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest,
+    SignupCompleteResponse, SignupProofMethod, SignupProofResponse, SignupVerifyRequest,
 };
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{
@@ -58,10 +59,12 @@ pub use permission_scope::{
     GatewayAccess, PermissionScope, PermissionScopeError,
 };
 pub use platform_identity::{
-    ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformCallbackRequest,
-    PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
-    PlatformPrincipalListResponse, PlatformPrincipalSummary, RegisterPlatformAdminRequest,
-    RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
+    ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformBrowserMethod,
+    PlatformBrowserSessionView, PlatformCallbackRequest, PlatformClientAuth, PlatformLoginRequest,
+    PlatformOidcConnectionView, PlatformPasswordLoginRequest, PlatformPasswordReauthRequest,
+    PlatformPrincipalListResponse, PlatformPrincipalSummary, PlatformSignInMethods,
+    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SetPlatformPasswordRequest,
+    SetPlatformPrincipalStatusRequest,
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;

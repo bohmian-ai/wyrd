@@ -26,11 +26,11 @@ pub mod github;
 
 /// In-process server handle used only by TypeScript integration tests.
 ///
-/// Journeys steer the server through exactly six test controls, each backed
+/// Journeys steer the server through exactly seven test controls, each backed
 /// by the production code path: `flushBifrost`, `waitForBaseline`,
-/// `makeBindingDue`, `holdPublications`, and, for contended process memory,
-/// `occupyHostedMemory` and `waitForHostedWaiters`. One more,
-/// `removeSettledExecutionRow`, stands in for cleanup of terminal
+/// `makeBindingDue`, `holdPublications`, `staleConsoleProof`, and, for
+/// contended process memory, `occupyHostedMemory` and `waitForHostedWaiters`.
+/// One more, `removeSettledExecutionRow`, stands in for cleanup of terminal
 /// coordination state, which no production owner performs yet. The remaining
 /// members start, address, or credential the server.
 #[napi]
@@ -186,8 +186,9 @@ impl NativeWyrdTestServer {
     }
 
     /// Hold process memory so at most `leave` bytes stay free until the
-    /// returned hold is released, so a hosted verification whose session
-    /// does not fit waits and one whose request does not fit is refused.
+    /// returned hold is released, charged to Verification, so a hosted
+    /// verification waits while the hold keeps Verification over its
+    /// contended share and one whose request does not fit is refused.
     ///
     /// # Errors
     ///
@@ -268,6 +269,22 @@ impl NativeWyrdTestServer {
                 let root = server.initialize_platform_root().await.map_err(reason)?;
                 Ok(secrecy::ExposeSecret::expose_secret(&root).to_owned())
             })
+        })
+    }
+
+    /// Age every platform console session's fresh proof past the shared
+    /// five-minute window, so a journey's next destructive console change
+    /// asks the operator to confirm it is them. The sessions stay live.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or the update fails.
+    #[napi]
+    pub fn stale_console_proof(&self) -> Result<()> {
+        self.with_server(|server| {
+            wyrd_runtime::runtime()
+                .block_on(server.stale_platform_console_proof())
+                .map_err(reason)
         })
     }
 

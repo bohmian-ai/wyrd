@@ -18,6 +18,8 @@ export type LoginMethods = {
   password_reset: boolean;
   email_verification_required: boolean;
   signup_providers: SocialProvider[];
+  /** The configured signup challenge's public Turnstile site key; absent without one. */
+  signup_challenge_site_key?: string;
 };
 
 const sessionPrefix = 'wyrd_session_';
@@ -34,16 +36,16 @@ type View = {
   expires_at: string;
 };
 
-type Call = { method: 'GET' | 'POST' | 'DELETE'; cookie?: string; body?: unknown };
+type Call = { method: 'GET' | 'POST' | 'PUT' | 'DELETE'; cookie?: string; body?: unknown };
 
 /**
- * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
+ * Call one Rust `/auth/browser/*`, `/platform/*` or `/v1` operation server to server as the
  * browser at `url`: the trusted public origin goes as `Origin` and the
  * forwarded host and scheme, the visitor's address as `stateSource` states it,
  * and only the cookie the caller selected is sent.
  * An unreachable server is the stable `upstream` problem.
  */
-async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
+export async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
   const headers = new Headers({
     origin: url.origin,
     'x-forwarded-host': url.host,
@@ -66,7 +68,7 @@ async function call(path: string, url: URL, { method, cookie, body }: Call): Pro
 }
 
 /** Refuse with the safe problem a non-2xx Wyrd answer maps to. */
-async function refuse(response: Response): Promise<never> {
+export async function refuse(response: Response): Promise<never> {
   reject(await upstreamProblem(response));
 }
 
@@ -220,12 +222,15 @@ export class BrowserSessions {
     return begun.authorization_url;
   }
 
-  /** The sign-in methods Rust allows on this tenant's pages; rendering only, never enforcement. */
-  async methods(tenantKey: string, url: URL): Promise<LoginMethods> {
-    this.cookieName(tenantKey);
-    const response = await call(`/auth/browser/methods?tenant=${encodeURIComponent(tenantKey)}`, url, {
-      method: 'GET'
-    });
+  /**
+   * The sign-in methods Rust allows on this tenant's pages, or with no tenant
+   * on the deployment's root pages (creation and discovery); rendering only,
+   * never enforcement.
+   */
+  async methods(tenantKey: string | null, url: URL): Promise<LoginMethods> {
+    if (tenantKey !== null) this.cookieName(tenantKey);
+    const query = tenantKey === null ? '' : `?tenant=${encodeURIComponent(tenantKey)}`;
+    const response = await call(`/auth/browser/methods${query}`, url, { method: 'GET' });
     if (!response.ok) await refuse(response);
     return (await response.json()) as LoginMethods;
   }
@@ -270,6 +275,20 @@ export class BrowserSessions {
   }
 
   /** Set a new password with an operator-issued reset code; signs nothing in. */
+  /**
+   * Ask Rust to mail a reset code to the verified recovery email of
+   * `username`; every account gets the same answer, so nothing here says
+   * whether one exists.
+   */
+  async requestReset(tenantKey: string, username: string, url: URL): Promise<void> {
+    this.cookieName(tenantKey);
+    const response = await call('/auth/browser/password/reset/request', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, username }
+    });
+    if (!response.ok) await refuse(response);
+  }
+
   async resetPassword(tenantKey: string, resetCode: string, newPassword: string, url: URL): Promise<void> {
     this.cookieName(tenantKey);
     const response = await call('/auth/browser/password/reset', url, {

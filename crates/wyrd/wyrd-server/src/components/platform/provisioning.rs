@@ -67,6 +67,30 @@ const TENANT_ADMIN_ROLE: &str = "admin";
 /// Lifetime of the initial tenant-administrator credential.
 const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration = std::time::Duration::from_hours(8760);
 
+/// Slugs a self-service signup may not claim, so no workspace can pose as
+/// the service operator or its support, sign-in or mail surfaces. Operators
+/// creating tenants through the platform API are not restricted.
+const RESERVED_SIGNUP_SLUGS: &[&str] = &[
+    "admin",
+    "administrator",
+    "api",
+    "app",
+    "auth",
+    "billing",
+    "help",
+    "login",
+    "mail",
+    "platform",
+    "root",
+    "security",
+    "signup",
+    "status",
+    "support",
+    "system",
+    "www",
+    "wyrd",
+];
+
 /// Tenant provisioning failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
@@ -391,7 +415,7 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::SlugTaken`] when the slug belongs to
-    /// another tenant or claim, [`ProvisionError::WorkspaceLimit`] when the
+    /// another tenant or claim or is reserved, [`ProvisionError::WorkspaceLimit`] when the
     /// creator is at the owned-workspace cap, and [`ProvisionError::Store`]
     /// when the write fails.
     #[tracing::instrument(level = "info", skip(self, owner), fields(slug = %request.slug), err)]
@@ -400,6 +424,11 @@ impl TenantProvisioning {
         owner: &HumanOwner<'_>,
         request: &CreateTenantRequest,
     ) -> Result<DataTenantId, ProvisionError> {
+        // A reserved slug answers exactly as a taken one, so a refusal says
+        // only that the name is unavailable.
+        if RESERVED_SIGNUP_SLUGS.contains(&request.slug.as_str()) {
+            return Err(ProvisionError::SlugTaken);
+        }
         let proposed = DataTenantId::new_v7();
         claim_signup_tenant(
             &self.operator,
@@ -603,7 +632,8 @@ impl TenantProvisioning {
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
     /// `tenants:suspend`, [`ProvisionError::TenantUnavailable`] when the tenant
-    /// is not in the state the transition requires, and
+    /// is not in the state the transition requires or is the platform system
+    /// tenant, and
     /// [`ProvisionError::Store`] when the write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn set_suspended(
@@ -630,9 +660,12 @@ impl TenantProvisioning {
         // nothing, but the permission was still evaluated, so the decision
         // commits alone before the stable refusal. A failed write commits
         // neither.
-        let applied = set_tenant_suspended(&mut decision, tenant_id, suspended)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        // The platform's own system tenant owns platform-plane audit and is
+        // never suspended; it is refused like any tenant not open to action.
+        let applied = tenant_id != DataTenantId::SYSTEM_OWNER
+            && set_tenant_suspended(&mut decision, tenant_id, suspended)
+                .await
+                .map_err(|e| ProvisionError::Store(e.to_string()))?;
         decision
             .commit()
             .await

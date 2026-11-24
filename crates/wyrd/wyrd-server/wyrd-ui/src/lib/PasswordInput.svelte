@@ -6,12 +6,12 @@
 -->
 <script lang="ts">
   import type { HTMLInputAttributes } from 'svelte/elements';
-  let { id, ...rest }: HTMLInputAttributes & { id: string } = $props();
+  let { id, value = $bindable(), ...rest }: HTMLInputAttributes & { id: string } = $props();
   let shown = $state(false);
 </script>
 
 <span class="password">
-  <input {id} class="app-input" type={shown ? 'text' : 'password'} {...rest} />
+  <input {id} class="app-input" type={shown ? 'text' : 'password'} bind:value {...rest} />
   <button class="app-control" type="button" aria-controls={id} aria-pressed={shown} onclick={() => (shown = !shown)}>
     {shown ? 'Hide' : 'Show'}<span class="sr-only"> password</span>
   </button>

@@ -77,6 +77,22 @@ http {
             proxy_send_timeout 1h;
         }
 
+        # The platform console's pages are the UI's, ahead of the server's
+        # `/platform/*` API: the entry, its page data, and the `/platform/ui`
+        # subtree. Every other `/platform` path stays the server's.
+        location = /platform {
+            proxy_pass http://wyrd_ui;
+        }
+        location = /platform/__data.json {
+            proxy_pass http://wyrd_ui;
+        }
+        location = /platform/ui {
+            proxy_pass http://wyrd_ui;
+        }
+        location ^~ /platform/ui/ {
+            proxy_pass http://wyrd_ui;
+        }
+
         # Every other path is the production UI.
         location / {
             proxy_pass http://wyrd_ui;

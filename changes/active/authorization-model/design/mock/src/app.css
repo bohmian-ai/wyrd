@@ -55,6 +55,14 @@ a { color: inherit; }
 .app-problem code { display: block; margin: 6px 0 0; color: var(--muted); overflow-wrap: anywhere; }
 .app-problem code { font: 10px var(--font-mono); }
 
+/* Field-level refusal: aria-invalid marks the field; the ⊘ line beneath carries the reason in words. */
+.app-input[aria-invalid='true'] { border-color: var(--danger); }
+.app-input[readonly] { opacity: 0.6; }
+p.field-error, p.done { color: var(--text); }
+.ok { color: var(--ok); }
+code { font: 11px var(--font-mono); color: var(--text); overflow-wrap: anywhere; }
+b { color: var(--text); font-weight: var(--weight-strong); overflow-wrap: anywhere; }
+
 /* Preview strip: outside the product, dashed so it never reads as a product control. */
 .preview-strip { position: sticky; top: 0; z-index: 2; background: var(--bg); display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; padding: 6px 16px; border-bottom: 1px dashed var(--border); font-size: 12px; }
 .preview-label { color: var(--muted); font: 11px var(--font-mono); }

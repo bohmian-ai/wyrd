@@ -1,0 +1,101 @@
+# Independent findings validation
+
+Recommended behavioral verdict: **FIX_REQUIRED** for TASK-003-carryover cycles 12–16. Approved specification revision 11; base `63ee31a0205c9b59a11877d5cf571d7bd0632cd6`, candidate `dfb3599d5fbfb3d863ecb68382257cb30abfd79b`. HEAD still matched the candidate during validation. This does not reopen or accept the whole parent task. Cycles 17–18 are deferred and 19–20 belong to TASK-004.
+
+Fresh `ponytail_rev` read the skill, subject, all four selected discovery reports, original task/specification, root/SQL/docs instructions, UI skill, workflow/style/testing references and narrow security authorities. CodeGraph preceded source tracing. Direct cumulative diff and actual source/assertions were inspected; no source was changed and no tests were run by this validator. Root execution receipts are separately attributed below. Earlier finding IDs 1–11 remain reserved; none is silently renumbered or reopened. No validator-origin blocking finding is introduced, so no additional independent validation pass is needed.
+
+## Proposal decisions
+
+| Discovery proposal | Decision | Reconciliation |
+| --- | --- | --- |
+| invariant INV-1: OIDC removal/reinstall resurrects sessions | CONFIRMED | Retain FIND-003-carryover-12. DELETE leaves sessions/login state, INSERT reuses revision 1, resolution compares the numeric revision only. |
+| domain D1: recipient-suppressed discovery differs from SMTP attempt | CONFIRMED | Retain FIND-003-carryover-13. This exposes recipient budget/delivery state, not registered-account membership; both the error-status split and recipient-dependent SMTP wait are source-backed. |
+| behavior B-1: creation form remains usable at cap | CONFIRMED | Retain FIND-003-carryover-14. REQ-011 expressly requires disabling/replacing it. Matching an approved mock does not waive that behavior. |
+| behavior B-2: provider/challenge page proof disconnected | REVISED | Retain FIND-003-carryover-15 as a bounded connected-page evidence gap. Do not replay every backend race through a browser or require live provider/Cloudflare credentials. Backend-only assertions remain reusable. |
+| domain D2 and behavior B-3: sealed pre-proof expiry unproven | CONFIRMED, CONSOLIDATED | Retain one FIND-003-carryover-16. Contact mutation and discovery-read first-use expiry are in the reviewed scope; earlier signup expiry remains dependency context rather than reopening an earlier review wholesale. |
+| behavior B-4: relay guide and docs gate unfinished | REVISED | Retain FIND-003-carryover-17: one bounded explanation of the changed update contract plus required docs gate. Current example is valid; no broken example or docs redesign is alleged. |
+| unrun startup means no routing proof | REJECTED as a standalone blocker | System report traces task C16 S7's recorded real nginx-template/stub probe, separate from real BFF/Rust browser journeys. Full official-image qualification remains unproven and transferred to TASK-004. Do not erase recorded focused route proof or claim an image pass. |
+
+## Reconciled acceptance coverage
+
+This matrix reconciles existing requirements and scenarios; it creates no new product promises. Detailed assertion references remain in the four discovery reports.
+
+| Existing requirement/scenario | Reconciled source/assertion/execution evidence | Status |
+| --- | --- | --- |
+| REQ-017; C12 S1/S4 contact freshness, binding, replacement, revision invalidation and preserved authority | Rust contact owner → tenant contact SQL, mail-derived proofs and foreign-user/tenant/race/replacement assertions; root platform journey 97/97 includes these delivered HTTP cases | PASS for exercised behavior; expiry below |
+| REQ-017; C12 S2/S5/S7 bounded/deduplicated live discovery, revalidation, RLS and reconciliation | Directory HMAC projection → authorized live tenant/User/contact checks; pagination, listener reconnect and unavailable-contact-read assertions; actual TenantConn/OperatorPool signatures and forced-RLS migration/tests inspected | PASS for exercised behavior |
+| REQ-017; C12 S3 private address suppression, admission before mail | Existing healthy-relay assertions prove budgets/mail count and generic bodies; source still leaks delivery/suppression under slow/refused SMTP | FAIL; -13 |
+| REQ-017; C12 S6 purpose/browser/one-use/read deadline and original email expiry | Purpose/binding/unique digest/fixed spent-read deadline assertions credible; original sealed-envelope first-use expiry absent | UNRESOLVED; -16 |
+| REQ-002/013/017; C13 S1–S3 private reset, stale/foreign/offline/SSO codes, no lockout or duplicate/retried delivery | Process-owned bounded send path, contact-revision/password lock checks and real HTTP/mail/reset/session/CLI-renewal/API-key assertions; root 97/97 | PASS |
+| REQ-018/AC-013; C14 platform password/OIDC proof, plane separation, TTL/replica/logout/suspension/password invalidation/storage refusal | Rust login/session/extractor → SQL lifecycle; HTTP assertion coverage inspected and root 97/97 passes | PASS for exercised paths; OIDC removal below |
+| REQ-018/AC-013; original OIDC connection invalidation and destructive same-operator proof | Fresh password/OIDC reauthentication paths and mutation refusals covered; conflict-update replacement tested, DELETE→reinstall not safe | FAIL; -12 |
+| REQ-011/014; C15 approved mock/readings and reserved names | Approval recorded; exact 18 names refused by self-service shared owner, operator creation preserved; HTTP loop and real browser reserved-name retry assertions | PASS; cap presentation below |
+| REQ-011; C16 cap refusal state | Backend refusal mapped to limit problem, but page restores enabled form | FAIL; -14 |
+| REQ-011/014/017; C16 root methods/private defaults/email signup/proof-method/normal recovery and retry | Rust methods feed loads; real production browser/Mailpit signup, discovery link/paste, reset/contact/invitation/device assertions and earlier recorded passes exist; root UI unit/component lane105/105 is clean. Fresh root production onboarding run now fails6/7 with signup503 and email-wait timeouts; mail connection-refused diagnostics are being investigated independently | UNRESOLVED current execution; -15 also requires valid delivered-flow proof |
+| REQ-011–014; C16 retained provider acquisition/contact/challenge page seams | Browser acquisition host exercises email; Google fixture invitation/return is distinct; Turnstile component replaces widget and Rust responses | UNRESOLVED; -15 |
+| REQ-018; C16 console password/SSO and providers/relay/signup controls | Six recorded real browser/BFF/Rust console journeys; safe metadata/cookie allowlist and same-operator actions inspected; latest root rerun result to be recorded separately | PASS for inspected recorded flows; underlying -12 remains |
+| REQ-018/AC-013; C16 official-host split | Shipped nginx exact/prefix configuration, recorded real template/stub selection probe and separate real BFF/Rust consumers; startup image compile never reached route assertions | PASS for bounded routing evidence, with explicit unrun image limit |
+| C16 docs handoff/changed public mail update; docs AGENTS gate | Changed guides/corpus exist, but omission/username update semantics explicitly left out and no successful required docs gate | FAIL/UNRESOLVED; -17 |
+| C16 approved mock appearance and later rulings | Recorded light/dark desktop/mobile sweep and final justified deviations, follow-up Show/device alignment; no independent new visual rerun | PASS for available recorded evidence except behavior -14 |
+
+Specialist selection is sufficient: domain covers sensitive contact/discovery/reset persistence, tenancy/concurrency and failure paths; invariant covers shared platform authentication lifecycle/security; system covers actual deployment route/failure seam. Primary covers UI/contracts/mock, repository/maintainability and unassigned obligations. Another general repo/maintainer reviewer would duplicate this coverage. Missing assertions identified here remain findings rather than being disguised as missing reviewer access. Cross-tier client facades are not invented: the new browser-auth operations have existing HTTP-only neighboring owners; absence of unsolicited SDK convenience methods is not a defect. No defined verification/gateway/Oracle/Scribe hot-path wait is added or moved by these auth/control-plane changes; no benchmark gate is created.
+
+## Retained findings
+
+### FIND-003-carryover-12 — INCORRECT: removed OIDC authorization revives after reinstall
+
+Authority: REQ-018 original connection revision and replacement invalidation, AC-013; security posture “Platform console browser sessions.” Locations: SQL `queries/platform/identity.rs:102–147`, `queries/platform/console.rs:208–223`, migration `20261123000001_platform_console_sessions.sql:20–21`, server `components/platform/identity.rs:546–569`.
+
+Starting with an initial revision-1 platform OIDC connection and a still-live operator cookie, an authorized operator deletes the connection then configures one again before the cookie expires. Removal only deletes the singleton; sessions are unrevoked and have no FK to that connection. Reinsertion omits `revision`, defaulting to 1. Resolver's EXISTS checks only `o.revision = s.connection_revision`, so the original cookie resumes access, even with a different installed issuer. The original trust anchor should stay invalidated. Same-issuer/configuration reinstall also leaves old unconsumed browser login/reauth transactions with a matching revision; issuer checking does not prevent this same-issuer case. Existing tests cover in-place upsert replacement, not removal/recreation.
+
+Smallest correction: permanently retire original OIDC browser sessions and pending browser login/reauth state through the existing connection-removal/lifecycle owners in the authorized removal transaction, or an equivalent complete existing-owner correction. Preserve password sessions, principal grants and separate CLI/API break-glass behavior. No new schema/persistence purpose is needed. Focused real HTTP/controlled OIDC proof must show old cookie remains refused after same/different-issuer reinstall, old bound callback cannot create/refresh a session, and a new login works. This is a supported administrative lifecycle/security failure, not hypothetical hardening.
+
+### FIND-003-carryover-13 — INCORRECT: discovery reveals recipient suppression and relay outcome
+
+Authority: REQ-017 shared budgets before SMTP and “recipient throttles and comparable timing never expose account existence or delivery”; C12 S3. Locations: `wyrd-auth/src/social/discovery.rs:86–106`, shared `social.rs:1553–1610`, mail `send_notice` at `mail.rs:392–421`, HTTP `auth/browser.rs:1008–1027`.
+
+With configured SMTP, a source below its public source limit asks about an address below/above the silent address budget. Below budget the request awaits actual SMTP and propagates refusal as503; above budget it skips SMTP and returns generic202. A slow healthy relay similarly delays only unsuppressed requests. The route does not normalize the distinction. This reveals recipient budget/delivery state without proving registered-account membership; no broader membership leak is claimed. Healthy-Mailpit body/count assertions do not exercise this split.
+
+Smallest correction: keep address-specific delivery/suppression outcomes off the public discovery response at the existing discovery/mail owner, reusing suitable bounded transient process work already present for reset rather than adding durable queue/retry machinery. Preserve admission-before-send, generic proof email, browser binding and no delivery guarantee. One focused real HTTP/controlled delayed/refusing-relay journey should compare generic status/body and comparable response timing below/above recipient suppression, while asserting attempted/accepted message counts independently. Deployment-wide refusal must not depend on recipient-budget state.
+
+### FIND-003-carryover-14 — INCORRECT: cap refusal retains an enabled creation form
+
+Authority: REQ-011 `spec.md:329–330`, C16 quota/refusal delivery. Location: production `routes/signup/workspace/+page.svelte:40,96–102,118–126,175–208`; mock `design/mock/src/Workspace.svelte` equivalent ending-state branch.
+
+A visitor submits a proven creation attempt and receives `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`. It maps to `PROBLEMS.limit`, but `ended` excludes it and phase returns to idle. The same inputs/button stay enabled; submit clears the refusal and repeats a refused creation. REQ-011 explicitly requires disabling/replacing creation with refusal/recovery guidance. Backend cap enforcement remains correct, and the mock's shared omission cannot waive the behavioral contract.
+
+Smallest correction: extend the existing page refusal state to disable/replace creation at the cap and show existing-workspace/operator recovery guidance; align that mock state. Focused production browser proof should reach the real cap refusal, assert no usable creation action remains and no extra workspace is created. Reuse backend cap/admission/provisioning mechanics.
+
+### FIND-003-carryover-15 — EVIDENCE_GAP: provider and challenge acquisition page seams lack connected proof
+
+Authority: REQ-011–014/AC-005, retained C16 provider acquisition and production browser proof at task `:1252–1265`, AGENTS/TESTING journey tier. Locations: new signup/workspace pages, `src/lib/server/auth/onboarding.integration.test.ts:1–404`, provider fixture cases in `ui-pages.integration.test.ts:3498–3563`, Turnstile component at `ui-pages.test.ts:1323–1382`, task Part B/challenge limitations.
+
+The browser acquisition host drives email signup only. Its Google browser fixture proves invitation and returning login, not new workspace acquisition; backend provider signup starts after the new page's producer seam. The challenge component test stubs both the widget global and Rust endpoint; the separate Siteverify HTTP test cannot demonstrate the production browser's token satisfies actual completion. Thus configured provider acquisition, provider missing-contact continuation, and configured challenge page→Rust decision remain unproven. No code defect is inferred.
+
+Smallest closure: extend existing production-browser journey hosts with their supported controlled provider/mail/Siteverify seams. Demonstrate provider proof→method read→correct page completion→usable tenant; missing provider contact→real mailed contact proof→same creation attempt; configured challenge token→actual Rust decision→refusal/fresh-token retry/success without duplicate creation. Include page-owned refusal/retry transitions already assigned to C16, while reusing credible backend-only negative/race assertions instead of duplicating every backend case in Chromium. Controlled widget/provider fixtures suffice; live third-party smoke is TASK-004 evidence, not a new requirement here. Use the existing environment-owning identity UI lane and affected UI checks.
+
+Fresh execution also leaves existing onboarding proof red: root reports the new production onboarding run executed7 browser tests and failed6, starting with signup503/mail-wait timeouts and SMTP connection-refused messages. Earlier recorded2/2 entry-point passes cannot override this current failure. The precise mail/harness cause is delegated for independent diagnosis; no product defect or particular correction is inferred here. Diagnose at the shared owner and obtain a clean focused delivered-flow run alongside the missing connected-page proof. This is current evidence inadequacy within -15, not a new unvalidated implementation finding.
+
+### FIND-003-carryover-16 — EVIDENCE_GAP: first-use sealed email expiry is not exercised
+
+Authority: REQ-017 fifteen-minute email-proof lifetime and purpose/binding/no-side-effects rules, security posture sealed email envelopes; C12 S6. Locations: `social/contacts.rs:206`, `social/discovery.rs:153`, `social.rs:2157–2163`; task explicitly unproven at `:924`.
+
+A valid sealed contact/discovery envelope and real mailed proof reach their original deadline before first verification. Expected is refusal with no contact/revision mutation or discovery-read authority. Existing proof ages an already-spent SQL read row, a later lifecycle stage; it cannot exercise the envelope deadline. Shared `require_live` exists, so this finding does not allege expired proof acceptance.
+
+Smallest closure: focused executable first-use expiry and prohibited-side-effect assertions at the real contact/discovery flow boundary, retaining the existing database-clock/envelope owners. Use deterministic appropriate test control or valid elapsed-deadline execution; do not demand new production clock APIs, migrations, or behavior changes merely to manufacture historical RED. Cover the distinct mutation and read-authority outcomes. Earlier signup expiry is related context, not a new separately scoped demand in this bounded review.
+
+### FIND-003-carryover-17 — MISSING / EVIDENCE_GAP: bounded mail-update documentation and required gate remain unfinished
+
+Authority: C16 retained documentation handoff, approved C15 reading7/PartA update contract and docs AGENTS “Done when” requiring `mise run docs:check`; task affected checks. Locations: guide `docs/src/content/docs/operate/add-people.md:222`, generated `docs/public/llms-full.txt`, task `:1409–1410`.
+
+An operator updating a stored authenticated relay is not told that omitting password preserves it for the same username, changing username without password is refused400, and omitting username removes stored authentication. The approved update behavior is implemented/tested; the task explicitly records leaving its bounded guide line unwritten because generation failed. The existing example works and is not misrepresented as broken. Changed guides also lack a successful mandatory docs gate; unavailable environment execution is an evidence gap, not proof the code is wrong or new product ambiguity.
+
+Smallest closure: add the bounded update explanation at the existing relay guide, regenerate the existing corpus through its generator, and obtain `mise run docs:check` evidence. No new guide, production feature or documentation refactor is required.
+
+## Verification, process and limits
+
+Root reports fresh candidate-bound `mise run ui:check`: 105 tests passed, zero Svelte errors/warnings; `mise run test:platform:journey`: 97/97 passed in 57.948s, preceded by exact wyrd-sql and vala-sql migration/idempotence tests 1/1 each. Fresh `codegen:check` also passes. These results strengthen exercised rows without proving the retained missing paths. Root's `test:identity:ui` exits 100: Rust entry points 1/2, production BFF browser tests 5/5 pass, onboarding browser tests fail 6/7 with signup503/mail timeouts. The primary's independent diagnosis traces the mapped port through lifecycle/env/Rust without finding a changed value; a forwarding fault remains a hypothesis, not an established cause. Root retains the exact receipt and diagnosis separately. No clean identity-UI rerun is claimed. Other clippy/tenant/dependency/docs outcomes are historical task evidence unless root records a fresh rerun. No tests were run by this validator.
+
+Behavior and TDD are separate. Preserve C12 first-contact race and S5–S7 production-before-test history; C13 supersession/contact-revision/admission/bounded-send/SQL one-use late tests; C16 PartB recovery S5 and PartC S3 callback/SSO/pop-up late tests; and earlier recorded task violations. Later mutation or temporary code removal does not create test-first history. Do not prescribe churn or impossible historical RED to repair these records.
+
+Prior earlier-cycle findings remain closed by their prior bounded verdicts; these are new material paths and evidence gaps introduced/assigned in cycles12–16, not expanding expectations after two failed repairs. No contract clarification is needed for retained findings. Mandatory independent reports are present; hence FIX_REQUIRED, not BLOCKED. Full startup/official-image qualification, live Google/GitHub/Cloudflare smoke, final cross-surface launch proof, fresh visual rerun and broad change-level gates are not claimed. Source was immutable; review did not implement, merge, push or deploy.

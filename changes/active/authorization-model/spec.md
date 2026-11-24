@@ -1,6 +1,6 @@
 ---
 id: SPEC-authorization-model
-revision: 9
+revision: 11
 status: approved
 ---
 
@@ -29,8 +29,9 @@ upgrade, existing-data conversion, token-reissue campaign or mixed-version rollo
 
 Revision 3 adds social signup and sign-in. An operator enables Google/GitHub;
 Sam accepts an addressed invitation and receives its scoped access, or creates
-a new workspace and becomes its administrator. Sam can explicitly connect
-another sign-in method to that same User. A tenant can require company SSO.
+a new workspace and becomes its administrator. A tenant can require company SSO.
+Explicitly connecting/removing another sign-in method is deferred from launch
+under revision 11; different methods can resolve to separate Users.
 Each invitation is a single-use link the administrator can copy; when an
 operator configures SMTP, Wyrd also emails it. No particular email provider is
 required.
@@ -46,7 +47,8 @@ operator-UI credential blocker. Operators sign in to **Platform admin** using th
 existing platform OIDC connection or a platform-user password without an IdP;
 workspace administrators remain **workspace admin**. The maintainer explicitly
 approved this behavior and the foundations-first, build-once order on 2026-11-21.
-Nothing ships until the complete carryover is done.
+Revision 11 narrows the remaining launch scope: complete carryover cycles 1–16
+and the retained SSO/verification work, excluding deferred cycles 17–18.
 
 Revision 8 moves this change's secrets and keyed values onto the shared
 stored-secret encryption of
@@ -526,6 +528,13 @@ limits.
 
 ### REQ-015 — Explicit linking preserves the User and its access
 
+**Revision-11 delivery status:** self-service linking, password addition to a
+social-only User and method removal are deferred, not launch acceptance. The
+behavior below remains the future contract if those capabilities are implemented;
+do not build their UI, endpoints or proof orchestration in the remaining task.
+Operator-wide invalidation required by shipped controls and REQ-012, and the
+shared password-validation/reset safeguards below, remain required.
+
 In account settings, a User freshly proves their existing allowed method within
 five minutes, then proves the additional provider in a purpose-bound linking
 transaction. A stale cookie or API-key recovery session alone is insufficient.
@@ -569,6 +578,35 @@ existing password/social browser sessions and CLI renewal become unusable under
 the established freshness rules. Disabling policy does not resurrect revoked
 sessions. Existing grants and token lifetime/revocation rules remain applicable;
 no instantaneous global revocation guarantee is added.
+
+Revision 11 fixes the remaining administration flow. Reuse tenant Authentication
+settings beside the existing company connection. An admin-only read reports the
+policy and its revision, current company connection ID/revision and readiness,
+and a count of active Users without a usable identity for that connection;
+disabled Users and Services are excluded. The count is an informational warning,
+not a requirement that all Users enroll before enablement. Show explicit
+confirmation. Enable submits the observed policy and connection revisions;
+Rust rechecks current tenant-admin authority and fresh company proof through
+that same current tested Active connection at the mutation boundary. A stale
+revision refuses with conflict and requires reload; refused changes have no effect.
+Ordinary Disable also requires fresh company-admin proof; unavailable SSO uses
+the existing independent operator-assisted recovery path.
+
+Fresh company proof retains the existing tenant five-minute successful-provider-
+sign-in meaning, not a new universal upstream password/MFA re-entry guarantee.
+If stale, sign in through the existing company flow and return to settings for
+explicit confirmation; no pending mutation runs automatically after login.
+Bearer/API-key possession, connection-test proof and an MCP write scope do not
+substitute for this human proof. Existing ordinary connection administration and
+independent recovery retain their current authority requirements.
+
+Linking is not a prerequisite: existing company first-login provisioning and
+verified group mapping, or existing explicit tenant-admin grants to that company
+User, establish a company-authenticated administrator before enforcement. A
+password/social User and a company User remain separate; their grants, keys and
+principal IDs are not merged or transferred automatically. Disabling policy
+permits new allowed-method logins, but does not revive invalidated credentials,
+including credentials not presented while enforcement was enabled.
 
 Preserve existing personal/Service API-key policy and independent operator-assisted
 recovery. Ordinary password/social login cannot bypass tenant policy. Company
@@ -980,7 +1018,7 @@ absence of forbidden side effects, not only UI success messages.
 | AC-003: Access changes affect existing sessions and credentials predictably | Copy a safe request, grant through HTTP/CLI, use the existing session, then remove/change through the UI. Observe healthy propagation, warm cache reuse, restricted/delegated limits and agreement across callers. Interrupt confirmation to prove known-invalidated refusal and the five-minute maximum with bearer requests independent of browser-store availability. | REQ-001, REQ-004, REQ-005, REQ-008, REQ-009, REQ-010 |
 | AC-004: An operator enables social login and an administrator invites a team | Set up/test/enable Google and GitHub through operator UI/APIs beside company SSO; tenant-admin changes to shared settings fail. Without SMTP, paste 10+ recipients with scoped access and copy each returned link; configure a local SMTP test server and observe separate emailed links, send outcomes and pending/resend/revoke state. Accept links using allowed password/provider methods; stranger login, expired/revoked/superseded/replayed links, an already-owned provider identity and concurrent redemption gain no unauthorized User/grant. SMTP failure is visible beside the returned link and creates no active User. Returning social login preserves access and company/direct bindings; another tenant remains separate. | REQ-011, REQ-012, REQ-013, REQ-017; preserves REQ-001, REQ-008 |
 | AC-005: A visitor creates a workspace and becomes its administrator | With signup enabled, prove Google/GitHub identity, choose a new workspace and observe a usable tenant, creator's admin binding and ordinary session. Disabled signup, rate-limit refusal, unavailable admission state and invalidated provider create no active tenant. Exercise replay, concurrent/retried creation, failed initialization and lost session response: no duplicate/ownerless active tenant or takeover of another attempt. An existing tenant's slug/domain grants no entry; no platform principal/privilege or bootstrap key is returned. Revision 5: behind configured trusted ingress, distinct visitors get distinct source windows, a spoofed forwarding header from an untrusted peer is ignored, rotating within one IPv6 /64 shares a window and a missing source refuses start and completion; starting signup leaves no pending signup row (bounded admission counters are allowed) and its flood is throttled before provider work; every throttle carries `Retry-After`; stored admission keys contain no plain identity or address; with a challenge configured, missing/invalid/wrong-hostname/wrong-action/reused tokens and an unavailable provider create no tenant, and unconfigured deployments and non-browser surfaces need none; a replayed or concurrent callback records one proof; the owned-workspace cap refuses a new claim with its quota error across replicas, while resuming an own claim and operator creation are unaffected; a completed attempt keeps no email; an interrupted `creating` attempt is resumed by its owner only. | REQ-011, REQ-012, REQ-014 |
-| AC-006: A User connects a method and the tenant adopts company SSO | Freshly prove a password User's existing method and connect Google/GitHub/company SSO; principal/access/keys remain. Stale/recovery-only proof, conflicts and races cannot transfer identities. Add a password from a social-only User, remove a method and inspect anchor invalidation; last-method removal is refused. Enable company-SSO policy after admin proof and observe refusal of password/social starts, racing callbacks, existing browser sessions and CLI renewals. Provider replacement/removal and policy apply across replicas; API keys and operator recovery retain existing policy. | REQ-012, REQ-015, REQ-016; preserves REQ-002, REQ-004, REQ-005 |
+| AC-006: A tenant adopts company SSO without account linking | Establish a company-authenticated admin through existing company provisioning and explicit grants or verified group mapping. Read the admin-only active-User warning, enable after fresh company proof and observe refusal of password/social starts, racing callbacks, existing browser sessions and CLI renewals across replicas. Ordinary Disable requires fresh company-admin proof and never revives invalidated credentials, including credentials unused while enforcement was enabled. Connection outage/replacement/deactivation never enables fallback; API keys, independent operator recovery, other tenants and platform login retain their policy. Revision 11 defers self-service linking/password-add/removal and their preservation/race assertions. | REQ-012, REQ-016; preserves REQ-002, REQ-004, REQ-005 |
 | AC-007: Local verified-email creation works with private defaults preserved | Defaults advertise no usable signup and anonymous creation writes no tenant. Enable signup/password/SMTP; email proof precedes credentials, then one workspace/admin/verified contact/password session is created. No pending signup row before proof except bounded counters, no bootstrap secret, no duplicate on replay/concurrency/lost response. Without SMTP local signup is absent; social acquisition needs a validated provider contact or bound Wyrd proof, while invitations remain offline-capable. | REQ-011, REQ-012, REQ-013, REQ-014, REQ-017 |
 | AC-008: Setup yields a human admin and ordinary CLI access | With no SMTP/IdP, setup's named admin signs in and approves the real CLI device code. Missing noninteractive credentials claim nothing; rerun/crash does not duplicate/reset admins or activate unusable tenants. Automation/recovery output remains separate. Public signup User also approves the same tenant-bound device flow. | REQ-002, REQ-014 |
 | AC-009: Discovery reveals verified workspace links only | Known/unknown requests disclose nothing before browser-bound proof. Proof returns bounded deduplicated active links, never User IDs or a login session. Separate tenant passwords/grants remain independent; revoked/replaced contacts, disabled Users, retired tenants, stale rows, cross-tenant references and unavailable validation reveal nothing. Projection lag may omit links. No SMTP hides discovery. | REQ-011, REQ-017 |
@@ -1040,6 +1078,39 @@ The bounded verified-email discovery projection and email proof metadata are
 explicitly included; neither creates a global identity account.
 Email invitations do not add delivery/notifications to REQ-009's access-request
 copy flow.
+
+### Revision 11: remaining launch scope and SSO administration
+
+Maintainer-approved 2026-11-23 in the explicit instruction to defer carryover
+cycles 17–18 and create one task for cycles 19–20, accepting their design
+recommendations. Self-service linking, password addition to a social-only User
+and method removal are deferred; they are not launch blockers. Their future
+REQ-015 contract remains documented, and existing provider-disablement,
+credential-invalidation, password-validation and recovery safeguards remain
+required for every shipped capability. No shipped feature is weakened.
+
+[TASK-003-carryover](tasks/TASK-003-carryover.md) retains cycles 1–16 and their
+evidence. [TASK-004](tasks/TASK-004-company-sso-and-launch-verification.md) owns
+company-SSO enforcement and connected launch verification (former 19–20), with
+no dependency on deferred linking/removal. REQ-016 above records the agreed
+warning, proof, revision-conflict, no-linking adoption and no-resurrection
+semantics. This delivery decision supersedes the earlier requirement to finish
+all twenty carryover cycles before launch; it does not assert deployment
+readiness or completion of unfinished retained work. The original TASK-001/002
+contracts and evidence remain unchanged.
+
+The existing approved tenant policy/identity/session/device/refresh/revision
+stores support this flow; no new persistence purpose, dependency, credential
+channel or recovery system is approved. Required safe methods/settings metadata
+and existing authorized-management projections remain within REQ-011/017;
+human-proof mutations use the Rust-owned browser HTTP channel, not unrestricted
+bearer/CLI/MCP setters. Live Google/GitHub smoke remains required evidence for
+shipped social flows; missing access is a disclosed unfinished verification item,
+not a silent waiver. No self-service method-management API is added by planning.
+
+### Revision 10 addendum: reserved signup slugs
+
+Maintainer-approved 2026-11-23. A self-service signup completion cannot claim a reserved slug (`admin`, `administrator`, `api`, `app`, `auth`, `billing`, `help`, `login`, `mail`, `platform`, `root`, `security`, `signup`, `status`, `support`, `system`, `www`, `wyrd`). It is refused with the same `409` as a taken slug and creates nothing. Operator creation through the platform API is unrestricted. No migration. Extends REQ-011/AC-005.
 
 ## Revision history
 
@@ -1107,3 +1178,10 @@ existing platform admission counters, amended in the unshipped migration
 rather than by a new one. The security posture's sign-in start note is
 reconciled to server admission. Approval does not authorize staging, commits
 or pushes.
+
+Revision 11 — status: approved; revision: 11; approval recorded: 2026-11-23.
+The maintainer explicitly agreed to defer cycles 17–18, accepted recommendations
+for cycles 19–20, and requested one new execution task plus deferral markers in
+the current packet. This revision records that scope and the REQ-016 details;
+frontmatter now includes approved revisions 10 and 11. It authorizes planning,
+not production edits, deployment, staging, commits or pushes.

@@ -3,29 +3,41 @@ id: TASK-003-carryover
 kind: implementation
 status: proposed
 spec: SPEC-authorization-model
-spec_revision: 7
-requirements: [REQ-002, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018]
-acceptance: [AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013]
+spec_revision: 11
+requirements: [REQ-002, REQ-011, REQ-012, REQ-013, REQ-014, REQ-017, REQ-018, REQ-019, REQ-020]
+acceptance: [AC-004, AC-005, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014, AC-015]
 depends_on: [TASK-003]
 ---
 
 # Complete onboarding, platform console and remaining social login
 
+**Current ownership (maintainer-approved 2026-11-23, spec revision 11):** this
+carryover owns cycles **1–16** and their existing evidence. Cycles **17–18 are
+DEFERRED** from launch. Cycles **19–20 are TRANSFERRED** to
+[TASK-004](TASK-004-company-sso-and-launch-verification.md), which has no
+linking/removal prerequisite. Finish the retained work; no historical statement
+that all twenty cycles must finish overrides this scope decision. Earlier
+revision/staged-migration descriptions below are historical context, not current
+migration authority or permission to edit an applied migration.
+
 After this task, an operator can establish a usable human admin without an IdP,
 visitors can create verified workspaces when enabled, and returning people can
 find workspace links and reset existing passwords through verified contacts.
 The delivered UI and clients consume the same Rust methods, provisioning and
-session owners; linking, invalidation and required company SSO complete the
-remaining social-login journey. Pre-registered operators can sign in to the
-platform console without a browser-held bootstrap key. Nothing ships until all
-cycles are complete; each capability is built once in its final form.
+session owners. Required company SSO and final connected verification are owned
+by TASK-004; self-service linking and removal are deferred. Pre-registered
+operators can sign in to the platform console without a browser-held bootstrap
+key. Retained launch work must be complete; each capability is built once in
+its final form.
 
 ## Inputs, ownership and dependencies
 
-Implement [approved spec revision 7](../spec.md), using finalized
+Implement the retained scope under [approved spec revision 11](../spec.md), using
+finalized
 [onboarding](../design/onboarding.md) (End-to-end journeys, HTTP contracts and
 configuration, Proofs/persistence/abuse, all eight decisions) and
-[social login](../design/social-login.md) (explicit linking/removal and company SSO).
+[social login](../design/social-login.md) (retained login/invitation behavior;
+linking/removal is deferred and company enforcement belongs to TASK-004).
 Revision 7 records the maintainer's explicitly approved 2026-11-21 platform-console
 and build-once decisions in REQ-018 and Revision history; those supplement the
 finalized onboarding/social design without inventing retroactive design notes.
@@ -97,7 +109,8 @@ No cycle creates an interim contract, pending-row signup implementation or
 provisioning/session engine for a later cycle to replace. Shared owners take the
 final local/external proof union and persistence purposes from the outset;
 later cycles add consumers/transport-specific proof, not replacement machinery.
-The original TASK-003 cycles 7–10 remain the final four cycles here.
+The original TASK-003 cycles 7–10 became cycles 17–20 below; their current
+deferral/transfer markers govern, not their historical acceptance text.
 
 ### 1. Trusted source, IPv6 /64 and missing-source refusal
 
@@ -848,10 +861,79 @@ directory-update owner once here; recovery below consumes its output.
   - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(=pg_auth_contacts::pg_tests::contact_replacement_takes_effect_only_at_its_expected_revision)"'`. GREEN: 1 passed.
   - Mutation check: without the guard it fails with `(Some(1), Some(2))` against `(Some(1), None)`.
   - TDD VIOLATED for this fix: the guard was written before its test.
-- Still open in cycle 12:
-  - a second User's session;
-  - contact and discovery admission budgets;
-  - the discovery directory and its revalidation;
+- Scenario 2, bounded discovery with revalidation:
+  `platform_admin_e2e::contacts::a_visitor_discovers_only_live_workspaces_for_a_verified_address`
+  (same file). It covers these cases:
+  - without a relay, a request gets 403 `METHOD_UNAVAILABLE`;
+  - verified contacts reach the directory within the propagation bound (`within_propagation`);
+  - known and unknown addresses both get exactly `202 {"status":"check_email"}` and a binding cookie, and the mail names no workspace;
+  - the proof without its binding cookie gets 401;
+  - in its own browser it gives 200 with exactly `tenant`, `display_name` and `login_url` per workspace. The links are fixed same-origin `/t/{slug}/login` paths, in route-key order, with no `next_cursor`, and a read cookie is set. An unknown address gets an empty list;
+  - the same browser repeating a spent proof gets the same page;
+  - replacing one contact, suspending one User and retiring one tenant (through SQL; there is no retirement surface) each drop that workspace at once, before reconciliation;
+  - a listed workspace still needs its own sign-in (401 without a session).
+  - RED: 401 from the middleware for the unmatched route `/auth/browser/workspaces/request`.
+  - GREEN: 1 passed.
+  - A first GREEN attempt saw an empty directory. Cause: an unbound `WyrdTestServer` starts only `authorization_cache` and leaves the other workers for `bind()`, so the new `workspace_directory` worker never ran under `oneshot`. Fix site: `WyrdTestServer::propagate_authority` (`crates/wyrd/wyrd-testing/src/server.rs`), which now also starts `workspace_directory`. Callers: every unbound test server.
+- Implementation:
+  - Schema: unshipped migration 0008 edited in place (spec revision 6 "Workspace discovery directory" and "Proven email … discovery … proof and one-use redemption"; maintainer approval: "nothing has shipped").
+    - `platform.workspace_directory` holds tenant, User, the HMAC address key and the contact revision.
+    - `platform.discovery_proofs` holds the proof digest, browser digest, read deadline and expiry.
+    - Both force operator-only RLS.
+    - A trigger on `wyrd.auth_user_contacts` notifies `wyrd_contact`.
+  - Owners: `SocialSignIn` in `wyrd-auth/src/social/discovery.rs`, the queries in `wyrd-sql/src/queries/platform/discovery.rs`, `live_contact`/`tenant_contacts`, and a `workspace_directory` worker on the existing `NotificationListener`.
+    - The worker reprojects a User on each notification and resyncs every live tenant on each (re)subscribe.
+    - Each page revalidates the active User and the exact current contact and revision through the tenant's connection. Any failure omits the workspace.
+    - Spent proofs are purged by the existing maintenance purge.
+  - Routes: `POST /auth/browser/workspaces/request`, `POST /auth/browser/workspaces/verify` and `GET /auth/browser/workspaces?cursor=`.
+- Lane regressions fixed: the full lane named below turned up two stale fixtures from merge 70a56a136, which predate operation-bundle roles. A read-only diagnostician found them; its report is summarized here.
+  - `pg_approvals::a_decision_outlives_its_retry_receipt`: `editor` no longer approves (`builtin_roles.rs`), so the test now uses `["approver","viewer"]` like its siblings.
+  - `pg_operator_connection_routes::renewal_keeps_revocation_and_refuses_without_authority`: a raw role row carried `"scope"`, which `Operation` refuses. The test drops it, like the same file's `:694`.
+  - Both pass. Neither assertion changed.
+- Not fixed, outside this task: `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees` fails intermittently (2 of 5 solo runs, and once in the lane).
+  - Cause, from a read-only diagnostician: after the runner admits an attempt, its input read's Oracle admission joins the operation and waits out the 20 s execution deadline while pressure is `Critical` (`runner.rs:808-813`, `oracle/mod.rs:2342-2346`, `workload.rs:622-660`). The working-tree diff is not involved.
+  - Fix site: the verification runner's nested admissions, which are on a hot path. Left for a maintainer decision.
+- Scenario 3, email request budgets: `platform_admin_e2e::contacts::email_requests_are_admitted_before_any_mail_is_sent` (same file). It covers these cases:
+  - one address asked about seven times always gets the same `202 {"status":"check_email"}`, but only five messages reach it (silent recipient throttle);
+  - one source asking about many addresses is refused on its 21st request with `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` and a `Retry-After` equal to `details.retry_after_seconds`. Nothing is mailed to the refused address, and another source is still served;
+  - a signed-in User asking to verify address after address is refused on the 6th request with the same 429, and nothing more is mailed.
+  - RED: `the address budget stops mail`, left 7, right 5 (every request mailed).
+  - GREEN: 1 passed. The contacts and signup modules then passed twice in a row (14 tests).
+  - Implementation:
+    - `SocialSignIn::admit_email` (`wyrd-auth/src/social.rs`) runs before any mail, on the existing `platform.signup_admissions` windows.
+    - Three new scopes: `email_source` (20 an hour), `email_account` (5 an hour), and `email_address` (5 an hour, keyed per purpose so a discovery flood cannot withhold a reset).
+    - The scope CHECK is in the unshipped migration 0006, edited in place (spec "Apply separate shared source and address/account budgets, including resend, … for signup/contact verification, discovery and reset"; "Source throttles may return `429`"; maintainer approval: "nothing has shipped").
+    - New stable code `WYRD_AUTH_429_EMAIL_ATTEMPTS` with `Retry-After`; projections regenerated (`codegen:regen`, UI catalog) and the errors reference updated.
+    - The two request handlers take `RequestSource`. `request_contact` now takes the `ContactRequest` body (the argument limit).
+  - First GREEN attempt: the earlier discovery journey failed because it asks about one address six times across contact and discovery. Cause: the address window was shared across purposes. It is now keyed per purpose. The 10-an-hour source limit then refused that journey's twelfth request from one browser; it was raised to 20 to match signup starts. The new test was adjusted before its first commit.
+  - Unexplained, not reproduced: in one combined run, `platform_admin_e2e::signup::completion_consumes_either_proof_and_recovers_its_own_claim` failed once. Its panic was lost to output trimming. It then passed in 5 runs, 3 of them under clippy load. One Mailpit `connection refused` also happened once while the teammates' test stacks were starting, and passed on rerun.
+- Scenario 4, a contact flow belongs to the User who began it: `platform_admin_e2e::contacts::a_contact_flow_belongs_to_the_user_who_began_it`. It covers these cases:
+  - another recent User of the same tenant presenting the flow cookie and the real proof gets 401 `ONE_TIME_CODE_INVALID`, and nothing is stored;
+  - the owner then completes the flow (204, one contact);
+  - a session for `harbor` asking for `cove`'s contact gets 401, mails nothing and stores nothing.
+  - No RED: the User and tenant checks shipped with scenario 1 and passed on first run. Mutation: dropping `user != principal.id` in `verify_contact` fails the test (204, expected 401). The code was restored.
+- Scenario 5, discovery pagination: `platform_admin_e2e::contacts::a_discovery_read_pages_through_every_workspace`.
+  - 23 workspaces for one address. Contacts are seeded through SQL because the per-purpose address window allows 5 verifications an hour; the projection still arrives through the real notification worker.
+  - The first page lists 20 in route-key order with `next_cursor`. The read cookie and that cursor return the last 3 with no cursor. Without the read cookie the next page gets 401.
+  - TDD VIOLATED: the paging code went in with scenario 2, before this test, which passed on first run. Mutation: returning no cursor from a full page fails the test (`a next cursor`). The code was restored.
+- Scenario 6, purpose and read expiry: `platform_admin_e2e::contacts::only_a_live_discovery_proof_reads_workspaces`. It covers these cases:
+  - a contact proof and flow cookie presented as a discovery flow get 401 and no read cookie;
+  - a discovery proof presented to contact verification gets 401, and the contact is unchanged;
+  - once the spent proof's read deadline passes (aged through SQL), the same browser's repeat gets 401.
+  - TDD VIOLATED: the code came with scenario 2. Mutation: dropping `read_until > statement_timestamp()` from `spend_discovery_proof` fails the test (200, expected 401). The code was restored.
+  - Not proven: expiry of the pre-proof sealed envelope. Its deadline is sealed in the cookie and checked by the shared `require_live` against the database clock, which no journey can advance. Signup has the same gap.
+- Scenario 7, reconciliation and revalidation: `platform_admin_e2e::contacts::the_directory_heals_and_discloses_only_what_it_revalidates`. It covers these cases:
+  - harbor's entry is deleted and a stale cove entry inserted, then the worker's LISTEN backend is terminated. The worker resubscribes and resyncs to exactly `["harbor"]`;
+  - with `SELECT` on contacts revoked from `wyrd_tenant`, discovery lists nothing, and after the grant it lists harbor again.
+  - TDD VIOLATED: the code came with scenario 2. Mutations: skipping the stale-entry removal fails the test (`["cove","harbor"]`), and treating a failed revalidation as valid fails it too. The code was restored.
+- SQL structure: `pg_auth_contacts::pg_tests::discovery_tables_hold_only_digests_behind_forced_rls`.
+  - `platform.workspace_directory` has exactly `data_tenant_id, user_id, address_key, contact_revision`.
+  - `platform.discovery_proofs` has exactly `proof_hash, browser_binding_hash, read_until, expires_at`.
+  - Both enable and force RLS. A tenant connection, each on its own transaction, is refused with exactly SQLSTATE 42501 ("permission denied"), while the platform owner writes them. An earlier draft accepted any SQL error; the commit hook flagged it and it was tightened.
+  - Structural proof, so no RED applies. Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(/pg_auth_contacts/)"'`.
+- Invalidating old-contact reset proofs landed with cycle 13 (`wyrd.auth_password_resets.contact_revision`; scenario `platform_admin_e2e::resets::a_reset_code_refuses_every_stale_or_foreign_use`), merged in c27c06f79.
+- Cycle 12 status: IMPLEMENTED. Every case has a runtime or structural proof except expiry of the pre-proof sealed envelope (see scenario 6).
+  - TDD VIOLATED for: the first-contact race fix, pagination (scenario 5), purpose and read expiry (scenario 6) and reconciliation and revalidation (scenario 7). In each, the code preceded its test, and a mutation check shows the test now catches the defect.
   - removing the old revision's reset proofs (the reset owner is cycle 13).
 - Commands:
   - the Postgres journey command, with selector `test(=platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact)`;
@@ -861,6 +943,65 @@ directory-update owner once here; recovery below consumes its output.
   - `mise run check:tenant-isolation`.
   All are clean.
 - TDD: PASS for scenario 1.
+- Scenario 2, every stale or foreign use refuses and the offline paths stay usable:
+  `platform_admin_e2e::contacts::a_reset_code_refuses_every_stale_or_foreign_use` (same file).
+  It covers these cases:
+  - a mailed code replaced by a newer request, then the newer one once expired (both aged
+    16 minutes in SQL), each get `401 ONE_TIME_CODE_INVALID`;
+  - a contact proof used as a reset code (wrong purpose), and a code mailed before the contact was
+    replaced (old contact), each get `401`; the password is unchanged afterwards;
+  - with company SSO required (policy row set in SQL), a request gets `403 METHOD_UNAVAILABLE` and
+    a live mailed code gets `403` at redemption;
+  - an operator reset for a social-only User (inserted in SQL) gets `404`, so no reset adds a password;
+  - with the relay removed (SQL, as no relay-removal surface exists), a request gets
+    `403 METHOD_UNAVAILABLE`, while a code mailed before and an operator-issued code both reset
+    (`204`) and their new passwords sign in.
+  - RED: none. The first run failed only in setup (the test's social-only insert used a retired
+    `auth_type`; fixed to `oidc`). Every assertion before it already passed.
+  - GREEN: 1 passed.
+  - Mutation check: without the mailed-code supersession, or without the contact-revision check, the
+    test fails with `204` where `401` is expected.
+  - TDD VIOLATED for the replaced and old-contact cases: their production code (supersession in
+    `insert_password_reset`, the contact-revision check in `password_reset`) went in with
+    scenario 1, before this test. Expired, wrong-purpose, SSO, relay removal, operator offline reset
+    and social-only are existing redemption behavior, proved here as regressions.
+- Scenario 3, throttled without locking or disclosing delivery:
+  `platform_admin_e2e::contacts::reset_requests_are_throttled_without_locking_or_disclosing_delivery`
+  (same file). It covers these cases:
+  - five requests for one User all get the generic `202`; once the account window shows five counted
+    attempts, exactly three codes were mailed, and the password still signs in (no lock);
+  - one source gets `202` thirty times, then `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS` with
+    `retry_after_seconds`; another source is still admitted;
+  - with the relay pointed at a local listener that answers `554`, the request still gets the generic
+    `202`. After the listener saw the attempt and the relay was restored, only a new request mailed a
+    code (one message), that code reset, and the listener saw no second attempt (no retry).
+  - The test polls Mailpit and the admission row with a 10-second deadline, because sends run after
+    the answer. It has no fixed sleep.
+  - RED: none; it passed on its first run.
+  - GREEN: 1 passed. Mutation check: without the account window it fails with five messages against three.
+  - TDD VIOLATED for the account and source windows and the bounded send: they went in with scenario 1.
+- SQL integration: `pg_auth_contacts::pg_tests::mailed_resets_replace_mailed_codes_and_are_consumed_once`
+  (`crates/wyrd/wyrd-sql/tests/integration/pg_auth_contacts.rs`). A mailed reset replaces the earlier
+  mailed one and not the operator code, keeps its contact revision, and two racing consumptions of one
+  code have one winner. GREEN: 1 passed (beside the cycle-12 test, 2/2). TDD VIOLATED: written after
+  the query change.
+  - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner &&
+    cargo nextest run --locked -p wyrd-sql --test integration -E "test(/^pg_auth_contacts::/)"'`.
+- Commands (all clean):
+  - the Postgres journey command with each scenario's exact selector, and with
+    `test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/)` (90/90, the existing operator
+    reset and browser-session regressions included);
+  - `cargo nextest run --locked -p wyrd-auth -p wyrd-sql --lib -E 'not test(/pg_tests::/)'` (125/125);
+  - `mise run fmt`; `cargo clippy --locked -p wyrd-spec -p wyrd-sql -p wyrd-auth -p wyrd-server
+    --features wyrd-server/test-support --all-targets -- -D warnings`; `mise run codegen:check`;
+    `mise run check:tenant-isolation`; `git diff --check`.
+- Left open:
+  - The timing comparison is a coarse median check (within the other classes' median, or 25 ms).
+    The public path is the same code for every account, because all account work runs after the answer.
+  - Social-only Users have no username, so a reset request cannot name them. The journey proves the
+    operator path refuses them (`404`); the mailed path finds no local credential by construction.
+  - No relay-removal or tenant-policy write surface was needed here; the tests set both in SQL.
+  - MCP and `wyrd-client` projections of the reset request are not added (as for signup).
 
 ### 13. Verified contacts support private self-service reset
 
@@ -887,6 +1028,54 @@ reset still works; removing SMTP does not invalidate issued codes.
 **Proof:** tier-1 Rust/HTTP/Mailpit → redemption → real local session/device renewal
 and key use, plus tenant SQL one-use/contact-revision integration. RED is missing
 reset-request/send isolation; existing contact and reset redemption are reused and regressed.
+
+**Cycle 13 evidence.**
+
+- Scenario 1, a verified contact resets a forgotten password:
+  `platform_admin_e2e::contacts::a_verified_contact_resets_a_forgotten_password`
+  (`crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/contacts.rs`).
+  It covers these cases:
+  - three rounds of requests for a verified User, an unknown username, an unverified User, a
+    suspended User with a verified contact and an unknown workspace all get `202`
+    `{"status":"check_email"}`; the verified User's median answer time is within the others'
+    median (or 25 ms) of theirs;
+  - only the verified User's contact is mailed: three messages, each with the workspace reset page
+    `/t/quay/reset` and one code to paste that is on no URL line; the suspended User's contact gets none;
+  - the newest code gives `204` with no session cookie; the old browser session gets `401`, the
+    CLI refresh token from a real device approval (which renewed once before) is refused, the
+    personal API key still exchanges, the old password is refused and the new one signs in;
+  - the contact receives one "password was reset" notice without the password; the same code then
+    gets `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`.
+  - RED: `contacts.rs:710`, `401 WYRD_AUTH_401_UNAUTHENTICATED` for the unmatched route
+    `/auth/browser/password/reset/request` (the route did not exist). All setup before it
+    (contacts, Users, key, device sign-in and renewal) passed.
+  - First run failed in setup: the test's own username `cy` is shorter than the 3-character
+    minimum (`400` from `POST /v1/principals/users`). I renamed it `cyd`; no assertion changed.
+  - GREEN: 1 passed; 4 more consecutive runs in one container passed.
+  - In those reruns the cycle-12 journey failed at `contacts.rs:283` ("nothing was mailed")
+    only because Mailpit keeps the first run's messages to the same address inside one container.
+    Its first run in the container passed; a fresh container is the lane's setup.
+- Implementation:
+  - `POST /auth/browser/password/reset/request` `{tenant, username}` (`PasswordResetCodeRequest`).
+    The handler admits the request in its per-source window (`429 PASSWORD_ATTEMPTS`), refuses
+    with `403 METHOD_UNAVAILABLE` when the tenant's methods report does not offer
+    `password_reset` (no relay, password off, or company SSO required), then answers `202`.
+  - `SocialSignIn::request_password_reset` (`wyrd-auth/src/social/contacts.rs`) answers before any
+    account read. A process semaphore (16 permits) bounds the spawned send; with none free the
+    request sends nothing. The send resolves the tenant, counts the account window silently (3
+    messages per hour), and mails only an active local password User with a verified contact.
+    The code is issued through the existing `issue_password_reset`, bound to the password
+    revision and the contact revision, and replaces the User's earlier mailed codes. Mail goes
+    after the commit; a failed send is logged and not retried.
+  - Redemption reuses `BrowserSessions::password_reset`. A mailed code also needs its contact
+    revision to still be current, which is how a contact replacement invalidates old-contact codes.
+    After the commit the verified contact is told.
+  - Schema, both edited in place (unshipped, maintainer-approved): `platform.signup_admissions`
+    scopes gain `reset` and `reset_account` (`20261121000006`), and
+    `wyrd.auth_password_resets` gains a nullable `contact_revision` (`20261121000008`). Both cite
+    the spec's revision-6 "Recovery and admission metadata" row and the "reset-contact revision
+    validity" support property. No new table.
+- TDD: PASS for scenario 1.
 
 ### 14. Platform operators obtain isolated browser sessions and re-authenticate
 
@@ -919,6 +1108,105 @@ RED is missing platform browser purpose/local credential/fresh-proof enforcement
 current platform API-token login is reused, not presented as browser proof.
 Production browser and host-routing proof follows cycle 16 after mock approval.
 
+#### Cycle 14 evidence
+
+Selector prefix: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --no-fail-fast -E "test(=<selector>)"'`.
+
+Schema (spec revision 9, REQ-018 / AC-013 platform-user password and platform
+browser sessions): migration `20261123000001_platform_console_sessions.sql`
+extends `platform.principals` (password verifier and revision, `user` only),
+`platform.oidc_connection` (revision) and `platform.login_state` (purpose,
+browser binding, re-auth session), and adds forced-RLS
+`platform.browser_sessions`. Like every other `platform.*` table it has no
+`data_tenant_id`: the platform plane is tenant-free by design.
+
+Decisions: password attempts share the existing per-source `admit_sign_in`
+window; "retiring a workspace" is the existing tenant suspension
+(`PUT /platform/tenants/{id}/status`), as no other retirement surface exists;
+fresh proof is enforced on browser-session callers only, so platform API tokens
+(the CLI/API break-glass channel) are unchanged; a platform-user password counts
+as a usable way in for the last-administrator guard.
+
+1. `platform_admin_e2e::console::a_registered_operator_signs_in_with_a_platform_password`
+   - RED: `POST /platform/admins {"name":"ops"}` returned 422 (`match_claim`
+     required; no IdP-free registration or platform password existed).
+   - GREEN: authorized registration without a claim, policy-checked
+     `PUT /platform/admins/{id}/password`, `POST /platform/browser/password/login`
+     (wrong/unknown/root-key-as-password 401 with no cookie, missing Origin 403),
+     regenerated opaque host-only Secure/HttpOnly/SameSite=Lax `Path=/platform`
+     cookie with token-free metadata, cookie use on platform reads and
+     same-origin mutations, tenant cookie refused on platform routes, platform
+     cookie refused on tenant routes and as a tenant cookie, logout revoking only
+     its own session, API token unaffected. 1 passed.
+
+2. `platform_admin_e2e::console::platform_console_sessions_end_on_every_replica`
+   - RED: after suspending and reactivating the operator, its old session
+     resolved again (`after active`: 200, expected 401). TDD note: steps 1–3
+     (idle expiry, activity capped at the absolute deadline, logout across
+     replicas) already passed because scenario 1's resolve statement checked
+     both deadlines and revocation; they are regression proof, not new RED. Two
+     earlier failures were test-setup bugs in how the test aged a session and
+     are not counted as RED.
+   - GREEN: suspension revokes the principal's platform browser sessions in its
+     own transaction. Idle expiry and the absolute cap hold on both replicas;
+     a password change ends earlier sessions and only the new password signs
+     in; when the session store cannot be written, a platform cookie gets 503
+     on session reads and platform routes, then works again. 1 passed.
+
+3. `platform_admin_e2e::console::a_registered_operator_signs_in_to_the_console_through_platform_oidc`
+   - RED: `POST /platform/browser/oidc/login` answered 401 "missing
+     X-Wyrd-Access-Token header" (expected 403 without Origin); the route did
+     not exist.
+   - GREEN: `POST /platform/browser/oidc/login` (same-origin, counted in the
+     per-source sign-in window, fixed `{origin}/platform/ui/callback`
+     redirect, `wyrd_platform_login` binding cookie on `Path=/platform`) and
+     `POST /platform/browser/oidc/callback`. The login state records purpose,
+     binding digest and connection revision, and is consumed only with the
+     matching binding. A missing or foreign binding, an unregistered subject,
+     a replay, and swapping API-token and browser states each create no
+     session. The registered subject gets an `oidc` session with no provider
+     token in its body or cookies. Replacing the connection advances its
+     revision and ends the sessions it created; the pinned subject signs in
+     again. Pre-registration and issuer/subject pinning reuse the existing
+     `PlatformSessions` owner: a first-login pin and its browser session
+     commit in one transaction. 1 passed; the existing platform OIDC journeys
+     (7) and `pg_platform_identity` (11) still pass.
+
+4. `platform_admin_e2e::console::destructive_console_changes_need_fresh_password_proof` and
+   `platform_admin_e2e::console::destructive_console_changes_accept_forced_fresh_idp_proof`
+   - RED (both): with proof older than five minutes, `PUT
+     /platform/tenants/{id}/status` (retiring a workspace) returned 200
+     (expected 403). Nothing checked browser freshness.
+   - GREEN: `PlatformCaller::require_recent_proof` runs first in tenant
+     status, social provider configure/enable, login settings, mail relay,
+     OIDC connection configure/remove, admin status and admin password. It
+     refuses only browser sessions whose `fresh_at` is outside the shared
+     five-minute window (`WYRD_AUTH_403_RECENT_LOGIN_REQUIRED`); platform API
+     tokens pass unchanged. With stale proof, retirement, provider, signup
+     settings and SMTP changes all refuse and the API-token readback is
+     unchanged. `POST /platform/browser/password/reauth` checks only the
+     session principal's own password: another operator's password, the
+     bootstrap key or a request with no session refreshes nothing; the right
+     password refreshes in place (no new cookie) and the changes land.
+     `POST /platform/browser/oidc/reauth` begins a login bound to this session
+     with `prompt=login` and `max_age=0`. The callback refreshes only that
+     presenting session, only for a token whose `auth_time` is within five
+     minutes and whose subject is already pinned to the same principal;
+     another registered operator's identity and a 10-minute-old
+     authentication refresh nothing. 2 passed.
+
+5. `platform_admin_e2e::console::maintenance_removes_ended_platform_sessions`
+   - RED: TDD deviation. The test did not compile because the platform
+     session owner had no purge entry point (`PlatformLogin::sessions`,
+     `purge_ended_browser_sessions`), so ended sessions would accumulate.
+     This is a compile-time RED, not a behavioral one.
+   - GREEN: the auth maintenance worker also drains ended platform browser
+     sessions (revoked, idle-expired or past the absolute deadline) in
+     batches of 1000 through `PlatformSessions::purge_ended_browser_sessions`.
+     The journey removes 3 ended sessions in one batch, then 0, and the live
+     session still resolves. Login states that reference a purged session
+     cascade with it. 1 passed.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.
@@ -939,6 +1227,10 @@ edit the mock; extension/approval are future work owned by this cycle.
 **Proof:** review the extended mock against advertised contracts and AC-013,
 record maintainer approval before any new production page. This planning edit
 neither changes the mock nor claims that future visual approval has occurred.
+
+**Cycle 15 status: APPROVED (2026-11-23).** The maintainer approved the extended mock (commits 2d2cdbe26, 1c8773557) and all seven contract readings in the mock README: (1) the proof step reports its method, so the completion page does not infer it; (2) recovery-contact entry appears only when `email_discovery` is offered; (3) no current recovery address is shown; (4) a read exposes whether platform OIDC exists so its button appears only when usable; (5) sign-in on `/platform`, console under `/platform/ui`; (6) retirement is Suspend/Resume; (7) a blank relay password keeps the stored one, with explicit removal.
+
+**Reserved signup slugs (spec revision 10 addendum).** RED: `platform_admin_e2e::signup::signup_cannot_claim_a_reserved_slug` failed with `admin is reserved: {"tenant":"admin"}` (200, expected 409). GREEN: `ProvisionOwner::claim_for_signup` refuses a reserved slug as `SlugTaken` before any write; all 12 signup journeys pass. TDD: PASS.
 
 ### 16. Deliver approved onboarding and platform console pages
 
@@ -972,6 +1264,129 @@ fixtures and actual CLI/client consumers. New page/journey missing-flow assertio
 must fail before production edits; existing signup server evidence is reused, not
 claimed as new RED. Documentation/contract checks complement journeys.
 
+#### Cycle 16 evidence (Part B: tenant onboarding pages)
+
+Journey host: `identity_ui_e2e::onboarding_ui_journey` (one bound server over
+repository Postgres, a production `node build` BFF at a public origin, the
+repository Mailpit as relay) runs `src/lib/server/auth/onboarding.integration.test.ts`
+in real Chromium; it joins `test:identity:ui:suite`. Command:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E "test(=identity_ui_e2e::onboarding_ui_journey)"'`
+after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
+
+1. **Root offers create/find only when usable.** RED before production edits:
+   with mail and signup enabled, `getByRole('link', { name: 'Create a workspace' })`
+   timed out (no link). The same run also showed `/readyz` 503
+   (`forge_coordinator_unavailable` right after bind), which the pages read as
+   "server down"; the journey now waits for readiness before its first page, as
+   an operator would. GREEN: private defaults show neither link and keep the
+   tenant entry; after the operator configures the relay and signup the root
+   page links `/signup` and `/workspaces`. The root load reads the no-tenant
+   `/auth/browser/methods` (`signup`, `email_discovery`).
+2. **Email signup creates a workspace and signs its administrator in.** Merged
+   teammate A's `GET /auth/signup/proof` first. RED before production edits:
+   `/signup` rendered the 404 page ("Unable to open this workspace", not
+   "Create a workspace"). GREEN: the visitor types an address on `/signup`
+   and sees "Check your email"; the Mailpit message links `/signup/verify#proof=…`;
+   opening it POSTs the proof and the address bar ends at `/signup/verify`
+   with no fragment; "Name your workspace" reads the proof method (`email`)
+   and asks for username and password; the reserved slug `platform` answers
+   "That URL is already taken"; retrying with a new slug sends no second
+   message (one message in the mailbox) and lands signed in on `/t/<slug>`;
+   a fresh browser signs in with the passphrase "correct horse battery
+   staple". The pages call `/auth/*` from the browser, so the BFF forwarder
+   now passes the four Rust flow cookies (`wyrd_signup`, `wyrd_signup_email`,
+   `wyrd_discovery`, `wyrd_contact`). Journey fix during GREEN: Playwright
+   request interception cannot follow a fulfilled 303 for a POST navigation
+   (`chrome-error://`), so Chromium now maps the public origin to the BFF with
+   `--host-rules` and nothing is intercepted. Added after GREEN, not a RED:
+   scenario 1 also asserts `/signup` shows the turned-off state by default.
+   Not journey-proven here (no provider fixture in this host): provider
+   signup buttons, the GitHub contact branch and the challenge refusal; the
+   server evidence in `platform_admin_e2e/signup.rs` covers their Rust side.
+3. **Discovery lists the workspace by link or pasted code.** RED before
+   production edits: `/workspaces` rendered the 404 page. GREEN: the signup
+   address asks on `/workspaces` ("Email me a link", "Check your email"); the
+   mailed `/workspaces/verify#proof=…` link lists exactly one workspace,
+   "Journey Research", linking `<origin>/t/<slug>/login`, with no fragment
+   left; a second browser pastes the mailed code on the request page, which
+   opens the same verify page with that code as its fragment, and follows the
+   listed link to the workspace sign-in. Signup's pasted code now takes the
+   same path (`/signup/verify#proof=<code>`). Two test-side corrections during
+   GREEN, diagnosed from the page text and a temporary directory/contact count
+   (directory 1, contact 1, tenant active): Playwright's heading name match
+   is substring by default ("Find your workspaces" matched "Your workspaces"),
+   now `exact`; and Rust answers `login_url` as an absolute same-origin URL.
+4. **Mailed reset code and advertised-only sign-in.** RED before production
+   edits: the signup-created password workspace's login page showed
+   "Sign in with SSO" (count 1, expected 0). GREEN: the login page renders the
+   password form and the "Reset your password" link only when `password` is
+   advertised and the SSO button only for `company_sso`; the reset page asks
+   for a username ("Email me a code") when `password_reset` is advertised,
+   answers every account the same ("If <slug> has a password account named
+   owner…"), takes the mailed code, sets "a brand new passphrase for owner",
+   lands on `login?reset=done` with "Password set.", and that passphrase
+   signs in. Without `password` the reset page shows "Password reset is not
+   available" and no form; without a relay only the pasted-code form shows.
+   The OIDC-off tenant assertion in `production-auth.integration.test.ts`
+   expected an SSO button its tenant does not advertise; it now asserts the
+   button is absent (the `?/sso` refusal it then posts is unchanged).
+   `mise run test:identity:ui` then passed `production_ui_bff_journey`.
+5. **Recovery email from the Account page.** TDD violation, recorded
+   honestly: the Account section and contact verify page were written in the
+   same step as the test, before RED was observed. The first run
+   (`mise run test:identity:ui`, whose UI build predated the contact verify
+   page) failed at the "Recovery email verified" heading; a fresh build is
+   GREEN. The signed-in owner (passphrase sign-in, so recent) opens
+   `/settings/account`, sees the "Recovery email" region only because
+   `email_discovery` is advertised, with no current address shown, sends a
+   verification link, opens the mailed `/t/<slug>/contact/verify` link, and
+   sees "Recovery email verified" with the fragment cleared; a signed-out
+   browser opening a contact link sees "You are signed out" with a "Sign in to
+   <slug>" link instead of a redirect. Scenarios 4 and 5 share one commit
+   because they edit the same wording module and journey file. The commit
+   hook flagged the combined signed-in/signed-out test as hard to read; the
+   signed-out case is now its own test.
+6. **Teammate invitation, enrollment and CLI device approval.** No
+   production change was needed, so there is no production RED; the two
+   failing runs were test mistakes (the invitation mail carries
+   `#invitation=`, not `#proof=`; a bearer token goes in
+   `x-wyrd-access-token`). GREEN: the signup-created owner signs in, invites
+   a teammate from Access → Invite users with a Role and the "all" scope, and
+   sees the pending invitation; the teammate opens the mailed
+   `/t/<slug>/signup#invitation=…` link in a fresh browser, creates
+   `teammate` with a passphrase and lands in the workspace; a `wyrd-cli`
+   device authorization started from that origin is approved on
+   `/auth/device` ("Login approved"), the device code redeems, and the
+   redeemed token reads `/v1/principals/me` as `teammate`. All 7 onboarding
+   journey tests pass.
+7. **Mock alignment sweep.** Every onboarding page and state was screenshotted
+   from the production BFF over the real journey host (dark and light, 1280
+   and 390 wide) beside the mock's `selfcheck.mjs --shots` captures. Fixed:
+   the entry card's narrow-screen padding, underlined footer links, `<b>` and
+   inline `<code>` styling, and the shared field-refusal rules (invalid
+   border, read-only fade, `p.field-error`/`p.done`, `.ok`) now live once in
+   `app.css` as the mock defines them; the problem carries `id="problem"` so a
+   taken slug points at it; the workspace page's password hint is the mock's
+   words, its contact-email field shows its own refusal, and its submit button
+   has the mock's spacing; the reset page checks the new password's length in
+   place and shows "Setting password…"; the expired workspace list shows its
+   refusal in the card's problem slot; the Account section's "Sign in again"
+   state links to sign-in. Remaining deviations, each with its reason:
+   - "Signed in with GitHub as <email>" shows no address: `GET
+     /auth/signup/proof` reports only the method (approved reading 1).
+   - The workspace page shows "Checking this browser's sign-in…" while that
+     read is in flight; the mock knows the method synchronously.
+   - No Turnstile widget and no "below" in the challenge remediation, and the
+     workspace-limit remediation names no number: the public methods answer
+     carries no challenge site key and the refusal carries no cap.
+   - Password fields use the existing `PasswordInput` (with Show), the
+     component every production password field uses.
+   - A 5xx keeps the existing entry card's "✕ Sign-in unavailable" state; the
+     mock defines no server-failure state.
+   - The card sits 33px higher: the mock reserves that for its preview strip.
+   - The Recovery email section is as wide as the Account page's other
+     sections; the mock shows it alone on a placeholder page.
+
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and
 same-operator re-authentication using cycle 14's Rust-owned session and safe
@@ -985,7 +1400,228 @@ BFF forwards only the platform cookie, never a global key or tenant cookie.
 This is the only new-page implementation cycle; later identity/policy cycles
 extend these approved pages for their respective final behaviors.
 
+#### Cycle 16 evidence (Part A: server contracts for readings 1, 4, 7)
+
+Focused runner: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E "test(=<selector>)"'`.
+
+- **Reading 1, `GET /auth/signup/proof`.** Selector `platform_admin_e2e::signup::the_proof_step_reports_its_method`. RED: the unrouted path answered `401 WYRD_AUTH_401_UNAUTHENTICATED` ("missing X-Wyrd-Access-Token header") where `WYRD_AUTH_401_ONE_TIME_CODE_INVALID` was expected. GREEN: no or forged cookie and an expired proof answer `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`; Google, GitHub and email proofs read exactly `{"method":"google"|"github"|"email"}`; a repeated read still completes the Google workspace. Owner: `SocialSignIn::signup_proof_method` over the existing `proven_signup` completion lookup (the completion cookie is a digest-keyed row, not a `SignupEnvelope`; its liveness is the row's `expires_at`, so `require_live` does not apply). Wire: `SignupProofResponse`/`SignupProofMethod` in `wyrd-spec`; no neighbouring signup endpoint has a CLI/SDK or generated TS projection, so none was added. TDD: PASS.
+- **Reading 4, `GET /platform/browser/methods`.** Selector `platform_admin_e2e::console::the_platform_entry_reads_its_sign_in_methods`. RED: the unrouted path answered `401 WYRD_AUTH_401_UNAUTHENTICATED` where `200` was expected. GREEN: with no session, Origin or cookie it answers `{"password":true,"oidc":false}` while OIDC begin is `404`; after `PUT /platform/oidc/connection` it answers `"oidc":true` and begin succeeds; after `DELETE` it is `false` again; it sets no cookie. Owner: `PlatformLogin::configured` reads the same `platform_oidc_connection` row whose absence is `NotConfigured` (404); it does not open the client secret, so the unauthenticated read never calls the key service. `password` is true wherever platform sessions are configured (platform password sign-in has no toggle). Wire: `PlatformSignInMethods` in `wyrd-spec`; no CLI/SDK projection exists for `/platform/browser/*`. TDD: PASS.
+- **Reading 7, `PUT /platform/mail` keeps an omitted password.** Selector `platform_admin_e2e::console::a_relay_save_without_a_password_keeps_the_stored_one`. RED: the save without `password` answered `"password_set": false` where `true` was expected. GREEN: a save without `password` and the same `username` keeps the exact sealed envelope; a changed `username` without its password is `400 WYRD_SPEC_400_VALIDATION` and changes nothing (the envelope's key-service context is bound to the username); without fresh proof a save is `403`; after re-authentication a save without `username` removes the password. Mechanism mirrors the signup challenge: the secret is kept when omitted and removed with its owning field (`site_key` there, `username` here), in one SQL statement (`put_mail_relay`'s `CASE`/`WHERE`), no migration. Regression: `test(/^platform_admin_e2e::/)` 96 passed. TDD: PASS.
+- **Docs limitation.** `docs/src/content/docs/operate/add-people.md` is not updated: `mise run docs:generate` fails in this environment (`node scripts/page_text.mjs` exits 1), so the generated `docs/public/llms-full.txt` could not be regenerated, and a guide edit would leave it out of date. The guide's single relay example still works unchanged.
+
+**Maintainer decisions (2026-11-23, cycle 16 part A):** approved — a relay save that changes the username without a password is refused with 400 rather than dropping the stored password; `oidc: true` means a platform OIDC connection row exists (no secret decryption on the anonymous read).
+
+#### Cycle 16 evidence (challenge site key and mock server failure)
+
+Maintainer-approved 2026-11-23: publish the Turnstile site key on the public methods answer; add a server-failure state to the mock.
+
+- **Site key on `GET /auth/browser/methods`.** Selector `platform_admin_e2e::signup::the_methods_report_publishes_the_challenge_site_key` (Part A's focused runner). RED: with a challenge configured, `report["signup_challenge_site_key"]` was `null` where `"0x4AAA-site"` was expected (signup.rs assertion in step 2). GREEN: without a challenge the key is absent; with one, the root and a tenant's report carry exactly the stored site key and never the secret; clearing the challenge removes it. Owner: `available_methods` reads the site key already loaded by `SocialSignIn::settings`; wire field `CreationMethods::signup_challenge_site_key` (omitted when `None`, so every existing exact-report assertion is unchanged). Regression: `test(/^platform_admin_e2e::(methods|signup)::/) | test(/pg_browser_sessions/)` 26 passed. `mise run codegen:regen` changed nothing (no generated projection carries this type). TDD: PASS.
+- **The workspace page renders Turnstile and sends its token.** This page has no challenge fixture in the identity UI journey host (no Siteverify mock there), so the proof is the `ui:check` component test `src/lib/ui-pages.test.ts` "the workspace page renders the configured Turnstile challenge and sends its token" (command: `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.test.ts -t Turnstile`), with Cloudflare's `turnstile` global stubbed and `fetch` answering the proof read and a `WYRD_AUTH_403_SIGNUP_CHALLENGE` refusal. RED before the page edit: `expect(widgets).toHaveLength(1)` received 0 (no widget rendered). GREEN: with a site key the page renders one widget in `data-testid="turnstile"` with `sitekey` and `action: 'signup'` (the action Rust checks), posts `challenge_token` with the completion, shows the mock's "Complete the challenge below, then create the workspace again.", resets the single-use widget and posts the fresh token on retry, and removes the widget when the page goes away (a script still loading then renders nothing; concurrent loads share one script); without a site key there is no widget and no `challenge_token`. The load reads `signup_challenge_site_key` from the root methods answer; the widget sits where the mock's placeholder does (after the credentials, before Create workspace) and loads Cloudflare's script only when a challenge is configured. `mise run ui:check`: 0 svelte-check errors, 104 tests passed. This resolves Part B's "No Turnstile widget and no 'below'" deviation; the workspace-limit remediation still names no number. TDD: PASS.
+- **Mock server-failure state.** RED: the new `selfcheck.mjs` check 'a server failure (5xx) shows the production "Sign-in unavailable" state and hides the form' timed out waiting for `[data-testid=problem]` on `#/signup/workspace?preview=unavailable`. GREEN: the mock's `Entry.svelte` now renders any 5xx exactly as wyrd-ui's `src/lib/Entry.svelte`: "✕ Sign-in unavailable", "Please try again later.", the code (`502 WYRD_SPEC_502_UPSTREAM_FAILURE`, production's `PROBLEMS.unavailable`), `data-state="error"` and no page form; the state is in the State menu ("Workspace · server failure (5xx)") and the README routes table. One test-side fix during GREEN: `innerText` separates the block paragraphs with blank lines, so the check matches by pattern as the other problem checks do. `node build.mjs` and `node selfcheck.mjs` pass (every state in both modes, plus every functional check). This resolves Part B's "the mock defines no server-failure state" deviation. TDD: PASS.
+
+**Onboarding UI journey independence (commit-hook finding, preference #5).** The discovery, reset, recovery-email, signed-out and invitation journeys in `wyrd-ui/src/lib/server/auth/onboarding.integration.test.ts` reused the workspace, address and reset password created by earlier tests. Each now sets up its own workspace through `signedUpWorkspace(label)` (email signup through the pages). Full suite: `mise run test:identity:ui` 2/2 pass. Each fixed journey alone (`WYRD_UI_FILTER=<name> mise run test:identity:ui`): discovery, reset and recovery-email pass; invitation failed twice and then passed 4/4. The two failures happened while another teammate was building the same UI tree at the same time, and their Vitest output was not captured, so the cause is unproven and recorded as an unreproduced one-off.
+
+#### Cycle 16 evidence (Part C: platform console)
+
+Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
+(production BFF build → native `WyrdTestServer` → repository Postgres), via
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd crates/wyrd/wyrd-server/wyrd-ui && WYRD_UI_INTEGRATION=1 pnpm exec vitest run src/lib/ui-pages.integration.test.ts -t "<name>"'`.
+
+- **S1 password sign-in, overview, cookie isolation**
+  (`a platform operator signs in to the console with a password`).
+  RED: `page.waitForURL(/platform)` timed out; `/platform/ui` had no
+  production page. GREEN: 1 passed. Proves the **Platform admin** entry; an
+  unknown name, a wrong password and the root key each refuse with
+  `WYRD_AUTH_401_UNAUTHENTICATED` and set no cookie; the overview shows only
+  Rust's safe session metadata and the workspaces; the cookie is host-only on
+  `/platform`, HttpOnly, SameSite=Lax; no page carries it, a token or a key;
+  a recording hop shows every BFF call to Rust's `/platform/*` carried only
+  `wyrd_platform_*` cookies although the browser held a tenant session; a
+  tenant session alone opens no console page; sign-out ends the session at
+  Rust.
+- **S2 same-operator re-authentication before Suspend/Resume**
+  (`a stale console session confirms the operator before suspending a workspace`).
+  Adds one native test control, `staleConsoleProof` (ages `fresh_at` of every
+  platform browser session by ten minutes through the operator pool).
+  RED: no Suspend control on the overview (`locator.click` timeout); the
+  stale-proof assertion itself passed. GREEN: 1 passed. Proves a stale
+  session's Suspend opens "Confirm it is you" naming the change while Rust's
+  tenant stays active; another operator's password and a wrong one refuse
+  with `WYRD_AUTH_401_UNAUTHENTICATED`; a confirmation held in flight and
+  released after Cancel answers 204 yet applies nothing (Rust still
+  `active`); the own password applies the suspension (Rust `suspended`) and
+  the session shows fresh; Resume then applies at once without a prompt.
+- **S3 platform SSO sign-in and forced-fresh IdP re-authentication**
+  (`a platform SSO operator confirms a suspension at the identity provider`),
+  on part A's `GET /platform/browser/methods`. The loopback fake IdP's ID
+  token now carries `auth_time`. RED: the IdP returned to
+  `/platform/ui/callback`, which had no page (`waitForURL(/platform/ui)`
+  timeout); the entry already hid the SSO button while `oidc` was false.
+  GREEN: 1 passed. Proves the SSO button appears only once a connection
+  exists; a registered operator signs in by platform SSO (`Platform SSO`,
+  same cookie attributes); a stale session's Suspend offers only the IdP
+  route; another registered operator's IdP return in the pop-up refuses with
+  `WYRD_AUTH_401_UNAUTHENTICATED` and changes nothing; the same operator's
+  return applies the suspension and the session shows fresh.
+  **TDD violation:** the callback page, SSO begin route and pop-up flow were
+  written before this test. They were set aside (files moved out, edited files
+  restored) to record the RED above against the S1–S2 code, then restored.
+- **S4 social providers view**
+  (`the console tests a provider revision before enabling it`).
+  RED: `/platform/ui/providers` had no page (h1 assertion failed). GREEN:
+  1 passed. Proves the view shows each provider's callback URL and
+  instructions; a saved client becomes an untested revision whose Enable is
+  disabled with "Test revision 1 before enabling it."; the secret is never in
+  the page or the field after save; a test of revision 1 held at the IdP and
+  finished after revision 2 was saved leaves revision 2 untested with no
+  "tested" notice; a test of the current revision shows it tested; an Enable
+  against a revision replaced through the API refuses as "This provider
+  changed" (`WYRD_SPEC_409_CONFLICT`); the current revision tested then
+  enables to "✓ enabled · offered". TDD: PASS.
+- **S5 mail relay view**
+  (`the console keeps a relay password unless the operator removes it`),
+  on part A's kept-password `PUT /platform/mail`, against the lane's Mailpit.
+  RED: `/platform/ui/mail` had no page. GREEN: 1 passed (after two
+  diagnosed fixes: a form reset blanked `value=` fields, so they use
+  `defaultValue`; `field()` refuses an empty optional username/password).
+  Proves the no-relay state and no test form; a saved relay shows
+  "✓ stored, never shown" and the password never reaches the page; a save
+  with a blank password keeps it (Rust `password_set: true`); the explicit
+  "Remove the stored username and password" control removes both (Rust
+  `username: null, password_set: false`); a test send reports Mailpit's
+  acceptance as "not proof it reached the inbox"; a refused connection reports
+  "✕ The relay did not accept the message." with its error. TDD: PASS.
+- **S6 signup settings view**
+  (`the console saves signup settings and keeps the challenge secret`).
+  RED: `/platform/ui/signup` had no settings form. GREEN: 1 passed. Proves
+  the view reads Rust's defaults (password on, signup off, limit 3); a save
+  sets signup, the limit and a Turnstile site key with a secret that never
+  reaches the page or stays in its field; on a stale session the save opens
+  "Confirm it is you" and changes nothing until the operator's password
+  confirms; a blank secret keeps the stored challenge; turning the challenge
+  off removes it (`signup_challenge: null`). TDD: PASS.
+- **S7 official host routes the console to the BFF.** RED: with the
+  shipped `nginx.conf.template` rendered in `nginx:stable` and each
+  upstream replaced by a stub that answers its own name, `/platform`,
+  `/platform/ui`, `/platform/ui/`, `/platform/ui/providers` and
+  `/platform/ui/callback` all answered `rust`. GREEN: after the exact
+  `/platform`, `/platform/__data.json` and `/platform/ui` locations and the
+  `^~ /platform/ui/` prefix, those answer `ui`, while
+  `/platform/browser/methods`, `/platform/browser/session`,
+  `/platform/tenants` and `/platform/uix` still answer `rust` and `/` and
+  `/platformx` stay `ui`. `/platform/__data.json` is the entry's page data,
+  so client-side navigation back to `/platform` reaches the BFF. The cookie
+  side was proven in S1: through a recording hop, every BFF call to Rust
+  carried only `wyrd_platform_session` or `wyrd_platform_login`, although the
+  browser also held a tenant session. `test:server:startup:dev` gained
+  `platform_console_routes` (entry HTML headed Platform admin, 303 to
+  `/platform` for the console subtree without a session, Rust's methods and
+  401 problem+json for `/platform/browser/session` and `/platform/tenants`).
+  That lane did not run here: the release `rustc` for `wyrd-server` was
+  SIGKILLed three times while the official image was building, once with
+  `CARGO_BUILD_JOBS=2`. TDD: the routing scenario went RED to GREEN with
+  the stub probe; the startup lane check is unrun.
+- **Mock alignment sweep.** Each production page and state was captured in
+  light and dark at 1280 and 390 wide (entry, refused sign-in, ended session,
+  refused SSO return, overview, password and SSO re-auth, refused re-auth,
+  providers, provider conflict, mail with and without a relay, refused mail
+  test, signup) and compared with `node selfcheck.mjs --shots`. Fixed: plain
+  password fields in place of the Show/Hide control; the entry's "Signing in…"
+  busy state with read-only fields; the SSO button always shown and disabled
+  without platform SSO; "Too many sign-in attempts" for the 429; notices as
+  `.done` with a green `.ok` tick, and the mail test result the same way;
+  the mail "Sending…" busy state; problem block spacing inside the console;
+  the workspaces table as a labelled scroll region; the hidden provider test
+  and enable forms no longer adding a gap. The six journeys pass after the
+  sweep (S3's no-SSO check now expects the disabled button). Remaining
+  deviations and why:
+  - Mail password copy and the "Remove the stored username and password"
+    box: Part A's `PUT /platform/mail` contract keeps an omitted password.
+  - Provider registration text, callback URLs and revisions come from Rust's
+    provider view, not the mock's sample text.
+  - The SSO return has no "Finishing platform SSO sign-in…" state: the
+    callback load finishes with Rust before the page renders. A pop-up
+    re-auth shows "Returning to the console…" instead, which the mock's
+    simulated re-auth has no page for.
+  - The password form is hidden when Rust's `methods.password` is false.
+  - Fields use native `required` rather than the mock's focus-on-empty
+    script, so the forms work as plain posts.
+  - The entry card's 390-wide side margin comes from the shared
+    `Entry.svelte`, which the tenant pages also use.
+  - No preview bar, so pages start 33px higher.
+
+**Part C merge verification.** Right after the merge, all six console journeys failed. Five got the text "Failed to …" where JSON was expected, from `POST /platform/admins`; the sixth (SSO) timed out on a click. A read-only diagnostician found the cause: the `@wyrd/testing` napi addon (`sdks/wyrd-sdk-ts/testing/wyrd_testing.linux-x64-gnu.node`) was built before d9349c026. That build still requires `match_claim`, and axum answered with a plain-text 422. No code changed. After `mise run ts:build:testing`, the console journeys pass 6/6, `platform_admin_e2e` passes 97/97 and `test:identity:ui` passes 2/2. Clippy, `ui:check` and `check:tenant-isolation` are clean.
+
+**Approved reading 4 and system-tenant guard (after the Part C merge).** RED:
+- `platform_admin_e2e::an_authorized_request_that_changes_nothing_still_records_the_decision`: suspending `DataTenantId::SYSTEM_OWNER` (`wyrd-system`) answered 200 instead of 404.
+- The console journeys `a stale console session confirms the operator before suspending a workspace` (the `wyrd-system` row offered 1 button, expected 0) and `a platform SSO operator confirms a suspension at the identity provider` (the SSO button was present without a connection).
+
+GREEN:
+- `ProvisionOwner::set_suspended` refuses the system tenant as `TenantUnavailable` after authorizing, so the decision still commits.
+- The overview offers no Suspend for `wyrd-system`.
+- `/platform` renders the SSO button only when `methods.oidc` is true.
+- `platform_admin_e2e` 97/97, the console journeys 6/6, `ui:check`, and clippy are clean. TDD: PASS.
+
+
+#### Cycle 16 mock sweep
+
+**Method.** Each of the mock's preview states, plus the new ones below, was opened in the production build (`node build`). The build ran against a stub upstream that answered each refusal, throttle and held (busy) request, and the matching mock hash was opened beside it. Each pair was captured in light and dark, at 1280 and 390 wide, which makes 72 pairs and 288 shots. For each pair the harness compared page text, a pixel diff, and computed style (font, colour, background, border, decoration and size) for every text element and control. The harness lived in the session scratchpad and never entered the tree.
+
+**Fixed in production:**
+- `/platform/ui/providers` now puts its problem and notice above the lead paragraph, in the mock's order.
+- A problem without a code (`/signup?signup=failed`) no longer renders an empty code line, which had made the card 6px taller. This applies to `Entry.svelte` and `ConsoleProblem.svelte`.
+  - RED: ui-pages `a refused provider proof has no code to show, so the problem shows none` found an empty `<code>`.
+  - GREEN: the same test passes.
+- Code and bold text now follow the mock's base styles: code 11px in the text colour, bold at the strong weight in the text colour. The rules are zero-specificity (`:where`) in the card and the console, so a page's own rule wins.
+  - Workspace route keys on `/workspaces/verify` are muted again; the old rule had made them text-coloured.
+  - Console keys and URLs moved from 12px to 11px.
+  - The re-auth "Suspending …" label moved from 700 muted to strong text.
+- Root page links are underlined, like every other entry-card link.
+
+**Mock updated to the approved readings** (build and `selfcheck` green, 17 checks):
+- The platform SSO button appears only with platform OIDC (`?sso=off`). `nosso` shows the 404 without the button. A new selfcheck assertion covers this.
+- The SSO callback has `reauth` ("Your sign-in is confirmed for five minutes.") and `popup` ("Returning to the console…"). The "Finishing…" state is gone, and a sign-in opens the console.
+- A new `#/platform?preview=unavailable` state shows a sign-in that answered 5xx with "Sign-in unavailable".
+- The workspace page has a new `?preview=checking` state ("Checking this browser's sign-in…").
+  - The identity line names only the provider.
+  - The workspace-limit remediation gives no number.
+- The relay copy now reads "Leave it blank to keep it; a new username needs its password." The form adds the "Remove the stored username and password" box.
+  - The mock refuses a new username without its password, so the stored credentials stay intact.
+- The overview footnote states that `wyrd-system` never suspends.
+- The console's `p.done` lines use the text colour, as the mock's own `app.css` intends; the mock's cascade had been muting them.
+- The README's contract readings now record the cycle 15 rulings.
+
+**Result.** After these changes, every pair matches in text and computed style in both modes and at both widths, apart from the deviations below. Pixel diffs remain only from sample input the harness typed, hover, focus and scroll position, and the items below.
+- Teammates' lists: Part B's "Signed in … as", Checking state, limit number, 5xx state and Turnstile items are resolved by the mock updates.
+- Part C's mail copy, "Finishing…" and SSO-button items are resolved the same way.
+- Part C's "390-wide margin" no longer differs: the 390 pairs are pixel-identical.
+- Provider text from Rust is sample data, not a deviation.
+
+**Justified deviations (final):**
+1. ~~Show button on new-password fields~~ Resolved by the maintainer ruling below: every human password field has Show, in production and the mock.
+2. **Turnstile.** Production renders Cloudflare's widget from the published site key, and the widget brings its own look. The mock keeps a labelled placeholder that simulates passing.
+3. **Recovery email width.** The section is as wide as the Account page's other sections. The mock shows it alone on a placeholder page; the section's own layout is identical.
+4. **Root and tenant sign-in pages** are existing pages. The mock draws placeholders for both and does not redesign them.
+5. **Preview strip.** The mock reserves 33px for chrome that is not product, so production pages start 33px higher.
+6. **Native `required`** on the reset request and the console forms, so they work as plain posts without script. The mock focuses the empty field instead. The two look the same until someone submits an empty field.
+7. **Password form hidden when `methods.password` is false** on `/platform`. Rust's methods read forces this, and the mock has no such state.
+
+**Maintainer rulings after the sweep (2026-11-24):**
+- **Show on every human password field.** The `/platform` password and the console re-auth password now use `PasswordInput`. The mock gained `PasswordInput.svelte` and uses it on `/platform`, re-auth, `/signup/workspace` and reset, which removes deviation 1. Secret fields (client secret, relay password, Turnstile secret key) stay plain write-only inputs.
+  - RED: the console journeys (`ui-pages.integration.test.ts` "a platform operator signs in to the console with a password" and "a stale console session confirms the operator before suspending a workspace") failed with `locator.click: Timeout 30000ms` on the button named "Show password": 2 failed, 4 passed.
+  - GREEN: the same command passed 6/6. The mock build and selfcheck passed (17 checks).
+- **`/auth/device` is styled in place.** The maintainer chose a styled page over moving it into wyrd-ui. `cli_login::page` now renders every device page (approve, approved, denied, refused, code not accepted) inside the entry card. It inlines the brand's light and dark tokens and the Wyrd mark, and the code field has a real `<label for>`.
+  - RED: `cargo nextest run -p wyrd-server --lib -E 'test(=auth::cli_login::tests::device_pages_render_in_the_branded_entry_card)'` panicked: `html.contains("<main class=\"entry\"><div class=\"card\">")` was false.
+  - GREEN: the test passes. The "Alice is given payments…" journey (which uses the device page) passed 1/1. `test:identity:ui` passed 2/2, clippy `-D warnings` was clean, and `ui:check` passed. Screenshots at 1280 and 390 wide, light and dark, match the entry card.
+  - Limit: the page falls back to system fonts, because it serves no font assets. The mock has no device state.
+- **Startup lane retried (2026-11-24): still unproven.** `mise run test:server:startup:dev` was retried with 46 GiB available. The release link of `wyrd-server` was killed with SIGKILL (out of memory), exit 101, before the container started. The nginx host-routing check in that lane has not run.
+
+
 ### 17. An existing User explicitly connects another sign-in method
+
+**Status: DEFERRED — maintainer-approved 2026-11-23.** Not required for launch
+or TASK-004. Retained below as future scope; do not execute its proof or build
+linking/password-add UI, endpoints or orchestration.
 
 **Reuses:** Cycles 4–5 password/method owners, cycle 16 approved account pages and existing bound identity linking; preserve the same User/grants.
 
@@ -1013,6 +1649,12 @@ observe preservation, not just identity row counts.
 
 ### 18. Removing or disabling a method invalidates its original credentials
 
+**Status: DEFERRED — maintainer-approved 2026-11-23.** Self-service removal and
+its combined cycle are not required for launch or TASK-004. Existing invalidation
+required by shipped operator controls and required SSO is retained in REQ-012/016
+and TASK-004; deferral never permits a disabled provider to keep authenticating.
+The original scenario below is retained as future scope, not an execution instruction.
+
 **Reuses:** Cycle 17 linked methods, cycle 5 policy/availability contract and existing browser/CLI anchors; extend their original invalidation checks.
 
 **Maps to:** REQ-011, REQ-012, REQ-015; preserves REQ-002; AC-006.
@@ -1035,64 +1677,17 @@ enforcement. Observe both selected invalidation and surviving credentials.
 
 ### 19. A tenant adopts company SSO without a password or social bypass
 
-**Reuses:** Cycles 5 and 17–18 methods, linking and invalidation plus existing company-connection lifecycle; extend the same policy owner and pages.
-
-**Maps to:** REQ-016; preserves REQ-002/REQ-004/REQ-005; AC-006.
-
-With linked Users and some unlinked accounts, a tenant admin freshly proves the
-tested Active company connection, sees the unlinked-account warning and enables
-require-company-SSO. Enablement without that proof or usable tested connection
-refuses. Allowed-method UI changes and direct password/social starts, racing
-callbacks and invitation enrollment cannot bypass policy. Existing password/social
-browser sessions and CLI renewal become unusable under established freshness;
-company sign-in and policy-compliant invitations still work.
-
-Replace/deactivate the company connection or interrupt it: policy remains enabled
-and login refuses without password/social fallback. Preserve company revision
-and issuer/subject ownership rules. Disabling policy does not resurrect revoked
-sessions. Repeat through another replica; tenant policy never affects another
-tenant or platform login. Exercise existing API-key/recovery paths unchanged.
-Do not assert immediate revocation from upstream IdP removal alone.
-
-**Proof:** Tier-1 tenant settings/login and device renewal journeys, including
-production UI, against real policy persistence. Initially fail on the missing
-human adoption flow and any unconnected completion/session/renewal consumers;
-reuse cycle 5's final evaluator and cycles 17–18's anchors/invalidation rather
-than introduce another policy implementation. If those checks already pass,
-record their connected regression proof without inventing RED. Hidden buttons
-alone do not pass.
+**Status: TRANSFERRED — 2026-11-23.** Execute only
+[TASK-004](TASK-004-company-sso-and-launch-verification.md), scenarios 1–5.
+Company provisioning plus existing grants/group mapping replaces the old
+linking-cycle prerequisite. REQ-016 and retained AC-006 govern.
 
 ### 20. Delivered surfaces and real providers complete the same journey
 
-**Reuses:** All earlier cycles and completed TASK-003 outputs; verify the connected shipped surfaces and real-provider compatibility without rebuilding them.
-
-**Maps to:** REQ-002, REQ-011–REQ-018; AC-004–AC-013 and the spec's shipped-surface safeguards.
-
-Using the operator setup, sent invitation, tenant User and grants produced above,
-complete production UI login, explicit CLI device-code approval and subsequent
-real Rust/Python/TypeScript client resource access. Exercise shipped HTTP/MCP
-management/read boundaries through their own typed consumers and denial behavior;
-do not make cookie authentication available on additional protocols. Verify
-generated/exported contracts match the Rust owners and Node retains no exchange
-or credential authority. Preserve scoped permissions/ceilings, local/company
-login, recovery and authorization regression cases at touched boundaries.
-
-Perform real Google and GitHub operator smoke tests for registration instructions,
-consent and callback compatibility. Record the configured flow and observed
-result without secrets; controlled-provider tests do not establish this external
-compatibility. No hosted SMTP provider test is required. Read updated operator
-and user instructions against the actual delivered actions and refusal messages.
-
-**Proof:** Tier-1 production UI/CLI/SDK/MCP journeys using their existing runners,
-plus live-provider smoke and contract checks. This connects earlier cycle outputs
-to actual consumers; disconnected fixtures or build success alone cannot pass.
-Record missing live-provider access as a material verification limitation rather
-than claiming those smoke tests ran.
-
-Local SMTP requires no hosted provider credential; real Google/GitHub smoke
-remains distinct and must honestly record unavailable external access. This
-cycle verifies the operator views delivered in cycle 16; it builds no second
-provider/SMTP/settings UI and introduces no new credential channel.
+**Status: TRANSFERRED — 2026-11-23.** Execute only
+[TASK-004](TASK-004-company-sso-and-launch-verification.md), scenarios 6–7.
+Carryover cycles 1–16 supply actual onboarding/platform outputs; final connected
+UI/CLI/SDK/HTTP/MCP and live-provider proof belong there, not to duplicate cycles.
 
 ## Verification owners and handoff
 
@@ -1149,12 +1744,14 @@ This carryover contains no new implementation or execution result, and does not
 authorize staging, committing or pushing.
 
 Planning validation: the completed TASK-003 cycles remain dependency evidence;
-all open cycle-6 work, revision-5 controls and original cycles 7–10 are owned here.
+all open cycle-6 work and revision-5 controls are retained here; original cycles
+7–10 now have the explicit deferral/transfer markers above.
 No code, migration, test, mock, stage, commit or push is part of this planning edit.
 Mock extension approval and live-provider smoke access are future execution gates,
 not unresolved product decisions. Platform sign-in semantics and route ownership
 are approved; mock appearance approval and live-provider evidence remain future
-execution gates. Nothing ships until every cycle is complete.
+execution gates. The revision-11 ownership notice supersedes the historical
+requirement that every carryover cycle finish before launch.
 
 
 Documentation handoff (2026-11-21): the bounded independent comprehension pass

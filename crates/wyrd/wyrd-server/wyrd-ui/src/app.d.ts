@@ -1,5 +1,6 @@
 import type { Session, TenantContext } from '$lib/server/auth/session';
 import type { BrowserSession } from '$lib/server/auth/browser-sessions';
+import type { PlatformSession } from '$lib/server/auth/platform-sessions';
 import type { WyrdProblem } from '$lib/server/problem';
 
 declare global {
@@ -9,6 +10,8 @@ declare global {
       session: Session | null;
       /** Production tenant session; its access token is private to the object. */
       browserSession?: BrowserSession;
+      /** Platform console session on `/platform/ui`; its cookie is private to the object. */
+      platformSession?: PlatformSession;
       sessionProblem: WyrdProblem | null;
       tenant?: TenantContext;
     }

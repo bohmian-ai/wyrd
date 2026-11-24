@@ -1017,6 +1017,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
 import { pullHref, readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
 import { load as loadRepositories } from '../routes/t/[tenantKey]/repositories/+page.server';
 import { load as loadAccount } from '../routes/t/[tenantKey]/settings/account/+page.server';
+import { browserSessions, type LoginMethods } from '$lib/server/auth/browser-sessions';
 import type { RepositoryIndexProps } from 'wyrd-ai-ui/loaders';
 import RepositoriesPage from '../routes/t/[tenantKey]/repositories/+page.svelte';
 import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[name]/+page.server';
@@ -1322,8 +1323,10 @@ test('the Repositories workspace keeps its index state, opens exact versions and
 test('account settings reads the profile and the own key page at once, for the session principal', async () => {
   const requested: string[] = [];
   let profiled = false;
+  vi.spyOn(browserSessions, 'methods').mockResolvedValueOnce({ email_discovery: true } as LoginMethods);
   const browserSession = {
     principalId: 'p-1',
+    tenantKey: 'acme',
     api: async (_method: string, path: string) => {
       requested.push(`${path} (profile answered: ${profiled})`);
       if (path !== '/principals/me') return Response.json({ items: [], next_cursor: null });
@@ -1335,7 +1338,7 @@ test('account settings reads the profile and the own key page at once, for the s
   const url = new URL('http://ui.test/t/acme/settings/account?after=k-9');
   const data = await loadAccount({ locals: { browserSession }, url } as never);
 
-  expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, problem: null });
+  expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, recovery: true, problem: null });
   expect(requested).toEqual(['/principals/me (profile answered: false)', '/principals/p-1/credentials?limit=50&cursor=k-9 (profile answered: false)']);
 });
 
@@ -1505,4 +1508,76 @@ test('Repository activity, Verify and an execution each lead to the pull request
   expect(verifyInputs({ ...state, group: 'pull_request' }).list).toMatchObject({ groupBy: 'pull_request' });
   expect(verifyStep(state, { name: 'pull_request.open', input: { repository: 'a b', number: 7 } }, '')).toEqual({ pull: '/repositories/a%20b/pulls/7' });
   expect(verifyStep(state, { name: 'pull_request.open', input: { repository: 'api', number: 7, generation: 'g1' } }, '')).toEqual({ pull: '/repositories/api/pulls/7?set=g1' });
+});
+
+import WorkspacePage from '../routes/signup/workspace/+page.svelte';
+
+test('the workspace page renders the configured Turnstile challenge and sends its token', async () => {
+  const posted: Record<string, unknown>[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (path: string, init?: RequestInit) => {
+    if (path === '/auth/signup/proof') return Response.json({ method: 'google' });
+    posted.push(JSON.parse(String(init?.body)));
+    return Response.json({ status: 403, code: 'WYRD_AUTH_403_SIGNUP_CHALLENGE', title: 'Forbidden', remediation: '' }, { status: 403 });
+  }));
+  // A stub of Cloudflare's widget: each render or reset solves the challenge with the next token.
+  type Options = { sitekey: string; action: string; callback: (token: string) => void };
+  const widgets: { element: Element; options: Options }[] = [];
+  const reset = vi.fn();
+  const remove = vi.fn();
+  let issued = 0;
+  const solve = () => {
+    issued += 1;
+    widgets[0].options.callback(`tok-${issued}`);
+  };
+  vi.stubGlobal('turnstile', {
+    render(element: Element, options: Options) {
+      widgets.push({ element, options });
+      solve();
+      return 'widget-1';
+    },
+    reset(id: string) {
+      reset(id);
+      solve();
+    },
+    remove
+  });
+  try {
+    const page = render(WorkspacePage, { data: { mail: true, problem: null, challenge: '0x4AAA-site' } } as never);
+    await page.findByLabelText('Workspace name');
+    await waitFor(() => expect(widgets).toHaveLength(1));
+    expect(widgets[0].options).toMatchObject({ sitekey: '0x4AAA-site', action: 'signup' });
+    expect(page.getByTestId('turnstile')).toContainElement(widgets[0].element as HTMLElement);
+    await fireEvent.input(page.getByLabelText('Workspace name'), { target: { value: 'Acme Research' } });
+    await fireEvent.click(page.getByRole('button', { name: 'Create workspace' }));
+    await page.findByText('Complete the challenge below, then create the workspace again.');
+    expect(posted[0]).toMatchObject({ slug: 'acme-research', challenge_token: 'tok-1' });
+    // A Siteverify token is single-use, so a refused attempt asks for a fresh one.
+    expect(reset).toHaveBeenCalledWith('widget-1');
+    await fireEvent.click(page.getByRole('button', { name: 'Create workspace' }));
+    await waitFor(() => expect(posted[1]).toMatchObject({ challenge_token: 'tok-2' }));
+    page.unmount();
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('widget-1'));
+
+    // Without a configured challenge there is no widget and no token.
+    widgets.length = 0;
+    posted.length = 0;
+    const plain = render(WorkspacePage, { data: { mail: true, problem: null, challenge: null } } as never);
+    await fireEvent.input(await plain.findByLabelText('Workspace name'), { target: { value: 'Acme Research' } });
+    await fireEvent.click(plain.getByRole('button', { name: 'Create workspace' }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).not.toHaveProperty('challenge_token');
+    expect(plain.queryByTestId('turnstile')).toBeNull();
+    expect(widgets).toHaveLength(0);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+import SignupPage from '../routes/signup/+page.svelte';
+
+test('a refused provider proof has no code to show, so the problem shows none', () => {
+  const page = render(SignupPage, { data: { signup: true, local: true, providers: ['google'], failed: true, problem: null } } as never);
+  const problem = page.getByRole('alert');
+  expect(problem).toHaveTextContent('Sign-in was not confirmed');
+  expect(problem.querySelector('code')).toBeNull();
 });

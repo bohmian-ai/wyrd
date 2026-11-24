@@ -504,9 +504,10 @@ test('OIDC-off credential UI', async () => {
   const browser = new Browser();
 
   const recovery = `${login}/api-key`;
-  // Routine sign-in is SSO; the operator key form is a separate recovery page the login page links to.
+  // Without an Active connection the page offers no SSO; the operator key form is a separate
+  // recovery page the login page links to.
   const page = await (await browser.go(0, login)).text();
-  expect(page).toContain('Sign in with SSO');
+  expect(page).not.toContain('Sign in with SSO');
   expect(page).not.toContain('name="apiKey"');
   expect(page).toContain(`href="${recovery}"`);
   expect(await (await browser.go(1, recovery)).text()).toContain('name="apiKey"');

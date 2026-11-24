@@ -2,6 +2,15 @@
 
 Status: finalized
 
+Finalized 2026-11-23 after the maintainer approved deferring carryover cycles
+17–18 and accepted the recommendations for 19–20. The
+[remaining-flow supplement](remaining-identity-flows.md) records the agreed
+company-SSO and connected-verification flow without linking/removal prerequisites.
+[Spec revision 11](../spec.md) records this approved scope;
+[TASK-004](../tasks/TASK-004-company-sso-and-launch-verification.md) owns former
+19–20. The carryover retains cycles 1–16 and their evidence. The earlier design
+and audit below remain context; this current scope governs remaining delivery.
+
 The maintainer resumed this packet on 2026-11-21 to design social sign-in and
 signup as task 003, after reporting tasks 001 and 002 complete. The original
 finalized agreement below remains the basis of approved specification revision 2;
@@ -20,6 +29,50 @@ and ordered acceptance scenarios for that approved addition. The maintainer appr
 the PostgreSQL platform-storage distinction in the
 supplement on 2026-11-21; authority/spec reconciliation is recorded on that date.
 Locked product decisions remain intact.
+
+### Cycles 17–20 decision audit (2026-11-23)
+
+The maintainer requested this audit while cycle 16 was in progress, because
+successive implementation cycles had required further decisions. This is a
+design/handoff inspection, not implementation acceptance or a new approval.
+
+No unresolved product decision was found in the remaining four cycles against
+REQ-012/015/016, AC-006, the finalized social-login supplement and the security
+posture's account-linking rules:
+
+- **17 — connect methods:** fresh allowed-method proof within five minutes,
+  bound proof of the added identity, same User/access/keys, no merge, ownership
+  conflicts and concurrency refusal, and validated password addition are settled.
+- **18 — remove or disable:** prove a remaining allowed method, refuse last-method
+  removal, invalidate the removed identity's credentials selectively, and preserve
+  operator-wide disablement and recovery exceptions. These are settled.
+- **19 — require company SSO:** freshly company-authenticated admin, tested Active
+  connection, warning about unlinked Users, enforcement across existing human
+  paths, no outage fallback or session resurrection, and unchanged API-key and
+  operator-recovery policy are settled.
+- **20 — connected proof:** delivered UI/CLI/SDK/HTTP/MCP journeys and real
+  Google/GitHub smoke are required. Missing external access is a verification
+  limitation, not a product-design choice or permission to claim completion.
+
+The handoff is less complete than these settled outcomes. Cycles 17–19 do not
+spell out the connected account-method read/actions, tenant fresh-proof return
+flow, or policy warning/write contracts. The cycle-15 mock's Account page covers
+recovery email, not the later method-management flow. Cycle 16's seven approved
+contract readings demonstrate how rendering a page exposed missing server
+outputs. That is evidence of an incomplete consumer/contract walkthrough, not
+evidence that the linking/removal/SSO rules need to be chosen again.
+
+Recommendation: reconcile those consumer-to-Rust paths before starting cycle 17,
+using the existing owners and approved rules; keep reversible implementation
+choices implementation-owned. Return only a concrete contradiction or a change
+to approved behavior, public contract or persistence purpose for a material
+decision. Do not infer an additional mock-approval gate for cycles 17–19.
+
+Packet references also need reconciliation: the carryover still names revision 7,
+the spec frontmatter says approved revision 9, and its body contains an approved
+revision-10 reserved-slug addendum. Historical staged/unapplied-migration claims
+are not evidence of current migration state. This audit does not revise the
+spec/task, authorize migration edits, or change finalized design decisions.
 
 The maintainer has locked the authorization model and preservation of existing
 identity, ownership and attribution semantics, the three scenarios and two-task

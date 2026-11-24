@@ -1,6 +1,6 @@
 //! Tenant-scoped local-password lifecycle queries: one-use enrollment
-//! invitations, operator-issued password resets, and fixed-window password
-//! failure counters.
+//! invitations, operator-issued and mailed password resets, and fixed-window
+//! password failure counters.
 //!
 //! Codes are stored only as the SHA-256 of their 256 random bits. Every
 //! deadline is derived by `PostgreSQL` from a bound or fixed duration, and
@@ -58,6 +58,9 @@ pub struct PasswordResetRow {
     pub user_id: Uuid,
     /// The User's password revision when it was issued.
     pub password_revision: i64,
+    /// The verified-contact revision a mailed code was sent to; `None` for
+    /// an operator-issued code.
+    pub contact_revision: Option<i64>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Absolute expiry.
@@ -248,6 +251,11 @@ pub async fn revoke_invitation(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bo
 /// `issuer`, whose code hashes to `code_hash`, expiring fifteen minutes after
 /// creation; returns its stored metadata. Expired resets are purged first.
 ///
+/// A code mailed to the User's verified contact carries that contact's
+/// `contact_revision` and replaces the User's earlier unconsumed mailed
+/// codes; operator-issued codes (`None`) replace nothing and are never
+/// replaced by a mailed one.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the purge or insert.
 pub async fn insert_password_reset(
@@ -257,18 +265,25 @@ pub async fn insert_password_reset(
     user_id: Uuid,
     password_revision: i64,
     issuer: Uuid,
+    contact_revision: Option<i64>,
 ) -> Result<PasswordResetRow, sqlx::Error> {
-    sqlx::query("DELETE FROM wyrd.auth_password_resets WHERE expires_at <= statement_timestamp()")
-        .execute(&mut **conn.transaction())
-        .await?;
+    sqlx::query(
+        "DELETE FROM wyrd.auth_password_resets
+          WHERE expires_at <= statement_timestamp()
+             OR ($2 AND user_id = $1 AND contact_revision IS NOT NULL AND consumed_at IS NULL)",
+    )
+    .bind(user_id)
+    .bind(contact_revision.is_some())
+    .execute(&mut **conn.transaction())
+    .await?;
     sqlx::query_as::<_, PasswordResetRow>(
         r"
         INSERT INTO wyrd.auth_password_resets (
             id, data_tenant_id, code_hash, user_id, password_revision, issuer_principal_id,
-            created_at, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp(),
+            contact_revision, created_at, expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, statement_timestamp(),
                   statement_timestamp() + interval '15 minutes')
-        RETURNING id, user_id, password_revision, created_at, expires_at
+        RETURNING id, user_id, password_revision, contact_revision, created_at, expires_at
         ",
     )
     .bind(id)
@@ -277,6 +292,7 @@ pub async fn insert_password_reset(
     .bind(user_id)
     .bind(password_revision)
     .bind(issuer)
+    .bind(contact_revision)
     .fetch_one(&mut **conn.transaction())
     .await
 }
@@ -298,7 +314,7 @@ pub async fn consume_password_reset(
          WHERE code_hash = $1
            AND consumed_at IS NULL
            AND expires_at > statement_timestamp()
-        RETURNING id, user_id, password_revision, created_at, expires_at
+        RETURNING id, user_id, password_revision, contact_revision, created_at, expires_at
         ",
     )
     .bind(code_hash.as_bytes().as_slice())

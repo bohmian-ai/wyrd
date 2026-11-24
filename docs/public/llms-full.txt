@@ -5902,8 +5902,11 @@ Wyrd limits sign-in and signup starts per visitor address. The `bohmian/wyrd` im
 With the server running, from a machine that has the same two database URLs exported:
 
 ```bash
-wyrd-server setup --tenant acme --server http://<server-host>:8080
+wyrd-server setup --tenant acme --server http://<server-host>:8080 \
+  --admin-username alice --admin-password-stdin < alice-password.txt
 ```
+
+`--admin-username` names the tenant's first person, who signs in with a password and needs neither a mail relay nor an identity provider. The password is read from the first line of standard input, so it never enters the command line or your shell history; without `--admin-password-stdin`, `setup` asks for it at a hidden prompt. It must be 15 to 128 characters; a passphrase works well.
 
 On a fresh database this creates the platform root and prints its `wyrd_global_...` credential, then creates the tenant and prints:
 
@@ -5913,9 +5916,29 @@ slug: acme
 admin_principal_id: <uuid>
 admin_credential: <key>
 This is the only time the tenant credential is shown. Store it now.
+admin_username: alice
+login_url: https://wyrd.example.com/t/acme/login
 ```
 
-Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Rerunning `setup` for an active tenant prints `is already set up; nothing to do.` To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Give `login_url` and the password to the person named by `--admin-username`.
+
+`setup` is safe to rerun. For an active tenant it prints `is already set up; nothing to do.` and discloses nothing. If a run was interrupted, rerun the same command: it finishes the tenant and keeps the administrator the first run created. To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+
+## 5. Decide who can create a workspace
+
+A new deployment is private. Nobody can create a workspace from the sign-in page, and the root page offers only sign-in to a workspace someone already knows. People join a workspace with an invitation from its administrator, which is a different step from creating one: [Add people](/wyrd/operate/add-people/) covers joining.
+
+To let visitors create their own workspaces, a platform administrator turns signup on:
+
+```bash
+curl -X PUT https://wyrd.example.com/platform/login-settings \
+  -H "X-Wyrd-Access-Token: Bearer $PLATFORM_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"password_enabled":true,"signup_enabled":true,"signup_workspace_cap":1}'
+```
+
+The root page then shows **Create a workspace**. A visitor proves an email address or a Google or GitHub account, names the workspace and its URL, and becomes its administrator. `signup_workspace_cap` limits how many workspaces one proven identity may create; the page says so when it is reached.
+
+Email signup, **Find my workspaces**, recovery email and mailed password reset codes need a mail relay ([Email invitations](/wyrd/operate/add-people/#email-invitations)). Without one, Wyrd sends no mail and the pages say so instead of offering those steps: invitations are copied links, and an administrator issues password reset codes.
 
 Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/wyrd/get-started/use-with-your-coding-agent/), and grant roles to others; [Identity and access](/wyrd/understand/identity-and-authorization/) explains the model.
 
@@ -6235,6 +6258,12 @@ In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email 
 
 Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
 
+## Recovery email and password reset
+
+A person with a password resets it on the sign-in page with **Reset your password**. With a mail relay, they enter their username and Wyrd emails a one-time code to the account's verified recovery email; the page answers every username the same, so it never says whether an account exists. Without a relay, or when the account has no verified recovery email, an administrator issues the code with `POST /v1/principals/users/{principal_id}/password-reset` and gives it to the person. A code works once, for fifteen minutes. Setting the new password signs the person out everywhere and ends their CLI sign-ins; API keys keep working.
+
+Each person verifies their own recovery email under **Settings**, then **Account**, then **Recovery email**. The section appears only when the deployment has a mail relay, needs a sign-in from the last five minutes, and never shows the current address. Wyrd emails a link to the new address; opening it in the same browser while signed in finishes the change, and the previous address is told. A verified recovery email is also what **Find my workspaces** uses to list the workspaces that address can sign in to; an unverified profile email is never used for either.
+
 ## Email invitations
 
 Wyrd can also email each invitation link through an SMTP relay you already use: your company's mail server or a transactional mail service such as Resend. Set up the sending account and domain with that service first. As a platform administrator, store the relay. The password is sealed and never returned, and tenant administrators can neither read nor change it:
@@ -6245,7 +6274,7 @@ curl -X PUT https://wyrd.example.com/platform/mail \
   -d '{"host":"smtp.example.com","port":587,"tls":"starttls","username":"wyrd","password":"…","sender":"invites@example.com"}'
 ```
 
-`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
+`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. To change other settings later, send the same `username` without `password` and Wyrd keeps the stored password; a new `username` needs its `password`, and leaving out `username` removes the stored sign-in. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
 
 From then on, Wyrd emails each new or resent link separately to its recipient and still returns it to you. `delivery` reads `accepted` when the relay took the message. That is not proof it reached an inbox. It reads `failed` when the relay refused it or could not be reached. The invitation stays pending, so copy the link or resend once the relay works. Wyrd does not queue or retry mail.
 
@@ -8646,6 +8675,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` | 409 | Tenant OIDC candidate is not freshly tested | Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test. |
 | `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
 | `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
+| `WYRD_AUTH_429_EMAIL_ATTEMPTS` | 429 | Too many email requests | Wait `details.retry_after_seconds` until the fixed email window ends, then ask again. |
 | `WYRD_AUTH_429_PASSWORD_ATTEMPTS` | 429 | Too many password attempts | Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again. |
 | `WYRD_AUTH_429_SIGNUP_ATTEMPTS` | 429 | Too many workspace signups | Wait `details.retry_after_seconds` until the fixed signup window ends, then try again. |
 | `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` | 429 | Too many sign-in starts | Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again. |

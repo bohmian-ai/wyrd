@@ -36,8 +36,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
     EnableSocialProviderRequest, IssuerUrl, LocalCredentials, LoginMethodsResponse, LoginSettings,
-    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SignupChallenge, SocialProvider,
-    SocialProviderState, SocialProviderView, SocialProvidersResponse,
+    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SignupChallenge, SignupProofMethod,
+    SocialProvider, SocialProviderState, SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -1109,7 +1109,8 @@ pub struct TenantLogin {
 }
 
 /// The methods `settings`, the `enabled` providers and a configured `mail`
-/// relay make usable, for `tenant` or, without one, the deployment root.
+/// relay make usable, for `tenant` or, without one, the deployment root,
+/// with the configured challenge's public site key.
 ///
 /// Password, returning providers and reset belong to a tenant and are never
 /// offered at the root; creation and discovery are deployment-wide.
@@ -1142,6 +1143,9 @@ fn available_methods(
             local_signup,
             email_verification_required: true,
             signup_providers,
+            signup_challenge_site_key: settings
+                .signup_challenge
+                .map(|challenge| challenge.site_key),
         },
     }
 }
@@ -1281,6 +1285,24 @@ enum SignupEnvelope {
         #[serde(default)]
         attempt: Option<Uuid>,
     },
+    /// A workspace-discovery proof sent to an address.
+    DiscoveryEmail {
+        /// SHA-256 of the proof the message carries.
+        proof_hash: Sha256Hex,
+        /// The address in comparison form.
+        address: String,
+        /// Random browser binding; its digest marks the spent proof.
+        binding: String,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
+    /// The directory read a spent discovery proof granted its browser.
+    DiscoveryRead {
+        /// The proven address in comparison form.
+        address: String,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
     /// A recovery-contact proof sent for a signed-in User.
     ContactEmail {
         /// SHA-256 of the proof the message carries.
@@ -1304,6 +1326,48 @@ pub const SIGNUP_EMAIL_TTL: std::time::Duration = std::time::Duration::from_mins
 /// Email signup starts admitted per address in one window, whatever their
 /// source.
 const SIGNUP_ADDRESS_ATTEMPTS: i32 = 5;
+
+/// Emailed-proof requests admitted per trusted source in one window.
+const EMAIL_SOURCE_ATTEMPTS: i32 = 20;
+
+/// Emailed-proof requests mailed to one address in one window, whatever their
+/// source.
+const EMAIL_ADDRESS_ATTEMPTS: i32 = 5;
+
+/// Emailed-proof requests admitted per signed-in account in one window.
+const EMAIL_ACCOUNT_ATTEMPTS: i32 = 5;
+
+/// Mail sends one process runs after their requests are answered; a request
+/// beyond them sends nothing, and its caller asks again.
+const ANSWERED_SENDS: usize = 16;
+
+/// The process's permits for mail sent after the answer.
+static ANSWERED_SENDERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(ANSWERED_SENDS);
+
+/// Run `send` after its request is answered, on one of the process's bounded
+/// send permits, so neither the relay's outcome nor its latency reaches the
+/// answer.
+///
+/// With no permit free, or when the process stops first, nothing is sent and
+/// nothing is retried; a failed send is logged as `what`.
+fn send_after_answer(
+    what: &'static str,
+    send: impl std::future::Future<Output = Result<(), WyrdError>> + Send + 'static,
+) {
+    let Ok(permit) = ANSWERED_SENDERS.try_acquire() else {
+        tracing::warn!(
+            what,
+            "every answered-send permit is busy; a request sent nothing"
+        );
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = send.await {
+            tracing::warn!(what, error = %error, "a mail was not sent");
+        }
+    });
+}
 
 /// The envelope context of the one signup challenge secret, which
 /// stored-secret maintenance rebuilds from the same fixed owner.
@@ -1331,6 +1395,7 @@ const fn provider_context<'a>(provider: &'a str, client_id: &'a [&'a str]) -> Se
 const ENVELOPE_LABEL: &str = "signup-envelope";
 
 mod contacts;
+mod discovery;
 
 /// One provider return to redeem: its code and the round-trip values the
 /// redemption must match.
@@ -1499,6 +1564,78 @@ impl SocialSignIn {
                 details: json!({ "retry_after_seconds": wait.as_secs() }),
             }),
         }
+    }
+
+    /// Admit one emailed-proof request of `purpose` (`discovery`, `contact`
+    /// or `reset`) for `address` from `source`, and for `account` when a
+    /// signed-in User asks, before anything is mailed.
+    ///
+    /// Each window is shared by every replica and keyed by a pseudonym. The
+    /// source and account windows refuse; the address window only answers
+    /// `false`, so the caller sends nothing yet answers as if it had and a
+    /// recipient throttle never shows whether an account exists or mail went.
+    /// The address window is per purpose, so a flood of one kind of request
+    /// cannot withhold another kind's mail, such as a reset.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::EmailAttempts`] with `retry_after_seconds` once
+    /// the source or account window is exhausted, and
+    /// [`WyrdError::AuthVerifyUnavailable`] for an unknown source or when
+    /// admission state is unavailable, which refuses rather than admits.
+    pub(crate) async fn admit_email(
+        &self,
+        purpose: &str,
+        source: Option<std::net::IpAddr>,
+        address: &crate::mail::EmailAddress,
+        account: Option<(DataTenantId, Uuid)>,
+    ) -> Result<bool, WyrdError> {
+        let source = source.ok_or_else(source_unknown)?;
+        let mut refusing = vec![(
+            SignupAdmissionScope::EmailSource,
+            self.pseudonym(
+                "email_source",
+                crate::admission::source_key(source).as_bytes(),
+            )
+            .await?,
+            EMAIL_SOURCE_ATTEMPTS,
+        )];
+        if let Some((tenant, user)) = account {
+            refusing.push((
+                SignupAdmissionScope::EmailAccount,
+                self.pseudonym("email_account", format!("{tenant}:{user}").as_bytes())
+                    .await?,
+                EMAIL_ACCOUNT_ATTEMPTS,
+            ));
+        }
+        let mut wait = None;
+        for (scope, key, limit) in &refusing {
+            let refused = admit_signup(&self.operator, *scope, key, *limit, SIGNUP_WINDOW)
+                .await
+                .map_err(store_error)?;
+            wait = wait.max(refused);
+        }
+        if let Some(wait) = wait {
+            return Err(WyrdError::EmailAttempts {
+                message: "too many email requests; wait before retrying".to_owned(),
+                details: json!({ "retry_after_seconds": wait.as_secs() }),
+            });
+        }
+        let mailbox = self
+            .pseudonym(
+                "email_address",
+                format!("{purpose}:{}", address.canonical).as_bytes(),
+            )
+            .await?;
+        let held = admit_signup(
+            &self.operator,
+            SignupAdmissionScope::EmailAddress,
+            &mailbox,
+            EMAIL_ADDRESS_ATTEMPTS,
+            SIGNUP_WINDOW,
+        )
+        .await
+        .map_err(store_error)?;
+        Ok(held.is_none())
     }
 
     /// Begin a public workspace signup by proving the mailbox `typed`, from
@@ -1939,6 +2076,44 @@ impl SocialSignIn {
             creator_key,
             claimed,
         }))
+    }
+
+    /// How the live proof held by `completion` was made, for the workspace
+    /// form to ask only for what completion needs.
+    ///
+    /// A pure read: it records, renews and consumes nothing, so the same
+    /// browser may read it again and still complete. It names no address or
+    /// identity.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OneTimeCodeInvalid`] without a completion, or
+    /// for one holding no live proof, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the read fails.
+    pub async fn signup_proof_method(
+        &self,
+        completion: Option<&str>,
+    ) -> Result<SignupProofMethod, WyrdError> {
+        let refused = || WyrdError::OneTimeCodeInvalid {
+            message: "no workspace signup is proven in this browser; start again".to_owned(),
+            details: json!({}),
+        };
+        let completion = completion.ok_or_else(refused)?;
+        let proven = proven_signup(
+            &self.operator,
+            Sha256Hex::digest(completion.as_bytes()).as_bytes(),
+        )
+        .await
+        .map_err(store_error)?
+        .ok_or_else(refused)?;
+        match (proven.proof_kind.as_str(), proven.provider.as_deref()) {
+            ("email", _) => Ok(SignupProofMethod::Email),
+            (_, Some(provider)) => match SocialProvider::parse(provider) {
+                Some(SocialProvider::Google) => Ok(SignupProofMethod::Google),
+                Some(SocialProvider::Github) => Ok(SignupProofMethod::Github),
+                None => Err(refused()),
+            },
+            _ => Err(refused()),
+        }
     }
 
     /// Remove one bounded batch of expired signup admission windows and

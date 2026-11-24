@@ -452,6 +452,13 @@ fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
             },
         ),
         (
+            "emailAttempts",
+            WyrdError::EmailAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
             "methodUnavailable",
             WyrdError::MethodUnavailable {
                 message: String::new(),

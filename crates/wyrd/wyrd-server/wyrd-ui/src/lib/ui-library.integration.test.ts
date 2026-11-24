@@ -2482,6 +2482,72 @@ deferred('TASK-005: a requirement judged while its execution waits stays readabl
   view.unmount();
 });
 
+/** Releases the model answer held back so far; every answer waits until the test releases it. */
+let releaseModel = () => {};
+const reviewing = serverTest({ perTest: true, verificationRuntime: true, provider: () => new Promise((resolve) => (releaseModel = () => resolve(judgeReply('{"done":true}')))) });
+
+reviewing('TASK-006: a pending approval waits beside a step still running, then beside the missing input once it parks, with no verdict', async ({ server: _ }) => {
+  // Setup: `release-beside-review` runs for the `release-desk` Service. Its `release` approval waits for a person, its `ci` input is still to come, and its `review-notes` agent step waits on a model that has not answered.
+  const admin = WyrdClient.connect();
+  await configureGateway(admin);
+  const cards = await Cards.connect({ client: admin });
+  const desk = await cards.declareFromPath(fixture('cards/approvals/release-desk.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-beside-review-'));
+  await cards.pull(desk.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: desk.root.name });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await state.startBifrost();
+  try {
+    const submitted = await state.run().observe.submit('release-beside-review', { sections: ['notes'] });
+    if (submitted.kind !== 'queued') throw new Error('release-beside-review queues an execution');
+    const executionId = submitted.execution.id;
+
+    // While the notes review runs, the server records the approval pending beside it and no result. It reports parked inputs only once nothing can run, so no input is named yet.
+    const principals = await Principals.connect({ client: admin });
+    const serviceViewer = { role: 'viewer', scope: { card: { family: { kind: 'Service', name: 'release-desk' } } } };
+    const { credential } = await principals.createServicePrincipal({ name: 'beside-review-reader', assignments: [serviceViewer] } as never);
+    const reader = WyrdClient.connect({ credential });
+    const read = () => loadExecution({ executionId }, { executor: nodeExecutor(reader) });
+    const steps = (loaded: Awaited<ReturnType<typeof read>>) => {
+      const view = render(VerificationExecution, loaded);
+      const head = within(view.container).getByRole('region', { name: 'Execution' });
+      const recorded = within(view.container).getByRole('group', { name: 'Recorded without the definition' });
+      const shown = {
+        input: head.querySelector('[data-blocked="awaiting_input"]')?.textContent ?? null,
+        approval: head.querySelector('[data-blocked="awaiting_approval"]')?.textContent ?? null,
+        verdict: head.querySelector('[data-verdict]')?.textContent,
+        steps: within(recorded).getAllByRole('button').map((each) => each.textContent?.replace(/\s+/g, ' ').trim())
+      };
+      view.unmount();
+      return shown;
+    };
+    await vi.waitFor(
+      async () => {
+        const { status, invocations } = data(await read(), 'reader while reviewing');
+        expect([status.status, status.waiting, status.result, status.approvals?.map((each) => [each.step_id, each.status])]).toEqual(['running', undefined, undefined, [['release', 'pending']]]);
+        expect(invocations?.state === 'populated' && invocations.data.items.map((item) => [item.producer.step_id, item.state])).toEqual([['review-notes', 'started']]);
+      },
+      { timeout: 30_000, interval: 200 }
+    );
+    // The shared component shows the running notes review apart from the waiting approval, and no verdict.
+    expect(steps(await read())).toEqual({ input: null, approval: 'waiting for approval', verdict: 'none while running', steps: ['Step review-notes started', 'Step release ◷waiting for approval'] });
+
+    // Once the model answers, the notes review succeeds and the same execution parks: the missing input and the pending approval are separate reasons, still with no verdict.
+    releaseModel();
+    await vi.waitFor(
+      async () => {
+        const { status } = data(await read(), 'reader once parked');
+        expect([status.execution_id, status.status, status.waiting, status.result, status.approvals?.map((each) => [each.step_id, each.status])]).toEqual([executionId, 'waiting', ['ci'], undefined, [['release', 'pending']]]);
+      },
+      { timeout: 30_000, interval: 200 }
+    );
+    expect(steps(await read())).toEqual({ input: 'waiting for input ci', approval: 'waiting for approval', verdict: 'none while running', steps: ['Step review-notes succeeded', 'Step release ◷waiting for approval'] });
+  } finally {
+    releaseModel();
+    await state.shutdown();
+  }
+});
+
 deferred('TASK-006: each reached approval occurrence is read without the Verifier and decided only with approve on that Verifier and read on its Repository', async ({ server }) => {
   // Setup: `release-signoff` runs on pull request 7 of `acme/web`. Its `review` approval repeats until approved, `release` waits beside it, and its `ci` input is still to come.
   const github = server.githubApp;

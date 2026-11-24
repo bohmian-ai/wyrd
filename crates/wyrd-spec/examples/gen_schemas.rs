@@ -466,6 +466,13 @@ fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
             },
         ),
         (
+            "originRefused",
+            WyrdError::OriginRefused {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
             "recentLogin",
             WyrdError::RecentLoginRequired {
                 message: String::new(),

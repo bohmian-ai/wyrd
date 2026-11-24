@@ -14,6 +14,7 @@ test('every BFF problem preserves the canonical Rust derive metadata', () => {
     'expired',
     'denied',
     'methodUnavailable',
+    'originRefused',
     'signInAttempts',
     'internal',
     'upstream'

@@ -1,0 +1,25 @@
+# A release sign-off that waits for a person and for CI evidence while a
+# review of the release notes is still running beside it.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: release-beside-review
+  version: 1.0.0
+spec:
+  description: A release owner signs off while CI evidence is still to come and a notes review runs.
+  inputs:
+    sections: {type: json, schema: {type: array, items: {type: string}}}
+    ci: {type: json, deferred: true}
+  steps:
+    - id: release
+      action: {kind: approval, message: Release?}
+    - id: review-notes
+      foreach: {items: inputs.sections, max_items: 1}
+      action:
+        kind: agent
+        agent: ./notes-reviewer.yaml
+        inputs: {section: item, index: item_index}
+  requirements:
+    - id: green
+      statement: CI is green
+      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}

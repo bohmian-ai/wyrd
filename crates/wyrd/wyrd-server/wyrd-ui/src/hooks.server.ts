@@ -1,9 +1,12 @@
 import { forwardAuth } from '$lib/server/upstream';
-import { error, redirect, type Handle, type HandleServerError } from '@sveltejs/kit';
+import { error, json, redirect, type Handle, type HandleServerError } from '@sveltejs/kit';
 import { localAuthEnabled } from '$lib/server/development';
 import { sessionCookie, sessions } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { problem } from '$lib/server/problem';
+
+/** Methods that never change state; every other request is a mutation. */
+const reads = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 const loginRoutes = [
   '/t/[tenantKey]/login',
@@ -15,6 +18,11 @@ const loginRoutes = [
 export const handle: Handle = async ({ event, resolve }) => {
   // The browser's leg of Wyrd's authorization server, served on this public origin.
   if (event.url.pathname.startsWith('/auth/')) return forwardAuth(event.request, event.url);
+  // A mutation must come from this public origin, before any session is read or request forwarded with the trusted one.
+  if (!reads.has(event.request.method) && event.request.headers.get('origin') !== event.url.origin) {
+    const value = problem('originRefused');
+    return json(value, { status: value.status, headers: { 'content-type': 'application/problem+json', 'cache-control': 'private, no-store' } });
+  }
   event.setHeaders({ 'cache-control': 'private, no-store' });
   const tenantKey = loginRoutes.includes(event.route.id ?? '') ? undefined : event.params.tenantKey;
   if (!localAuthEnabled()) {

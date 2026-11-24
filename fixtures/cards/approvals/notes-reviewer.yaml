@@ -1,0 +1,19 @@
+# Reviews one section of the release notes through the gateway's model.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: release-notes-reviewer
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 1}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "REVIEW: {{section}} at={{index}}"
+    response_format:
+      type: object
+      properties: {done: {type: boolean}}
+      additionalProperties: false

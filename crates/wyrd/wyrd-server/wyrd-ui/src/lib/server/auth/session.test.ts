@@ -34,6 +34,28 @@ test('cookie is opaque and page metadata excludes session authority', () => {
   expect(JSON.stringify(safe)).not.toContain('tenantId');
 });
 
+test('request hook refuses a mutation without this exact public Origin before any session is read', async () => {
+  const resolve = vi.fn();
+  const cookies = { get: vi.fn(), delete: vi.fn() };
+  const event = (headers: Record<string, string>) =>
+    ({
+      locals: {},
+      params: { tenantKey: 'acme' },
+      route: { id: '/t/[tenantKey]/verify/executions/[executionId]/cancel' },
+      cookies,
+      setHeaders: vi.fn(),
+      url: new URL('http://localhost/t/acme/verify/executions/exec_1/cancel'),
+      request: new Request('http://localhost/t/acme/verify/executions/exec_1/cancel', { method: 'POST', headers }),
+      isDataRequest: false
+    }) as unknown as Parameters<typeof handle>[0]['event'];
+  for (const headers of [{}, { origin: 'http://evil.test' }, { origin: 'http://localhost:8080' }] as Record<string, string>[]) {
+    const refused = (await handle({ event: event(headers), resolve })) as Response;
+    expect([refused.status, ((await refused.json()) as { code: string }).code]).toEqual([403, 'WYRD_AUTH_403_ORIGIN_REFUSED']);
+  }
+  expect(resolve).not.toHaveBeenCalled();
+  expect(cookies.get).not.toHaveBeenCalled();
+});
+
 test('request hook rejects expiry and disabled local identity before tenant loads execute', async () => {
   const resolve = vi.fn();
   const expired = sessions.create(Date.now() - sessionLifetime);
@@ -48,7 +70,7 @@ test('request hook rejects expiry and disabled local identity before tenant load
     cookies,
     setHeaders: vi.fn(),
     url: new URL('http://localhost/t/acme'),
-    request: new Request('http://localhost/t/acme', { method: 'POST' }),
+    request: new Request('http://localhost/t/acme', { method: 'POST', headers: { origin: 'http://localhost' } }),
     isDataRequest: false
   } as unknown as Parameters<typeof handle>[0]['event'];
   await expect(handle({ event, resolve })).rejects.toMatchObject({

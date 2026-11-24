@@ -2677,6 +2677,17 @@ reviewing('TASK-006: an approver reads each waiting approval in the execution pa
     for (const step of ['review', 'release']) expect(await page.locator(`[data-node="step:${step}"]`).textContent()).toContain('waiting for approval');
     await captureRepositories(page, 'execution-approval-pending');
 
+    // This session's cookie with a missing or foreign Origin: a decision and a cancel are refused before anything is forwarded, and nothing changes. Reads stay readable.
+    const decision = `${base}/verify/executions/${executionId}/approvals/${review.approval_id}`;
+    for (const headers of [{}, { origin: 'http://evil.test' }] as Record<string, string>[]) {
+      const refused = await page.request.post(decision, { data: { decision: 'approved' }, headers });
+      expect([refused.status(), ((await refused.json()) as { code: string }).code]).toEqual([403, 'WYRD_AUTH_403_ORIGIN_REFUSED']);
+      const cancel = await page.request.post(`${base}/verify/executions/${executionId}/cancel`, { headers });
+      expect([cancel.status(), ((await cancel.json()) as { code: string }).code]).toEqual([403, 'WYRD_AUTH_403_ORIGIN_REFUSED']);
+    }
+    expect([(await execution.status()).status, (await occurrences()).map((each) => each.status)]).toEqual(['waiting', ['pending', 'pending']]);
+    expect((await page.request.get(`${base}/verify/executions/${executionId}`)).status()).toBe(200);
+
     // Approve the review with a reason through its button: the receipt is reported and the reread shows it approved.
     await reviewBox.getByLabel('Reason (optional)').fill('reviewed the diff');
     await reviewBox.getByRole('button', { name: 'Approve' }).click();
@@ -2690,6 +2701,9 @@ reviewing('TASK-006: an approver reads each waiting approval in the execution pa
     await releaseBox.getByRole('button', { name: 'Reject' }).focus();
     await page.keyboard.press('Enter');
     await expect.poll(() => releaseBox.locator('[data-approval-status]').textContent(), { timeout: 30_000 }).toContain('rejected');
+    // Resending the same decision, as after a lost answer, replays the server's receipt and records nothing new.
+    const replay = await page.request.post(`${base}/verify/executions/${executionId}/approvals/${release.approval_id}`, { data: { decision: 'rejected' }, headers: { origin: new URL(base).origin } });
+    expect([replay.status(), ((await replay.json()) as { status: string }).status]).toEqual([200, 'rejected']);
     expect((await occurrences()).map((each) => [each.approval_id, each.status, each.reason])).toEqual([
       [review.approval_id, 'approved', 'reviewed the diff'],
       [release.approval_id, 'rejected', null]

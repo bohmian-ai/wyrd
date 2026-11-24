@@ -937,6 +937,7 @@ import { load as loadUndeclared } from '../routes/t/[tenantKey]/repositories/git
 import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.svelte';
 import { load as loadGithub } from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.server';
 import GithubPage from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.svelte';
+import { load as loadSecrets } from '../routes/t/[tenantKey]/settings/(admin)/secrets/+page.server';
 import { connectionExecutor } from '$lib/ui-fixtures';
 import { EventEmitter } from 'node:events';
 import { GET as getObserveSupport } from '../routes/t/[tenantKey]/observe/support/+server';
@@ -1249,6 +1250,31 @@ test('account settings reads the profile and the own key page at once, for the s
 
   expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, recovery: true, problem: null });
   expect(requested).toEqual(['/principals/me (profile answered: false)', '/principals/p-1/credentials?limit=50&cursor=k-9 (profile answered: false)']);
+});
+
+test('Secrets lists each owner on its own: a refused owner is its problem, never an empty success', async () => {
+  const refused = { type: 'about:blank', title: 'Permission denied', status: 403, code: 'WYRD_PERMISSION_403_DENIED_RBAC', remediation: 'Ask an administrator.' };
+  const answers: Record<string, unknown> = {
+    '/admin/gateway/provider-credentials': [
+      { name: 'openai-prod', provider: 'openai', source: 'managed_secret', state: 'active', rotated_at: '2026-11-01T00:00:00Z', revoked_at: null, created_at: '2026-10-01T00:00:00Z', updated_at: '2026-11-01T00:00:00Z' },
+      { name: 'openai-old', provider: 'openai', source: 'managed_secret', state: 'revoked', rotated_at: null, revoked_at: '2026-10-02T00:00:00Z', created_at: '2026-10-01T00:00:00Z', updated_at: '2026-10-02T00:00:00Z' }
+    ],
+    '/identity/oidc/connections': { active: { id: 'c-1', state: 'Active', issuer: 'https://idp.example.test/realm', client_id: 'wyrd', client_auth: 'SecretBasic' }, candidate: null, callback_url: null },
+    '/admin/trusted-issuers': [{ issuer: 'https://ci.example.test', client_id: 'ci', client_auth: 'Public' }]
+  };
+  const browserSession = {
+    api: async (_method: string, path: string) =>
+      path in answers ? Response.json(answers[path]) : new Response(JSON.stringify(refused), { status: 403, headers: { 'content-type': 'application/problem+json' } })
+  };
+  const data = (await loadSecrets({ locals: { browserSession } } as never)) as { secrets: { name: string; state: string; revoke: boolean }[]; problems: { owner: string; problem: { status: number } }[] };
+
+  expect(data.secrets.map(({ name, state, revoke }) => [name, state, revoke])).toEqual([
+    ['openai-prod', 'active', true],
+    ['openai-old', 'revoked', false],
+    ['idp.example.test', 'active', false]
+  ]);
+  // Operator connections refused: named, not shown as none. A public issuer holds no secret.
+  expect(data.problems).toMatchObject([{ owner: 'operator', problem: { status: 403 } }]);
 });
 
 test('Settings connects and disconnects GitHub once through the host and reads state back', async () => {

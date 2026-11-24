@@ -372,7 +372,7 @@ async function freshBff(): Promise<{ url: string; stop: () => void }> {
 
 test('production SSO crosses replicas', async () => {
   const sso = journey.ssoTenant;
-  const settings = `/t/${sso}/settings`;
+  const settings = `/t/${sso}/settings/sign-in`;
 
   // A missing or forged login binding at an unknown state is the stable problem and sets nothing.
   const alice = new Browser();
@@ -440,7 +440,7 @@ test('production SSO crosses replicas', async () => {
   );
   expect(crossed.cookies.has(sessionCookie(journey.apiKeyTenant))).toBe(false);
   expect(
-    (await alice.go(0, `/t/${journey.apiKeyTenant}/settings?/deactivate`, { form: {} })).status
+    (await alice.go(0, `/t/${journey.apiKeyTenant}/settings/sign-in?/deactivate`, { form: {} })).status
   ).toBe(401);
 
   // A cross-site form post is refused (SvelteKit `csrf.checkOrigin`).
@@ -502,7 +502,7 @@ test('production SSO crosses replicas', async () => {
 test('OIDC-off credential UI', async () => {
   const tenant = journey.apiKeyTenant;
   const login = `/t/${tenant}/login`;
-  const settings = `/t/${tenant}/settings`;
+  const settings = `/t/${tenant}/settings/sign-in`;
   const browser = new Browser();
 
   const recovery = `${login}/api-key`;
@@ -684,7 +684,7 @@ test('production multi-provider tenant switch', async () => {
 
 test('production provider replacement settings', async () => {
   const tenant = journey.replacementTenant;
-  const settings = `/t/${tenant}/settings`;
+  const settings = `/t/${tenant}/settings/sign-in`;
   const alice = new Browser();
   const stage = () =>
     alice.go(0, `${settings}?/stage`, {
@@ -699,7 +699,7 @@ test('production provider replacement settings', async () => {
         groupRoles: ''
       }
     });
-  /** The rendered connections: ids in page order (Active first) and the candidate revision. */
+  /** The rendered connections' ids and the candidate revision. */
   const connections = async () => {
     const html = await (await alice.go(1, settings)).text();
     return {
@@ -717,7 +717,7 @@ test('production provider replacement settings', async () => {
   expect((await stage()).status).toBe(200);
   const discarded = await connections();
   expect(discarded.ids).toHaveLength(2);
-  const removed = await alice.go(1, `${settings}?/remove`, { form: { id: discarded.ids[1] } });
+  const removed = await alice.go(1, `${settings}?/remove`, { form: { id: discarded.ids.find((id) => id !== oldConnection)! } });
   expect(removed.status).toBe(200);
   expect((await connections()).ids).toEqual([oldConnection]);
 
@@ -776,7 +776,7 @@ test('production provider replacement settings', async () => {
   expect(listed.status).toBe(200);
   const view = (await listed.json()) as { active: { id: string; issuer: string } | null };
   expect(view.active?.issuer.replace(/\/$/, '')).toBe(secondIssuer);
-  expect(view.active?.id).toBe(ids[1]);
+  expect(view.active?.id).toBe(ids.find((id) => id !== oldConnection));
   const retiredConnection = `/identity/oidc/connections/${oldConnection}`;
   expect((await asKey(journey.replacementOwnerKey, 'DELETE', retiredConnection)).status).toBeLessThan(300);
   expect((await asKey(journey.replacementOwnerKey, 'DELETE', retiredConnection)).status).toBe(404);
@@ -832,14 +832,17 @@ test('production SSO account settings', async () => {
 test('production required company SSO settings', async () => {
   // The switch journey is done with this tenant; nothing after it signs in here.
   const tenant = journey.switchTenants.peer;
-  const settings = `/t/${tenant}/settings`;
+  const settings = `/t/${tenant}/settings/sign-in`;
+  // The policy form is the switch's confirmation, opened for the change the policy can take next.
   const policyOf = async (browser: Browser, replica: 0 | 1) => {
     const html = await (await browser.go(replica, settings)).text();
-    const form = /<form[^>]*action="\?\/policy"[\s\S]*?<\/form>/.exec(html)?.[0] ?? '';
+    const required = html.includes('Company SSO is required.');
+    const dialog = await (await browser.go(replica, `${settings}?confirm=${required ? 'allow' : 'require'}`)).text();
+    const form = /<form[^>]*action="\?\/policy"[\s\S]*?<\/form>/.exec(dialog)?.[0] ?? '';
     const field = (name: string) => new RegExp(`name="${name}"[^>]*value="([^"]*)"`).exec(form)?.[1];
     return {
       html,
-      required: html.includes('✓ Required'),
+      required,
       fields: {
         require: field('require')!,
         revision: field('revision')!,
@@ -854,7 +857,7 @@ test('production required company SSO settings', async () => {
   await ssoLogin(alice, journey.users.admin, 0, 1, tenant);
   const before = await policyOf(alice, 1);
   expect(before.required).toBe(false);
-  expect(before.html).toMatch(/\d+ active accounts? cannot sign in through your company/);
+  expect(before.html).toMatch(/\d+ (person has|people have) no company sign-in yet and would be locked out/);
   expect(before.fields.require).toBe('true');
 
   // Enabling needs the explicit confirmation; without it nothing changes.

@@ -1,6 +1,6 @@
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject } from '$lib/server/auth/session';
-import type { BrowserSession } from '$lib/server/auth/browser-sessions';
+import { browserSessions, type BrowserSession, type LoginMethods } from '$lib/server/auth/browser-sessions';
 import { problem, upstreamProblem, safeProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
@@ -44,23 +44,28 @@ async function call(
   return response;
 }
 
-export const load: PageServerLoad = async ({ locals }) => {
+/**
+ * The connections and login policy as this session may read them, beside the sign-in methods
+ * the tenant's login page offers; methods that cannot be read leave their tiles unstated.
+ */
+export const load: PageServerLoad = async ({ locals, params, url }) => {
   // Connection administration is a server contract; the development identity has no server session.
   if (!locals.browserSession)
-    return { connections: null, policy: null, problem: problem('upstream') };
+    return { connections: null, policy: null, methods: null, problem: problem('upstream') };
   const session = locals.browserSession;
+  const methods = browserSessions.methods(params.tenantKey, url).catch((): LoginMethods | null => null);
   try {
     const [connections, policy] = await Promise.all(
       ['/identity/oidc/connections', '/identity/login-policy'].map(async (path) =>
         (await call(session, 'GET', path)).json()
       )
     );
-    return { connections: connections as Connections, policy: policy as LoginPolicy, problem: null };
+    return { connections: connections as Connections, policy: policy as LoginPolicy, methods: await methods, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
-    return { connections: null, policy: null, problem: safeProblem(cause) };
+    return { connections: null, policy: null, methods: await methods, problem: safeProblem(cause) };
   }
-}
+};
 
 /** Run one mutation as the signed-in principal and render its refusal as a safe problem. */
 async function mutate(

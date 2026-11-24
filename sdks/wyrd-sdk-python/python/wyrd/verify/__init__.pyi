@@ -657,6 +657,17 @@ class ApprovalOccurrence(TypedDict):
     decided_at: str | None
     reason: str | None
 
+class InputWait(TypedDict):
+    """One declared task held before dispatch for deferred inputs not yet consumed.
+
+    ``task_id`` is a step or whole-Verifier requirement; an attached
+    requirement's inputs count for its step. No invocation exists for it yet.
+    """
+
+    task_id: str
+    slots: list[str]
+    """The missing deferred inputs it reads; never empty."""
+
 class ApprovalReceipt(TypedDict):
     """``Execution.decide()``: the durable decision of one approval occurrence."""
 
@@ -683,6 +694,8 @@ class ExecutionState(TypedDict, Generic[DataT]):
     """The deferred inputs a ``waiting`` execution is parked for."""
     approvals: NotRequired[list[ApprovalOccurrence]]
     """Every approval occurrence the execution reached, in step order."""
+    input_waits: NotRequired[list[InputWait]]
+    """Each task an unfinished execution holds for deferred inputs, in task order; never decides ``status``."""
 
 class EvidenceRepository(TypedDict):
     """The connected repository a publication's slug resolved to."""

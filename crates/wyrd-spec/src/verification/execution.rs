@@ -433,7 +433,7 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// Every declared task an unfinished execution holds because a deferred
     /// input it reads has not been consumed, one per task in task order,
     /// reported while independent work still runs; empty otherwise. It never
-    /// decides [`Self::status`] and never implies a verdict.
+    /// decides the status and never implies a verdict.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_waits: Vec<InputWait>,
     /// How far GitHub delivery of a `pull_request` execution's current

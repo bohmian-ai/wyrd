@@ -3964,6 +3964,23 @@ export interface InputDeclarationTrace {
 export type InputSlot = TypedInputSlot | SourceText;
 
 /**
+ * One declared step or whole-Verifier requirement held before dispatch
+ * because deferred inputs it reads directly have not been consumed. An
+ * attached requirement's inputs count for its step; a task only downstream
+ * of a waiting one is not listed. No invocation exists for it yet.
+ */
+export interface InputWait {
+  /**
+   * The missing deferred inputs it reads; never empty.
+   */
+  readonly slots: readonly SlotName[];
+  /**
+   * The waiting step or whole-Verifier requirement.
+   */
+  readonly task_id: TaskId;
+}
+
+/**
  * OTel-canonical instrumentation scope.
  *
  * Fields:
@@ -8730,6 +8747,13 @@ export interface VerificationExecutionState {
    * judges.
    */
   readonly group_id?: GroupId | null;
+  /**
+   * Every declared task an unfinished execution holds because a deferred
+   * input it reads has not been consumed, one per task in task order,
+   * reported while independent work still runs; empty otherwise. It never
+   * decides the status and never implies a verdict.
+   */
+  readonly input_waits?: readonly InputWait[];
   /**
    * Binding owner of a background execution.
    */

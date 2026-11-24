@@ -2907,7 +2907,9 @@ impl Oracle {
     /// so a later grant sizes only its memory ceiling. When this node composed
     /// the Analytical owners the build runs through the pinned distributed
     /// planner, which is what lets the root come back as a `DistributedExec`;
-    /// the class is then read from that root alone.
+    /// the class is then read from that root alone. That planner's session is
+    /// installed before the one logical optimizer pass, because its settings
+    /// decide how subqueries are lowered for the physical build.
     ///
     /// Nothing here admits, reserves, publishes, or reads a row. The planning
     /// session is dropped as soon as the root and its config are retained.
@@ -2947,6 +2949,12 @@ impl Oracle {
             .register_cut_providers(&planning, context, cuts)
             .await?;
         providers.done();
+        // The distributed planner's configuration governs how the optimizer
+        // lowers subqueries, so it is installed before the one logical pass.
+        let planning = match self.analytical.as_ref() {
+            Some(handle) => handle.planning_session(&planning, roster.oracles())?,
+            None => planning,
+        };
         let logical_planning = planned.profile.physical_planning.timer();
         let logical = Self::before_deadline(
             deadline,
@@ -3003,13 +3011,8 @@ impl Oracle {
             cap,
             "Oracle sized the query's partitions from its scanned bytes"
         );
-        let oracles = roster.oracles();
         #[cfg(feature = "test-support")]
         record_physical_build(&roster.fingerprint());
-        let planning = match self.analytical.as_ref() {
-            Some(handle) => handle.planning_session(&planning, oracles)?,
-            None => planning,
-        };
         #[cfg(feature = "test-support")]
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);

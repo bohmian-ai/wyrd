@@ -1426,29 +1426,43 @@ async fn a_relay_save_without_a_password_keeps_the_stored_one() {
     };
 
     // 1. The first save stores the password.
-    let reply = save(json!({ "host": "relay.wyrd.test", "port": 2525, "tls": "none",
+    let reply = save(
+        json!({ "host": "relay.wyrd.test", "port": 2525, "tls": "none",
         "username": "relay-user", "password": "relay-password-plaintext",
-        "sender": "invites@wyrd.test" }))
+        "sender": "invites@wyrd.test" }),
+    )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     assert_eq!(reply.body["relay"]["password_set"], true);
     let stored = sealed().await.expect("a sealed password");
 
     // 2. Omitting it keeps the same envelope.
-    let reply = save(json!({ "host": "relay2.wyrd.test", "port": 587, "tls": "starttls",
-        "username": "relay-user", "sender": "invites@wyrd.test" }))
+    let reply = save(
+        json!({ "host": "relay2.wyrd.test", "port": 587, "tls": "starttls",
+        "username": "relay-user", "sender": "invites@wyrd.test" }),
+    )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     assert_eq!(reply.body["relay"]["password_set"], true, "{}", reply.body);
     assert_eq!(reply.body["relay"]["host"], "relay2.wyrd.test");
-    assert_eq!(sealed().await.as_ref(), Some(&stored), "the password is kept");
+    assert_eq!(
+        sealed().await.as_ref(),
+        Some(&stored),
+        "the password is kept"
+    );
 
     // 3. A new username needs its own password.
-    let reply = save(json!({ "host": "relay3.wyrd.test", "port": 587, "tls": "starttls",
-        "username": "someone-else", "sender": "invites@wyrd.test" }))
+    let reply = save(
+        json!({ "host": "relay3.wyrd.test", "port": 587, "tls": "starttls",
+        "username": "someone-else", "sender": "invites@wyrd.test" }),
+    )
     .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
-    assert_eq!(reply.body["code"], "WYRD_SPEC_400_VALIDATION", "{}", reply.body);
+    assert_eq!(
+        reply.body["code"], "WYRD_SPEC_400_VALIDATION",
+        "{}",
+        reply.body
+    );
     let (status, read) = social_call(
         &srv,
         social_request(Method::GET, "/platform/mail", Some(&api), None),

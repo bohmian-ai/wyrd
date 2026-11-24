@@ -335,6 +335,8 @@ impl<'a> VerificationControl<'a> {
         }
         if let Some(failure) = &retained.state.failure {
             state.error = Some(failure.error.clone());
+        } else if let Some((_, error)) = &retained.settled {
+            state.error.clone_from(error);
         }
         if grouped {
             state.group = match &record {
@@ -846,7 +848,7 @@ impl<'a> VerificationControl<'a> {
         // memory only. A target that does not resolve is refused by
         // acceptance with its own reason, so only an operation-level grant is
         // required to learn it.
-        let required = match self
+        let target = self
             .state
             .verification
             .verifier_cards()
@@ -857,8 +859,12 @@ impl<'a> VerificationControl<'a> {
                 &request.card_uid,
             )
             .await
-            .map_err(registry_db_error)?
-        {
+            .map_err(registry_db_error)?;
+        let subject = target
+            .as_ref()
+            .ok()
+            .map(|target| CardPermissionScope::exact(&target.subject, request.card_uid.clone()));
+        let required = match target {
             Ok(target) => Permission::verifier_run(CardPermissionScope::exact(
                 &target.verifier,
                 request.verifier_card_uid.clone(),
@@ -892,6 +898,7 @@ impl<'a> VerificationControl<'a> {
                 // The inputs row records no Verifier version.
                 verifier_version: "",
                 card_uid: &submission.request.card_uid,
+                subject: subject.as_ref(),
                 owner_card_uid: wyrd_runtime::owning_root(
                     &caller.principal,
                     &caller.delegation_chain,
@@ -981,12 +988,14 @@ impl<'a> VerificationControl<'a> {
         started_at: chrono::DateTime<Utc>,
     ) {
         let verifier_version = target.verifier.version.to_string();
+        let subject = CardPermissionScope::exact(&target.subject, request.card_uid.clone());
         let builder = ResultPayloadBuilder::new(
             ResultRun {
                 execution_id,
                 run_id: request.run_id.as_ref(),
                 verifier_version: &verifier_version,
                 card_uid: &request.card_uid,
+                subject: Some(&subject),
                 owner_card_uid: wyrd_runtime::owning_root(
                     &caller.principal,
                     &caller.delegation_chain,

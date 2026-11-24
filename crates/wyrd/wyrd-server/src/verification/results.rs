@@ -32,6 +32,7 @@ use vala_bifrost_redux::tables::verification::{
 };
 use wyrd_queue::variant::EncodedVariant;
 use wyrd_runtime::request_context::AcceptedAuthority;
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
@@ -236,6 +237,10 @@ pub struct ResultRun<'a> {
     pub verifier_version: &'a str,
     /// The Card verified, stored as the managed `subject_card_uid`.
     pub card_uid: &'a CardUid,
+    /// That Card's exact registered scope, stored as `subject_kind` and
+    /// `subject_name` so a record proves its execution's read parent with
+    /// no queue row or Card read; `None` leaves both null.
+    pub subject: Option<&'a CardPermissionScope>,
     /// Owner Service, stored as the managed `workload_card_uid`: the binding
     /// owner for binding-created work, else the authenticated caller's owner
     /// Service; `None` when neither is known.
@@ -546,13 +551,21 @@ impl<'a> ResultPayloadBuilder<'a> {
                 });
             }
         }
+        let subject_kind = self
+            .run
+            .subject
+            .and_then(|subject| serde_json::to_value(subject.kind()).ok())
+            .and_then(|kind| kind.as_str().map(str::to_owned));
         named.extend(
             [
                 (SERVICE_NAME, None),
                 (SERVICE_VERSION, None),
                 (DEPLOYMENT_ENVIRONMENT, self.run.deployment_environment),
-                (SUBJECT_KIND, None),
-                (SUBJECT_NAME, None),
+                (SUBJECT_KIND, subject_kind.as_deref()),
+                (
+                    SUBJECT_NAME,
+                    self.run.subject.map(|subject| subject.name().as_str()),
+                ),
                 (SUBJECT_VERSION, None),
             ]
             .map(|(name, value)| (name, Cell::text(value))),
@@ -695,6 +708,7 @@ mod tests {
                     run_id: Some(&self.run_id),
                     verifier_version: "1.2.0",
                     card_uid: &self.subject,
+                    subject: None,
                     owner_card_uid: Some(&self.owner),
                     group_id: None,
                     deployment_environment: None,

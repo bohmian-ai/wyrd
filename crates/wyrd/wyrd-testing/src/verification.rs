@@ -693,6 +693,7 @@ impl VerificationFixture {
                 run_id: None,
                 verifier_version: "",
                 card_uid: subject,
+                subject: None,
                 owner_card_uid: None,
                 group_id: None,
                 deployment_environment: None,

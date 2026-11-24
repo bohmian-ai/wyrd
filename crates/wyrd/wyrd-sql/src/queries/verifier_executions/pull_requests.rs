@@ -29,14 +29,14 @@ use sqlx::types::{Json, Uuid};
 use sqlx::{Error as SqlxError, Row as _};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, CardPermissionScope};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, RepositoryId};
 use wyrd_spec::verification::execution::PullRequestActivation;
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
 use super::{
     Admitted, CancelledExecution, CancelledRow, EnqueueRefusal, ExecutionAuthority,
-    VerifierExecutionQueue, resolve_binding, stored, timed,
+    VerifierExecutionQueue, resolve_binding, stored, subject_columns, subject_scope, timed,
 };
 use crate::{OperatorPool, TenantConn};
 
@@ -68,12 +68,14 @@ const LATEST_SQL: &str = concat!(
 /// The columns [`GenerationRow`] reads.
 macro_rules! generation_columns {
     () => {
-        "SELECT execution_id, binding_id, status, next_attempt_at = 'infinity' AS reserved,
-                authority IS NULL AS refused, verifier_card_uid, card_uid, owner_card_uid,
-                sub_principal_id, act_principal_id, pull_request, pr_observed_at,
-                pr_deactivated_at
-           FROM wyrd.verifier_executions
-          WHERE "
+        concat!(
+            "SELECT execution_id, binding_id, status, next_attempt_at = 'infinity' AS reserved,
+                    authority IS NULL AS refused, verifier_card_uid, card_uid, owner_card_uid,
+                    sub_principal_id, act_principal_id, pull_request, pr_observed_at,
+                    pr_deactivated_at, ",
+            subject_columns!("verifier_executions"),
+            " FROM wyrd.verifier_executions WHERE "
+        )
     };
 }
 
@@ -139,7 +141,7 @@ const DEACTIVATE_SQL: &str = concat!(
       WHERE ",
     this_pull_request!(),
     " AND (status IN ('pending', 'retrying', 'running') OR pr_deactivated_at IS NULL)
-     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id,
+     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id, error,
                status = 'cancelled' AND error = $4 AS cancelled"
 );
 
@@ -152,7 +154,7 @@ const SUPERSEDE_SQL: &str = concat!(
       WHERE ",
     this_pull_request!(),
     " AND status IN ('pending', 'retrying', 'running')
-     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id"
+     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id, error"
 );
 
 /// Cancel the unfinished PR executions of host `$1` whose repository is one
@@ -174,7 +176,7 @@ const CANCEL_REPOSITORIES_SQL: &str = "
      WHERE origin = 'pull_request' AND pull_request->>'host' = $1
        AND ($2::text[] IS NULL OR pull_request->>'repository_id' = ANY($2))
        AND (status IN ('pending', 'retrying', 'running') OR pr_deactivated_at IS NULL)
-     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id,
+     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id, error,
                status = 'cancelled' AND error = $3 AS cancelled
 ";
 
@@ -401,6 +403,9 @@ pub struct PullRequestExecution {
     pub verifier_card_uid: CardUid,
     /// Exact subject.
     pub card_uid: CardUid,
+    /// The subject's exact registered scope, its retained read parent;
+    /// `None` once its Card is gone.
+    pub subject: Option<CardPermissionScope>,
     /// The Repository Card version that owns the binding.
     pub owner_card_uid: CardUid,
     /// Who the execution serves and who accepted it.
@@ -491,6 +496,10 @@ struct GenerationRow {
     card_uid: Uuid,
     /// Repository owner.
     owner_card_uid: Uuid,
+    /// The subject Card's registered kind; `None` once it is gone.
+    subject_kind: Option<String>,
+    /// The subject Card's registered name; `None` once it is gone.
+    subject_name: Option<String>,
     /// Served subject.
     sub_principal_id: Uuid,
     /// Accepting actor.
@@ -544,6 +553,11 @@ fn generation_of(rows: Vec<GenerationRow>) -> Result<Option<PullRequestGeneratio
             reserved: row.reserved.unwrap_or(false),
             refused: row.refused.unwrap_or(false),
             verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
+            subject: subject_scope(
+                &stored(CardUid::from_uuid(row.card_uid))?,
+                row.subject_kind,
+                row.subject_name,
+            )?,
             card_uid: stored(CardUid::from_uuid(row.card_uid))?,
             owner_card_uid: stored(CardUid::from_uuid(row.owner_card_uid))?,
             attribution: Attribution::new(

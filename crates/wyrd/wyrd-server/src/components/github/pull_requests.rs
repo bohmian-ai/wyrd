@@ -782,6 +782,7 @@ impl GithubConnections<'_> {
                     // The inputs row records no Verifier version.
                     verifier_version: "",
                     card_uid: &execution.card_uid,
+                    subject: execution.subject.as_ref(),
                     owner_card_uid: Some(&execution.owner_card_uid),
                     group_id: None,
                     deployment_environment: None,
@@ -826,6 +827,7 @@ impl GithubConnections<'_> {
                         &execution.verifier_card_uid,
                         &execution.card_uid,
                         execution.status,
+                        None,
                         execution.attribution,
                         generation.observed_at,
                     ),

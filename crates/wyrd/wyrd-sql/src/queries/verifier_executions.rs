@@ -204,9 +204,11 @@ const SCHEDULE_CLAIM_DELAY: Duration = Duration::seconds(30);
 /// and the next cursor on the same delayed clock that decides dueness.
 /// Bindings in `$2`, whose candidates this process is already handing off,
 /// are passed over.
-const DUE_BINDING_SQL: &str = r"
-    SELECT binding_id, verifier_card_uid, card_uid, schedule_cron, schedule_tz, next_run_at,
-           statement_timestamp() - ($1::bigint * INTERVAL '1 millisecond') AS schedule_clock
+const DUE_BINDING_SQL: &str = concat!(
+    "SELECT binding_id, verifier_card_uid, card_uid, schedule_cron, schedule_tz, next_run_at,
+            statement_timestamp() - ($1::bigint * INTERVAL '1 millisecond') AS schedule_clock, ",
+    subject_columns!("verification_bindings"),
+    "
       FROM wyrd.verification_bindings
      WHERE activation = 'schedule'
        AND next_run_at + ($1::bigint * INTERVAL '1 millisecond') <= statement_timestamp()
@@ -214,7 +216,8 @@ const DUE_BINDING_SQL: &str = r"
      ORDER BY next_run_at, binding_id
      LIMIT 1
        FOR UPDATE SKIP LOCKED
-";
+"
+);
 
 /// Record acknowledged source activity of grouped items: every `group_end`
 /// binding of the recorded owner with a source slot for the item's exact
@@ -265,11 +268,11 @@ const DUE_GROUP_SQL: &str = r"
 
 /// Read a pending group's binding owner, frozen `group_end` settings, group
 /// Verifier, and subject.
-const GROUP_BINDING_SQL: &str = r"
-    SELECT owner_card_uid, group_end, verifier_card_uid, card_uid
-      FROM wyrd.verification_bindings
-     WHERE binding_id = $1
-";
+const GROUP_BINDING_SQL: &str = concat!(
+    "SELECT owner_card_uid, group_end, verifier_card_uid, card_uid, ",
+    subject_columns!("verification_bindings"),
+    " FROM wyrd.verification_bindings WHERE binding_id = $1"
+);
 
 /// Consume a claimed pending group.
 const CONSUME_GROUP_SQL: &str = r"
@@ -628,7 +631,7 @@ const CANCEL_PRINCIPAL_SQL: &str = r"
            updated_at = statement_timestamp()
      WHERE (sub_principal_id = $1 OR act_principal_id = $1)
        AND status IN ('pending', 'retrying', 'running')
-    RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id
+    RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id, error
 ";
 
 /// Which of principals `$1` are no longer active, read once every listed
@@ -1021,6 +1024,9 @@ pub struct CancelledExecution {
     pub card_uid: CardUid,
     /// Its subject and accepting actor.
     pub attribution: Attribution,
+    /// The sanitized error the cancellation recorded on the queue row;
+    /// `None` for a row the statement touched without cancelling it.
+    pub error: Option<VerificationError>,
 }
 
 /// The executions cancelled by one [`CANCEL_PRINCIPAL_SQL`] statement.
@@ -1036,6 +1042,8 @@ struct CancelledRow {
     sub_principal_id: Uuid,
     /// Accepting actor.
     act_principal_id: Uuid,
+    /// The stored terminal error.
+    error: Option<Json<VerificationError>>,
 }
 
 impl CancelledRow {
@@ -1052,6 +1060,7 @@ impl CancelledRow {
                 PrincipalId::new(self.sub_principal_id),
                 PrincipalId::new(self.act_principal_id),
             ),
+            error: self.error.map(|Json(error)| error),
         })
     }
 }
@@ -1446,6 +1455,9 @@ pub struct DueBinding {
     pub verifier_card_uid: CardUid,
     /// The Card the binding verifies, whose observations a run judges.
     pub card_uid: CardUid,
+    /// That Card's exact registered scope, its executions' retained read
+    /// parent; `None` once the Card is gone.
+    pub subject: Option<CardPermissionScope>,
     /// What the occurrence calls for.
     decision: DueDecision,
 }
@@ -1517,6 +1529,9 @@ pub struct DueGroup {
     pub verifier_card_uid: CardUid,
     /// The Card the group Verifier verifies.
     pub card_uid: CardUid,
+    /// That Card's exact registered scope, its executions' retained read
+    /// parent; `None` once the Card is gone.
+    pub subject: Option<CardPermissionScope>,
     /// The pinned Trigger duration and source bindings.
     pub settings: GroupEndSettings,
     /// The owner family's runtime account, whatever its status; `None` when
@@ -2424,6 +2439,7 @@ impl VerifierExecutionQueue {
             let binding_id = stored(BindingId::new(due.binding_id))?;
             let verifier_card_uid = stored(CardUid::from_uuid(due.verifier_card_uid))?;
             let card_uid = stored(CardUid::from_uuid(due.card_uid))?;
+            let subject = subject_scope(&card_uid, due.subject_kind, due.subject_name)?;
             let occurrence = match BindingSchedule::parse(
                 &due.schedule_cron,
                 due.schedule_tz.as_deref(),
@@ -2438,6 +2454,7 @@ impl VerifierExecutionQueue {
                         due_at,
                         verifier_card_uid,
                         card_uid,
+                        subject,
                         decision: DueDecision::InvalidSchedule,
                     }));
                 }
@@ -2465,6 +2482,7 @@ impl VerifierExecutionQueue {
                 due_at,
                 verifier_card_uid,
                 card_uid,
+                subject,
                 decision,
             }))
         })
@@ -2677,25 +2695,22 @@ impl VerifierExecutionQueue {
             let Some((binding_id, group_id, due_at, overdue, generation)) = due else {
                 return Ok(None);
             };
-            let (owner, Json(settings), verifier, subject): (
-                Uuid,
-                Json<GroupEndSettings>,
-                Uuid,
-                Uuid,
-            ) = sqlx::query_as(GROUP_BINDING_SQL)
+            let binding: GroupBindingRow = sqlx::query_as(GROUP_BINDING_SQL)
                 .bind(binding_id)
                 .fetch_one(&mut **conn.transaction())
                 .await?;
+            let card_uid = stored(CardUid::from_uuid(binding.card_uid))?;
             let binding_id = stored(BindingId::new(binding_id))?;
             let activity = binding_activity(conn, binding_id, self.inactivity).await?;
             Ok(Some(DueGroup {
                 binding_id,
                 group_id: stored(GroupId::new(group_id))?,
                 due_at,
-                owner_card_uid: stored(CardUid::from_uuid(owner))?,
-                verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
-                card_uid: stored(CardUid::from_uuid(subject))?,
-                settings,
+                owner_card_uid: stored(CardUid::from_uuid(binding.owner_card_uid))?,
+                verifier_card_uid: stored(CardUid::from_uuid(binding.verifier_card_uid))?,
+                subject: subject_scope(&card_uid, binding.subject_kind, binding.subject_name)?,
+                card_uid,
+                settings: binding.group_end.0,
                 owner: activity.as_ref().and_then(|activity| activity.principal_id),
                 active: activity.is_some_and(|activity| activity.active),
                 overdue,
@@ -3891,6 +3906,10 @@ struct DueBindingRow {
     verifier_card_uid: Uuid,
     /// The Card the binding verifies.
     card_uid: Uuid,
+    /// That Card's registered kind; `None` once it is gone.
+    subject_kind: Option<String>,
+    /// That Card's registered name; `None` once it is gone.
+    subject_name: Option<String>,
     /// Stored cron expression.
     schedule_cron: String,
     /// Stored IANA time zone, when the schedule names one.
@@ -3902,6 +3921,23 @@ struct DueBindingRow {
     /// tick is made at, so a boundary counts as passed only once its own
     /// occurrence would be claimable.
     schedule_clock: DateTime<Utc>,
+}
+
+/// A `group_end` binding as [`GROUP_BINDING_SQL`] reads it.
+#[derive(sqlx::FromRow)]
+struct GroupBindingRow {
+    /// Binding owner.
+    owner_card_uid: Uuid,
+    /// The pinned Trigger duration and source bindings.
+    group_end: Json<GroupEndSettings>,
+    /// The group Verifier.
+    verifier_card_uid: Uuid,
+    /// The Card it verifies.
+    card_uid: Uuid,
+    /// That Card's registered kind; `None` once it is gone.
+    subject_kind: Option<String>,
+    /// That Card's registered name; `None` once it is gone.
+    subject_name: Option<String>,
 }
 
 /// An execution status row from [`STATUS_SQL`].
@@ -4003,6 +4039,41 @@ fn fixed_width<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N], SqlxError> {
 ///
 /// # Errors
 /// Returns [`SqlxError::Decode`] wrapping `value`'s error.
+/// The exact registered scope of subject `uid` from its Card's `kind` and
+/// `name`, read beside the row that names it; `None` once the Card is gone.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when the stored kind or name is malformed.
+pub(crate) fn subject_scope(
+    uid: &CardUid,
+    kind: Option<String>,
+    name: Option<String>,
+) -> Result<Option<CardPermissionScope>, SqlxError> {
+    let (Some(kind), Some(name)) = (kind, name) else {
+        return Ok(None);
+    };
+    Ok(Some(CardPermissionScope::version(
+        stored(serde_json::from_value(Value::String(kind)))?,
+        stored(wyrd_spec::ids::CardName::new(name))?,
+        uid.clone(),
+    )))
+}
+
+/// The registry columns naming a row's subject Card, `card_uid`, for
+/// [`subject_scope`].
+macro_rules! subject_columns {
+    ($table:literal) => {
+        concat!(
+            "(SELECT s.kind FROM wyrd.cards s WHERE s.card_uid = ",
+            $table,
+            ".card_uid) AS subject_kind, (SELECT s.name FROM wyrd.cards s WHERE s.card_uid = ",
+            $table,
+            ".card_uid) AS subject_name"
+        )
+    };
+}
+pub(crate) use subject_columns;
+
 pub(crate) fn stored<T, E>(value: Result<T, E>) -> Result<T, SqlxError>
 where
     E: StdError + Send + Sync + 'static,

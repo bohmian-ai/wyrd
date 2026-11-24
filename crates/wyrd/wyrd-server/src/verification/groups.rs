@@ -286,6 +286,7 @@ impl GroupPoller {
                 // The inputs row records no Verifier version.
                 verifier_version: "",
                 card_uid: &due.card_uid,
+                subject: due.subject.as_ref(),
                 owner_card_uid: Some(&due.owner_card_uid),
                 group_id: Some(&due.group_id),
                 deployment_environment: None,

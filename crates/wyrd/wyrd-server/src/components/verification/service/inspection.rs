@@ -42,7 +42,7 @@ use wyrd_spec::verification::state::{
     AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord, RecordedApproval,
 };
 use wyrd_spec::verification::{
-    PublicationName, TaskId, VerificationExecutionStatus, VerificationVerdict,
+    PublicationName, TaskId, VerificationError, VerificationExecutionStatus, VerificationVerdict,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::get_card_for_reconciliation;
@@ -279,19 +279,26 @@ pub(super) struct Retained {
     /// The accepted decision of each approval occurrence `state` recorded
     /// that has one.
     pub(super) decisions: BTreeMap<ApprovalId, ApprovalReceipt>,
+    /// With no queue row, the terminal status and sanitized error its
+    /// newest retained `status` event recorded; `None` while a queue row
+    /// exists, for direct work, or when no terminal status is visible.
+    pub(super) settled: Option<(VerificationExecutionStatus, Option<VerificationError>)>,
 }
 
 impl Retained {
     /// The execution's status: the outcome its state selected, read as
     /// completed once its queue row, if any, commits completion; else the
     /// failure its state retained; else `waiting` for a queued execution parked on deferred inputs or an
-    /// undecided approval, else its queue status, else `running`, since a
-    /// state with neither and no queue row belongs to direct work still in
-    /// flight.
+    /// undecided approval, else its queue status or, once the queue row is
+    /// gone, its retained terminal status, else `running`, since a state
+    /// with none of them belongs to work still in flight.
     pub(super) fn status(&self) -> VerificationExecutionStatus {
         execution_status(
             &self.state,
-            self.queued.as_ref().map(|queued| queued.state.status),
+            self.queued
+                .as_ref()
+                .map(|queued| queued.state.status)
+                .or_else(|| self.settled.as_ref().map(|(status, _)| *status)),
             self.direct.is_some(),
             self.undecided(),
         )
@@ -553,12 +560,8 @@ impl<'a> VerificationControl<'a> {
             .records(&mut conn, caller.data_tenant_id, Some(caller))
             .await?;
         conn.commit().await.map_err(registry_db_error)?;
-        let (revision, state) = accepted(
-            execution_id,
-            queued.as_ref(),
-            &InputResolver::new(&query, None),
-        )
-        .await?;
+        let records = InputResolver::new(&query, None);
+        let (revision, state) = accepted(execution_id, queued.as_ref(), &records).await?;
         let mut direct = None;
         let exact = |reference: &CardRef| {
             reference
@@ -568,26 +571,31 @@ impl<'a> VerificationControl<'a> {
         };
         // The trusted scopes come from the queue row's registered Cards, or
         // the accepted identity, or the published direct result's exact
-        // Cards; never from caller input. An unprovable one hides the
-        // execution.
+        // Cards, or, for queued work that never checkpointed, its input
+        // record's subject; never from caller input. An unprovable one hides
+        // the execution.
         let (verifier, parent) = match (&queued, &state.identity) {
             (Some(queued), _) => (queued.verifier_scope.clone(), queued.card_scope.clone()),
             (None, Some(identity)) => (exact(&identity.verifier), exact(&identity.subject)),
-            (None, None) => {
-                let found = InputResolver::new(&query, None)
-                    .direct(execution_id)
-                    .await?
-                    .ok_or_else(|| execution_not_found(execution_id))?;
-                let found = self.direct_identity(caller, execution_id, found).await?;
-                let scopes = (exact(&found.1.verifier), exact(&found.1.subject));
-                direct = Some(found);
-                scopes
-            }
+            (None, None) => match records.direct(execution_id).await? {
+                Some(found) => {
+                    let found = self.direct_identity(caller, execution_id, found).await?;
+                    let scopes = (exact(&found.1.verifier), exact(&found.1.subject));
+                    direct = Some(found);
+                    scopes
+                }
+                // Settled queued work is only read, so it needs no Verifier
+                // scope.
+                None => (None, records.parent(execution_id).await?),
+            },
         };
-        let (Some(verifier), Some(parent)) = (verifier, parent) else {
+        let Some(parent) = parent else {
             return Err(execution_not_found(execution_id));
         };
         if !reading {
+            let Some(verifier) = verifier else {
+                return Err(execution_not_found(execution_id));
+            };
             let required = Permission {
                 resource: Resource::Verifier,
                 action,
@@ -618,8 +626,21 @@ impl<'a> VerificationControl<'a> {
             .map(|recorded| recorded.approval_id)
             .collect();
         let decisions = ApprovalDecisions::new(self.state, caller.data_tenant_id)
-            .decided(&InputResolver::new(&query, None), execution_id, &approvals)
+            .decided(&records, execution_id, &approvals)
             .await?;
+        let settled = if queued.is_none() && direct.is_none() {
+            records.settled(execution_id).await?.filter(|(status, _)| {
+                matches!(
+                    status,
+                    VerificationExecutionStatus::Completed
+                        | VerificationExecutionStatus::Cancelled
+                        | VerificationExecutionStatus::TimedOut
+                        | VerificationExecutionStatus::Errored
+                )
+            })
+        } else {
+            None
+        };
         Ok(Retained {
             queued,
             revision,
@@ -627,6 +648,7 @@ impl<'a> VerificationControl<'a> {
             query,
             direct,
             decisions,
+            settled,
         })
     }
 
@@ -680,6 +702,7 @@ impl<'a> VerificationControl<'a> {
             query,
             direct: None,
             decisions,
+            settled: None,
         };
         let status = retained.status();
         let waiting = retained
@@ -1112,6 +1135,7 @@ impl<'a> VerificationControl<'a> {
                     &status.verifier_card_uid,
                     &status.card_uid,
                     VerificationExecutionStatus::Cancelled,
+                    status.state.error.as_ref(),
                     status.attribution,
                     occurred_at,
                 ),

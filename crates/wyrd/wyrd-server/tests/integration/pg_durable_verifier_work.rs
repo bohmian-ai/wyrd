@@ -2833,6 +2833,7 @@ async fn state_format_changes_preserve_existing_custody() {
             run_id: None,
             verifier_version: &verifier_version,
             card_uid: &card_uid,
+            subject: None,
             owner_card_uid: None,
             group_id: None,
             deployment_environment: None,

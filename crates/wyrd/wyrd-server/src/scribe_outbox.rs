@@ -93,6 +93,7 @@ use vala_bifrost_redux::tables::{
     ApprovalsTable, AuditLogTable, DomainTable, EvidenceTable, ExecutionEventsTable,
     ExecutionInputsTable, ExecutionOutputsTable, ResultsTable, SpansTable,
 };
+use wyrd_queue::variant::EncodedVariant;
 use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
@@ -103,6 +104,7 @@ use wyrd_spec::vala::api::{AuditEvent, NodeId};
 use wyrd_spec::vala::{
     ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
 };
+use wyrd_spec::verification::VerificationError;
 use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::verifier_executions::{
@@ -576,14 +578,15 @@ impl ScribeWrite {
 
     /// The status row recording that queued `execution`, run by Verifier
     /// `verifier` over `subject` for `attribution`, entered `status` at
-    /// `occurred_at`.
+    /// `occurred_at`, with the sanitized `error` a cancellation recorded.
     ///
     /// Its owner stages it only after the transition's transaction commits.
     /// The row has `event = 'status'`, `status` as the status serializes, a
     /// new event id, and `sequence` 0, which orders nothing: a reader takes
     /// an execution's newest status by `occurred_at`. `subject_card_uid` is the
-    /// execution's subject, its trusted read parent; every other content and
-    /// correlation column is null. A status row is never a checkpoint, so
+    /// execution's subject, its trusted read parent; `value` holds `error`,
+    /// so work that never checkpointed keeps its terminal error once its
+    /// queue row is gone; every other content and correlation column is null. A status row is never a checkpoint, so
     /// state recovery, which reads checkpoint revisions only, never sees it.
     #[must_use]
     pub fn status(
@@ -591,10 +594,19 @@ impl ScribeWrite {
         verifier: &CardUid,
         subject: &CardUid,
         status: VerificationExecutionStatus,
+        error: Option<&VerificationError>,
         attribution: Attribution,
         occurred_at: DateTime<Utc>,
     ) -> Self {
         let (event_id, execution) = (Uuid::now_v7().to_string(), execution.to_string());
+        let mut value = error
+            .map(EncodedVariant::from_serialize)
+            .transpose()
+            .inspect_err(|violation| {
+                tracing::error!(?violation, %execution, "an execution status error cannot be encoded; it is recorded without one");
+            })
+            .ok()
+            .flatten();
         let schema = checkpoint_schema();
         let cells = schema
             .fields()
@@ -607,7 +619,7 @@ impl ScribeWrite {
                 "status" => Cell::text(Some(<&'static str>::from(status))),
                 "verifier_card_uid" => Cell::text(Some(verifier.as_str())),
                 SUBJECT_CARD_UID => Cell::text(Some(subject.as_str())),
-                "value" => Cell::Variant(None),
+                "value" => Cell::Variant(value.take()),
                 "occurred_at" => Cell::Micros(Some(occurred_at.timestamp_micros())),
                 "item_index" | "iteration_index" | "attempt" | "size_bytes" | "file_count" => {
                     Cell::Int(None)
@@ -2310,6 +2322,7 @@ pub(crate) fn stage_cancelled(
                 &execution.verifier_card_uid,
                 &execution.card_uid,
                 VerificationExecutionStatus::Cancelled,
+                execution.error.as_ref(),
                 execution.attribution,
                 occurred_at,
             ),
@@ -2507,6 +2520,7 @@ mod tests {
                 run_id: None,
                 verifier_version: "1.0.0",
                 card_uid: subject,
+                subject: None,
                 owner_card_uid: None,
                 group_id: None,
                 deployment_environment: None,
@@ -2705,6 +2719,7 @@ mod tests {
                 run_id: None,
                 verifier_version: "1.0.0",
                 card_uid: &subject,
+                subject: None,
                 owner_card_uid: None,
                 group_id: None,
                 deployment_environment: None,
@@ -3650,7 +3665,15 @@ mod tests {
             .iter()
             .zip(statuses)
             .map(|(caller, status)| {
-                ScribeWrite::status(ExecutionId::new_v7(), &uid(), &uid(), status, *caller, at)
+                ScribeWrite::status(
+                    ExecutionId::new_v7(),
+                    &uid(),
+                    &uid(),
+                    status,
+                    None,
+                    *caller,
+                    at,
+                )
             })
             .collect();
         let key = uuid::Uuid::now_v7();

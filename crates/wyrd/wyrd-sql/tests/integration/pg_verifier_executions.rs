@@ -1197,6 +1197,7 @@ async fn revocation_and_admission_order_on_the_principal() {
                 verifier_card_uid: custom.clone(),
                 card_uid: first_card.clone(),
                 attribution: late.authority.attribution(),
+                error: Some(revoked()),
             }],
         },
         "the admission returns what its fence cancelled"
@@ -1236,6 +1237,7 @@ async fn revocation_and_admission_order_on_the_principal() {
             verifier_card_uid: custom,
             card_uid: second_card,
             attribution: early.authority.attribution(),
+            error: Some(revoked()),
         }],
         "the revocation cancels the admitted execution"
     );
@@ -1321,6 +1323,7 @@ async fn background_admission_of_a_revoked_owner_is_cancelled() {
             verifier_card_uid: verifier,
             card_uid: owner,
             attribution: authority.attribution(),
+            error: Some(revoked()),
         }],
         "the admission returns what its fence cancelled"
     );
@@ -4393,6 +4396,14 @@ fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
     }
 }
 
+/// The error a principal revocation or admission fence records.
+fn revoked() -> VerificationError {
+    VerificationError {
+        code: "principal_revoked".to_owned(),
+        message: "the principal the execution acts for was revoked".to_owned(),
+    }
+}
+
 /// What a cancellation of `executions` must return: each execution with the
 /// Verifier and attribution its stored row holds, in execution order.
 ///
@@ -4411,6 +4422,7 @@ async fn stored_cancellations(
             verifier_card_uid: stored.verifier_card_uid,
             card_uid: stored.card_uid,
             attribution: stored.attribution,
+            error: stored.state.error,
         });
     }
     expected.sort_by_key(|cancelled| cancelled.execution_id);

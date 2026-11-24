@@ -875,6 +875,29 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
     // cancellation as the execution's current status.
     let cancelled: Vec<Uuid> = rows.iter().map(|row| row.execution_id).collect();
     deployment.await_newest(&cancelled, "cancelled").await;
+
+    // None of them wrote a checkpoint: one was claimed and fenced, the rest
+    // never ran. Once each scheduling row is gone, its status, cancellation
+    // reason, pins and delivery read the same from retained history.
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    for execution in cancelled {
+        let before = deployment.status(execution).await;
+        let deleted = sqlx::query("DELETE FROM wyrd.verifier_executions WHERE execution_id = $1")
+            .bind(execution)
+            .execute(&pool)
+            .await
+            .expect("the queue row deletes")
+            .rows_affected();
+        assert_eq!(deleted, 1, "the terminal scheduling row is removed");
+        let retained = deployment.status(execution).await;
+        for field in ["status", "error", "pull_request", "github_delivery"] {
+            assert_eq!(retained[field], before[field], "{field}: {retained}");
+        }
+    }
 }
 
 /// Forty-one PRs opened at once each admit exactly one execution per

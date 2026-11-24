@@ -3142,6 +3142,7 @@ async fn result_redelivery_is_idempotent_after_restart() {
             run_id: None,
             verifier_version: "0.0.0",
             card_uid: &harness.subject,
+            subject: None,
             owner_card_uid: None,
             group_id: None,
             deployment_environment: None,

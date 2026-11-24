@@ -26,14 +26,17 @@ use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{
-    ApprovalId, CardUid, EvidenceId, ExecutionId, GroupId, SlotName, VerificationResultId,
+    ApprovalId, CardName, CardUid, EvidenceId, ExecutionId, GroupId, SlotName, VerificationResultId,
 };
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::{
     ApprovalReceipt, ApprovalStatus, GithubDelivery, InputDeclaration, PullRequestActivation,
 };
-use wyrd_spec::verification::{DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId};
+use wyrd_spec::verification::{
+    DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId, VerificationError,
+    VerificationExecutionStatus,
+};
 
 use super::drift::ObservationWindow;
 use crate::query::scheduled::ScheduledQueryCaller;
@@ -308,6 +311,75 @@ impl<'q> InputResolver<'q> {
             .parse()
             .map_err(|error: std::num::ParseIntError| invalid(error.to_string()))?;
         Ok(Some((revision, variant(batch, "value", 0)?)))
+    }
+
+    /// The read parent `execution`'s input record retains: its subject's
+    /// exact scope from the recorded `subject_card_uid`, `subject_kind` and
+    /// `subject_name`; `None` while no record is visible or it names no kind
+    /// and name.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored row is malformed.
+    pub(crate) async fn parent(
+        &self,
+        execution: ExecutionId,
+    ) -> Result<Option<wyrd_spec::auth::CardPermissionScope>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT subject_card_uid, subject_kind, subject_name \
+                 FROM bifrost.verification.execution_inputs WHERE execution_id = {} LIMIT 1",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        if column(batch, "subject_kind")?.is_null(0) || column(batch, "subject_name")?.is_null(0) {
+            return Ok(None);
+        }
+        let kind = serde_json::from_value(Value::String(text(batch, "subject_kind", 0)?))
+            .map_err(|error| invalid(error.to_string()))?;
+        let name = CardName::new(text(batch, "subject_name", 0)?)
+            .map_err(|error| invalid(error.to_string()))?;
+        let uid = CardUid::new(text(batch, "subject_card_uid", 0)?)
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(Some(wyrd_spec::auth::CardPermissionScope::version(
+            kind, name, uid,
+        )))
+    }
+
+    /// The newest lifecycle status `execution`'s queue owners recorded, by
+    /// `occurred_at`, with the sanitized error a cancellation recorded;
+    /// `None` while no status row is visible.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored row is malformed.
+    pub(crate) async fn settled(
+        &self,
+        execution: ExecutionId,
+    ) -> Result<Option<(VerificationExecutionStatus, Option<VerificationError>)>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT status, value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND event = 'status' \
+                 ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        let status = serde_json::from_value(Value::String(text(batch, "status", 0)?))
+            .map_err(|error| invalid(error.to_string()))?;
+        let error = match variant(batch, "value", 0)? {
+            Value::Null => None,
+            value => {
+                Some(serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?)
+            }
+        };
+        Ok(Some((status, error)))
     }
 
     /// The GitHub delivery outcome `event` recorded for `execution`'s state

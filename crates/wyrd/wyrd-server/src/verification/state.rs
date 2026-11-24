@@ -493,6 +493,7 @@ impl Checkpoint {
                 run_id: row.run_id.as_ref(),
                 verifier_version: "",
                 card_uid: &row.card_uid,
+                subject: None,
                 owner_card_uid: row.owner_card_uid.as_ref(),
                 group_id: None,
                 deployment_environment: row.deployment_environment.as_deref(),

@@ -553,6 +553,7 @@ impl VerificationScheduler {
                 // The inputs row records no Verifier version.
                 verifier_version: "",
                 card_uid: &due.card_uid,
+                subject: due.subject.as_ref(),
                 owner_card_uid: due.owner().map(|(_, root)| root),
                 group_id: None,
                 deployment_environment: None,

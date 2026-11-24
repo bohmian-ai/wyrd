@@ -24,7 +24,14 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 if TYPE_CHECKING:
-    from wyrd.auth import AccessSummary, CreateRoleBindingRequest, FamilyRestriction, PrincipalKind
+    from wyrd.auth import (
+        AccessSummary,
+        CreateRoleBindingRequest,
+        FamilyRestriction,
+        Operation,
+        PrincipalKind,
+        PrincipalSummary,
+    )
 
 from .support import FIXTURES, Count, client_of, declare, hydrated, runtime_account
 
@@ -32,6 +39,9 @@ pytestmark = pytest.mark.integration
 
 TENANT_WIDE = "SELECT COUNT(*) AS n FROM bifrost.drift.observations"
 """A tenant-wide query over a built-in table, which ``workload`` permits."""
+
+READS: list[Operation] = [{"resource": "cards", "action": "read"}]
+"""The one operation the custom roles in these tests carry."""
 
 AUTHORED = FIXTURES / "cards/gateway_inference/ask-prompt.yaml"
 """A Card only an author can declare."""
@@ -129,6 +139,79 @@ def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None
     assert grants(principals.access(user)) == [("viewer", "provider")]
 
 
+def test_a_role_filter_pages_this_tenants_holders_with_their_counts(
+    server: WyrdTestServer,
+) -> None:
+    principals = Principals(client_of(server))
+    principals.put_role("ledger_reader", {"operations": READS})
+    users = {server.bootstrap_user(["ledger_reader"], name) for name in ("ann", "bo")}
+    service, _ = issue(server)
+    principals.bind(bind_all(service, "service", "ledger_reader"))
+    # Another tenant's holder of a same-named role is never counted or listed.
+    other = server.seed_tenant("ledger-other")
+    foreign = Principals(
+        client_of(server, server.bootstrap_service_in_tenant(other, ["admin"], "other-admin"))
+    )
+    foreign.put_role("ledger_reader", {"operations": READS})
+    foreign.create_service_principal(
+        {"name": "stranger", "assignments": [{"role": "ledger_reader", "scope": "all"}]}
+    )
+
+    seen: list[PrincipalSummary] = []
+    after = None
+    while True:
+        page = principals.list(role="ledger_reader", limit=1, after=after)
+        assert page["counts"] == {"active": 3, "suspended": 0}
+        seen += page["principals"]
+        if page["next"] is None:
+            break
+        after = page["next"]
+
+    by_id = {found["principal_id"]: found for found in seen}
+    assert set(by_id) == {*users, service}
+    assert by_id[service]["authentication"] is None
+    assert by_id[service]["roles"] == [
+        {"role": "ledger_reader", "scope": "all"},
+        {"role": "workload", "scope": "all"},
+    ]
+    for user in users:
+        assert by_id[user]["authentication"] == "sso"
+        assert by_id[user]["display_name"] is None
+        assert by_id[user]["roles"] == [{"role": "ledger_reader", "scope": "all"}]
+
+
+def test_a_role_nobody_holds_lists_no_one(server: WyrdTestServer) -> None:
+    nobody = Principals(client_of(server)).list(role="no_such_role")
+    assert nobody["principals"] == []
+    assert nobody["counts"] == {"active": 0, "suspended": 0}
+
+
+def test_roles_carry_their_description_and_member_count(server: WyrdTestServer) -> None:
+    principals = Principals(client_of(server))
+    created = principals.put_role(
+        "ledger_reader", {"operations": READS, "description": "Reads ledger Cards"}
+    )
+    assert created["description"] == "Reads ledger Cards"
+    assert created["member_count"] == 0
+
+    server.bootstrap_user(["ledger_reader"], "ann")
+    roles = {role["name"]: role for role in principals.roles()["roles"]}
+    assert roles["ledger_reader"]["member_count"] == 1
+    assert roles["viewer"]["description"] == "Read Cards, executions, artifacts and tables"
+
+    # The role is replaced whole: a request without a description clears it.
+    cleared = principals.put_role("ledger_reader", {"operations": READS})
+    assert cleared["description"] is None
+    assert cleared["member_count"] == 1
+
+
+def test_a_built_in_role_refuses_a_new_description(server: WyrdTestServer) -> None:
+    principals = Principals(client_of(server))
+    with pytest.raises(WyrdError) as refused:
+        principals.put_role("viewer", {"operations": READS, "description": "Mine now"})
+    assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
 def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
     ceiling = ["personal_credentials:write", "cards:read", "personal_credentials:read"]
     user, key = server.bootstrap_user_key(["editor"], "keeper", ceiling)
@@ -139,6 +222,8 @@ def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
     assert me["principal_kind"] == "user"
     assert me["username"] == "keeper"
     assert me["authentication"] == "password"
+    assert me["display_name"] is None
+    assert me["email"] is None
     assert me["permissions"] == sorted(ceiling)
 
     page = own.list_credentials_page(user, limit=10)

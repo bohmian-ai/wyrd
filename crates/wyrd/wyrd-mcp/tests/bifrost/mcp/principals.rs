@@ -686,6 +686,12 @@ mod pg_tests {
         assert_eq!(me["principal_id"], user.to_string(), "{me}");
         assert_eq!(me["username"], "keeper", "{me}");
         assert_eq!(me["authentication"], "password", "{me}");
+        assert_eq!(me["display_name"], JsonValue::Null, "a password User: {me}");
+        assert_eq!(
+            me["email"],
+            JsonValue::Null,
+            "this local User has no email: {me}"
+        );
         assert_eq!(
             me["permissions"],
             serde_json::json!(["personal_credentials:read", "personal_credentials:write"])
@@ -1068,11 +1074,30 @@ mod pg_tests {
                     serde_json::json!({
                         "role": "payments_reader",
                         "operations": [{ "resource": "cards", "action": "read" }],
+                        "description": "Reads payment Verifiers",
                     }),
                 )?)
                 .await?,
         )?;
         assert_eq!(role["builtin"], false);
+        assert_eq!(role["description"], "Reads payment Verifiers");
+        assert_eq!(role["member_count"], 0);
+        let builtin = refusal(
+            agent
+                .call_tool(call(
+                    "principals.put_role",
+                    serde_json::json!({
+                        "role": "viewer",
+                        "operations": [{ "resource": "cards", "action": "read" }],
+                        "description": "Mine now",
+                    }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            builtin.contains("WYRD_SPEC_400_VALIDATION"),
+            "a built-in Role is read-only: {builtin}"
+        );
         let roles = structured(
             agent
                 .call_tool(call("principals.list_roles", serde_json::json!({}))?)
@@ -1163,6 +1188,44 @@ mod pg_tests {
             .ok_or("the member holds the group's grant")?;
         assert_eq!(grant["scope"], scope);
         assert_eq!(grant["source"]["kind"], "group");
+        let listed = |roles: &JsonValue, name: &str| -> Result<JsonValue, McpJourneyError> {
+            Ok(roles["roles"]
+                .as_array()
+                .ok_or("roles is a list")?
+                .iter()
+                .find(|role| role["name"] == name)
+                .ok_or("the role is listed")?
+                .clone())
+        };
+        let roles = structured(
+            agent
+                .call_tool(call("principals.list_roles", serde_json::json!({}))?)
+                .await?,
+        )?;
+        let custom = listed(&roles, "payments_reader")?;
+        assert_eq!(custom["member_count"], 1, "the Group member counts once");
+        assert_eq!(custom["description"], "Reads payment Verifiers");
+        assert_eq!(
+            listed(&roles, "viewer")?["description"],
+            "Read Cards, executions, artifacts and tables"
+        );
+        let cleared = structured(
+            agent
+                .call_tool(call(
+                    "principals.put_role",
+                    serde_json::json!({
+                        "role": "payments_reader",
+                        "operations": [{ "resource": "cards", "action": "read" }],
+                    }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(
+            cleared["description"],
+            JsonValue::Null,
+            "omitting it clears"
+        );
+        assert_eq!(cleared["member_count"], 1);
         let bound = |listing: &JsonValue| -> Result<usize, McpJourneyError> {
             Ok(listing["bindings"]
                 .as_array()

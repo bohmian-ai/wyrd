@@ -410,6 +410,211 @@ async fn direct_and_idp_user_assignments_coexist() {
     deployment.shutdown().await;
 }
 
+/// An administrator reads each principal's sign-in method and scoped Roles,
+/// pages Role holders with status counts over the whole filter set, and
+/// reads each Role's description and member count; a custom Role's
+/// description is set and cleared through its PUT and a built-in's is
+/// read-only. Another tenant's Role holders appear in neither.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn administrators_read_people_roles_and_counts() {
+    use wyrd_ai::auth::{Operation, PrincipalStatusCounts, PutRoleRequest};
+
+    let deployment = Deployment::start().await;
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let operations = vec![
+        serde_json::from_value::<Operation>(json!({"resource": "cards", "action": "read"}))
+            .expect("operation parses"),
+    ];
+    let role = admin
+        .put_role(
+            "ledger_reader",
+            &PutRoleRequest {
+                operations: operations.clone(),
+                description: Some("Reads ledger Cards".to_owned()),
+            },
+        )
+        .await
+        .expect("the custom role is stored");
+    assert_eq!(role.description.as_deref(), Some("Reads ledger Cards"));
+    assert_eq!(role.member_count, 0);
+
+    let server = deployment.server();
+    let mut holders = Vec::new();
+    for name in ["ledger-ann", "ledger-bo"] {
+        let Bootstrap::User { id, .. } = server
+            .bootstrap_user(name, &["ledger_reader"])
+            .await
+            .expect("user signs in")
+        else {
+            panic!("user bootstrap returned a machine principal");
+        };
+        holders.push(id);
+    }
+    let created = admin
+        .create_service_principal(&CreateServicePrincipalRequest {
+            name: "ledger-service".to_owned(),
+            assignments: vec![ScopedRoleAssignment::tenant("workload")],
+            description: None,
+            workload_restriction: None,
+        })
+        .await
+        .expect("the Service account is created");
+    let ledger: PermissionScope = serde_json::from_value(
+        json!({ "card": { "family": { "kind": "Prompt", "name": "ledger" } } }),
+    )
+    .expect("scope parses");
+    admin
+        .bind(&CreateRoleBindingRequest {
+            subject: BindingSubject::Principal {
+                id: created.principal_id,
+                kind: PrincipalKindTag::Service,
+            },
+            role: "ledger_reader".to_owned(),
+            scope: ledger.clone(),
+        })
+        .await
+        .expect("the Service is bound at the ledger family");
+    holders.push(created.principal_id);
+
+    let other = Principals::connect_with(
+        &deployment.client(&deployment.other_tenant_admin("ledger-other").await),
+    )
+    .await
+    .expect("handle connects");
+    other
+        .put_role(
+            "ledger_reader",
+            &PutRoleRequest {
+                operations: operations.clone(),
+                description: Some("Another tenant's".to_owned()),
+            },
+        )
+        .await
+        .expect("the other tenant stores its role");
+    other
+        .create_service_principal(&CreateServicePrincipalRequest {
+            name: "ledger-stranger".to_owned(),
+            assignments: vec![ScopedRoleAssignment::tenant("ledger_reader")],
+            description: None,
+            workload_restriction: None,
+        })
+        .await
+        .expect("the other tenant's holder is created");
+
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = admin
+            .list(&PrincipalQuery {
+                role: Some("ledger_reader".to_owned()),
+                limit: Some(1),
+                after,
+                ..PrincipalQuery::default()
+            })
+            .await
+            .expect("the role filter lists");
+        assert_eq!(
+            page.counts,
+            PrincipalStatusCounts {
+                active: 3,
+                suspended: 0
+            },
+            "counts span every page and exclude the other tenant"
+        );
+        seen.extend(page.principals);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    let ids: BTreeSet<_> = seen
+        .iter()
+        .map(|item| item.principal_id.as_uuid())
+        .collect();
+    assert_eq!(
+        ids,
+        holders
+            .iter()
+            .map(PrincipalId::as_uuid)
+            .collect::<BTreeSet<_>>()
+    );
+    for item in &seen {
+        if item.kind == PrincipalKindTag::Service {
+            assert_eq!(item.authentication, None, "a Service has no human method");
+            assert_eq!(
+                item.roles,
+                [
+                    ScopedRoleAssignment {
+                        role: "ledger_reader".to_owned(),
+                        scope: ledger.clone(),
+                    },
+                    ScopedRoleAssignment::tenant("workload"),
+                ]
+            );
+        } else {
+            assert_eq!(item.authentication, Some(AccountAuthentication::Sso));
+            assert_eq!(item.display_name, None);
+            assert_eq!(item.roles, [ScopedRoleAssignment::tenant("ledger_reader")]);
+        }
+    }
+    let none = admin
+        .list(&PrincipalQuery {
+            role: Some("no_such_role".to_owned()),
+            ..PrincipalQuery::default()
+        })
+        .await
+        .expect("an unheld role lists");
+    assert!(none.principals.is_empty());
+    assert_eq!(none.counts, PrincipalStatusCounts::default());
+
+    let roles = admin.roles().await.expect("roles list").roles;
+    let reader = roles
+        .iter()
+        .find(|role| role.name == "ledger_reader")
+        .expect("custom role listed");
+    assert_eq!(reader.member_count, 3);
+    assert_eq!(reader.description.as_deref(), Some("Reads ledger Cards"));
+    let viewer = roles
+        .iter()
+        .find(|role| role.name == "viewer")
+        .expect("built-in listed");
+    assert!(viewer.builtin);
+    assert_eq!(
+        viewer.description.as_deref(),
+        Some("Read Cards, executions, artifacts and tables")
+    );
+    let cleared = admin
+        .put_role(
+            "ledger_reader",
+            &PutRoleRequest {
+                operations: operations.clone(),
+                description: None,
+            },
+        )
+        .await
+        .expect("the description clears");
+    assert_eq!(cleared.description, None);
+    assert_eq!(cleared.member_count, 3);
+    let refused = admin
+        .put_role(
+            "viewer",
+            &PutRoleRequest {
+                operations,
+                description: Some("Mine now".to_owned()),
+            },
+        )
+        .await
+        .expect_err("a built-in description is read-only");
+    assert_eq!(refused.code(), "WYRD_SPEC_400_VALIDATION");
+    deployment.shutdown().await;
+}
+
 /// A local User reads their own profile and key metadata, page by page,
 /// through their own restricted key, and revokes it; the key never carries
 /// more than its ceiling and a Service is never given a human profile.
@@ -439,6 +644,11 @@ async fn users_manage_personal_keys() {
     assert_eq!(me.principal_kind, PrincipalKindTag::User);
     assert_eq!(me.username.as_deref(), Some("keeper"));
     assert_eq!(me.authentication, AccountAuthentication::Password);
+    assert_eq!(
+        me.display_name, None,
+        "a password User has no provider name"
+    );
+    assert_eq!(me.email, None, "this local User has no email");
     assert_eq!(
         me.permissions,
         [

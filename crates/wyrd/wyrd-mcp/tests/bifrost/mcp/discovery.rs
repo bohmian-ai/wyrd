@@ -216,6 +216,25 @@ mod pg_tests {
                 );
                 assert!(tool.output_schema.is_some());
             }
+            // The principal tools publish the self-profile, Role list and
+            // Role PUT fields their HTTP operations carry.
+            let tool = |name: &str| tools.iter().find(|tool| tool.name == name);
+            let me = tool("principals.me").ok_or("principals.me is advertised")?;
+            let me_output = json!(me.output_schema.as_deref()).to_string();
+            for field in ["display_name", "email", "google", "github"] {
+                assert!(me_output.contains(field), "principals.me returns {field}");
+            }
+            let roles = tool("principals.list_roles").ok_or("list_roles is advertised")?;
+            let roles_output = json!(roles.output_schema.as_deref()).to_string();
+            for field in ["description", "member_count"] {
+                assert!(roles_output.contains(field), "list_roles returns {field}");
+            }
+            let put_role = tool("principals.put_role").ok_or("put_role is advertised")?;
+            let put_role_input = json!(&*put_role.input_schema).to_string();
+            assert!(
+                put_role_input.contains("description"),
+                "put_role accepts a description"
+            );
             Ok(tools)
         }
 

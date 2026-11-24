@@ -1038,7 +1038,8 @@ contact/projection RLS, enumeration resistance and bounded transient mail sends.
 operator administration; tenant admins manage company SSO and tenant login policy.
 
 `GET /v1/principals/me` returns the calling User's safe profile: principal,
-tenant, username, authentication method and effective permissions. Users
+tenant, username, display name, the User's own email, authentication method and
+effective permissions. It never returns another principal's email. Users
 list, create and revoke their own keys through the existing
 `/v1/principals/{principal_id}/credentials` routes under
 `personal_credentials:read|write`; creation requires a human login in the last

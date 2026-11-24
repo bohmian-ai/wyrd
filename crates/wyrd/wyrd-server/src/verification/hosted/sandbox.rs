@@ -179,10 +179,10 @@ impl Sandbox {
     /// returned hold drops, raising the pressure the process samples and
     /// refusing retained inputs that do not fit in `leave`.
     ///
-    /// The held bytes are verification work, as a memory-heavy run's would
-    /// be, so contended pressure holds new Python operations in their
-    /// admission wait until enough of the hold is released. Pressure is
-    /// sampled once at once, so the next operation already sees the hold.
+    /// The hold is attributed to the Verification workload, as hosted
+    /// Python memory is, and pressure is sampled once it is taken, so new
+    /// hosted work waits in admission while the hold leaves Verification
+    /// over its contended share.
     ///
     /// Memory other owners release while the hold lives is absorbed into it
     /// soon after, so the free bytes return to `leave`.
@@ -196,9 +196,6 @@ impl Sandbox {
         let operation = self.workloads.begin(Workload::Verification, None, None);
         let mut held = memory.charge_infallible(memory.available().saturating_sub(leave));
         held.attribute(&operation);
-        // Sample now so work arriving before the next periodic sample already
-        // sees the hold; that sample restores the parent's real commitment.
-        self.workloads.sample(0);
         let charge = Arc::new(std::sync::Mutex::new(Some(held)));
         let held = Arc::clone(&charge);
         let pin = tokio::spawn(async move {
@@ -220,6 +217,7 @@ impl Sandbox {
                 changed.await;
             }
         });
+        self.workloads.sample(0);
         OccupiedForTest {
             charge,
             pin,
@@ -241,12 +239,14 @@ impl Sandbox {
     /// Report one worker committing more memory than the process ceiling
     /// until the returned observation drops, so every pressure sample is
     /// critical while the byte ledger keeps its room for the stores and
-    /// queries a run needs before and after Python.
+    /// queries a run needs before and after Python. Pressure is sampled
+    /// before this returns, so work submitted next already sees it critical.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn overcommit_for_test(&self) -> wyrd_runtime::resources::CommitObservation {
         let observation = self.workloads.observe_commitment();
         observation.set(u64::MAX);
+        self.workloads.sample(0);
         observation
     }
 
@@ -465,8 +465,8 @@ impl Sandbox {
         let retained = u64::try_from(retained).unwrap_or(u64::MAX);
         let victim = CancellationToken::new();
         let waited = Instant::now();
-        // The inputs are materialized now: ones that cannot fit are Busy at
-        // once, never a wait the deadline ends.
+        // Retained inputs that cannot fit are refused now rather than after
+        // an admission wait, and stay charged while the operation waits.
         let mut held = self.memory.try_charge(retained).map_err(|_| {
             refused(
                 "memory",

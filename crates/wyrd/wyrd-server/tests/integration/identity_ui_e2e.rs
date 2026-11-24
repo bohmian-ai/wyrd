@@ -680,12 +680,15 @@ async fn operator_token(srv: &WyrdTestServer, server: &str) -> String {
 
 /// The production onboarding UI journey: a real Chromium at the public
 /// origin of a production BFF in front of one bound Wyrd server, with the
-/// repository Mailpit as the deployment's mail relay.
+/// repository Mailpit as the deployment's mail relay, and the journey's own
+/// fake Google and fake Turnstile Siteverify as the deployment's provider
+/// endpoints.
 ///
 /// The Vitest journey `src/lib/server/auth/onboarding.integration.test.ts`
 /// configures the relay and signup through the platform API with the
 /// operator token, then drives the root, signup, email-proof, workspace,
-/// discovery, recovery-contact and reset pages as a visitor would, reading
+/// discovery, recovery-contact and reset pages, and Google and challenged
+/// workspace signup, as a visitor would, reading
 /// each mailed link or code from Mailpit. Rust owns every proof, cookie and
 /// session; the pages only render and call the browser's `/auth/*` leg.
 ///
@@ -701,7 +704,15 @@ async fn onboarding_ui_journey() {
     let (smtp_host, smtp_port) = smtp.rsplit_once(':').expect("Mailpit SMTP is host:port");
     let host = format!("localhost:{}", free_port());
     let origin = format!("http://{host}");
+    // The journeys serve a fake Google and a fake Siteverify on these ports.
+    let google = format!("http://127.0.0.1:{}", free_port());
+    let siteverify = format!("http://127.0.0.1:{}/siteverify", free_port());
     let srv = WyrdTestServerBuilder::default()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.clone()),
+            turnstile_siteverify_url: Some(siteverify.clone()),
+            ..Default::default()
+        })
         .start_bound()
         .await
         .expect("server starts");
@@ -713,6 +724,8 @@ async fn onboarding_ui_journey() {
         "bff": bff.url,
         "server": server,
         "operator": operator,
+        "google": google,
+        "siteverify": siteverify,
         "mail": {
             "host": smtp_host,
             "port": smtp_port.parse::<u16>().expect("Mailpit SMTP port"),

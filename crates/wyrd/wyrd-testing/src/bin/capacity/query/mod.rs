@@ -1,4 +1,5 @@
-//! The Bifrost engine's experiments, run through `mise run benchmark:l1:bifrost`
+//! The Bifrost engine's experiments, run through `mise run benchmark:l1:bifrost-writes`,
+//! `mise run benchmark:l1:bifrost-reads`
 //! and `mise run bench:l2:bifrost`.
 //!
 //! Both read as the production journey they measure. One release

@@ -1349,6 +1349,38 @@ const EMAIL_ADDRESS_ATTEMPTS: i32 = 5;
 /// Emailed-proof requests admitted per signed-in account in one window.
 const EMAIL_ACCOUNT_ATTEMPTS: i32 = 5;
 
+/// Mail sends one process runs after their requests are answered; a request
+/// beyond them sends nothing, and its caller asks again.
+const ANSWERED_SENDS: usize = 16;
+
+/// The process's permits for mail sent after the answer.
+static ANSWERED_SENDERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(ANSWERED_SENDS);
+
+/// Run `send` after its request is answered, on one of the process's bounded
+/// send permits, so neither the relay's outcome nor its latency reaches the
+/// answer.
+///
+/// With no permit free, or when the process stops first, nothing is sent and
+/// nothing is retried; a failed send is logged as `what`.
+fn send_after_answer(
+    what: &'static str,
+    send: impl std::future::Future<Output = Result<(), WyrdError>> + Send + 'static,
+) {
+    let Ok(permit) = ANSWERED_SENDERS.try_acquire() else {
+        tracing::warn!(
+            what,
+            "every answered-send permit is busy; a request sent nothing"
+        );
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = send.await {
+            tracing::warn!(what, error = %error, "a mail was not sent");
+        }
+    });
+}
+
 /// The envelope context of the one signup challenge secret, which
 /// stored-secret maintenance rebuilds from the same fixed owner.
 const CHALLENGE_CONTEXT: SecretContext<'static> = SecretContext {

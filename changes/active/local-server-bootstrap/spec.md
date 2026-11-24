@@ -1,6 +1,6 @@
 ---
 id: SPEC-local-server-bootstrap
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -113,11 +113,13 @@ configuration; this change adds no login or credential format.
 
 - **REQ-008 — Credential provisioning.** First use creates the platform root,
   the requested tenant, and its administrator credential through existing
-  Wyrd authority. The tenant credential is saved to Wyrd's protected
+  Wyrd authority, and names the tenant's first human administrator `admin`
+  with a generated initial password. The tenant credential is saved to Wyrd's protected
   credential store and becomes usable by the CLI and first-class SDKs without
   an environment export. Platform and tenant credentials remain distinct.
   Plaintext credentials never enter arguments, logs, errors, or MCP host
-  configuration; any one-time platform-root disclosure goes only to the
+  configuration; any one-time disclosure of the platform root credential or
+  the tenant administrator's generated initial password goes only to the
   invoking terminal.
 - **REQ-009 — Config location and endpoint.** Local setup persists the
   effective loopback HTTP endpoint in the existing global `config.toml`,
@@ -444,3 +446,4 @@ None.
 | 5 | approved | Cursor, Pi, and Hermes Agent join the initial MCP host variants (REQ-011); approved by the owner. |
 | 6 | approved | Owner explicitly requested removal of the schema collection and schema-based SDK models in favor of PyO3/N-API exposure with accompanying declarations, preserving current strict typing and functionality (REQ-017–REQ-019, INV-005, D-006, AC-009–AC-010). Earlier bootstrap obligations are unchanged. |
 | 7 | approved | Owner requested the proposed shared branded terminal-output task and replacement of the older local brand library with Evidence Thread from `wyrd-doc-site` (REQ-020–REQ-022, INV-006, AC-011–AC-012). Portable ANSI semantics are the first delivery; earlier obligations are unchanged. |
+| 8 | approved | Owner approved that first use creates the tenant's human administrator `admin` with a generated initial password, disclosed once only to the invoking terminal, so `wyrd init` asks for no new input (REQ-008). Earlier obligations are unchanged. |

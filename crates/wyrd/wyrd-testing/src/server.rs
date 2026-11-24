@@ -6775,7 +6775,7 @@ mod tests {
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 23] = [
+    const TYPESCRIPT_SETUP: [&str; 25] = [
         "baseUrl",
         "grpcUrl",
         "token",
@@ -6799,6 +6799,8 @@ mod tests {
         "tenantAdminKey",
         "bootstrapUserKey",
         "seedUserKeys",
+        "initializePlatformRoot",
+        "staleConsoleProof",
     ];
 
     /// Member names declared in the body of `class` in `source`.

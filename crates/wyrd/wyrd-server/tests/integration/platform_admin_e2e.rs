@@ -1387,13 +1387,24 @@ async fn mount_platform_provider(
     token_response: wiremock::ResponseTemplate,
 ) {
     server.reset().await;
+    mount_platform_discovery(server, key_set, &format!("{}/token", server.uri())).await;
+    mount_platform_token(server, token_response).await;
+}
+
+/// Answer `server`'s discovery, advertising RFC 9207 response issuers and
+/// `token_endpoint`, and its key set with `key_set`.
+async fn mount_platform_discovery(
+    server: &wiremock::MockServer,
+    key_set: wiremock::ResponseTemplate,
+    token_endpoint: &str,
+) {
     let issuer = server.uri();
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(PLATFORM_DISCOVERY))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
+            "token_endpoint": token_endpoint,
             "jwks_uri": format!("{issuer}/jwks"),
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
@@ -1407,7 +1418,6 @@ async fn mount_platform_provider(
         .respond_with(key_set)
         .mount(server)
         .await;
-    mount_platform_token(server, token_response).await;
 }
 
 /// A key set publishing [`PLATFORM_SIGNING_KEY`] under `kid`.
@@ -1491,7 +1501,31 @@ fn identity_token_reply_with(
     email: &str,
     email_verified: bool,
 ) -> wiremock::ResponseTemplate {
-    signed_identity_reply(
+    wiremock::ResponseTemplate::new(200).set_body_json(identity_token_body(
+        issuer,
+        nonce,
+        audience,
+        kid,
+        subject,
+        email,
+        email_verified,
+    ))
+}
+
+/// The token-endpoint body [`identity_token_reply_with`] answers.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn identity_token_body(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> Value {
+    signed_identity_body(
         kid,
         &identity_claims(issuer, nonce, audience, subject, email, email_verified),
     )
@@ -1542,16 +1576,24 @@ fn identity_claims(
 /// # Panics
 /// Panics when the test key does not load or the token does not sign.
 fn signed_identity_reply(kid: &str, claims: &Value) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(signed_identity_body(kid, claims))
+}
+
+/// The token-endpoint body whose ID token carries `claims`, signed under `kid`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn signed_identity_body(kid: &str, claims: &Value) -> Value {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     header.kid = Some(kid.to_owned());
     let key = jsonwebtoken::EncodingKey::from_ed_pem(PLATFORM_SIGNING_KEY.as_bytes())
         .expect("test key loads");
     let id_token = jsonwebtoken::encode(&header, claims, &key).expect("token signs");
-    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+    json!({
         "access_token": "provider-access",
         "token_type": "Bearer",
         "id_token": id_token,
-    }))
+    })
 }
 
 /// Begin a platform login and return its state and the nonce the provider

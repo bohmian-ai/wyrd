@@ -2084,7 +2084,7 @@ async fn scoped_readers_query_only_their_parents_records_across_pods() -> Result
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut states = Vec::new();
     for path in [
-        root.join("examples/quickstart/support-reply.yaml"),
+        root.join("examples/setup-check/support-reply.yaml"),
         root.join("fixtures/cards/scoped_peer_reads/other-reply.yaml"),
     ] {
         let declared = DeclareOptions {

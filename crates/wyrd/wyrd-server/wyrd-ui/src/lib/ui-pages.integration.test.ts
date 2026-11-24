@@ -5,7 +5,6 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { closeSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
@@ -21,6 +20,7 @@ import { z } from 'zod';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { declarePolicy, exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
+import { startFakeGoogle } from '$lib/fake-google.integration';
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -3415,80 +3415,6 @@ test('People and Service accounts work from the keyboard and fit a phone and a d
   }
 });
 
-/** The Google account the fake Google signs in next. */
-type GoogleAccount = { sub: string; email: string };
-
-/**
- * A loopback stand-in for Google's OpenID provider, as Wyrd's controlled
- * test endpoints allow: `/authorize` signs `account` in at once and returns to
- * the caller's redirect URI, and `/token` answers an EdDSA-signed ID token
- * echoing that request's client and nonce.
- */
-async function startFakeGoogle(): Promise<{ issuer: string; account: GoogleAccount }> {
-  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
-  const pending = new Map<string, { aud: string; nonce: string; account: GoogleAccount }>();
-  const google = { issuer: '', account: { sub: 'google-user', email: 'user@gmail.test' } };
-  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
-  const server = createHttpServer((request, response) => {
-    const url = new URL(request.url ?? '/', google.issuer);
-    const json = (body: unknown) => {
-      response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify(body));
-    };
-    if (url.pathname === '/.well-known/openid-configuration') {
-      return json({
-        issuer: google.issuer,
-        authorization_endpoint: `${google.issuer}/authorize`,
-        token_endpoint: `${google.issuer}/token`,
-        jwks_uri: `${google.issuer}/jwks`,
-        response_types_supported: ['code'],
-        subject_types_supported: ['public'],
-        id_token_signing_alg_values_supported: ['EdDSA'],
-        authorization_response_iss_parameter_supported: true
-      });
-    }
-    if (url.pathname === '/jwks') return json({ keys: [{ ...publicKey.export({ format: 'jwk' }), kid: 'fake-google' }] });
-    if (url.pathname === '/authorize') {
-      const code = randomUUID();
-      pending.set(code, { aud: url.searchParams.get('client_id') ?? '', nonce: url.searchParams.get('nonce') ?? '', account: { ...google.account } });
-      const back = new URL(url.searchParams.get('redirect_uri') ?? '');
-      back.searchParams.set('code', code);
-      back.searchParams.set('state', url.searchParams.get('state') ?? '');
-      back.searchParams.set('iss', google.issuer);
-      response.writeHead(302, { location: back.toString() });
-      return response.end();
-    }
-    if (url.pathname === '/token') {
-      let form = '';
-      request.on('data', (chunk: Buffer) => (form += chunk.toString()));
-      request.on('end', () => {
-        const grant = pending.get(new URLSearchParams(form).get('code') ?? '');
-        if (!grant) {
-          response.writeHead(400, { 'content-type': 'application/json' });
-          return response.end(JSON.stringify({ error: 'invalid_grant' }));
-        }
-        const now = Math.floor(Date.now() / 1000);
-        const signed = `${encode({ alg: 'EdDSA', typ: 'JWT', kid: 'fake-google' })}.${encode({
-          iss: google.issuer, aud: grant.aud, sub: grant.account.sub, email: grant.account.email,
-          email_verified: true, nonce: grant.nonce, iat: now, exp: now + 300, auth_time: now
-        })}`;
-        json({
-          access_token: randomUUID(), token_type: 'Bearer', expires_in: 300,
-          id_token: `${signed}.${sign(null, Buffer.from(signed), privateKey).toString('base64url')}`
-        });
-      });
-      return;
-    }
-    response.writeHead(404);
-    response.end();
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('the fake Google has no port');
-  google.issuer = `http://127.0.0.1:${address.port}`;
-  server.unref();
-  return google;
-}
 
 const google = process.env.WYRD_UI_INTEGRATION ? await startFakeGoogle() : { issuer: 'http://127.0.0.1:9', account: { sub: '', email: '' } };
 /** A deployment whose shared Google sign-in is the fake Google. */

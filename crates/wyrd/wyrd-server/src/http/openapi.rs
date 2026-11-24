@@ -35,8 +35,7 @@ pub(crate) const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 pub(crate) struct SecurityAddon;
 
 impl Modify for SecurityAddon {
-    /// Register the caller scheme and require it document-wide, and register
-    /// the platform console session cookie its routes name.
+    /// Register the caller scheme and require it document-wide.
     fn modify(&self, openapi: &mut OpenApiDocument) {
         let components = openapi.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
@@ -48,25 +47,23 @@ impl Modify for SecurityAddon {
                  reaches is decided by its scope and by the route, never by the header.",
             ))),
         );
+        components.add_security_scheme(
+            PLATFORM_BROWSER_SESSION_SCHEME,
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                crate::components::platform::console::PLATFORM_SESSION_COOKIE,
+                "Opaque platform console session, scoped to `/platform`. Only the                  platform console's own session operations read it; tenant routes never                  accept it, and a tenant session cookie never satisfies it.",
+            ))),
+        );
         openapi.security = Some(vec![SecurityRequirement::new(
             WYRD_ACCESS_TOKEN_SCHEME,
             Vec::<String>::new(),
         )]);
-        components.add_security_scheme(
-            PLATFORM_SESSION_SCHEME,
-            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
-                "wyrd_platform_session",
-                "Opaque platform console session set by a platform browser sign-in, \
-                 scoped to `/platform`. Only the console's own session routes read it; \
-                 every other platform operation takes the access token.",
-            ))),
-        );
     }
 }
 
-/// Name the contract gives the platform console's session cookie scheme,
-/// which the console routes that act on a live console session require.
-pub(crate) const PLATFORM_SESSION_SCHEME: &str = "wyrdPlatformSession";
+/// Name the contract gives the platform console browser-session cookie scheme,
+/// required by the console operations that act on an existing platform session.
+pub(crate) const PLATFORM_BROWSER_SESSION_SCHEME: &str = "wyrdPlatformBrowserSession";
 
 /// Name the contract gives the tenant browser-session cookie scheme.
 pub(crate) const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";

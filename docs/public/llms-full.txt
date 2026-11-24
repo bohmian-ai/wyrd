@@ -195,7 +195,10 @@ Enter your database URL and a tenant name when asked, and decline the other offe
 Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
 ```
 
-It also prints a root credential once. Save it; it recovers a lost tenant key.
+It also prints two secrets once, on the terminal only. Save both:
+
+- a root credential, which recovers a lost tenant key;
+- the password of the tenant's `admin` user, with the page where you sign in to the Wyrd UI.
 
 **Start it without prompts:**
 
@@ -4570,19 +4573,19 @@ A schedule runs as the Service's own account, and only while that account has re
 **Python**
 
 ```bash
-uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+uv run wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 **Rust**
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 **TypeScript**
 
 ```bash
-pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+pnpm wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 Copy the credential it prints into an environment variable for the next step:
@@ -6289,7 +6292,7 @@ curl -X PUT https://wyrd.example.com/platform/mail \
   -d '{"host":"smtp.example.com","port":587,"tls":"starttls","username":"wyrd","password":"…","sender":"invites@example.com"}'
 ```
 
-`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
+`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. To change other settings later, send the same `username` without `password` and Wyrd keeps the stored password; a new `username` needs its `password`, and leaving out `username` removes the stored sign-in. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
 
 From then on, Wyrd emails each new or resent link separately to its recipient and still returns it to you. `delivery` reads `accepted` when the relay took the message. That is not proof it reached an inbox. It reads `failed` when the relay refused it or could not be reached. The invitation stays pending, so copy the link or resend once the relay works. Wyrd does not queue or retry mail.
 

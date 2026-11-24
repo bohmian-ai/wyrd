@@ -30,7 +30,7 @@ use wyrd_sql::queries::platform::discovery::{
 };
 use wyrd_sql::queries::platform::tenants::list_active_tenant_ids;
 
-use super::{SignupEnvelope, SocialSignIn};
+use super::{SignupEnvelope, SocialSignIn, send_after_answer};
 use crate::browser_sessions::random_secret;
 use crate::error::store_error;
 use crate::mail::{ApplicationMail, EmailAddress};
@@ -61,14 +61,15 @@ impl SocialSignIn {
     /// address, and whether or not the address's email window let the
     /// message go. The request is admitted in its source's window first. The
     /// message links `/workspaces/verify` on `origin` with the proof in its
-    /// fragment and names no workspace.
+    /// fragment and names no workspace. It is sent after the answer, on the
+    /// process's bounded send permits, so neither the relay's outcome nor its
+    /// latency shows whether it was sent; a lost send is not retried.
     ///
     /// # Errors
     /// Returns [`WyrdError::MethodUnavailable`] without a mail relay,
     /// [`WyrdError::Validation`] for an unparsable address,
     /// [`WyrdError::EmailAttempts`] past the source window, and
-    /// [`WyrdError::AuthVerifyUnavailable`] when the store, key or relay
-    /// fails.
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store or key fails.
     pub async fn begin_discovery(
         &self,
         mail: &ApplicationMail,
@@ -100,8 +101,11 @@ impl SocialSignIn {
             .map_err(|_| super::invalid_state("the deployment origin is invalid"))?;
         link.set_fragment(Some(&format!("proof={proof}")));
         if send {
-            mail.send_discovery_proof(&address, link.as_str(), &proof)
-                .await?;
+            let mail = mail.clone();
+            send_after_answer("discovery proof", async move {
+                mail.send_discovery_proof(&address, link.as_str(), &proof)
+                    .await
+            });
         }
         Ok(cookie)
     }

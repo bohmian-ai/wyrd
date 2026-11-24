@@ -551,7 +551,7 @@ async fn principal_user_cli_journey() {
                 .expect("wyrd command runs");
             std::io::Write::write_all(
                 &mut child.stdin.take().expect("stdin is piped"),
-                b"development\n",
+                b"quartz heron 150\n",
             )
             .expect("password is written");
             child.wait_with_output().expect("wyrd command exits")
@@ -569,7 +569,8 @@ async fn principal_user_cli_journey() {
     );
     assert!(stdout.contains("username: development"), "{stdout}");
     assert!(
-        !stdout.contains("development\ndevelopment"),
+        !stdout.contains("quartz heron 150")
+            && !String::from_utf8_lossy(&created.stderr).contains("quartz heron 150"),
         "the password is never printed"
     );
 

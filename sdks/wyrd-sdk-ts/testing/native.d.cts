@@ -136,8 +136,9 @@ export declare class NativeWyrdTestServer {
   waitForBaseline(verifier: string, timeoutMs: number): void
   /**
    * Hold process memory so at most `leave` bytes stay free until the
-   * returned hold is released, so a hosted verification whose session
-   * does not fit waits and one whose request does not fit is refused.
+   * returned hold is released, charged to Verification, so a hosted
+   * verification waits while the hold keeps Verification over its
+   * contended share and one whose request does not fit is refused.
    *
    * # Errors
    *

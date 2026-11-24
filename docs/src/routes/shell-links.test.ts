@@ -69,6 +69,21 @@ describe('landing and shell actions reach real destinations', () => {
   });
 });
 
+describe('error page indexing', () => {
+  it('excludes a missing page from the index', () => {
+    app.page.status = 404;
+    expect(render(ErrorPage).head).toContain('<meta name="robots" content="noindex"');
+  });
+
+  it('leaves a transient failure indexable', () => {
+    app.page.status = 500;
+    app.page.error = { message: 'Internal Error' };
+    const { head, body } = render(ErrorPage);
+    expect(head).not.toContain('robots');
+    expect(body).toContain('Something went wrong');
+  });
+});
+
 // The landing's server HTML carries the finance figure's whole meaning: the
 // finance API's tested source, the three requirements, the API's decision, and
 // the asynchronous capture, resting on the finished state until motion starts.

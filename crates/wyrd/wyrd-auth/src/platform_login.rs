@@ -382,11 +382,14 @@ impl PlatformLogin {
     ///
     /// As [`Self::complete`], except the login state is taken only with the
     /// browser binding it began with and must belong to the connection
-    /// revision still in place. A sign-in creates a browser session anchored
-    /// to that revision. A re-authentication must be presented by the very
-    /// session it began from (`presented`), carry a provider `auth_time`
-    /// within the recent-proof window, and verify to the identity already
-    /// pinned to that session's principal; it then refreshes that session.
+    /// revision still in place. Taking it only claims it; the sessions owner
+    /// finishes it in the transaction that grants, so removing the connection
+    /// while the provider answers ends this login too. A sign-in creates a
+    /// browser session anchored to that revision. A re-authentication must be
+    /// presented by the very session it began from (`presented`), carry a
+    /// provider `auth_time` within the recent-proof window, and verify to the
+    /// identity already pinned to that session's principal; it then refreshes
+    /// that session.
     ///
     /// # Errors
     /// As [`Self::complete`]; a missing or foreign binding, a connection
@@ -424,7 +427,7 @@ impl PlatformLogin {
                 return Err(PlatformLoginError::NotAccepted);
             }
             self.sessions
-                .reauthenticate_federated(session, issuer, &verified.identity.subject)
+                .reauthenticate_federated(state, session, issuer, &verified.identity.subject)
                 .await
                 .map_err(session_error)?;
             return Ok(PlatformBrowserLogin::Reauthenticated);
@@ -432,6 +435,7 @@ impl PlatformLogin {
         let match_claim = verified_email(&verified);
         self.sessions
             .browser_federated(
+                state,
                 issuer,
                 &verified.identity.subject,
                 match_claim.as_deref(),

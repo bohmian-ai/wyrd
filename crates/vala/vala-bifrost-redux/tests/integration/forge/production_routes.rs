@@ -1767,7 +1767,7 @@ async fn worker_selects_current_iceberg_files() {
 /// # Panics
 ///
 /// Panics when the full root admits the rewrite, the free root refuses it, or
-/// a finished rewrite leaves governed bytes or spill files behind.
+/// a finished rewrite leaves Forge bytes or spill files behind.
 async fn assert_rewrite_draws_on_shared_root(
     promoted: &PromotedRewriteFixture,
     forge: &Arc<Forge>,
@@ -1781,6 +1781,7 @@ async fn assert_rewrite_draws_on_shared_root(
         .forge_resources
         .snapshot()
         .expect("held snapshot");
+    let occupant_bytes = occupant.size();
     drop(occupant);
     assert!(
         refused.failure.is_some(),
@@ -1788,8 +1789,8 @@ async fn assert_rewrite_draws_on_shared_root(
         refused.handoffs
     );
     assert_eq!(
-        occupied.forge_memory_used_bytes, occupied.governed_memory_used_bytes,
-        "the occupant is the only holder once the refused rewrite returned"
+        occupied.forge_memory_used_bytes, occupant_bytes,
+        "the occupant is the only Forge holder once the refused rewrite returned"
     );
     drop(refused);
     let run = promoted
@@ -1811,8 +1812,8 @@ async fn assert_rewrite_draws_on_shared_root(
             released.forge_memory_used_bytes,
             released.governed_memory_used_bytes
         ),
-        (0, 0),
-        "a finished rewrite returns every Forge byte"
+        (0, released.scribe_memory_used_bytes),
+        "a finished rewrite returns every Forge byte; only Scribe's retained encoders remain"
     );
     assert_eq!(
         std::fs::read_dir(&promoted.fixture.forge_spill)

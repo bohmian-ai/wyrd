@@ -1579,9 +1579,9 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// A queued execution that process memory cannot admit returns to the
 /// queue with its attempt refunded and runs once memory frees.
 ///
-/// An overcommitted worker turns process pressure critical. The queued
-/// execution waits out its code timeout, is refused busy, and is
-/// deferred rather than failed, retried, or judged; once the memory frees,
+/// An overcommitted worker turns process pressure critical before the
+/// execution is queued, so the runner refuses it busy and defers it rather
+/// than failing, retrying, or judging it; once the memory frees,
 /// it completes on its first counted attempt with its real verdict.
 ///
 /// # Panics
@@ -1642,9 +1642,9 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .expect("blocks are hosted")
             .sandbox(),
     );
-    // An overcommitted worker keeps pressure critical, pausing the queued
-    // operation until its code timeout, when it defers; the byte ledger
-    // keeps room for the run's input read and result.
+    // An overcommitted worker makes pressure critical at once, so the queued
+    // execution defers; the byte ledger keeps room for the run's input read
+    // and result.
     let held = sandbox.overcommit_for_test();
     let deferred = seed
         .submit(&adder, &subject, one())
@@ -1666,7 +1666,17 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     while !logs.text().lines().any(|line| {
         line.contains("deferred by admission backpressure") && line.contains(&deferred.to_string())
     }) {
-        assert!(Instant::now() < deadline, "the adder was never deferred");
+        if Instant::now() >= deadline {
+            let row = seed.execution(deferred).await;
+            let text = logs.text();
+            let tail: Vec<&str> = text.lines().rev().take(60).collect();
+            panic!(
+                "the adder was never deferred; execution: {row:?}; runtime finished: {}; \
+                 last captured lines (newest first):\n{}",
+                task.is_finished(),
+                tail.join("\n")
+            );
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let waiting = seed.execution(deferred).await.expect("execution reads");

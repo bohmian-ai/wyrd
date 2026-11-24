@@ -3,7 +3,8 @@
  * contended: `verify` waits for memory and then passes, is refused as
  * retryable `503` when memory cannot even hold the waiting request, and ends
  * in `504` at the one deadline from its arrival without a replay; `submit`
- * defers a queued execution until memory frees.
+ * is accepted while memory is held and its queued execution is judged once
+ * memory frees.
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,8 +21,8 @@ vi.setConfig({ testTimeout: 120_000 });
 /** The direct deadline every story here runs under. */
 const VERIFY_TIMEOUT_MS = 2_000;
 
-/** Bytes left free while an operation should wait: short of one session envelope. */
-const SHORT_OF_A_SESSION = 64 << 20;
+/** Bytes left free while an operation should wait: the held memory puts Verification over its contended share. */
+const CONTENDED = 64 << 20;
 
 /** Bytes of the answer the full-memory refusal sends. */
 const REQUEST_BYTES = 256 << 10;
@@ -63,7 +64,7 @@ function awaitWaiters(server: NativeWyrdTestServer, count: number): void {
 }
 
 test("verify_waits_for_hosted_memory_then_passes", async ({ server, state }) => {
-  const held = server.occupyHostedMemory(SHORT_OF_A_SESSION);
+  const held = server.occupyHostedMemory(CONTENDED);
   let settled = false;
   const waiting = verifyAnswer(state).finally(() => (settled = true));
   awaitWaiters(server, 1);
@@ -72,8 +73,8 @@ test("verify_waits_for_hosted_memory_then_passes", async ({ server, state }) => 
   expect((await waiting).outcome.verdict).toBe("passed");
 });
 
-test("submit_defers_under_hosted_memory_then_passes", async ({ server, state }) => {
-  const held = server.occupyHostedMemory(SHORT_OF_A_SESSION);
+test("submit_under_hosted_memory_is_accepted_then_passes", async ({ server, state }) => {
+  const held = server.occupyHostedMemory(CONTENDED);
   const accepted = await state.run("agent").observe.submit("adds-one", { answer: 2 });
   if (accepted.kind !== "queued") {
     throw new Error("Run evidence queues an execution");
@@ -95,7 +96,7 @@ test("verify_refusals_follow_the_arrival_deadline", async ({ server, state }) =>
   });
   full.release();
 
-  const held = server.occupyHostedMemory(SHORT_OF_A_SESSION);
+  const held = server.occupyHostedMemory(CONTENDED);
   const started = performance.now();
   await expect(verifyAnswer(state)).rejects.toMatchObject({
     code: "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT",

@@ -287,11 +287,25 @@ function together(values: readonly string[]): Pick<NodeState, 'value' | 'word'> 
 }
 
 /**
+ * The deferred inputs each task of an unfinished execution waits for, by step
+ * or whole-Verifier requirement ID, as its status reports them. A settled
+ * execution, or a retained state recorded before tasks reported waits, has none.
+ */
+export function inputWaits(status: VerificationExecutionState): ReadonlyMap<string, readonly string[]> {
+  return new Map(settled(status.status) ? [] : (status.input_waits ?? []).map((each) => [each.task_id, each.slots]));
+}
+
+/** Inputs an unfinished execution started without and still waits for: its parked summary and every slot a task reports, in name order. */
+export function missingInputs(status: VerificationExecutionState): string[] {
+  return settled(status.status) ? [] : [...new Set([...(status.waiting ?? []), ...[...inputWaits(status).values()].flat()])].sort();
+}
+
+/**
  * The recorded state of every input, step and requirement node, by node key.
- * In an unfinished execution, an input the status lists as waiting is not
- * provided yet, and a step with a pending approval occurrence waits for
- * approval. A step with no recorded invocation reads its latest decided
- * occurrence, else waits for input when it reads a waiting input. Otherwise a
+ * In an unfinished execution, a missing input is not provided yet, and a step
+ * with a pending approval occurrence waits for approval. A step with no
+ * recorded invocation reads its latest decided occurrence, else waits for
+ * input when the status reports it waiting for one. Otherwise a
  * step reads the last attempt of each of its items and iterations; a requirement
  * reads the compact result, else its recorded requirement attempts. Nothing
  * here positions or sizes a node.
@@ -300,8 +314,8 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
   const done = settled(status.status);
   const idle: NodeState = { value: done ? 'not run' : 'not started', dim: done };
   const states: Record<string, NodeState> = {};
-  const missing = new Set(done ? [] : (status.waiting ?? []).map((slot) => `input:${slot}`));
-  for (const key of missing) states[key] = { value: 'not provided', wait: true };
+  const waits = inputWaits(status);
+  for (const slot of missingInputs(status)) states[`input:${slot}`] = { value: 'not provided', wait: true };
   for (const step of graph.steps) {
     const latest = new Map<string, Invocation>();
     for (const item of attemptsOf(items, step.id)) if ((latest.get(slotKey(item.producer))?.producer.attempt ?? 0) <= item.producer.attempt) latest.set(slotKey(item.producer), item);
@@ -311,7 +325,7 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
     const occurrences = status.approvals?.filter((each) => each.step_id === step.id) ?? [];
     if (!done && occurrences.some((each) => each.status === 'pending')) states[step.key] = { value: 'awaiting_approval', wait: true };
     else if (last.length === 0 && occurrences.length) states[step.key] = { value: occurrences.at(-1)!.status };
-    else if (last.length === 0 && graph.edges.some((edge) => edge.target === step.key && missing.has(edge.source))) states[step.key] = { value: 'awaiting_input', wait: true };
+    else if (last.length === 0 && waits.has(step.id)) states[step.key] = { value: 'awaiting_input', wait: true };
     else if (last.length === 0) states[step.key] = idle;
     else if (last.some((item) => item.state === 'started')) states[step.key] = done ? { value: 'not finished', dim: true } : { value: 'running', dim };
     else {
@@ -326,12 +340,13 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
 /**
  * The recorded state of one requirement, with or without its definition: its
  * judgments in the selected result, else its settled requirement invocations,
- * else not judged.
+ * else waiting for input when the status reports it waiting for one, else not judged.
  */
 export function requirementState(status: VerificationExecutionState, items: readonly Invocation[], id: string): NodeState {
   const judged = status.result?.outcome.requirements.filter((each) => each.id === id).map((each) => each.outcome);
   const recorded = judged?.length ? judged : requirementAttempts(items, id).map((item) => item.outcome);
-  return recorded.length ? together(recorded) : { value: 'not judged', dim: settled(status.status) };
+  if (recorded.length) return together(recorded);
+  return inputWaits(status).has(id) ? { value: 'awaiting_input', wait: true } : { value: 'not judged', dim: settled(status.status) };
 }
 
 /** The settled requirement invocations of `id`, one per item, iteration and attempt, in first-seen order. */

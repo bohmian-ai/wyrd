@@ -8,7 +8,7 @@
 <script lang="ts">
   import type { CardTypes } from 'wyrd-ai';
   import type { ActionProps } from '../contract.js';
-  import { attemptsOf, executionStates, requirementAttempts, requirementState, sameProducer, settled, type Part, type VerificationExecutionProps } from '../execution.js';
+  import { attemptsOf, executionStates, inputWaits, missingInputs, requirementAttempts, requirementState, sameProducer, settled, type Part, type VerificationExecutionProps } from '../execution.js';
   import { fmtBytes, fmtCardRef, fmtDuration, fmtShortId, fmtYaml } from '../format.js';
   import type { ExecutionInput } from '../schemas.js';
   import Code from './Code.svelte';
@@ -45,7 +45,7 @@
   }
 
   const DRIFT_WORDS: Record<CardTypes.DriftVerdict, string> = { NoDrift: 'no drift', Drift: 'drift', Inconclusive: 'inconclusive' };
-  const WORDS = { input: 'Input', step: 'Step', req: 'Requirement' } as const;
+  const WORDS = { input: 'Input', step: 'Step', req: 'Requirement', task: 'Task' } as const;
   /** The most characters of one JSON or text value a preview draws. */
   const PREVIEW = 65_536;
 
@@ -76,11 +76,13 @@
   /** Whether `step` of this unfinished execution waits for a decision. */
   const awaiting = (step: string) => !!data && !settled(data.status.status) && approvals.some((each) => each.step_id === step && each.status === 'pending');
   /** Inputs this unfinished execution started without and still waits for. */
-  const missing = $derived(data && !settled(data.status.status) ? (data.status.waiting ?? []) : []);
-  /** The waiting inputs the selected step reads, by its declared edges. */
-  const awaitedBy = (key: string) => missing.filter((slot) => definition?.graph.edges.some((edge) => edge.source === `input:${slot}` && edge.target === key));
+  const missing = $derived(data ? missingInputs(data.status) : []);
+  /** The inputs each task reports waiting for, by step or requirement ID. */
+  const waits = $derived(data ? inputWaits(data.status) : new Map<string, readonly string[]>());
   /** Requirements judged in the result or by a settled invocation, each once, in recorded order; the only requirements known when the definition is unavailable. */
   const judgedIds = $derived([...new Set([...(data?.status.result?.outcome.requirements.map((each) => each.id) ?? []), ...items.flatMap((each) => (each.state === 'requirement' ? [each.producer.step_id] : []))])]);
+  /** Waiting tasks known by no recorded invocation, approval or judgment; without the definition their kind is unknown. */
+  const waitingOnly = $derived([...waits.keys()].filter((task) => !reached.includes(task) && !judgedIds.includes(task)));
   const attempts = $derived(type === 'step' ? attemptsOf(items, id) : []);
   const attempt = $derived(attempts.find((each) => selection.producer && sameProducer(each.producer, selection.producer)) ?? attempts.at(-1));
   const produced = $derived(attempt ? outputs.filter((each) => sameProducer(each.producer, attempt.producer)) : []);
@@ -363,7 +365,7 @@
     {:else}
       <Panel title="Graph" note="The Verifier this execution ran">
         {@render refused(data.definition, 'Verifier definition')}
-        {#if judgedIds.length + reached.length}
+        {#if judgedIds.length + reached.length + waitingOnly.length}
           <div class="recorded" role="group" aria-label="Recorded without the definition">
             <p class="hint">Recorded requirements and invocations stay selectable. Declared order and edges need the definition.</p>
             {#each judgedIds as requirement (requirement)}
@@ -375,6 +377,11 @@
               <button type="button" class="tool" aria-pressed={selection.node === `step:${step}`} onclick={() => select({ node: `step:${step}` })}
                 ><span class="label">Step</span> {step}
                 {#if awaiting(step)}<StatusMark value="awaiting_approval" />{:else if last}<span class="muted">{recorded(last)}</span>{/if}</button
+              >
+            {/each}
+            {#each waitingOnly as task (task)}
+              <button type="button" class="tool" aria-pressed={selection.node === `task:${task}`} onclick={() => select({ node: `task:${task}` })}
+                ><span class="label">Task</span> {task} <StatusMark value="awaiting_input" /> <b class="mono">{waits.get(task)?.join(', ')}</b></button
               >
             {/each}
           </div>
@@ -429,18 +436,20 @@
         {/if}
       </Panel>
     {:else if type && id}
-      <Panel title="{WORDS[type]} {id}" note={type === 'req' ? 'Recorded judgment' : type === 'step' ? 'Recorded invocations' : 'Recorded input'}>
+      <Panel title="{WORDS[type]} {id}" note={type === 'req' ? 'Recorded judgment' : type === 'step' ? 'Recorded invocations' : type === 'task' ? 'Reported wait' : 'Recorded input'}>
         {#if type === 'input' && missing.includes(id)}
-          {@const readers = (definition?.graph.edges ?? []).filter((edge) => edge.source === `input:${id}`).map((edge) => (edge.target.startsWith('req:') ? `${edge.target.slice(4)} is judged` : `${edge.target.slice(5)} starts`))}
+          {@const readers = [...waits].filter(([, slots]) => slots.includes(id)).map(([task]) => (definition?.graph.requirements.some((each) => each.id === task) ? `${task} is judged` : `${task} starts`))}
           <p class="note box waitnote" data-waiting-input>Not provided yet. The execution started without it{#if readers.length}; {readers.join(' and ')} when it arrives{/if}.</p>
         {/if}
         {#if type === 'step'}
           {#each approvals.filter((each) => each.step_id === id) as each (each.approval_id)}
             {@render approval(each)}
           {/each}
-          {#if !attempts.length && awaitedBy(`step:${id}`).length}
-            <p class="note box waitnote" data-waiting-input>Waiting for input <b class="mono">{awaitedBy(`step:${id}`).join(', ')}</b>. The execution started without it; this step starts when the evidence is provided. Nothing here is judged until then.</p>
-          {/if}
+        {/if}
+        {#if type !== 'input' && waits.has(id) && !attempts.length}
+          <p class="note box waitnote" data-waiting-input>Waiting for input <b class="mono">{waits.get(id)?.join(', ')}</b>. The execution started without it; this {type === 'req' ? 'requirement is judged' : type === 'step' ? 'step starts' : 'task runs'} when the evidence is provided. Nothing here is judged until then.</p>
+        {/if}
+        {#if type === 'step'}
           {#if attempts.length > 1}
             <div class="attempts" role="radiogroup" aria-label="Invocations of {id}">
               {#each attempts as each (where(each.producer))}

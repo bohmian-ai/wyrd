@@ -169,7 +169,7 @@ export const ProducerSchema = z
 
 /** What an execution view shows beyond the execution itself; every field is shareable selection state. */
 const executionSelection = {
-  /** The selected graph node: `input:`, `step:` or `req:` plus its id; `outputs` for every retained output; `none` for no selection. Absent, a judged execution selects its first failed requirement. */
+  /** The selected graph node: `input:`, `step:` or `req:` plus its id, or `task:` plus the id of a reported waiting task whose kind is unknown without the definition; `outputs` for every retained output; `none` for no selection. Absent, a judged execution selects its first failed requirement. */
   node: z.string().min(1).max(300).optional(),
   /** The selected invocation attempt of the selected step. */
   producer: ProducerSchema.optional(),

@@ -3211,7 +3211,7 @@ test('execution inspector shows recorded state, judgments and outputs as separat
 
 
 test('TASK-006: a waiting execution shows each reached approval occurrence and decides only the exact one', async () => {
-  // Setup: `exec_approval` waits for its `eval_report` input while `audit` runs; `release` fanned out to two approval occurrences and `review` repeated twice. Its Verifier definition is refused.
+  // Setup: `exec_approval` waits for its `eval_report` input, which its `compare` step reports waiting for, while `audit` runs; `release` fanned out to two approval occurrences and `review` repeated twice. Its Verifier definition is refused.
   const onaction = vi.fn();
   const sent = () => onaction.mock.lastCall?.[0];
   const actions = reactive<Record<string, ActionState>>({});
@@ -3228,11 +3228,25 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
   expect(within(head).getByRole('button', { name: /Cancel execution/ })).toBeEnabled();
 
   // Without the definition, each approval step is selectable though it recorded no invocation; a pending occurrence reads as waiting for approval.
+  // The reported waiting task, whose kind only the definition tells, is a Task waiting for its input.
   const recorded = within(view.container).getByRole('group', { name: 'Recorded without the definition' });
-  expect(within(recorded).getAllByRole('button').map((each) => each.textContent?.replace(/\s+/g, ' ').trim())).toEqual(['Step gather succeeded', 'Step audit started', 'Step release ◷waiting for approval', 'Step review ◷waiting for approval']);
+  expect(within(recorded).getAllByRole('button').map((each) => each.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+    'Step gather succeeded',
+    'Step audit started',
+    'Step release ◷waiting for approval',
+    'Step review ◷waiting for approval',
+    'Task compare ◷waiting for input eval_report'
+  ]);
+  await fireEvent.click(within(recorded).getByRole('button', { name: /Task compare/ }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'task:compare' } });
+  await view.rerender({ ...(await load('task:compare')), onaction, actions });
+  expect(within(view.container).getByRole('region', { name: 'Task compare' }).querySelector('[data-waiting-input]')).toHaveTextContent(
+    'Waiting for input eval_report. The execution started without it; this task runs when the evidence is provided.'
+  );
   await fireEvent.click(within(recorded).getByRole('button', { name: /Step release/ }));
   expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:release' } });
   await view.rerender({ ...(await load('step:release')), onaction, actions });
+  expect(within(view.container).getByRole('region', { name: 'Step release' }).querySelector('[data-waiting-input]')).toBeNull();
 
   // Each occurrence, laid out as the mock's approval box: boxed state, message, then Occurrence, For, Expires and Decided rows. Expiry is the execution's lifecycle; the server records no per-occurrence time.
   const step = (id: string) => within(view.container).getByRole('region', { name: `Step ${id}` });
@@ -3306,15 +3320,17 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
   readOnly.unmount();
 
   // With the definition, each graph node says what it waits for, as the mock's nodes do: an input not provided yet,
-  // a step waiting for that input, a step waiting for approval, and a decided step the server has not yet recorded as an invocation.
+  // the step the status reports waiting for that input, a step waiting for approval, and a decided step the server has not yet recorded as an invocation.
   const read = { kind: 'assert', path: 'inputs.eval_report.f1', operator: 'is_truthy' };
   const parked = definitionGraph({
     inputs: { eval_report: { type: 'json', deferred: true } },
     steps: [
       { id: 'release', action: { kind: 'approval', message: 'Promote?' } },
       { id: 'review', action: { kind: 'approval', message: 'Reviewed?' } },
-      { id: 'compare', action: { kind: 'code', entrypoint: 'f', source: { inline: '' } }, requirements: [{ id: 'beats', statement: 's', check: read }] }
-    ]
+      { id: 'compare', action: { kind: 'code', entrypoint: 'f', source: { inline: '' } }, requirements: [{ id: 'beats', statement: 's', check: read }] },
+      { id: 'later', action: { kind: 'code', entrypoint: 'f', source: { inline: '' } }, requirements: [{ id: 'also', statement: 's', check: read }] }
+    ],
+    requirements: [{ id: 'reported', statement: 's', check: read }]
   } as never);
   const states = executionStates(parked, executionStatus.exec_approval, []);
   expect([states['input:eval_report'], states['step:release'], states['step:review'], states['step:compare']]).toEqual([
@@ -3323,6 +3339,29 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
     { value: 'awaiting_approval', wait: true },
     { value: 'awaiting_input', wait: true }
   ]);
+  // Only reported tasks wait: `later` and `reported` read the same input by their declared edges, but the status names neither.
+  // An attached check belongs to its step and is not judged; a reported whole-Verifier requirement waits for its input.
+  expect([states['step:later'], states['req:beats'], states['req:reported']]).toEqual([
+    { value: 'not started', dim: false },
+    { value: 'not judged', dim: false },
+    { value: 'not judged', dim: false }
+  ]);
+  const reported = { ...executionStatus.exec_approval, input_waits: [...(executionStatus.exec_approval.input_waits ?? []), { task_id: 'reported', slots: ['eval_report'] }] };
+  expect(executionStates(parked, reported, [])['req:reported']).toEqual({ value: 'awaiting_input', wait: true });
+  // A task's reported slot is missing even before the execution parks, and an older state with no reported waits infers none.
+  const running = { ...executionStatus.exec_approval, status: 'running' as const, waiting: [] };
+  expect([executionStates(parked, running, [])['input:eval_report'], executionStates(parked, running, [])['step:compare']]).toEqual([
+    { value: 'not provided', wait: true },
+    { value: 'awaiting_input', wait: true }
+  ]);
+  const older = { ...executionStatus.exec_approval, input_waits: undefined };
+  expect([executionStates(parked, older, [])['input:eval_report'], executionStates(parked, older, [])['step:compare']]).toEqual([
+    { value: 'not provided', wait: true },
+    { value: 'not started', dim: false }
+  ]);
+  // A settled execution waits for nothing, whatever a stale snapshot says.
+  const cancelled = executionStates(parked, { ...reported, status: 'cancelled' }, []);
+  expect([cancelled['input:eval_report'], cancelled['step:compare'], cancelled['req:reported']]).toEqual([undefined, { value: 'not run', dim: true }, { value: 'not judged', dim: true }]);
   // Once review's only occurrence is decided, the step reads that decision until its invocation is recorded.
   const decidedOnly = { ...executionStatus.exec_approval, approvals: executionStatus.exec_approval.approvals?.filter((each) => each.approval_id === 'apo_review_0') };
   expect(executionStates(parked, decidedOnly, [])['step:review']).toEqual({ value: 'rejected' });

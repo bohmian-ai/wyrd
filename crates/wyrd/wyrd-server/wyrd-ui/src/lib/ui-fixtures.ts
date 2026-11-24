@@ -512,6 +512,7 @@ export const executionStatus = {
     status: 'waiting',
     dispatches: [],
     waiting: ['eval_report'],
+    input_waits: [{ task_id: 'compare', slots: ['eval_report'] }],
     approvals: [
       { approval_id: 'apo_release_0', step_id: 'release', item: 0, iteration: null, message: 'Promote item 0 of refund-classifier?', status: 'pending', actor_id: null, decided_at: null, reason: null },
       { approval_id: 'apo_release_1', step_id: 'release', item: 1, iteration: null, message: 'Promote item 1 of refund-classifier?', status: 'approved', actor_id: 'pr_ana', decided_at: '2026-10-20T11:40:00Z', reason: 'reviewed the diff' },

@@ -359,12 +359,14 @@ test('the administrator invites a teammate who enrolls and approves a CLI sign-i
   const admin = await visitor();
   try {
     await signIn(admin.page, slug, ws.username, ws.password);
-    await admin.page.goto(`${journey.origin}/t/${slug}/settings/access?tab=users`);
-    const invite = admin.page.getByRole('form', { name: 'Invite users' });
+    await admin.page.goto(`${journey.origin}/t/${slug}/settings/people`);
+    await admin.page.getByRole('link', { name: 'Invite people' }).click();
+    const invite = admin.page.getByRole('form', { name: 'Invite people' });
     await invite.getByLabel('Email addresses').fill(teammate);
-    await invite.getByLabel('Role').selectOption({ index: 1 });
-    await invite.getByLabel('Scope').selectOption('all');
-    await invite.getByRole('button', { name: 'Create invitations' }).click();
+    await invite.getByRole('radio').nth(1).check();
+    await invite.getByLabel('Applies to').selectOption('all');
+    await admin.page.getByRole('button', { name: 'Send invitations' }).click();
+    await admin.page.goto(`${journey.origin}/t/${slug}/settings/people?filter=invited`);
     await admin.page.getByRole('region', { name: 'Pending invitations' }).getByText(teammate).waitFor();
   } finally {
     await admin.context.close();

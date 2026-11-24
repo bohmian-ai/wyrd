@@ -2646,10 +2646,26 @@ async function connectGithub(page: Page, base: string) {
 
 /** Choose `role` at the `kind`/`name` Card family in the grant fields inside `form`. */
 async function chooseFamilyGrant(form: ReturnType<Page['locator']>, role: string, kind: string, name: string) {
-  await form.getByLabel('Role').selectOption(role);
-  await form.getByLabel('Scope', { exact: true }).selectOption('card_family');
+  // The invitation lists Roles as choices; the account drawer offers one select.
+  if (await form.getByRole('radio').count()) await form.getByRole('radio', { name: new RegExp(`^${role}\\b`) }).check();
+  else await form.getByLabel('Role').selectOption(role);
+  await form.getByLabel('Applies to').selectOption('card_family');
   await form.getByLabel('Card kind').selectOption(kind);
   await form.getByLabel('Card name').fill(name);
+}
+
+/** Open one account's drawer from its Settings list, by the name the list shows. */
+async function openAccount(page: Page, name: string) {
+  await page.getByRole('link', { name: new RegExp(`^${name}\\b`) }).first().click();
+  const drawer = page.getByRole('dialog', { name });
+  await drawer.waitFor();
+  return drawer;
+}
+
+/** Open the invitation drawer on Settings → People. */
+async function openInvite(page: Page) {
+  await page.getByRole('link', { name: 'Invite people' }).click();
+  return page.getByRole('form', { name: 'Invite people' });
 }
 
 reviewing('Alice is given payments in Settings and sees only payments in her browser, CLI and SDK, then gains and loses ledger without signing in again', async ({ server }) => {
@@ -2686,21 +2702,22 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
     expect(github.deliverPullRequest(server.baseUrl, 101, 2, 9, 'opened')).toBe(202);
 
-    // Settings leads to Access. The administrator invites a user with viewer at the payments family: no IdP, no tenant-wide default.
+    // Settings leads to People. The administrator invites a user with viewer at the payments family: no IdP, no tenant-wide default.
     await page.goto(`${base}/settings`);
-    await page.getByRole('link', { name: 'Access', exact: true }).click();
-    await page.waitForURL(`${base}/settings/access`);
-    const invite = page.getByRole('form', { name: 'Invite users' });
+    await page.getByRole('link', { name: 'People', exact: true }).click();
+    await page.waitForURL(`${base}/settings/people`);
+    const invite = await openInvite(page);
     await invite.getByLabel('Email addresses').fill('alice@example.test\ncarol@example.test');
     await chooseFamilyGrant(invite, 'viewer', 'Repository', 'payments');
-    await invite.getByRole('button', { name: 'Create invitations' }).click();
+    await page.getByRole('button', { name: 'Send invitations' }).click();
     const links = page.locator('[data-secret]');
     await expect.poll(() => links.count()).toBe(2);
     await expect.poll(() => page.getByText('Wyrd does not email invitations until an operator configures a mail relay.').count()).toBe(1);
     const aliceLink = (await links.first().textContent()) ?? '';
     expect(aliceLink.startsWith(`${base}/signup#invitation=`)).toBe(true);
+    await page.getByRole('group', { name: 'Filter' }).getByRole('link', { name: /^Invited/ }).click();
     const pending = page.getByRole('region', { name: 'Pending invitations' });
-    await expect.poll(() => pending.getByRole('row', { name: /carol@example\.test/ }).textContent()).toContain('not emailed');
+    await expect.poll(() => pending.getByRole('row', { name: /carol@example\.test/ }).textContent()).toContain('Not emailed');
 
     // Alice opens her copied link and sets her own password; the server created her account and exactly the invited binding.
     const password = strongPassword();
@@ -2718,20 +2735,19 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
       { subject: { principal: { id: account.principal_id, kind: 'user' } }, role: 'viewer', scope: payments, source: 'direct' }
     ]);
 
-    // Access shows the same account, role, scope and source the server holds.
-    await page.goto(`${base}/settings/access`);
-    await page.getByRole('link', { name: 'Access for alice' }).click();
-    const grants = page.getByRole('region', { name: 'Access for alice' }).locator('tbody tr');
+    // People shows the same account, role and scope the server holds, removable because it is direct.
+    await page.goto(`${base}/settings/people`);
+    const grants = (await openAccount(page, 'alice')).locator('[data-binding]');
     await expect.poll(() => grants.count()).toBe(1);
     const row = (await grants.first().textContent()) ?? '';
-    for (const text of ['viewer', 'Repository/payments', 'every version, including future ones', 'Direct', 'cards:read', 'executions:read']) expect(row).toContain(text);
+    for (const text of ['viewer', 'Repository/payments', 'every version, including future ones', 'Remove']) expect(row).toContain(text);
 
-    // The tenant's own administrative account is not offered in Access, and a direct request to remove its admin binding is refused.
+    // The tenant's own administrative account is not offered in People, and a direct request to remove its admin binding is refused.
     server.tenantAdminKey();
     const admins = (await principals.bindings({ role: 'admin' })).bindings;
     const listed = new Set((await principals.list({})).principals.map((principal) => principal.principal_id));
     const [held] = admins.filter((binding) => 'principal' in binding.subject && !listed.has(binding.subject.principal.id));
-    const refused = await page.request.post(`${base}/settings/access?/unbind`, { form: { bindingId: held.id }, headers: { origin: bff.url } });
+    const refused = await page.request.post(`${base}/settings/people?/unbind`, { form: { bindingId: held.id }, headers: { origin: bff.url } });
     expect(await refused.json()).toMatchObject({ type: 'failure', status: 400 });
     expect((await principals.bindings({ role: 'admin' })).bindings.map((binding) => binding.id)).toContain(held.id);
 
@@ -2748,13 +2764,13 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     expect(await index.textContent()).toContain('payments');
     expect(await her.locator('main').textContent()).not.toContain('ledger');
 
-    // The ledger Repository she was not granted reads as no such Card, and GitHub setup and Access administration are refused.
+    // The ledger Repository she was not granted reads as no such Card, and GitHub setup and People administration are refused.
     await her.goto(`${base}/repositories/ledger?version=${ledger.version}`);
     expect(await her.locator('main').textContent()).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
     await her.goto(`${base}/settings/integrations/github`);
     expect(await her.locator('main').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
-    await her.goto(`${base}/settings/access`);
-    expect(await her.locator('main').textContent()).toContain("You can't administer access for this tenant");
+    await her.goto(`${base}/settings/people`);
+    expect(await her.locator('main').textContent()).toContain("You can't administer people in this workspace");
     expect(await her.getByRole('form').count()).toBe(0);
 
     // She starts a CLI login in a terminal and approves its code in the browser she is signed in to: no provider is involved.
@@ -2934,9 +2950,9 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await expect.poll(ledgerInSdk, { timeout: 30_000 }).toBe(true);
     await expect.poll(ledgerInCli, { timeout: 30_000 }).toBe(true);
 
-    // The administrator removes that binding in Access. Alice loses ledger everywhere and keeps payments.
-    await page.goto(`${base}/settings/access`);
-    await page.getByRole('link', { name: 'Access for alice' }).click();
+    // The administrator removes that binding in People. Alice loses ledger everywhere and keeps payments.
+    await page.goto(`${base}/settings/people`);
+    await openAccount(page, 'alice');
     await page.getByRole('button', { name: 'Remove viewer at Repository/ledger · every version, including future ones from alice' }).click();
     await expect.poll(() => grants.count()).toBe(1);
     await expect.poll(ledgerInBrowser, { timeout: 30_000 }).toBe(false);
@@ -2953,7 +2969,7 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
   }
 });
 
-test('an administrator manages direct, group and custom-role grants in Access, and a refused grant saves nothing', async ({ server, ui }) => {
+test('an administrator manages direct and custom-role grants in People and Roles, sees group grants, and a refused grant saves nothing', async ({ server, ui }) => {
   const tenantKey = 'ui-access';
   const tenant = server.seedTenant(tenantKey);
   const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-access-admin');
@@ -2966,19 +2982,19 @@ test('an administrator manages direct, group and custom-role grants in Access, a
   const page = await signIn(ui.browser, ui.base, tenantKey, adminKey);
   const context = await ui.browser.newContext();
   try {
-    /** Post one Access form action directly, as a request that skipped the page's own controls. */
+    /** Post one access form action directly, as a request that skipped the page's own controls. */
     const post = async (action: string, form: Record<string, string>) =>
-      ((await (await page.request.post(`${base}/settings/access?/${action}`, { form, headers: { origin: ui.base } })).json()) as { type: string; status: number });
-    await page.goto(`${base}/settings/access`);
+      ((await (await page.request.post(`${base}/settings/people?/${action}`, { form, headers: { origin: ui.base } })).json()) as { type: string; status: number });
+    await page.goto(`${base}/settings/people`);
 
     // An invitation that names no scope is refused: nobody is enrolled with a tenant-wide default.
     expect(await post('invite', { recipients: 'bob@example.test', role: 'viewer' })).toMatchObject({ type: 'failure', status: 400 });
 
     // Bob is invited as viewer of the ask-prompt family and sets his own password.
-    const invite = page.getByRole('form', { name: 'Invite users' });
+    const invite = await openInvite(page);
     await invite.getByLabel('Email addresses').fill('bob@example.test');
     await chooseFamilyGrant(invite, 'viewer', 'Prompt', 'ask-prompt');
-    await invite.getByRole('button', { name: 'Create invitations' }).click();
+    await page.getByRole('button', { name: 'Send invitations' }).click();
     const link = page.locator('[data-secret]');
     await expect.poll(() => link.count()).toBe(1);
     const signup = await context.newPage();
@@ -2993,24 +3009,25 @@ test('an administrator manages direct, group and custom-role grants in Access, a
     const exact = `viewer ${JSON.stringify({ card: { version: { kind: 'Prompt', name: 'ask-prompt', uid } } })}`;
     expect(await saved()).toEqual([family]);
 
-    // On Bob's Access page the administrator adds one exact version; the page tells it apart from the family grant.
-    await page.goto(`${base}/settings/access`);
-    await page.getByRole('link', { name: 'Access for bob' }).click();
+    // In Bob's drawer the administrator adds one exact version; the drawer tells it apart from the family grant.
+    await page.goto(`${base}/settings/people`);
+    const drawer = await openAccount(page, 'bob');
+    await drawer.getByRole('button', { name: 'Add role' }).click();
     const grant = page.getByRole('form', { name: 'Grant access to bob' });
-    const rows = page.getByRole('region', { name: 'Bindings of bob' }).locator('tbody tr');
+    const rows = drawer.locator('[data-binding]');
     const refuse = async (role: string, scopeType: string, fill: () => Promise<void>) => {
       await grant.getByLabel('Role').selectOption(role);
-      await grant.getByLabel('Scope', { exact: true }).selectOption(scopeType);
+      await grant.getByLabel('Applies to').selectOption(scopeType);
       await fill();
-      await grant.getByRole('button', { name: 'Save binding' }).click();
+      await grant.getByRole('button', { name: 'Save role' }).click();
       await expect.poll(() => page.getByRole('alert').textContent()).toContain('Nothing was changed');
     };
     await grant.getByLabel('Role').selectOption('viewer');
-    await grant.getByLabel('Scope', { exact: true }).selectOption('card_version');
+    await grant.getByLabel('Applies to').selectOption('card_version');
     await grant.getByLabel('Card kind').selectOption('Prompt');
     await grant.getByLabel('Card name').fill('ask-prompt');
     await grant.getByLabel('Card UID').fill(uid);
-    await grant.getByRole('button', { name: 'Save binding' }).click();
+    await grant.getByRole('button', { name: 'Save role' }).click();
     await expect.poll(() => rows.count()).toBe(2);
     expect(await rows.allTextContents()).toEqual([expect.stringContaining('every version, including future ones'), expect.stringContaining(`exact version ${uid}`)]);
     expect((await saved()).sort()).toEqual([family, exact].sort());
@@ -3032,39 +3049,32 @@ test('an administrator manages direct, group and custom-role grants in Access, a
     expect((await saved()).sort()).toEqual([family, exact].sort());
 
     // Built-in roles offer no edit, and a direct request to change one is refused. A custom role is created from operations.
-    await page.getByRole('link', { name: 'Roles', exact: true }).click();
-    await expect.poll(() => page.locator('[data-role="viewer"]').textContent()).toContain('built-in · read-only');
-    expect(await page.getByRole('form', { name: 'Edit role viewer' }).count()).toBe(0);
+    await page.goto(`${base}/settings/roles`);
+    await expect.poll(() => page.locator('[data-role="viewer"]').textContent()).toContain('built-in');
+    expect(await page.getByRole('link', { name: 'Edit viewer' }).count()).toBe(0);
     expect(await post('putRole', { role: 'viewer', operation: 'cards:write' })).toMatchObject({ type: 'failure', status: 400 });
+    await page.getByRole('link', { name: 'New role' }).click();
     const create = page.getByRole('form', { name: 'Create a custom role' });
-    await create.getByLabel('Role name').fill('prompt_reader');
+    await create.getByLabel('Name', { exact: true }).fill('prompt_reader');
     await create.getByRole('group', { name: 'cards' }).getByLabel('read').check();
-    await create.getByRole('button', { name: 'Create role' }).click();
+    await page.getByRole('button', { name: 'Create role' }).click();
     await expect.poll(() => page.locator('[data-role="prompt_reader"]').count()).toBe(1);
     expect((await principals.roles()).roles.find((role) => role.name === 'prompt_reader')).toMatchObject({ builtin: false, operations: [{ resource: 'cards', action: 'read' }] });
 
-    // A group holds Bob and the custom role at the family; Bob's page names the group as that grant's source.
-    await page.getByRole('link', { name: 'Groups', exact: true }).click();
-    const group = page.getByRole('form', { name: 'Create a group' });
-    await group.getByLabel('Group name').fill('reviewers');
-    await group.getByRole('button', { name: 'Create group' }).click();
-    const member = page.getByRole('form', { name: 'Add a member to reviewers' });
-    await member.getByLabel('Account').selectOption(bob);
-    await member.getByRole('button', { name: 'Add member' }).click();
-    await expect.poll(() => page.locator('[data-group="reviewers"] .members').textContent()).toContain('bob');
-    await page.getByText('Grant access to reviewers', { exact: true }).click();
-    await chooseFamilyGrant(page.getByRole('form', { name: 'Grant access to reviewers' }), 'prompt_reader', 'Prompt', 'ask-prompt');
-    await page.getByRole('form', { name: 'Grant access to reviewers' }).getByRole('button', { name: 'Save binding' }).click();
-    await expect.poll(() => page.getByRole('region', { name: 'Bindings of reviewers' }).locator('tbody tr').count()).toBe(1);
-    await page.getByRole('link', { name: 'Users', exact: true }).click();
-    await page.getByRole('link', { name: 'Access for bob' }).click();
+    // Groups are administered through the SDK. A group holds Bob and the custom role at the family; Bob's drawer names the group as that grant's source and offers no Remove for it.
+    const reviewers = await principals.createGroup({ name: 'reviewers' });
+    await principals.addGroupMember(reviewers.id, bob);
+    await principals.bind({ subject: { group: { id: reviewers.id } }, role: 'prompt_reader', scope: { card: { family: { kind: 'Prompt', name: 'ask-prompt' } } } });
+    await page.goto(`${base}/settings/people`);
+    await openAccount(page, 'bob');
     await expect.poll(() => rows.count()).toBe(3);
-    expect((await rows.allTextContents()).filter((row) => row.includes('Group reviewers'))).toEqual([expect.stringContaining('prompt_reader')]);
+    expect((await rows.allTextContents()).filter((row) => row.includes('Through group reviewers'))).toEqual([expect.stringContaining('prompt_reader')]);
+    expect(await drawer.getByRole('button', { name: /^Remove prompt_reader/ }).count()).toBe(0);
 
     // Removing Bob's direct family grant leaves the group's: the page still shows it, and the server still grants the family read.
     await page.getByRole('button', { name: 'Remove viewer at Prompt/ask-prompt · every version, including future ones from bob' }).click();
     await expect.poll(() => rows.count()).toBe(2);
-    expect(await page.locator('[data-combined]').textContent()).toContain('cards:read at Prompt/ask-prompt · every version, including future ones');
+    expect((await rows.allTextContents()).filter((row) => row.includes('Prompt/ask-prompt · every version, including future ones'))).toEqual([expect.stringContaining('Through group reviewers')]);
     expect((await principals.access(bob)).grants.map((held) => `${held.role} ${held.source.kind}`).sort()).toEqual(['prompt_reader group', 'viewer direct']);
   } finally {
     await context.close();
@@ -3072,7 +3082,7 @@ test('an administrator manages direct, group and custom-role grants in Access, a
   }
 });
 
-test('an administrator suspends a User and a Service account in Access, and their sessions and keys stop working', async ({ server, ui }) => {
+test('an administrator suspends a User and a Service account in Settings, and their sessions and keys stop working', async ({ server, ui }) => {
   const tenantKey = 'ui-suspend';
   const tenant = server.seedTenant(tenantKey);
   const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-suspend-admin');
@@ -3100,7 +3110,7 @@ test('an administrator suspends a User and a Service account in Access, and thei
     await asService();
 
     // A signed-in viewer posts the action directly: the server refuses it and the account stays active.
-    const direct = await bystander.request.post(`${base}/settings/access?/suspend`, {
+    const direct = await bystander.request.post(`${base}/settings/service-accounts?/suspend`, {
       form: { principalId: service.principal_id, principalKind: 'service', reason: 'not mine to stop' },
       headers: { origin: ui.base }
     });
@@ -3110,15 +3120,14 @@ test('an administrator suspends a User and a Service account in Access, and thei
     expect(await state(service.principal_id)).toEqual(before.service);
 
     // The administrator opens the Service account. A reason the server will not record is refused: the page shows the server's problem and the account stays active.
-    await page.goto(`${base}/settings/access?tab=services`);
-    await page.getByRole('link', { name: 'Access for ui-suspend-runner' }).click();
-    const account = page.getByRole('region', { name: 'Access for ui-suspend-runner' });
+    await page.goto(`${base}/settings/service-accounts`);
+    const account = await openAccount(page, 'ui-suspend-runner');
     const suspend = page.getByRole('form', { name: 'Suspend ui-suspend-runner' });
     await suspend.getByLabel('Reason').fill('password=hunter2 was pasted in chat');
-    await suspend.getByRole('button', { name: 'Suspend account' }).click();
+    await suspend.getByRole('button', { name: 'Suspend', exact: true }).click();
     await expect.poll(() => page.getByRole('alert').textContent()).toContain('Nothing was changed');
     expect(await page.getByRole('alert').textContent()).toContain('WYRD_SPEC_400_VALIDATION');
-    expect(await account.textContent()).toContain('✓ active');
+    expect(await account.textContent()).toContain('✓Active');
     expect(await state(service.principal_id)).toEqual(before.service);
 
     // The control fits a phone in dark mode, and the keyboard alone reaches it with a visible focus ring and submits it.
@@ -3131,7 +3140,7 @@ test('an administrator suspends a User and a Service account in Access, and thei
       const style = getComputedStyle(document.activeElement as Element);
       return { text: document.activeElement?.textContent, style: style.outlineStyle, width: parseFloat(style.outlineWidth) };
     });
-    expect(ring.text).toBe('Suspend account');
+    expect(ring.text).toBe('Suspend');
     expect(ring.style).not.toBe('none');
     expect(ring.width).toBeGreaterThan(0);
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -3140,23 +3149,23 @@ test('an administrator suspends a User and a Service account in Access, and thei
     // Suspended from the keyboard: the page reads the server's state back, the account and its bindings stay, and its key is refused.
     await suspend.getByLabel('Reason').fill('runner host decommissioned');
     await page.keyboard.press('Enter');
-    await expect.poll(() => account.textContent()).toContain('⊘ suspended');
+    await expect.poll(() => account.textContent()).toContain('–Suspended');
     expect(await page.getByRole('status').textContent()).toContain('Account suspended');
     expect(await suspend.count()).toBe(0);
     // A suspended Service account keeps its keys on the page, says they are refused and offers no new one.
     expect(await account.textContent()).toContain('Its keys are refused');
-    expect(await account.getByRole('region', { name: `Keys of ${service.name}` }).locator('tbody tr').count()).toBe(1);
+    expect(await account.getByRole('region', { name: `Keys of ${service.name}` }).locator('[data-key]').count()).toBe(1);
     expect(await page.getByRole('button', { name: 'Issue key' }).count()).toBe(0);
     expect(await state(service.principal_id)).toEqual({ ...before.service, status: 'suspended' });
     await expect.poll(() => asService().then(() => 'read', (error: { code?: string }) => error.code), { timeout: 30_000 }).toBe('WYRD_AUTH_401_API_KEY_INVALID');
 
     // The User is suspended the same way: her signed-in browser is sent back to sign in, and her account and binding stay.
-    const name = user.name!;
-    await page.goto(`${base}/settings/access`);
-    await page.getByRole('link', { name: `Access for ${name}` }).click();
+    const name = user.display_name ?? user.name!;
+    await page.goto(`${base}/settings/people`);
+    const drawer = await openAccount(page, name);
     await page.getByRole('form', { name: `Suspend ${name}` }).getByLabel('Reason').fill('left the team');
-    await page.getByRole('form', { name: `Suspend ${name}` }).getByRole('button', { name: 'Suspend account' }).click();
-    await expect.poll(() => page.getByRole('region', { name: `Access for ${name}` }).textContent()).toContain('⊘ suspended');
+    await page.getByRole('form', { name: `Suspend ${name}` }).getByRole('button', { name: 'Suspend', exact: true }).click();
+    await expect.poll(() => drawer.textContent()).toContain('–Suspended');
     expect(await state(user.principal_id)).toEqual({ ...before.user, status: 'suspended' });
     await expect
       .poll(
@@ -3172,7 +3181,7 @@ test('an administrator suspends a User and a Service account in Access, and thei
   }
 });
 
-test('an administrator creates a runtime Service account in Access, and its one key runs two releases of the family', async ({ server, ui }) => {
+test('an administrator creates a runtime Service account in Settings, and its one key runs two releases of the family', async ({ server, ui }) => {
   const tenantKey = 'ui-runtime';
   const tenant = server.seedTenant(tenantKey);
   const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-runtime-admin');
@@ -3195,12 +3204,13 @@ test('an administrator creates a runtime Service account in Access, and its one 
   const page = await signIn(ui.browser, ui.base, tenantKey, adminKey);
   try {
     // The form asks for the Service family only: no release version or UID, and no operation.
-    await page.goto(`${base}/settings/access?tab=services`);
+    await page.goto(`${base}/settings/service-accounts`);
+    await page.getByRole('link', { name: 'New service account' }).click();
     const create = page.getByRole('form', { name: 'Create a Service account' });
     expect(await create.getByRole('textbox').evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).name))).toEqual(['name', 'description', 'family']);
     await create.getByLabel('Name').fill('checkout-runtime');
     await create.getByLabel('Runtime family').fill('observed-service');
-    await create.getByRole('button', { name: 'Create Service account' }).click();
+    await page.getByRole('button', { name: 'Create service account' }).click();
     const secret = page.locator('[data-secret]');
     await expect.poll(() => secret.count()).toBe(1);
     const key = (await secret.textContent()) ?? '';
@@ -3210,30 +3220,30 @@ test('an administrator creates a runtime Service account in Access, and its one 
     expect(account.workload_restriction).toEqual({ mode: 'family', kind: 'Service', name: 'observed-service' });
     expect((await principals.access(account.principal_id)).grants).toEqual([]);
 
-    // Its page shows the family apart from its bindings, says it grants nothing, and never shows the key again.
-    await page.getByRole('link', { name: 'Access for checkout-runtime' }).click();
-    const detail = page.getByRole('region', { name: 'Access for checkout-runtime' });
+    // Its drawer shows the family apart from its roles, says it grants nothing, and never shows the key again.
+    const detail = await openAccount(page, 'checkout-runtime');
     await expect.poll(() => detail.locator('[data-runtime-family]').textContent()).toBe('Service/observed-service · every release');
-    expect(await detail.textContent()).toContain('The runtime family grants no operation and no access to the Service\'s dependencies');
-    expect(await detail.textContent()).toContain('– No access');
+    expect(await detail.textContent()).toContain('No roles. This account can sign in but can do nothing.');
     expect(await serverHtml(page, page.url())).not.toContain(key);
     await page.reload();
     expect(await secret.count()).toBe(0);
 
-    // Operations are separate bindings saved through the same grant form: workload at the Service family and at the drift schema it records to, and table definitions tenant-wide.
-    await chooseFamilyGrant(page.getByRole('form', { name: 'Grant access to checkout-runtime' }), 'workload', 'Service', 'observed-service');
-    await page.getByRole('form', { name: 'Grant access to checkout-runtime' }).getByRole('button', { name: 'Save binding' }).click();
-    await expect.poll(() => page.getByRole('region', { name: 'Bindings of checkout-runtime' }).locator('tbody tr').count()).toBe(1);
+    // Operations are separate roles saved through the same grant form: workload at the Service family and at the drift schema it records to, and table definitions workspace-wide.
+    await detail.getByRole('button', { name: 'Add role' }).click();
     const grant = page.getByRole('form', { name: 'Grant access to checkout-runtime' });
+    const held = detail.locator('[data-binding]');
+    await chooseFamilyGrant(grant, 'workload', 'Service', 'observed-service');
+    await grant.getByRole('button', { name: 'Save role' }).click();
+    await expect.poll(() => held.count()).toBe(1);
     await grant.getByLabel('Role').selectOption('workload');
-    await grant.getByLabel('Scope', { exact: true }).selectOption('bifrost_schema');
+    await grant.getByLabel('Applies to').selectOption('bifrost_schema');
     await grant.getByLabel('Schema').fill('drift');
-    await grant.getByRole('button', { name: 'Save binding' }).click();
-    await expect.poll(() => page.getByRole('region', { name: 'Bindings of checkout-runtime' }).locator('tbody tr').count()).toBe(2);
+    await grant.getByRole('button', { name: 'Save role' }).click();
+    await expect.poll(() => held.count()).toBe(2);
     await grant.getByLabel('Role').selectOption('runtime_tables');
-    await grant.getByLabel('Scope', { exact: true }).selectOption('all');
-    await grant.getByRole('button', { name: 'Save binding' }).click();
-    await expect.poll(() => page.getByRole('region', { name: 'Bindings of checkout-runtime' }).locator('tbody tr').count()).toBe(3);
+    await grant.getByLabel('Applies to').selectOption('all');
+    await grant.getByRole('button', { name: 'Save role' }).click();
+    await expect.poll(() => held.count()).toBe(3);
     expect((await principals.access(account.principal_id)).grants.map((held) => [held.role, held.scope, held.source.kind])).toEqual(
       expect.arrayContaining([
         ['workload', { card: { family: { kind: 'Service', name: 'observed-service' } } }, 'direct'],
@@ -3282,14 +3292,14 @@ test('an administrator creates a runtime Service account in Access, and its one 
     expect(next).not.toBe(key);
     const [first] = (await principals.listCredentials(account.principal_id)).credentials.filter((credential) => key.startsWith(credential.prefix));
     await page.getByRole('button', { name: `Revoke key ${first.prefix}` }).click();
-    await expect.poll(() => page.getByRole('region', { name: 'Keys of checkout-runtime' }).textContent()).toContain('⊘ revoked');
+    await expect.poll(() => page.getByRole('region', { name: 'Keys of checkout-runtime' }).textContent()).toContain('revoked');
     await expect(WyrdClient.connect({ serverUrl: ui.serverUrl, credential: key }).accessToken()).rejects.toMatchObject({ code: 'WYRD_AUTH_401_API_KEY_INVALID' });
     expect(await WyrdClient.connect({ serverUrl: ui.serverUrl, credential: next }).accessToken()).toBeTruthy();
 
-    // An account created through the SDK reads the same way in Access.
+    // An account created through the SDK reads the same way in Service accounts.
     await principals.createServicePrincipal({ name: 'spare-runtime', workload_restriction: { mode: 'family', kind: 'Service', name: 'spare-service' } });
-    await page.goto(`${base}/settings/access?tab=services`);
-    const listed = page.getByRole('region', { name: 'Service account list' }).locator('tbody tr');
+    await page.goto(`${base}/settings/service-accounts`);
+    const listed = page.getByRole('region', { name: 'Service accounts', exact: true }).locator('tbody tr');
     expect((await listed.allTextContents()).find((row) => row.includes('spare-runtime'))).toContain('Service/spare-service');
   } finally {
     await reader.shutdown();
@@ -3297,7 +3307,7 @@ test('an administrator creates a runtime Service account in Access, and its one 
   }
 });
 
-test('Access tells an unavailable server apart from a refusal', async ({ ui }) => {
+test('People tells an unavailable server apart from a refusal', async ({ ui }) => {
   // A loopback hop to the server whose access reads fail while `down`, as an unreachable dependency does.
   let down = false;
   const hop = createHttpServer((req, res) => {
@@ -3319,26 +3329,26 @@ test('Access tells an unavailable server apart from a refusal', async ({ ui }) =
     contexts.push(admin);
     const reader = await signIn(ui.browser, bff.url, TENANT, ui.readerKey);
     contexts.push(reader);
-    const access = `${bff.url}/t/${TENANT}/settings/access`;
+    const access = `${bff.url}/t/${TENANT}/settings/people`;
     // A person without administration is refused, and offered a request to copy.
     await reader.goto(access);
-    expect(await reader.locator('main').textContent()).toContain("⊘ You can't administer access for this tenant");
+    expect(await reader.locator('main').textContent()).toContain("⊘ You can't administer people in this workspace");
     expect(await reader.getByRole('button', { name: 'Copy access request' }).count()).toBe(1);
 
     // The administrator, while the server cannot answer, is told it is unavailable: no refusal, no request to copy, no form.
     down = true;
     await admin.goto(access);
     const unavailable = (await admin.locator('main').textContent()) ?? '';
-    expect(unavailable).toContain('✕ Access administration is unavailable');
+    expect(unavailable).toContain('✕ This section is unavailable');
     expect(unavailable).toContain('WYRD_SPEC_502_UPSTREAM_FAILURE');
-    expect(unavailable).not.toContain("You can't administer access");
+    expect(unavailable).not.toContain("You can't administer people");
     expect(await admin.getByRole('button', { name: 'Copy access request' }).count()).toBe(0);
     expect(await admin.getByRole('form').count()).toBe(0);
 
     // Once it answers again the same session administers access.
     down = false;
     await admin.reload();
-    expect(await admin.getByRole('form', { name: 'Invite users' }).count()).toBe(1);
+    expect(await admin.getByRole('link', { name: 'Invite people' }).count()).toBe(1);
   } finally {
     for (const page of contexts) await page.context().close();
     bff.stop();
@@ -3346,10 +3356,10 @@ test('Access tells an unavailable server apart from a refusal', async ({ ui }) =
   }
 });
 
-test('Access works from the keyboard and fits a phone and a desktop in light and dark', async ({ ui }) => {
+test('People and Service accounts work from the keyboard and fit a phone and a desktop in light and dark', async ({ ui }) => {
   const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
   try {
-    await page.goto(`${ui.base}/t/${TENANT}/settings/access`);
+    await page.goto(`${ui.base}/t/${TENANT}/settings/people`);
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 900 });
       for (const mode of ['light', 'dark'] as const) {
@@ -3360,11 +3370,11 @@ test('Access works from the keyboard and fits a phone and a desktop in light and
       }
     }
 
-    // The keyboard alone opens another tab, and the control it lands on next shows a focus ring.
+    // The keyboard alone opens another section, and the control it lands on next shows a focus ring.
     await page.getByRole('link', { name: 'Service accounts', exact: true }).focus();
     await page.keyboard.press('Enter');
-    await page.waitForURL(/tab=services/);
-    await page.getByLabel('Name', { exact: true }).focus();
+    await page.waitForURL(/\/settings\/service-accounts/);
+    await page.getByRole('link', { name: 'New service account' }).focus();
     await page.keyboard.press('Tab');
     const ring = await page.evaluate(() => {
       const style = getComputedStyle(document.activeElement as Element);
@@ -3507,11 +3517,11 @@ withGoogle('an invited person joins with Google and returns with Google', async 
     const base = `${bff.url}/t/${tenant}`;
     const page = await signIn(browser, bff.url, tenant, adminKey);
     const inviteOne = async (address: string) => {
-      await page.goto(`${base}/settings/access`);
-      const invite = page.getByRole('form', { name: 'Invite users' });
+      await page.goto(`${base}/settings/people`);
+      const invite = await openInvite(page);
       await invite.getByLabel('Email addresses').fill(address);
       await chooseFamilyGrant(invite, 'viewer', 'Prompt', 'payments');
-      await invite.getByRole('button', { name: 'Create invitations' }).click();
+      await page.getByRole('button', { name: 'Send invitations' }).click();
       const links = page.locator('[data-secret]');
       await expect.poll(() => links.count()).toBe(1);
       return (await links.first().textContent()) ?? '';

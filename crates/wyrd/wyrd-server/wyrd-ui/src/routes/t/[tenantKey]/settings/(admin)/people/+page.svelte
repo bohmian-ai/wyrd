@@ -1,658 +1,189 @@
 <!--
-  Settings → Access: tenant administrators manage Users, Service accounts,
-  roles, optional groups and their scoped bindings. Every list, summary and
-  refusal is the server's; the page words them and submits forms.
+  Settings → People: who can sign in to the workspace, how they sign in and
+  what they can do. Counts, rows and invitations are the server's; the page
+  words them, keeps filters and drawers in the URL and posts access actions.
 -->
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import { replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import type { CardTypes } from 'wyrd-ai';
-  import { OPERATIONS, operationName, scopeLabel } from '$lib/access';
-  import { guidance } from '$lib/Entry.svelte';
-  import AccessRequest from '$lib/AccessRequest.svelte';
+  import { fmtInstant } from 'wyrd-ai-ui';
+  import { scopeLabel } from '$lib/access';
+  import { ICONS } from '$lib/icons';
+  import Icon from '$lib/Icon.svelte';
+  import Mark from '$lib/Mark.svelte';
+  import Overlay from '$lib/Overlay.svelte';
+  import Pill from '$lib/Pill.svelte';
+  import AccountDrawer, { METHODS, initialsOf, labelOf } from '../AccountDrawer.svelte';
   import GrantFields from '../GrantFields.svelte';
+  import Outcome from '../Outcome.svelte';
+  import Refusal from '../Refusal.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
 
-  const TABS = [
-    ['users', 'Users'],
-    ['services', 'Service accounts'],
-    ['roles', 'Roles'],
-    ['groups', 'Groups']
-  ] as const;
-  const tab = $derived(TABS.find(([key]) => key === page.url.searchParams.get('tab'))?.[0] ?? 'users');
-  const access = $derived(data.access);
-  const problem = $derived(form && 'problem' in form ? form.problem : null);
-  let dismissed = $state<string | null>(null);
-  let copied = $state(false);
-  const issued = $derived(form?.issued && form.issued.id !== dismissed ? form.issued : null);
-  const invitations = $derived(form?.invitations && form.invitations[0]?.link !== dismissed ? form.invitations : null);
-  const DELIVERY = { not_emailed: '– not emailed', accepted: '✓ accepted by the mail relay', failed: '✕ email failed' } as const;
+  const people = $derived(data.people);
+  const params = $derived(page.url.searchParams);
+  const filter = $derived(params.get('filter') === 'invited' ? 'invited' : 'members');
+  const role = $derived(params.get('role'));
+  const you = $derived(page.data.session?.subject.id);
+  const invited = $derived(people?.invitations.length ?? 0);
+  const undelivered = $derived(people?.invitations.filter((one) => one.delivery === 'failed').length ?? 0);
+  const selectedId = $derived(params.get('person'));
+  const summary = $derived(people?.principals.find((one) => one.principal_id === selectedId));
 
-  const label = (principal: CardTypes.PrincipalSummary) => principal.name ?? principal.email ?? principal.principal_id;
-  const nameOf = (principalId: string) => {
-    const found = access?.principals.find((principal) => principal.principal_id === principalId);
-    return found ? label(found) : principalId;
-  };
-  const accounts = $derived(access?.principals.filter((principal) => principal.kind === (tab === 'services' ? 'service' : 'user')) ?? []);
-  const selected = $derived(access?.selected ?? null);
-  const directCount = (principalId: string) =>
-    access?.bindings.filter((binding) => 'principal' in binding.subject && binding.subject.principal.id === principalId).length ?? 0;
-  const groupBindings = (groupId: string) => access?.bindings.filter((binding) => 'group' in binding.subject && binding.subject.group.id === groupId) ?? [];
-  const boundCount = (role: string) => access?.bindings.filter((binding) => binding.role === role).length ?? 0;
-  const family = (restriction: CardTypes.WorkloadRestriction | null | undefined) =>
-    restriction?.mode === 'family' ? `${restriction.kind}/${restriction.name}` : null;
-  const granted = (permissions: readonly CardTypes.Permission[]) => permissions.map(operationName).join(', ');
-  const when = (value: string | null | undefined) => (value ? new Date(value).toISOString().slice(0, 16).replace('T', ' ') : '—');
-  const keyState = (key: { revoked_at: string | null; expires_at: string | null }) =>
-    key.revoked_at ? '⊘ revoked' : key.expires_at && Date.parse(key.expires_at) <= Date.now() ? '– expired' : '✓ active';
-  const href = (target: string, account?: string) => `?tab=${target}${account ? `&account=${encodeURIComponent(account)}` : ''}`;
-  /** A form action that keeps the section and selected account when the form posts without JavaScript. */
+  /** This page with `changes` applied to its query; `null` removes a key. Drawers and paging never carry over. */
+  function href(changes: Record<string, string | null>) {
+    const next = new URLSearchParams(params);
+    for (const key of ['drawer', 'person', 'after']) next.delete(key);
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === null) next.delete(key);
+      else next.set(key, value);
+    }
+    const query = next.toString();
+    return `${page.url.pathname}${query ? `?${query}` : ''}`;
+  }
+  /** A form action that keeps the page's query when the form posts without JavaScript. */
   const action = (name: string) => {
-    const kept = [...page.url.searchParams].filter(([key]) => !key.startsWith('/'));
+    const kept = [...params].filter(([key]) => !key.startsWith('/'));
     return `?/${name}${kept.length ? `&${new URLSearchParams(kept)}` : ''}`;
   };
-  async function copy(secret: string) {
-    await navigator.clipboard.writeText(secret);
-    copied = true;
-  }
+  const scoped = (assignment: { role: string; scope: CardTypes.PermissionScope }) => assignment.role + (assignment.scope === 'all' ? '' : ' · scoped');
 </script>
 
-{#snippet operationChecks(held: readonly string[])}
-  <div class="operations">
-    {#each Object.entries(OPERATIONS) as [resource, actions] (resource)}
-      <fieldset>
-        <legend>{resource}</legend>
-        {#each actions as action (action)}
-          <label class="check"><input type="checkbox" name="operation" value={`${resource}:${action}`} checked={held.includes(`${resource}:${action}`)} /> {action}</label>
-        {/each}
-      </fieldset>
-    {/each}
+<svelte:head><title>People · {data.tenant.name} · Wyrd</title></svelte:head>
+<header class="pagehead">
+  <div>
+    <h1>People</h1>
+    <p>Who can sign in to {data.tenant.name}, how they sign in, and what they can do.</p>
   </div>
-{/snippet}
+  {#if people}<div class="actions"><a class="app-control primary lg" href={href({ drawer: 'invite' })} data-sveltekit-noscroll><Icon d={ICONS.plus} />Invite people</a></div>{/if}
+</header>
 
-{#snippet bindingRows(rows: readonly { id: string; role: string; scope: CardTypes.PermissionScope; permissions: readonly CardTypes.Permission[]; source: CardTypes.GrantSource | CardTypes.RoleSource }[], owner: string)}
-  {#each rows as row (row.id)}
-    {@const source = typeof row.source === 'string' ? { kind: row.source === 'idp' ? 'provider' : 'direct' } : row.source}
-    <tr>
-      <td>{row.role}</td>
-      <td>{scopeLabel(row.scope)}</td>
-      <td>
-        {#if source.kind === 'direct'}Direct
-        {:else if source.kind === 'group' && 'name' in source}Group <a href={`${href('groups')}#group-${source.id}`}>{source.name}</a>
-        {:else}Identity provider{/if}
-      </td>
-      <td><code>{granted(row.permissions)}</code></td>
-      <td>
-        {#if source.kind === 'direct'}
-          <form method="POST" action={action('unbind')} use:enhance>
-            <input type="hidden" name="bindingId" value={row.id} />
-            <button class="app-control" type="submit" aria-label="Remove {row.role} at {scopeLabel(row.scope)} from {owner}">Remove</button>
-          </form>
-        {:else if source.kind === 'group'}
-          <span class="muted">Edit in its group</span>
-        {:else}
-          <span class="muted">Set at provider sign-in</span>
-        {/if}
-      </td>
-    </tr>
-  {/each}
-{/snippet}
+<Outcome {form} />
 
-<svelte:head><title>Access · {data.tenant.name} · Wyrd</title></svelte:head>
-<div class="app-page">
-  <div class="heading">
-    <h1>Access</h1>
-    <p>Who can do what in {data.tenant.name}. A role is a set of operations; a binding gives a role to an account or group at one explicit scope.</p>
+{#if !people}
+  <Refusal problem={data.problem} action="Administer people" />
+{:else}
+  <div class="stats">
+    <a class="stat" href={href({ filter: null })}><span class="v">{people.counts.active}</span><span class="k">Active</span></a>
+    <a class="stat" href={href({ filter: 'invited' })}><span class="v">{invited}</span><span class="k">Invited · pending</span></a>
+    {#if undelivered}<a class="stat warn" href={href({ filter: 'invited' })}><span class="v">{undelivered}</span><span class="k">Invitation not delivered</span></a>{/if}
+    <div class="stat"><span class="v">{people.counts.suspended}</span><span class="k">Suspended</span></div>
   </div>
 
-  {#if problem}
-    <div class="app-problem" role="alert" data-state={problem.status === 403 ? 'unauthorized' : 'error'}>
-      <strong>{problem.status === 403 ? '⊘' : '✕'} {problem.title}</strong>
-      <p>{guidance(problem)} Nothing was changed.</p>
-      <code>{problem.code}</code>
+  <div class="toolbar">
+    <div class="seg" role="group" aria-label="Filter">
+      <a href={href({ filter: null })} aria-current={filter === 'members' ? 'true' : undefined}>Members</a>
+      <a href={href({ filter: 'invited' })} aria-current={filter === 'invited' ? 'true' : undefined}>Invited ({invited})</a>
     </div>
-  {:else if form && 'done' in form}
-    <p role="status">✓ {form.done}</p>
-  {/if}
+    {#if role}<a class="app-control" href={href({ role: null })} aria-label="Stop filtering by role {role}">Role: {role} ✕</a>{/if}
+    <form class="find" method="GET" role="search">
+      {#if filter === 'invited'}<input type="hidden" name="filter" value="invited" />{/if}
+      {#if role}<input type="hidden" name="role" value={role} />{/if}
+      <input class="app-input" name="q" value={params.get('q') ?? ''} placeholder="Exact email or username" aria-label="Find people by exact email or username" />
+    </form>
+  </div>
 
-  {#if data.problem?.status === 403}
-    <div class="app-problem" data-state="unauthorized">
-      <strong>⊘ You can't administer access for this tenant</strong>
-      <p>Access administration is for tenant administrators. Ask one to grant what you need.</p>
-      <code>{data.problem.code}</code>
-    </div>
-    <AccessRequest action="Administer access" />
-  {:else if data.problem || !access}
-    <div class="app-problem" data-state="error">
-      <strong>✕ Access administration is unavailable</strong>
-      <p>{data.problem?.remediation ?? 'Please try again later.'}</p>
-      <code>{data.problem?.code}</code>
-    </div>
-  {:else}
-    <nav class="tabs" aria-label="Access sections">
-      {#each TABS as [key, name] (key)}
-        <a href={href(key)} aria-current={tab === key ? 'page' : undefined}>{name}</a>
-      {/each}
-    </nav>
-
-    {#if invitations}
-      <div class="secret" role="status" aria-label="Invitation links">
-        <strong>✓ {invitations.length === 1 ? 'Invitation link' : `${invitations.length} invitation links`} created. Copy them now; they are not shown again.</strong>
-        {#if invitations.some((sent) => sent.delivery === 'not_emailed')}
-          <p>Wyrd does not email invitations until an operator configures a mail relay. Send each person their link yourself.</p>
-        {/if}
-        <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-        <div class="scroll" role="region" aria-label="Issued invitation links" tabindex="0">
-          <table>
-            <thead><tr><th>Recipient</th><th>Email</th><th>Link</th></tr></thead>
-            <tbody>
-              {#each invitations as sent (sent.link)}
-                <tr>
-                  <td>{sent.recipient}</td>
-                  <td>{DELIVERY[sent.delivery]}</td>
-                  <td><code data-secret>{sent.link}</code></td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-        <p>Anyone holding a link can sign up once before {when(invitations[0].expiresAt)} UTC and receives exactly the access chosen here. Revoke a link that reached the wrong person.</p>
-        <div class="row">
-          <button class="app-control" type="button" onclick={() => copy(invitations.map((sent) => `${sent.recipient}\t${sent.link}`).join('\n'))}>{copied ? 'Copied' : 'Copy all'}</button>
-          <button class="app-control" type="button" onclick={() => ((dismissed = invitations[0].link), (copied = false))}>Dismiss</button>
-        </div>
-      </div>
-    {/if}
-    {#if issued}
-      <div class="secret" role="status">
-        <strong>✓ Key created. Copy it now; it is not shown again.</strong>
-        <code data-secret>{issued.credential}</code>
-        <div class="row">
-          <button class="app-control" type="button" onclick={() => copy(issued.credential)}>{copied ? 'Copied' : 'Copy'}</button>
-          <button class="app-control" type="button" onclick={() => ((dismissed = issued.id), (copied = false))}>Dismiss</button>
-        </div>
-      </div>
-    {/if}
-
-    <div class="grid">
-      {#if (tab === 'users' || tab === 'services') && selected}
-        {@const name = nameOf(selected.principal_id)}
-        {@const runtime = family(selected.workload_restriction)}
-        <section aria-label="Access for {name}">
-          <h2>Access for {name}</h2>
-          <dl>
-            <dt>Account</dt><dd>{selected.kind === 'service' ? 'Service account' : 'User'} · {selected.status === 'active' ? '✓ active' : '⊘ suspended'}</dd>
-            <dt>Principal</dt><dd>{selected.principal_id}</dd>
-            {#if selected.kind === 'service'}
-              <dt>Runtime family</dt>
-              <dd data-runtime-family>{runtime ? `${runtime} · every release` : 'Not restricted to a Service'}</dd>
-            {/if}
-          </dl>
-          {#if selected.kind === 'service'}
-            <p>
-              {#if runtime}This account may run only as a release of {runtime}. The application names its exact release; a new release needs no new account or key.{/if}
-              The runtime family grants no operation and no access to the Service's dependencies: every grant is a binding below.
-            </p>
-          {/if}
-          {#if selected.status === 'active'}
-            <form class="stack" method="POST" action={action('suspend')} aria-label="Suspend {name}" use:enhance>
-              <h3>Suspend account</h3>
-              <p>
-                Suspending stops this account: it can no longer sign in or use a key, what it already holds stops working within seconds, and its unfinished Verifier executions are cancelled. The account
-                and its bindings are kept. Access cannot resume a suspended account.
-              </p>
-              <input type="hidden" name="principalId" value={selected.principal_id} />
-              <input type="hidden" name="principalKind" value={selected.kind} />
-              <label>Reason <input class="app-input" name="reason" required maxlength="1024" autocomplete="off" /></label>
-              <p>Recorded in the audit log. Say why, without pasting a credential.</p>
-              <button class="app-control" type="submit">Suspend account</button>
-            </form>
-          {/if}
-          <h3>Bindings</h3>
-          {#if selected.grants.length}
-            <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-            <div class="scroll" role="region" aria-label="Bindings of {name}" tabindex="0">
-              <table>
-                <thead><tr><th>Role</th><th>Scope</th><th>Source</th><th>Operations granted</th><th></th></tr></thead>
-                <tbody>{@render bindingRows(selected.grants.map((grant) => ({ ...grant, id: grant.binding_id })), name)}</tbody>
-              </table>
-            </div>
-            <p>Removing a binding removes only that binding. Access another binding still grants, directly or through a group, stays in effect.</p>
-          {:else}
-            <div class="app-problem" data-state="absent"><strong>– No access</strong><p>This account can sign in but holds no binding.</p></div>
-          {/if}
-          <h3>Combined access</h3>
-          <ul class="combined" data-combined>
-            {#each selected.permissions as permission (operationName(permission) + JSON.stringify(permission.scope))}
-              <li><code>{operationName(permission)}</code> at {scopeLabel(permission.scope)}</li>
-            {:else}
-              <li>None</li>
-            {/each}
-          </ul>
-          <form class="stack" method="POST" action={action('grant')} aria-label="Grant access to {name}" use:enhance>
-            <h3>Grant access</h3>
-            <input type="hidden" name="principalId" value={selected.principal_id} />
-            <input type="hidden" name="principalKind" value={selected.kind} />
-            <GrantFields roles={access.roles} />
-            <button class="app-control primary" type="submit">Save binding</button>
-          </form>
-          {#if access.keys}
-            <h3>API keys</h3>
-            <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-            <div class="scroll" role="region" aria-label="Keys of {name}" tabindex="0">
-              <table>
-                <thead><tr><th>Prefix</th><th>Created</th><th>Expires</th><th>Last used</th><th>State</th><th></th></tr></thead>
-                <tbody>
-                  {#each access.keys.credentials as key (key.id)}
-                    <tr>
-                      <td><code>{key.prefix}</code></td>
-                      <td>{when(key.created_at)}</td>
-                      <td>{when(key.expires_at)}</td>
-                      <td>{when(key.last_used_at)}</td>
-                      <td>{keyState(key)}</td>
-                      <td>
-                        {#if !key.revoked_at}
-                          <form method="POST" action={action('revokeKey')} use:enhance>
-                            <input type="hidden" name="principalId" value={selected.principal_id} />
-                            <input type="hidden" name="credentialId" value={key.id} />
-                            <button class="app-control" type="submit" aria-label="Revoke key {key.prefix}">Revoke</button>
-                          </form>
-                        {/if}
-                      </td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-            </div>
-            {#if selected.status === 'active'}
-              <form method="POST" action={action('issueKey')} use:enhance>
-                <input type="hidden" name="principalId" value={selected.principal_id} />
-                <p>To rotate, issue a new key, deploy it, then revoke the old one. Keys carry the account's bindings; they add none.</p>
-                <button class="app-control" type="submit">Issue key</button>
-              </form>
-            {:else}
-              <p>This account is suspended. Its keys are refused, and none can be issued.</p>
-            {/if}
-          {/if}
-        </section>
-      {/if}
-
-      {#if tab === 'users' || tab === 'services'}
-        <section aria-label={tab === 'users' ? 'Users' : 'Service accounts'}>
-          <h2>{tab === 'users' ? 'Users' : 'Service accounts'}</h2>
-          {#if accounts.length}
-            <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-            <div class="scroll" role="region" aria-label="{tab === 'users' ? 'User' : 'Service account'} list" tabindex="0">
-              <table>
-                <thead><tr><th>Name</th>{#if tab === 'services'}<th>Runtime family</th>{/if}<th>Status</th><th>Direct bindings</th><th></th></tr></thead>
-                <tbody>
-                  {#each accounts as account (account.principal_id)}
-                    <tr>
-                      <td>{label(account)}</td>
-                      {#if tab === 'services'}<td>{family(account.workload_restriction) ?? '—'}</td>{/if}
-                      <td>{account.status === 'active' ? '✓ active' : '⊘ suspended'}</td>
-                      <td>{directCount(account.principal_id)}</td>
-                      <td><a href={href(tab, account.principal_id)} aria-label="Access for {label(account)}">Access</a></td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-            </div>
-          {:else}
-            <div class="app-problem" data-state="absent"><strong>– No {tab === 'users' ? 'Users' : 'Service accounts'} yet</strong></div>
-          {/if}
-          {#if access.next}<div class="row"><a href={`${href(tab)}&after=${encodeURIComponent(access.next)}`}>More accounts</a></div>{/if}
-        </section>
-      {/if}
-
-      {#if tab === 'users'}
-        <section>
-          <h2>Invite users</h2>
-          <form class="stack" method="POST" action={action('invite')} aria-label="Invite users" use:enhance>
-            <p>Each address gets its own single-use link, valid for 24 hours. The person signs up with it and their account is created holding exactly this binding; add more from their Access page afterwards.</p>
-            <label>Email addresses <textarea class="app-input mono" name="recipients" required rows="4" autocomplete="off" placeholder="one per line"></textarea></label>
-            <GrantFields roles={access.roles} />
-            <button class="app-control primary" type="submit">Create invitations</button>
-          </form>
-          <h3>Pending invitations</h3>
-          {#if access.invitations.length}
-            <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-            <div class="scroll" role="region" aria-label="Pending invitations" tabindex="0">
-              <table>
-                <thead><tr><th>Recipient</th><th>Access</th><th>Email</th><th>Expires</th><th></th></tr></thead>
-                <tbody>
-                  {#each access.invitations as pending (pending.id)}
-                    <tr>
-                      <td>{pending.recipient}</td>
-                      <td>{pending.assignments.map((grant) => `${grant.role} at ${scopeLabel(grant.scope)}`).join(', ')}</td>
-                      <td>{DELIVERY[pending.delivery]}</td>
-                      <td>{when(pending.expires_at)}</td>
-                      <td>
-                        <div class="row">
-                          <form method="POST" action={action('resendInvitation')} use:enhance>
-                            <input type="hidden" name="invitationId" value={pending.id} />
-                            <button class="app-control" type="submit" aria-label="Resend invitation to {pending.recipient}">Resend</button>
-                          </form>
-                          <form method="POST" action={action('revokeInvitation')} use:enhance>
-                            <input type="hidden" name="invitationId" value={pending.id} />
-                            <button class="app-control" type="submit" aria-label="Revoke invitation to {pending.recipient}">Revoke</button>
-                          </form>
-                        </div>
-                      </td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-            </div>
-            <p>Resend replaces the link; the old one stops working.</p>
-          {:else}
-            <div class="app-problem" data-state="absent"><strong>– No pending invitations</strong></div>
-          {/if}
-        </section>
-      {:else if tab === 'services'}
-        <section>
-          <h2>Create a Service account</h2>
-          <form class="stack" method="POST" action={action('createService')} aria-label="Create a Service account" use:enhance>
-            <label>Name <input class="app-input mono" name="name" required maxlength="128" autocomplete="off" /></label>
-            <label>Description <input class="app-input" name="description" maxlength="256" autocomplete="off" /></label>
-            <label>Runtime family <input class="app-input mono" name="family" autocomplete="off" placeholder="Service Card name, e.g. checkout" /></label>
-            <p>Optional. Name the Service Card family this account runs as, not a release version or UID: the same account and key serve every release. Leave empty for automation that runs as no Service.</p>
-            <p>The account starts with no access. Grant its operations from its Access page after creating it.</p>
-            <button class="app-control primary" type="submit">Create Service account</button>
-          </form>
-        </section>
-      {:else if tab === 'roles'}
-        <section aria-label="Roles">
-          <h2>Roles</h2>
-          <p>Built-in roles are read-only. A role's operations take effect only at the scope of each binding.</p>
-          {#each access.roles as role (role.name)}
-            {@const bound = boundCount(role.name)}
-            {@const held = role.operations.map(operationName)}
-            <div class="item" data-role={role.name}>
-              <h3>{role.name} <span class="tag">{role.builtin ? 'built-in · read-only' : 'custom'}</span></h3>
-              <p><code>{held.join(', ')}</code></p>
-              <p>{bound} binding{bound === 1 ? '' : 's'} use this role.</p>
-              {#if !role.builtin}
-                <details>
-                  <summary>Edit {role.name}</summary>
-                  <form class="stack" method="POST" action={action('putRole')} aria-label="Edit role {role.name}" use:enhance>
-                    <input type="hidden" name="role" value={role.name} />
-                    {#if bound}<p>Saving changes the access of all {bound} binding{bound === 1 ? '' : 's'} that use this role.</p>{/if}
-                    {@render operationChecks(held)}
-                    <button class="app-control primary" type="submit">Save {role.name}</button>
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
+  <div class="tablewrap" role="region" aria-label={filter === 'invited' ? 'Pending invitations' : 'People'} tabindex="0">
+    {#if filter === 'invited'}
+      {#if people.invitations.length}
+        <table>
+          <thead><tr><th>Email</th><th>Will get</th><th>Delivery</th><th>Expires</th><th class="right"></th></tr></thead>
+          <tbody>
+            {#each people.invitations as one (one.id)}
+              <tr>
+                <td>{one.recipient}</td>
+                <td>{#each one.assignments as grant (grant.role + JSON.stringify(grant.scope))}<span class="role" title={scopeLabel(grant.scope)}>{scoped(grant)}</span>{/each}</td>
+                <td>{#if one.delivery === 'failed'}<Pill tone="warn" label="Not delivered" />{:else if one.delivery === 'accepted'}<Pill tone="info" label="Emailed" />{:else}<Pill tone="off" label="Not emailed" />{/if}</td>
+                <td class="muted">{fmtInstant(Date.parse(one.expires_at))}</td>
+                <td class="right" style="white-space:nowrap">
+                  <form style="display:inline" method="POST" action={action('resendInvitation')} use:enhance>
+                    <input type="hidden" name="invitationId" value={one.id} />
+                    <button class="app-control" type="submit" aria-label="Resend invitation to {one.recipient}">Resend</button>
                   </form>
-                </details>
-                <form method="POST" action={action('deleteRole')} use:enhance>
-                  <input type="hidden" name="role" value={role.name} />
-                  <button class="app-control" type="submit" disabled={bound > 0} title={bound > 0 ? 'Remove its bindings first' : undefined}>Delete {role.name}</button>
-                </form>
-              {/if}
-            </div>
-          {/each}
-        </section>
-        <section>
-          <h2>Create a custom role</h2>
-          <form class="stack wide" method="POST" action={action('putRole')} aria-label="Create a custom role" use:enhance>
-            <label>Role name <input class="app-input mono" name="role" required maxlength="64" pattern="[a-z0-9_]+" title="Lowercase letters, digits and underscores" autocomplete="off" /></label>
-            <p>Lowercase letters, digits and underscores. A role needs at least one operation.</p>
-            {@render operationChecks([])}
-            <button class="app-control primary" type="submit">Create role</button>
-          </form>
-        </section>
-      {:else if tab === 'groups'}
-        <section aria-label="Groups">
-          <h2>Groups</h2>
-          <p>Optional. A group is a local list of accounts that share bindings. Changing its members changes their inherited access; a group owns nothing and cannot contain another group.</p>
-          {#each access.groups as group (group.id)}
-            {@const rows = groupBindings(group.id)}
-            <div class="item" id="group-{group.id}" data-group={group.name}>
-              <h3>{group.name}</h3>
-              <ul class="members">
-                {#each group.members as member (member.principal_id)}
-                  <li>
-                    {nameOf(member.principal_id)} <span class="tag">{member.kind}</span>
-                    <form method="POST" action={action('removeMember')} use:enhance>
-                      <input type="hidden" name="groupId" value={group.id} />
-                      <input type="hidden" name="principalId" value={member.principal_id} />
-                      <button class="app-control" type="submit" aria-label="Remove {nameOf(member.principal_id)} from {group.name}">Remove</button>
-                    </form>
-                  </li>
-                {:else}
-                  <li class="muted">No members</li>
-                {/each}
-              </ul>
-              <form class="row" method="POST" action={action('addMember')} aria-label="Add a member to {group.name}" use:enhance>
-                <input type="hidden" name="groupId" value={group.id} />
-                <label>Account
-                  <select class="app-input" name="principalId" required>
-                    <option value="" disabled selected>Choose an account</option>
-                    {#each access.principals as principal (principal.principal_id)}<option value={principal.principal_id}>{label(principal)} ({principal.kind})</option>{/each}
-                  </select>
-                </label>
-                <button class="app-control" type="submit">Add member</button>
-              </form>
-              {#if rows.length}
-                <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-                <div class="scroll" role="region" aria-label="Bindings of {group.name}" tabindex="0">
-                  <table>
-                    <thead><tr><th>Role</th><th>Scope</th><th>Source</th><th>Operations granted</th><th></th></tr></thead>
-                    <tbody>{@render bindingRows(rows, group.name)}</tbody>
-                  </table>
-                </div>
-              {/if}
-              <details>
-                <summary>Grant access to {group.name}</summary>
-                <form class="stack" method="POST" action={action('grant')} aria-label="Grant access to {group.name}" use:enhance>
-                  <input type="hidden" name="groupId" value={group.id} />
-                  <GrantFields roles={access.roles} />
-                  <button class="app-control primary" type="submit">Save binding</button>
-                </form>
-              </details>
-              <form method="POST" action={action('deleteGroup')} use:enhance>
-                <input type="hidden" name="groupId" value={group.id} />
-                <button class="app-control" type="submit">Delete {group.name}</button>
-              </form>
-            </div>
-          {:else}
-            <div class="app-problem" data-state="absent"><strong>– No groups</strong><p>Groups are optional; direct bindings work without them.</p></div>
-          {/each}
-        </section>
-        <section>
-          <h2>Create a group</h2>
-          <form class="stack" method="POST" action={action('createGroup')} aria-label="Create a group" use:enhance>
-            <label>Group name <input class="app-input" name="name" required maxlength="128" autocomplete="off" /></label>
-            <button class="app-control primary" type="submit">Create group</button>
-          </form>
-        </section>
+                  <form style="display:inline" method="POST" action={action('revokeInvitation')} use:enhance>
+                    <input type="hidden" name="invitationId" value={one.id} />
+                    <button class="app-control" type="submit" aria-label="Revoke invitation to {one.recipient}">Revoke</button>
+                  </form>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {:else}
+        <div class="empty"><b>No pending invitations</b><p>Invite people to send each one a single-use link.</p></div>
       {/if}
-    </div>
+    {:else if people.principals.length}
+      <table>
+        <thead><tr><th>Person</th><th>Signs in with</th><th>Roles</th><th>Status</th></tr></thead>
+        <tbody>
+          {#each people.principals as person (person.principal_id)}
+            {@const open = href({ person: person.principal_id })}
+            <tr class="link">
+              <td>
+                <a class="person" href={open} style="text-decoration:none" data-sveltekit-noscroll>
+                  <span class="avatar" aria-hidden="true">{initialsOf(person)}</span>
+                  <span><b>{labelOf(person)}{person.principal_id === you ? ' (you)' : ''}</b>{#if person.email}<span>{person.email}</span>{/if}</span>
+                </a>
+              </td>
+              <td>{#if person.authentication}<span class="method"><Mark method={person.authentication} />{METHODS[person.authentication]}</span>{/if}</td>
+              <td>{#each person.roles as grant (grant.role + JSON.stringify(grant.scope))}<span class="role" title={scopeLabel(grant.scope)}>{scoped(grant)}</span>{:else}<span class="muted">None</span>{/each}</td>
+              <td>{#if person.status === 'active'}<Pill label="Active" />{:else}<Pill tone="off" label="Suspended" />{/if}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {:else}
+      <div class="empty"><b>No one matches</b><p>{params.get('q') || role ? 'Clear the filter to see everyone.' : 'Invite people to give them access.'}</p></div>
+    {/if}
+  </div>
+  {#if people.next && filter === 'members'}<p style="margin-top:12px"><a href={href({ after: people.next })}>More people</a></p>{/if}
+
+  {#if params.get('drawer') === 'invite'}
+    <Overlay kind="drawer" title="Invite people" close={href({})}>
+      <form id="invite" class="invite" method="POST" action={action('invite')} aria-label="Invite people" use:enhance={() => async ({ result, update }) => {
+          await update();
+          // The links show once, beside the closed drawer; a reload never brings them back.
+          if (result.type === 'success') replaceState(href({}), {});
+        }}>
+        <div class="field">
+          <label for="emails">Email addresses</label>
+          <textarea id="emails" class="app-input" name="recipients" rows="4" required autocomplete="off" placeholder="dana@example.test, omar@example.test"></textarea>
+          <span class="hint">Separate with commas or new lines. Each person gets their own link, valid for 24 hours.</span>
+        </div>
+        <GrantFields roles={people.roles.filter((one) => one.name !== 'workload')} pick="choices" />
+        <p class="muted" style="font-size:12px">They choose how to sign in when they accept. Add more roles from their profile later.</p>
+      </form>
+      {#snippet footer()}
+        <a class="app-control" href={href({})} data-sveltekit-noscroll>Cancel</a>
+        <button class="app-control primary" type="submit" form="invite">Send invitations</button>
+      {/snippet}
+    </Overlay>
+  {:else if people.selected}
+    <AccountDrawer {summary} selected={people.selected} roles={people.roles} close={href({})} {action} />
   {/if}
-</div>
+{/if}
 
 <style>
-  .heading {
-    margin-bottom: 16px;
+  .find {
+    margin-left: auto;
   }
-  h1 {
-    font: var(--weight-strong) 24px var(--font-sans);
+  .find .app-input {
+    width: 240px;
   }
-  h2 {
-    margin: 0 0 12px;
-    font: var(--weight-strong) 13px var(--font-sans);
-  }
-  h3 {
-    margin: 16px 0 8px;
-    font: var(--weight-strong) 12px var(--font-sans);
-  }
-  .tabs {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin: 16px 0;
-    border-bottom: 1px solid var(--border);
-  }
-  .tabs a {
-    padding: 8px 12px;
-    color: var(--muted);
-    font: 13px var(--font-sans);
-    text-decoration: none;
-  }
-  .tabs a[aria-current='page'] {
-    box-shadow: inset 0 -2px 0 var(--declare);
-    color: var(--text);
-  }
-  .grid {
+  .invite {
     display: grid;
-    gap: 20px;
-    max-width: 1080px;
+    gap: 18px;
   }
-  section {
-    min-width: 0;
-    padding: 16px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    background: var(--surface);
-  }
-  .item {
-    display: grid;
-    gap: 8px;
-    padding: 12px 0;
-    border-top: 1px solid var(--border-soft);
-  }
-  .item h3 {
-    margin: 0;
-  }
-  .scroll {
-    overflow-x: auto;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font: 12px var(--font-sans);
-  }
-  th,
-  td {
-    padding: 6px 12px 6px 0;
-    border-bottom: 1px solid var(--border-soft);
-    text-align: left;
-    vertical-align: top;
-  }
-  th {
-    color: var(--muted);
-    font: 700 11px var(--font-mono);
-    white-space: nowrap;
-  }
-  dl {
-    display: grid;
-    grid-template-columns: max-content minmax(0, 1fr);
-    gap: 6px 16px;
-    margin: 0 0 8px;
-    font: 12px var(--font-mono);
-  }
-  dt,
-  .muted {
-    color: var(--muted);
-  }
-  dd {
-    margin: 0;
-    overflow-wrap: anywhere;
-  }
-  code {
-    font: 12px var(--font-mono);
-    overflow-wrap: anywhere;
-  }
-  p,
-  li {
-    margin: 0;
-    font: 12px/18px var(--font-sans);
-    color: var(--muted);
-  }
-  a {
-    color: var(--declare);
-  }
-  ul {
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-  .members li {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 2px 0;
-    color: var(--text);
-  }
-  .tag {
-    padding: 1px 6px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    color: var(--muted);
-    font: 400 10px var(--font-mono);
-  }
-  .stack {
-    display: grid;
-    gap: 8px;
-    max-width: 480px;
-  }
-  .stack.wide,
-  details .stack {
-    max-width: none;
-  }
-  .stack h3 {
-    margin-bottom: 0;
-  }
-  label,
-  legend,
-  summary {
-    font: 700 11px var(--font-mono);
-  }
-  .stack > label,
-  .row label {
-    display: grid;
-    gap: 4px;
-  }
-  summary {
-    cursor: pointer;
-  }
-  .operations {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 8px;
-  }
-  fieldset {
-    display: grid;
-    gap: 4px;
-    margin: 0;
-    padding: 8px 10px;
-    border: 1px solid var(--border-soft);
-    border-radius: var(--r);
-  }
-  .check {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-weight: 400;
-  }
-  .row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: end;
-    gap: 8px;
-    font: 12px var(--font-sans);
-  }
-  .secret {
-    display: grid;
-    gap: 8px;
-    max-width: 1080px;
-    margin-bottom: 16px;
-    padding: 12px;
-    border: 1px solid var(--declare);
-    border-radius: var(--r);
-    background: var(--surface);
-    font: 12px var(--font-sans);
-  }
-  [role='status'] {
-    color: var(--text);
+  @media (max-width: 900px) {
+    .find {
+      width: 100%;
+      margin-left: 0;
+    }
+    .find .app-input {
+      width: 100%;
+    }
   }
 </style>

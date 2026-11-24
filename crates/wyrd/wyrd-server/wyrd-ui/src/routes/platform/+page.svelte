@@ -19,9 +19,11 @@
       <button class="app-control primary wide" type="submit" disabled={!!busy} aria-busy={busy === 'password' ? 'true' : undefined}>{busy === 'password' ? 'Signing in…' : 'Sign in'}</button>
     </form>
   {/if}
-  <form method="POST" action="?/sso" onsubmit={() => (busy = 'sso')}>
-    <button class="app-control wide" type="submit" disabled={!!busy || !data.methods.oidc}>Sign in with platform SSO</button>
-  </form>
+  {#if data.methods.oidc}
+    <form method="POST" action="?/sso" onsubmit={() => (busy = 'sso')}>
+      <button class="app-control wide" type="submit" disabled={!!busy}>Sign in with platform SSO</button>
+    </form>
+  {/if}
 </Entry>
 
 <style>

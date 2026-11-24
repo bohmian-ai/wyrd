@@ -1552,6 +1552,17 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
 
 **Part C merge verification.** Right after the merge, all six console journeys failed. Five got the text "Failed to …" where JSON was expected, from `POST /platform/admins`; the sixth (SSO) timed out on a click. A read-only diagnostician found the cause: the `@wyrd/testing` napi addon (`sdks/wyrd-sdk-ts/testing/wyrd_testing.linux-x64-gnu.node`) was built before d9349c026. That build still requires `match_claim`, and axum answered with a plain-text 422. No code changed. After `mise run ts:build:testing`, the console journeys pass 6/6, `platform_admin_e2e` passes 97/97 and `test:identity:ui` passes 2/2. Clippy, `ui:check` and `check:tenant-isolation` are clean.
 
+**Approved reading 4 and system-tenant guard (after the Part C merge).** RED:
+- `platform_admin_e2e::an_authorized_request_that_changes_nothing_still_records_the_decision`: suspending `DataTenantId::SYSTEM_OWNER` (`wyrd-system`) answered 200 instead of 404.
+- The console journeys `a stale console session confirms the operator before suspending a workspace` (the `wyrd-system` row offered 1 button, expected 0) and `a platform SSO operator confirms a suspension at the identity provider` (the SSO button was present without a connection).
+
+GREEN:
+- `ProvisionOwner::set_suspended` refuses the system tenant as `TenantUnavailable` after authorizing, so the decision still commits.
+- The overview offers no Suspend for `wyrd-system`.
+- `/platform` renders the SSO button only when `methods.oidc` is true.
+- `platform_admin_e2e` 97/97, the console journeys 6/6, `ui:check`, and clippy are clean. TDD: PASS.
+
+
 ### 17. An existing User explicitly connects another sign-in method
 
 **Status: DEFERRED — maintainer-approved 2026-11-23.** Not required for launch

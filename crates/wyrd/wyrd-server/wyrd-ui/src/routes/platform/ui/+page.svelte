@@ -35,7 +35,7 @@
             <td><code>{tenant.slug}</code></td>
             <td data-testid="status-{tenant.slug}">{status[tenant.status] ?? tenant.status}</td>
             <td>
-              {#if tenant.status === 'active' || tenant.status === 'suspended'}
+              {#if tenant.slug !== 'wyrd-system' && (tenant.status === 'active' || tenant.status === 'suspended')}
                 {@const next = tenant.status === 'active' ? 'suspended' : 'active'}
                 <form method="POST" action="?/status" use:enhance={reauth.guard(`${next === 'suspended' ? 'Suspending' : 'Resuming'} ${tenant.slug}`)}>
                   <input type="hidden" name="id" value={tenant.id} />
@@ -50,7 +50,7 @@
       </tbody>
     </table>
   </div>
-  <p>Suspending keeps every row, grant and credential; resuming restores them. Provisioning and failed workspaces change only by provisioning.</p>
+  <p>Suspending keeps every row, grant and credential; resuming restores them. Provisioning and failed workspaces change only by provisioning; the platform's own <code>wyrd-system</code> workspace never suspends.</p>
 </section>
 
 <style>

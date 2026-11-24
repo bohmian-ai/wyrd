@@ -4882,6 +4882,16 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "suspending a tenant that does not exist",
         ),
         (
+            platform_request(
+                Method::PUT,
+                &format!("/platform/tenants/{}/status", DataTenantId::SYSTEM_OWNER),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+            StatusCode::NOT_FOUND,
+            "suspending the platform's own wyrd-system tenant",
+        ),
+        (
             platform_post(
                 "/platform/admins",
                 &session,

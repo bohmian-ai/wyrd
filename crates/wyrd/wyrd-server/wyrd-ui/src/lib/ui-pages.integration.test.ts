@@ -3738,6 +3738,10 @@ withConsole('a stale console session confirms the operator before suspending a w
     expect(await page.getByTestId('recent').textContent()).toContain('no');
 
     const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
+    // The platform's own wyrd-system workspace is listed but offers no Suspend.
+    const system = page.getByRole('row').filter({ hasText: 'wyrd-system' });
+    expect(await system.count()).toBe(1);
+    expect(await system.getByRole('button').count()).toBe(0);
     const row = page.getByRole('row').filter({ hasText: slug });
     await row.getByRole('button', { name: 'Suspend' }).click();
     await dialog.waitFor();
@@ -3815,7 +3819,9 @@ withConsole('a platform SSO operator confirms a suspension at the identity provi
     const page = await browser.newPage();
     const sso = page.getByRole('button', { name: 'Sign in with platform SSO' });
     await page.goto(`${bff.url}/platform`);
-    expect(await sso.isDisabled()).toBe(true);
+    // Without a platform OIDC connection the entry offers no SSO button at all.
+    await page.getByRole('heading', { name: 'Platform admin' }).waitFor();
+    expect(await sso.count()).toBe(0);
 
     const connected = await api('PUT', '/platform/oidc/connection', { issuer_url: google.issuer, client_id: 'wyrd-platform', client_auth: { method: 'public' } });
     expect(connected.status, JSON.stringify(connected.body)).toBe(200);

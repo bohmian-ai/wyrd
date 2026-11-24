@@ -25,7 +25,9 @@ use wyrd_spec::ids::SlotName;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::github::PullRequest;
 
-use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY, expire_receipts};
+use super::pg_github_pull_requests::{
+    Deployment, INSTALLATION, REPOSITORY, expire_receipts, read_as,
+};
 use super::pg_hosted_artifacts::client;
 
 /// The connected repository's slug.
@@ -439,6 +441,149 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
     );
 }
 
+/// A task reports its own input wait while an independent step runs, and
+/// the wait ends only once the runner consumes the evidence.
+///
+/// `ci-gate` here also runs an independent Python `measure` step, held at
+/// the sandbox's admission gate after it started, and a `ci-review` step reading
+/// `ci`. While `measure` is held the execution is `running` with no parked
+/// inputs and no result, `ci-review` and the whole-Verifier `green` each report
+/// `ci`, and only `measure` has an invocation. Publishing `ci` meanwhile
+/// leaves the running drive's waits as they are. Once `measure` is released
+/// the execution parks, the recheck consumes `ci`, and the same execution
+/// runs `ci-review` and passes with no waits, also once its queue row is gone.
+///
+/// # Panics
+/// Panics when the waits, invocations, or lifecycle differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn task_input_waits_are_reported_while_an_independent_step_runs() {
+    let deployment = Deployment::launch(|builder| {
+        builder
+            .with_verification_runtime_for_test()
+            .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
+    })
+    .await;
+    let reviewed = ci_gate("1.0.0").replace(
+        "  requirements:\n",
+        r#"  steps:
+    - id: measure
+      action:
+        kind: code
+        entrypoint: measure
+        source:
+          inline: |
+            def measure():
+                return {"measured": True}
+    - id: ci-review
+      action:
+        kind: code
+        entrypoint: review
+        inputs: {ci: inputs.ci}
+        source:
+          inline: |
+            def review(ci):
+                return {"status": ci["status"]}
+  requirements:
+"#,
+    );
+    deployment
+        .declare_files(
+            &[("ci-gate.yaml", reviewed)],
+            &gated("1.1.0"),
+            "gate-reviewed",
+        )
+        .await;
+    let held = deployment
+        .server
+        .state()
+        .verification
+        .blocks()
+        .expect("blocks are hosted")
+        .sandbox()
+        .hold_admission_for_test();
+    let execution = deployment.open(12, C1).await;
+    deployment
+        .server
+        .wait_for_hosted_waiters(1, Duration::from_secs(30))
+        .await
+        .expect("the measure step waits at the admission gate");
+    let waits = json!([
+        {"task_id": "ci-review", "slots": ["ci"]},
+        {"task_id": "green", "slots": ["ci"]}
+    ]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let served = loop {
+        let served = deployment.status(execution).await;
+        if served["input_waits"] == waits {
+            break served;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the waits are reported while measure runs: {served}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        [&served["status"], &served["waiting"], &served["result"]],
+        [&json!("running"), &Value::Null, &Value::Null],
+        "{served}"
+    );
+    let invoked = |page: Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .expect("an invocation page")
+            .iter()
+            .map(|item| {
+                item["producer"]["step_id"]
+                    .as_str()
+                    .expect("a step")
+                    .to_owned()
+            })
+            .collect()
+    };
+    let invocations = format!("/v1/verification/executions/{execution}/invocations");
+    assert_eq!(
+        invoked(read_as(&deployment, &deployment.jwt, &invocations).await.1),
+        ["measure"],
+        "a waiting task has no invocation"
+    );
+
+    let (status, receipt) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["matched_subscriptions"], 1, "{receipt}");
+    let served = deployment.status(execution).await;
+    assert_eq!(
+        [&served["status"], &served["input_waits"]],
+        [&json!("running"), &waits],
+        "publication alone does not end the running drive's waits: {served}"
+    );
+
+    drop(held);
+    let served = deployment.until(execution, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    assert!(served["input_waits"].is_null(), "{served}");
+    assert_eq!(
+        invoked(read_as(&deployment, &deployment.jwt, &invocations).await.1),
+        ["measure", "ci-review", "green"]
+    );
+
+    let mut conn = deployment.conn().await;
+    let deleted = sqlx::query("DELETE FROM wyrd.verifier_executions WHERE execution_id = $1")
+        .bind(execution)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the queue row deletes")
+        .rows_affected();
+    conn.commit().await.expect("delete commits");
+    assert_eq!(deleted, 1);
+    let served = deployment.status(execution).await;
+    assert_eq!(
+        [&served["status"], &served["input_waits"]],
+        [&json!("completed"), &Value::Null],
+        "{served}"
+    );
+}
+
 /// A parked execution never reopens once superseded, and its deadline ends
 /// it when evidence never arrives.
 ///
@@ -450,7 +595,12 @@ async fn parked_executions_end_by_supersession_and_deadline() {
     let deployment = Deployment::start_limited(limits(Duration::from_secs(8))).await;
     deployment.gate("1.1.0", "1.0.0").await;
     let superseded = deployment.open(4, C2).await;
-    deployment.until(superseded, "waiting").await;
+    let served = deployment.until(superseded, "waiting").await;
+    assert_eq!(
+        served["input_waits"],
+        json!([{"task_id": "green", "slots": ["ci"]}]),
+        "{served}"
+    );
     deployment
         .mock
         .edit_pull_request(REPOSITORY, 4, |pr| C3.clone_into(&mut pr.head_sha));
@@ -460,6 +610,10 @@ async fn parked_executions_end_by_supersession_and_deadline() {
     );
     let served = deployment.until(superseded, "cancelled").await;
     assert_eq!(served["error"]["code"], "pull_request_superseded");
+    assert!(
+        served["input_waits"].is_null(),
+        "ended work waits for nothing: {served}"
+    );
     let (status, receipt) = deployment.publish_ci(C2, json!({"status": "green"})).await;
     assert_eq!(
         status,
@@ -483,6 +637,7 @@ async fn parked_executions_end_by_supersession_and_deadline() {
         served["result"].is_null(),
         "missing evidence never passes: {served}"
     );
+    assert!(served["input_waits"].is_null(), "{served}");
 }
 
 /// Evidence published while its consumer is still running reaches it.
@@ -564,18 +719,32 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 
     let (stop, task) = runtime();
     let waiting = deployment.open(9, C1).await;
-    deployment.until(waiting, "waiting").await;
+    let served = deployment.until(waiting, "waiting").await;
+    assert_eq!(
+        served["input_waits"],
+        json!([{"task_id": "green", "slots": ["ci"]}]),
+        "{served}"
+    );
     stop.cancel();
     task.await.expect("the runtime task does not panic");
 
     let (status, receipt) = deployment.publish_ci(C1, json!({"status": "green"})).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["status"], "accepted", "{receipt}");
-    assert_eq!(deployment.status(waiting).await["status"], "waiting");
+    let served = deployment.status(waiting).await;
+    assert_eq!(
+        [&served["status"], &served["input_waits"]],
+        [
+            &json!("waiting"),
+            &json!([{"task_id": "green", "slots": ["ci"]}])
+        ],
+        "stopped work keeps its waits until a runner consumes the evidence: {served}"
+    );
 
     let (stop, task) = runtime();
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    assert!(served["input_waits"].is_null(), "{served}");
     assert_eq!(deployment.spent(waiting).await, (1, "1.0.0".to_owned()));
     stop.cancel();
     task.await.expect("the runtime task does not panic");
@@ -834,12 +1003,18 @@ async fn a_resumed_execution_keeps_its_admission_deadline() {
     let execution = deployment.open(5, C0).await;
     let served = deployment.until(execution, "waiting").await;
     assert_eq!(served["waiting"], json!(["ci", "lint"]));
+    assert_eq!(
+        served["input_waits"],
+        json!([{"task_id": "green", "slots": ["ci"]}, {"task_id": "linted", "slots": ["lint"]}])
+    );
 
     tokio::time::sleep_until(admitted + DEADLINE / 2).await;
     let (status, receipt) = deployment.publish_ci(C0, json!({"status": "green"})).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while deployment.status(execution).await["waiting"] != json!(["lint"]) {
+    while deployment.status(execution).await["input_waits"]
+        != json!([{"task_id": "linted", "slots": ["lint"]}])
+    {
         assert!(
             tokio::time::Instant::now() < deadline,
             "{execution} resumes onto lint"
@@ -847,7 +1022,8 @@ async fn a_resumed_execution_keeps_its_admission_deadline() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    deployment.until(execution, "timed_out").await;
+    let served = deployment.until(execution, "timed_out").await;
+    assert!(served["input_waits"].is_null(), "{served}");
     let mut conn = deployment.conn().await;
     let (lived,): (f64,) = sqlx::query_as(
         "SELECT EXTRACT(EPOCH FROM updated_at - created_at)::float8
@@ -1110,6 +1286,33 @@ async fn artifact_evidence_is_admitted_before_it_is_accepted() {
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
 }
 
+/// Cancelling a waiting execution ends its task input waits.
+///
+/// # Panics
+/// Panics when the cancelled execution still reports a wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_waiting_execution_ends_its_input_waits() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let waiting = deployment.open(8, C1).await;
+    let served = deployment.until(waiting, "waiting").await;
+    assert_eq!(
+        served["input_waits"],
+        json!([{"task_id": "green", "slots": ["ci"]}]),
+        "{served}"
+    );
+    let (status, cancelled) = deployment
+        .post(
+            &deployment.jwt,
+            &format!("/v1/verification/executions/{waiting}/cancel"),
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    let served = deployment.until(waiting, "cancelled").await;
+    assert!(served["input_waits"].is_null(), "{served}");
+}
+
 /// Losing repository access cancels a parked execution, and evidence
 /// published afterwards is refused and reopens nothing.
 ///
@@ -1121,7 +1324,12 @@ async fn lost_repository_access_fences_a_parked_execution() {
     let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
     deployment.gate("1.1.0", "1.0.0").await;
     let parked = deployment.open(6, C1).await;
-    deployment.until(parked, "waiting").await;
+    let served = deployment.until(parked, "waiting").await;
+    assert_eq!(
+        served["input_waits"],
+        json!([{"task_id": "green", "slots": ["ci"]}]),
+        "{served}"
+    );
     let deleted = json!({"action": "deleted", "installation": {"id": INSTALLATION}});
     let status = deployment
         .mock
@@ -1131,6 +1339,7 @@ async fn lost_repository_access_fences_a_parked_execution() {
     assert_eq!(status, StatusCode::ACCEPTED);
     let served = deployment.until(parked, "cancelled").await;
     assert_eq!(served["error"]["code"], "repository_access_lost");
+    assert!(served["input_waits"].is_null(), "{served}");
 
     let (status, refused) = deployment.publish_ci(C1, json!({"status": "green"})).await;
     assert!(status.is_client_error(), "{status}: {refused}");

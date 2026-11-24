@@ -2001,7 +2001,7 @@ async fn a_repository_removal_during_a_pull_request_read_admits_nothing() {
 ///
 /// # Panics
 /// Panics when the request cannot be served.
-async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, Value) {
+pub(crate) async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, Value) {
     let request = Request::builder()
         .uri(uri)
         .body(Body::empty())

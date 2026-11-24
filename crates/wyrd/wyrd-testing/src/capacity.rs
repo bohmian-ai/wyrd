@@ -1212,7 +1212,11 @@ mod tests {
             &serde_json::to_string(&repetition).expect("a repetition serializes"),
         )
         .expect("a repetition deserializes");
-        assert_eq!(back, repetition);
+        assert_eq!(
+            serde_json::to_value(&back).expect("json"),
+            serde_json::to_value(&repetition).expect("json"),
+            "everything written reads back; window histograms are never written"
+        );
         let declared: Vec<_> = Population::response_byte_metrics(Role::Driver, "client.http")
             .into_iter()
             .map(|metric| (metric.id, metric.unit))

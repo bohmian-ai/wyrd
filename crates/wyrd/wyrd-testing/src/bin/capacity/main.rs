@@ -540,7 +540,12 @@ mod tests {
     /// A case script: `work` reads `per_window` in every window, OTLP
     /// writes send `wire_mib` MiB, and every server and client percentile
     /// reads a histogram of 2,000 samples at `nanos`, kept for pooling.
-    fn case_script(work: &'static str, per_window: f64, wire_mib: f64, nanos: u64) -> Script {
+    pub(crate) fn case_script(
+        work: &'static str,
+        per_window: f64,
+        wire_mib: f64,
+        nanos: u64,
+    ) -> Script {
         Box::new(move |_, _, repetition| {
             repetition.set(work, Reading::exact(per_window));
             if wire_mib > 0.0 {
@@ -566,7 +571,7 @@ mod tests {
 
     /// The case record of `selector` in `category`, measured on the case
     /// clock through the shared runner with `script`.
-    async fn case_record(
+    pub(crate) async fn case_record(
         category: Category,
         selector: &str,
         profile: Option<ProfileMode>,
@@ -598,6 +603,7 @@ mod tests {
                 .iter()
                 .map(|reason| reason.message.clone())
                 .collect(),
+            timings: std::collections::BTreeMap::new(),
             record: Some(record),
             cleanup: crate::summary::Cleanup {
                 project: format!("wyrd-l1-test-{}", case.id),
@@ -639,67 +645,87 @@ mod tests {
         (sweep, record)
     }
 
-    /// A saved Bifrost sweep renders the same table again through `capacity
-    /// report` after its temporary artifacts are removed: coverage, mode
-    /// and path, rows in saved order with fixed units, each workload's
-    /// headline (OTLP and native input, durable ACK p99, server query p99
-    /// and p95, client page p99), invalid and unstarted rows with their
-    /// reasons and no performance cells, and derived readings naming their
-    /// unselected inputs. Each case record still renders its full report,
-    /// and neither the schema-3 comparison nor the L2 calibration reads it.
+    /// A lookup's scaling reading, printed when the sweep ran both of its
+    /// cases, is the `c64` rate over 64 times the `c1` rate and names each
+    /// case with its rate.
     ///
     /// # Panics
     ///
-    /// Panics when the regenerated table or a report differs.
+    /// Panics when the reading is missing or names its rates as cases.
+    #[tokio::test(start_paused = true)]
+    async fn derived_scaling_names_its_cases_and_rates() {
+        let root = tempfile::tempdir().expect("root");
+        let records = vec![
+            case_record(
+                Category::BifrostReads,
+                "point-memtable-c1",
+                None,
+                case_script("queries", 300.0, 0.0, 1_000_000),
+            )
+            .await,
+            case_record(
+                Category::BifrostReads,
+                "point-memtable-c64",
+                None,
+                case_script("queries", 9_600.0, 0.0, 1_000_000),
+            )
+            .await,
+        ];
+        let (sweep, _) = saved_sweep(
+            Category::BifrostReads,
+            &["--cases", "point-memtable-c1,point-memtable-c64"],
+            root.path(),
+            records,
+        )
+        .await;
+        let printed = crate::summary::report(&sweep.directory.join(crate::summary::SWEEP_FILE))
+            .expect("reads")
+            .expect("a sweep");
+        assert!(
+            printed.contains(
+                "- point-memtable-scaling: 0.500 (Q64 / (64 × Q1)) from `point-memtable-c64` (320.0 queries/s) and `point-memtable-c1` (10.0 queries/s)\n"
+            ),
+            "{printed}"
+        );
+    }
+
+    /// Saved Bifrost writes and reads sweeps render the same tables again
+    /// through `capacity report` after their temporary artifacts are
+    /// removed: coverage, mode and path, rows in saved order with fixed
+    /// units, each workload's headline (OTLP and native input, durable ACK
+    /// p99, server query p99 and p95, client page p99), each read's storage
+    /// tier, invalid and unstarted rows with their reasons and no
+    /// performance cells, and derived readings only for selected inputs.
+    /// Each case record still renders its full report, and neither the
+    /// schema-3 comparison nor the L2 calibration reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a regenerated table or a report differs.
     #[tokio::test(start_paused = true)]
     async fn saved_sweeps_regenerate_their_summary_and_case_reports() {
         let root = tempfile::tempdir().expect("root");
-        let mut invalid = case_record(
-            Category::Bifrost,
-            "point-c64",
-            None,
-            case_script("queries", 30_000.0, 0.0, 1_000_000),
-        )
-        .await;
-        invalid.verdict = Verdict::Invalid;
-        invalid.reasons = vec!["window 2: wrong | answer".to_owned()];
-        invalid.cleanup.confirmed = false;
-        let records = vec![
+        let writes = vec![
             case_record(
-                Category::Bifrost,
+                Category::BifrostWrites,
                 "otlp-logs-c64",
                 None,
                 case_script("rows", 30_000.0, 30.0, 2_000_000),
             )
             .await,
             case_record(
-                Category::Bifrost,
+                Category::BifrostWrites,
                 "native-write-c1",
                 None,
                 case_script("rows", 15_000.0, 0.0, 2_000_000),
             )
             .await,
-            case_record(
-                Category::Bifrost,
-                "full-scan-c1",
-                None,
-                case_script("queries", 300.0, 0.0, 40_000_000),
-            )
-            .await,
-            case_record(
-                Category::Bifrost,
-                "ui-sql/published-ui-c8",
-                None,
-                case_script("requests", 600.0, 0.0, 9_000_000),
-            )
-            .await,
-            invalid,
         ];
-        let (sweep, record) = saved_sweep(
-            Category::Bifrost,
-            &["--cases", "otlp-logs-c64,native-write-c1,full-scan-c1,ui-sql/published-ui-c8,point-c64,point-c1"],
+        let (sweep, _) = saved_sweep(
+            Category::BifrostWrites,
+            &["--cases", "otlp-logs-c64,native-write-c1"],
             root.path(),
-            records,
+            writes,
         )
         .await;
         let path = sweep.directory.join(crate::summary::SWEEP_FILE);
@@ -724,87 +750,154 @@ mod tests {
             0
         );
         let lines: Vec<&str> = printed.lines().collect();
-        assert_eq!(lines[0], "L1 bifrost sweep");
-        assert_eq!(lines[2], "Coverage: targeted selection of 6 cases");
+        assert_eq!(lines[0], "L1 bifrost-writes sweep");
+        assert_eq!(lines[2], "Coverage: targeted selection of 2 cases");
         assert_eq!(lines[3], "Mode: standard");
         assert_eq!(lines[4], format!("Sweep: {}", path.display()));
         assert_eq!(
             lines[6],
             "| Case | Status | Throughput | Server CPU per unit | Headline latency | Input | Target | Record |"
         );
-        let rows: Vec<&str> = lines
-            .iter()
-            .copied()
-            .filter(|line| line.starts_with("| ") && !line.starts_with("| Case"))
-            .collect();
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.split(" | ").next().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            [
-                "| otlp-logs-c64",
-                "| native-write-c1",
-                "| full-scan-c1",
-                "| ui-sql/published-ui-c8",
-                "| point-c64",
-                "| point-c1"
-            ]
-        );
-        assert!(
-            rows[0].starts_with(
-                "| otlp-logs-c64 | VALID | 1000.0 rows/s | 500.00 µs/row | durable ACK p99: ("
-            ),
-            "{}",
-            rows[0]
-        );
-        assert!(rows[0].contains(" ms, n=6000 | 1.00 MiB/s; 2.00 MiB/CPU-s | none | 01-writes-parquet-otlp-logs-c64.json |"), "{}", rows[0]);
-        assert!(
-            rows[1].starts_with(
-                "| native-write-c1 | VALID | 500.0 rows/s | 1000.00 µs/row | durable ACK p99: ("
-            ),
-            "{}",
-            rows[1]
-        );
-        assert!(
-            rows[1].contains("| unavailable: native input bytes are not measured |"),
-            "{}",
-            rows[1]
-        );
-        assert!(
-            rows[2].contains("| 10.0 queries/s | 50000.00 µs/query | server query p95: ("),
-            "{}",
-            rows[2]
-        );
-        assert!(rows[2].contains("| n/a |"), "{}", rows[2]);
-        assert!(
-            rows[3].contains("| 20.0 pages/s | 25000.00 µs/page | client page p99: ("),
-            "{}",
-            rows[3]
-        );
-        assert_eq!(
-            rows[4],
-            "| point-c64 | INVALID: window 2: wrong \\| answer | — | — | — | — | — | 05-parquet-point-c64.json |",
-        );
-        assert_eq!(
-            rows[5],
-            "| point-c1 | NOT RUN: not started: cleanup of `point-c64` could not be confirmed within its teardown allowance | — | — | — | — | — | unavailable |"
-        );
-        assert!(
-            printed.contains("- otlp-logs-peak: incomplete: `otlp-logs-c1` was not selected\n"),
-            "{printed}"
-        );
-        assert!(
+        let rows = |printed: &str| -> Vec<String> {
             printed
-                .contains("- native-write-peak: incomplete: `native-write-c64` was not selected\n"),
-            "{printed}"
+                .lines()
+                .filter(|line| line.starts_with("| ") && !line.starts_with("| Case"))
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+        let written = rows(&printed);
+        assert!(
+            written[0].starts_with(
+                "| otlp-logs-c64 | VALID | 1000.0 rows/s | 500.000 ms/1k rows | durable ACK p99: ("
+            ),
+            "{}",
+            written[0]
+        );
+        assert!(written[0].contains(" ms, n=6000 | 1.00 MiB/s; 2.00 MiB/CPU-s | none | 01-writes-parquet-otlp-logs-c64.json |"), "{}", written[0]);
+        assert!(
+            written[1].starts_with(
+                "| native-write-c1 | VALID | 500.0 rows/s | 1000.000 ms/1k rows | durable ACK p99: ("
+            ),
+            "{}",
+            written[1]
         );
         assert!(
-            printed.contains(
+            written[1].contains("| unavailable: native input bytes are not measured |"),
+            "{}",
+            written[1]
+        );
+        assert!(
+            !printed.contains("otlp-logs-peak") && !printed.contains("native-write-peak"),
+            "a derived reading missing a selected input is not printed: {printed}"
+        );
+        for definition in [
+            "\nDefinitions:\n",
+            "- **Server CPU per unit**: CPU time (user and system) of the server process",
+            "- **Headline latency**, *durable ACK p99*: per write request",
+            "- **Input**: OTLP writes only",
+        ] {
+            assert!(printed.contains(definition), "{definition} in {printed}");
+        }
+        assert!(!printed.contains("Tier"), "writes have no tier: {printed}");
+
+        let mut invalid = case_record(
+            Category::BifrostReads,
+            "point-c64",
+            None,
+            case_script("queries", 30_000.0, 0.0, 1_000_000),
+        )
+        .await;
+        invalid.verdict = Verdict::Invalid;
+        invalid.reasons = vec!["window 2: wrong | answer".to_owned()];
+        invalid.cleanup.confirmed = false;
+        let reads = vec![
+            case_record(
+                Category::BifrostReads,
+                "full-scan-c1",
+                None,
+                case_script("queries", 300.0, 0.0, 40_000_000),
+            )
+            .await,
+            case_record(
+                Category::BifrostReads,
+                "ui-sql/staged-ui-c8",
+                None,
+                case_script("requests", 600.0, 0.0, 9_000_000),
+            )
+            .await,
+            invalid,
+        ];
+        let (read_sweep, record) = saved_sweep(
+            Category::BifrostReads,
+            &[
+                "--cases",
+                "full-scan-c1,ui-sql/staged-ui-c8,point-c64,point-c1",
+            ],
+            root.path(),
+            reads,
+        )
+        .await;
+        let read_path = read_sweep.directory.join(crate::summary::SWEEP_FILE);
+        let printed_reads = levels::report(&read_path).expect("reads");
+        assert!(
+            printed_reads.starts_with("L1 bifrost-reads sweep\n"),
+            "{printed_reads}"
+        );
+        assert!(
+            printed_reads.contains(
+                "\n| Case | Tier | Status | Throughput | Server CPU per unit | Headline latency | Target | Record |\n"
+            ),
+            "{printed_reads}"
+        );
+        let read_rows = rows(&printed_reads);
+        assert!(
+            read_rows[0].starts_with(
+                "| full-scan-c1 | published | VALID | 10.0 queries/s | 50.000 ms/query | server query p95: ("
+            ),
+            "{}",
+            read_rows[0]
+        );
+        assert!(
+            read_rows[1].starts_with(
+                "| ui-sql/staged-ui-c8 | staged | VALID | 20.0 pages/s | 25.000 ms/page | client page p99: ("
+            ),
+            "{}",
+            read_rows[1]
+        );
+        assert_eq!(
+            read_rows[2],
+            "| point-c64 | published | INVALID: window 2: wrong \\| answer | — | — | — | — | 03-parquet-point-c64.json |",
+        );
+        assert_eq!(
+            read_rows[3],
+            "| point-c1 | published | NOT RUN: not started: cleanup of `point-c64` could not be confirmed within its teardown allowance | — | — | — | — | unavailable |"
+        );
+        assert!(
+            printed_reads.contains(
                 "- point-scaling: incomplete: `point-c1` is not VALID; `point-c64` is not VALID\n"
             ),
-            "{printed}"
+            "{printed_reads}"
         );
-        assert!(!printed.contains("span-trace-scaling"), "no input selected");
+        assert!(
+            !printed_reads.contains("span-trace-scaling"),
+            "no input selected"
+        );
+        for definition in [
+            "- **Tier**: where the queried rows live",
+            "  - *server query p99*: per query, the server's time from the request's arrival at its outermost HTTP middleware",
+            "  - *client page p99* (UI SQL)",
+            "- **Variant reads**: both count, over the same published spans,",
+            "Shown only when the sweep ran both cases.",
+        ] {
+            assert!(
+                printed_reads.contains(definition),
+                "{definition} in {printed_reads}"
+            );
+        }
+        assert!(
+            !printed_reads.contains("| Input |"),
+            "reads have no input: {printed_reads}"
+        );
         assert_eq!(record.exit_code(), 2);
 
         let case = crate::summary::read_case(
@@ -813,11 +906,13 @@ mod tests {
         .expect("case");
         let full = levels::report(&sweep.directory.join("01-writes-parquet-otlp-logs-c64.json"))
             .expect("full report");
-        assert!(full.starts_with("L1 case otlp-logs-c64 (bifrost / writes-parquet), protocol wyrd-l1-case v1\nMode: standard\n"), "{full}");
+        assert!(full.starts_with("L1 case otlp-logs-c64 (bifrost-writes / writes-parquet), protocol wyrd-l1-case v1\nMode: standard\n"), "{full}");
         assert!(full.contains("| measurement | 90.0 | 90 |"), "{full}");
         assert!(full.contains("| repetition-3 | 30.000 | 0.000 |"), "{full}");
         assert!(
-            full.contains("Case aggregate: throughput 1000.0 rows/s; server CPU 500.00 µs/row;"),
+            full.contains(
+                "Case aggregate: throughput 1000.0 rows/s; server CPU 500.000 ms/1k rows;"
+            ),
             "{full}"
         );
         let engine = case.record.as_ref().expect("engine record");
@@ -858,28 +953,30 @@ mod tests {
         assert!(legacy.compare(&legacy).is_err());
     }
 
-    /// A profiled sweep marks its mode and every VALID row diagnostic while
-    /// judging the same target predicate, and its case report keeps the
-    /// profile's capture notes.
+    /// Previous performance targets apply in neither ordinary nor profiled
+    /// sweeps: a case whose pooled p99 would miss the old overhead target
+    /// keeps that target inapplicable in both, its row's Target cell reads
+    /// `none`, and the profiled sweep marks its mode and every VALID row
+    /// diagnostic while its case report keeps the profile's capture notes.
     ///
     /// # Panics
     ///
-    /// Panics when profiling changes a target or loses its evidence.
+    /// Panics when a previous target is judged or profiling loses evidence.
     #[tokio::test(start_paused = true)]
-    async fn profiled_sweeps_keep_targets_and_capture_evidence() {
+    async fn profiled_sweeps_apply_no_previous_targets_and_keep_capture_evidence() {
         let root = tempfile::tempdir().expect("root");
         let mut profiled = case_record(
             Category::Verification,
             "direct-verify-c64",
             Some(ProfileMode::Cpu),
-            case_script("verifications", 3_000.0, 0.0, 300_000),
+            case_script("verifications", 3_000.0, 0.0, 900_000),
         )
         .await;
         let plain = case_record(
             Category::Verification,
             "direct-verify-c64",
             None,
-            case_script("verifications", 3_000.0, 0.0, 300_000),
+            case_script("verifications", 3_000.0, 0.0, 900_000),
         )
         .await;
         if let Some(record) = profiled.record.as_mut() {
@@ -899,22 +996,45 @@ mod tests {
             .expect("reads")
             .expect("a sweep");
         assert!(
-            printed.contains(
-                "Mode: diagnostic (profile cpu; readings are diagnostic, targets unchanged)\n"
-            ),
+            printed.contains("Mode: diagnostic (profile cpu; readings are diagnostic)\n"),
             "{printed}"
         );
         let row = printed
             .lines()
             .find(|line| line.starts_with("| direct-verify-c64"))
             .expect("row");
-        assert!(row.starts_with("| direct-verify-c64 | VALID (diagnostic) | 100.0 verifications/s | 5000.00 µs/verification | server overhead p99: ("), "{row}");
+        assert!(
+            printed.contains("| Case | Status | Throughput | Server CPU per unit | Server overhead p99 | Client round trip p99 | Target | Record |\n"),
+            "{printed}"
+        );
+        assert!(row.starts_with("| direct-verify-c64 | VALID (diagnostic) | 100.0 verifications/s | 5.000 ms/verification | ("), "{row}");
+        assert_eq!(
+            row.matches("ms, n=6000 |").count(),
+            2,
+            "server overhead and client round trip each have a column: {row}"
+        );
+        assert!(
+            printed.contains(
+                "- **Client round trip p99**: per direct verification, the caller's time"
+            ),
+            "{printed}"
+        );
+        assert!(
+            row.ends_with("| none | 01-direct-verify-direct-verify-c64.json |"),
+            "{row}"
+        );
         let target = |record: &crate::summary::CaseRecord| {
             record.record.as_ref().expect("record").steps[0]
                 .criteria
                 .iter()
                 .filter(|judgment| judgment.criterion.contains("overhead"))
-                .map(|judgment| (judgment.criterion.clone(), judgment.outcome))
+                .map(|judgment| {
+                    (
+                        judgment.criterion.clone(),
+                        judgment.outcome,
+                        judgment.applicable,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let case = crate::summary::read_case(
@@ -926,16 +1046,16 @@ mod tests {
         assert_eq!(target(&case), target(&plain));
         assert!(
             !target(&case).is_empty(),
-            "direct-verify-c64 declares its overhead target"
+            "direct-verify-c64 still reads its overhead aggregate"
         );
         assert!(
             target(&case)
                 .iter()
-                .all(|(_, outcome)| *outcome == Some(Outcome::Met)),
+                .all(|(_, outcome, applicable)| outcome.is_none() && !applicable),
             "{:?}",
             target(&case)
         );
-        assert!(row.contains(": met"), "{row}");
+        assert_eq!(plain.verdict, wyrd_testing::experiment::Verdict::Valid);
         let full = crate::summary::render_case(&case);
         assert!(
             full.contains("Mode: diagnostic (profile cpu; readings are diagnostic)\n"),
@@ -958,20 +1078,22 @@ mod tests {
     #[tokio::test]
     async fn category_commands_list_and_refuse_before_launch() {
         let root = tempfile::tempdir().expect("root");
-        for category in ["verification", "gateway", "bifrost"] {
+        for category in ["verification", "gateway", "bifrost-writes", "bifrost-reads"] {
             assert_eq!(
                 dispatch(&line(&["l1", category, "--list-cases"]), root.path()).await,
                 0
             );
         }
         for refused in [
-            &["l1", "bifrost", "--cases", "memtable-ui-c8"][..],
+            &["l1", "bifrost-reads", "--cases", "memtable-ui-c8"][..],
+            &["l1", "bifrost-reads", "--cases", "otlp-logs-c1"],
+            &["l1", "bifrost", "--list-cases"],
             &["l1", "gateway", "--cases", "point-c1"],
             &["l1", "verification", "--steps", "direct-verify-c1"],
             &["l1", "verification", "--profile", "wall"],
             &["l1", "verification", "--smoke"],
             &["l1"],
-            &["l1", "bifrost", "writes-parquet"],
+            &["l1", "bifrost-writes", "writes-parquet"],
         ] {
             assert_eq!(
                 dispatch(&line(refused), root.path()).await,
@@ -982,6 +1104,73 @@ mod tests {
         assert!(
             !root.path().join("target").exists(),
             "no sweep directory was created"
+        );
+    }
+
+    /// Each category's `benchmark:l1:<category> -- --list-cases` script
+    /// lists from the registry without a prepared driver and without
+    /// building: in a checkout holding only the script and the registry,
+    /// with `cargo` and `mise` replaced by stubs that record any call, it
+    /// prints exactly the driver's listing, and `--list-cases` with another
+    /// flag is refused; neither calls a stub.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a listing differs or a build tool is called.
+    #[test]
+    fn category_listing_scripts_build_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let checkout = tempfile::tempdir().expect("checkout");
+        for path in [
+            "scripts/benchmarks/l1.sh",
+            "crates/wyrd/wyrd-testing/src/bin/capacity/cases.tsv",
+        ] {
+            let target = checkout.path().join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("directory");
+            std::fs::copy(repository().join(path), &target).expect("copied");
+        }
+        let stubs = tempfile::tempdir().expect("stubs");
+        let calls = stubs.path().join("calls");
+        for tool in ["cargo", "mise"] {
+            let stub = stubs.path().join(tool);
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho {tool} >> '{}'\nexit 1\n", calls.display()),
+            )
+            .expect("stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+        let path = format!("{}:/usr/bin:/bin", stubs.path().display());
+        let script = checkout.path().join("scripts/benchmarks/l1.sh");
+        let listing = |arguments: &[&str]| {
+            std::process::Command::new("/bin/bash")
+                .arg(&script)
+                .args(arguments)
+                .env("PATH", &path)
+                .output()
+                .expect("the script runs")
+        };
+        for category in Category::ALL {
+            let listed = listing(&[category.name(), "--list-cases"]);
+            assert!(
+                listed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&listed.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&listed.stdout), category.list());
+        }
+        let refused = listing(&["bifrost-reads", "--list-cases", "--cases", "point-c1"]);
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("takes no other flag"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            !calls.exists(),
+            "a build tool was called: {}",
+            std::fs::read_to_string(&calls).unwrap_or_default()
         );
     }
 
@@ -2322,12 +2511,18 @@ mod tests {
             &["l1", "--clients", "4"],
             &["l2"],
             &["l2", "nosuch"],
-            &["l1", "bifrost", "nosuch"],
-            &["l1", "bifrost", "--clients", "4"],
-            &["l1", "bifrost", "writes", "--steps", "native-write-c1"],
-            &["smoke", "l1", "bifrost"],
+            &["l1", "bifrost-writes", "nosuch"],
+            &["l1", "bifrost-writes", "--clients", "4"],
+            &[
+                "l1",
+                "bifrost-writes",
+                "writes",
+                "--steps",
+                "native-write-c1",
+            ],
+            &["smoke", "l1", "bifrost-writes"],
             &["l1", "--profile", "memory"],
-            &["l1", "bifrost", "--profile", "cpu", "cpu"],
+            &["l1", "bifrost-writes", "--profile", "cpu", "cpu"],
             &[],
         ] {
             assert_eq!(dispatch(&line(usage), root.path()).await, 2, "{usage:?}");

@@ -11,21 +11,24 @@
 //! launched.
 
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 use wyrd_testing::experiment::Engine;
 use wyrd_testing::profile::ProfileMode;
 
 use crate::flags;
 
-/// The three L1 categories, each one `mise run benchmark:l1:<category>`.
+/// The four L1 categories, each one `mise run benchmark:l1:<category>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     /// Direct verification through the public SDKs.
     Verification,
     /// The AI gateway's added overhead.
     Gateway,
-    /// Bifrost ingest and reads.
-    Bifrost,
+    /// Bifrost ingest through durable acknowledgement.
+    BifrostWrites,
+    /// Bifrost queries over each storage tier.
+    BifrostReads,
 }
 
 /// One registered L1 case.
@@ -42,100 +45,46 @@ pub struct Case {
     pub routine: bool,
 }
 
-/// The Verification family every case belongs to.
-const DIRECT_VERIFY: &str = "direct-verify";
+/// The registry: `category, family, id, routine|targeted` lines, which
+/// `scripts/benchmarks/l1.sh` also reads to list cases without a build.
+const REGISTRY: &str = include_str!("cases.tsv");
 
-/// The Gateway family every case belongs to.
-const OVERHEAD: &str = "overhead";
-
-/// Verification cases in registry order: the routine five first, in sweep
-/// order, then the targeted SDK closed-loop, Rust concurrency and Agent-only
-/// model cases.
-const VERIFICATION: [(&str, &str, bool); 14] = [
-    (DIRECT_VERIFY, "direct-verify-c1", true),
-    (DIRECT_VERIFY, "direct-verify-c64", true),
-    (DIRECT_VERIFY, "direct-verify-r3000", true),
-    (DIRECT_VERIFY, "direct-verify-python-r3000", true),
-    (DIRECT_VERIFY, "direct-verify-typescript-r3000", true),
-    (DIRECT_VERIFY, "direct-verify-python-c1", false),
-    (DIRECT_VERIFY, "direct-verify-python-c64", false),
-    (DIRECT_VERIFY, "direct-verify-typescript-c1", false),
-    (DIRECT_VERIFY, "direct-verify-typescript-c64", false),
-    (DIRECT_VERIFY, "direct-verify-c4", false),
-    (DIRECT_VERIFY, "direct-verify-c16", false),
-    (DIRECT_VERIFY, "direct-verify-c32", false),
-    (DIRECT_VERIFY, "direct-verify-model-c1", false),
-    (DIRECT_VERIFY, "direct-verify-model-c64", false),
-];
-
-/// Gateway cases in registry order: the routine five, then the three
-/// targeted single-client controls.
-const GATEWAY: [(&str, &str, bool); 8] = [
-    (OVERHEAD, "buffered-1kib-capture-metadata.c1", true),
-    (OVERHEAD, "buffered-1kib-capture-metadata.c64", true),
-    (OVERHEAD, "streamed-1kib-capture-metadata.c64", true),
-    (OVERHEAD, "buffered-64kib-capture-metadata.c64", true),
-    (OVERHEAD, "buffered-64kib-capture-payload.c64", true),
-    (OVERHEAD, "streamed-1kib-capture-metadata.c1", false),
-    (OVERHEAD, "buffered-64kib-capture-metadata.c1", false),
-    (OVERHEAD, "buffered-64kib-capture-payload.c1", false),
-];
-
-/// Bifrost cases in registry order: the routine eighteen in sweep order
-/// (writes, hot, Parquet, UI SQL), then the targeted read shapes, the
-/// single-client UI arms, and the 10x-volume and learned-layout UI families.
-const BIFROST: [(&str, &str, bool); 43] = [
-    ("writes-parquet", "otlp-spans-c1", true),
-    ("writes-parquet", "otlp-spans-c64", true),
-    ("writes-parquet", "otlp-spans-1k-c1", true),
-    ("writes-parquet", "otlp-spans-1k-c64", true),
-    ("writes-parquet", "otlp-logs-c1", true),
-    ("writes-parquet", "otlp-logs-c64", true),
-    ("writes-parquet", "native-write-c1", true),
-    ("writes-parquet", "native-write-c64", true),
-    ("hot", "point-memtable-c1", true),
-    ("hot", "point-memtable-c64", true),
-    ("hot", "point-staged-c1", true),
-    ("parquet", "point-c1", true),
-    ("parquet", "point-c64", true),
-    ("parquet", "full-scan-c1", true),
-    ("parquet", "span-trace-c64", true),
-    ("ui-sql", "memtable-ui-c8", true),
-    ("ui-sql", "staged-ui-c8", true),
-    ("ui-sql", "published-ui-c8", true),
-    ("hot", "small-aggregate-memtable-c1", false),
-    ("hot", "small-aggregate-staged-c1", false),
-    ("hot", "span-shredded-memtable-c1", false),
-    ("hot", "span-shredded-staged-c1", false),
-    ("hot", "span-long-tail-memtable-c1", false),
-    ("hot", "span-long-tail-staged-c1", false),
-    ("parquet", "small-aggregate-c1", false),
-    ("parquet", "span-trace-c1", false),
-    ("parquet", "span-shredded-c1", false),
-    ("parquet", "span-long-tail-c1", false),
-    ("ui-sql", "memtable-ui-c1", false),
-    ("ui-sql", "staged-ui-c1", false),
-    ("ui-sql", "published-ui-c1", false),
-    ("ui-sql-10x", "memtable-ui-c1", false),
-    ("ui-sql-10x", "memtable-ui-c8", false),
-    ("ui-sql-10x", "staged-ui-c1", false),
-    ("ui-sql-10x", "staged-ui-c8", false),
-    ("ui-sql-10x", "published-ui-c1", false),
-    ("ui-sql-10x", "published-ui-c8", false),
-    ("ui-sql-learned", "memtable-ui-c1", false),
-    ("ui-sql-learned", "memtable-ui-c8", false),
-    ("ui-sql-learned", "staged-ui-c1", false),
-    ("ui-sql-learned", "staged-ui-c8", false),
-    ("ui-sql-learned", "published-ui-c1", false),
-    ("ui-sql-learned", "published-ui-c8", false),
-];
+/// Every registered case of every category, in registry order.
+static CASES: LazyLock<Vec<Case>> = LazyLock::new(|| {
+    REGISTRY
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<&'static str> = line.split('\t').collect();
+            let [category, family, id, sweep] = fields[..] else {
+                panic!("cases.tsv line `{line}` has not four fields");
+            };
+            Case {
+                category: Category::parse(category)
+                    .unwrap_or_else(|| panic!("cases.tsv names no category `{category}`")),
+                family,
+                id,
+                routine: match sweep {
+                    "routine" => true,
+                    "targeted" => false,
+                    other => panic!("cases.tsv status `{other}` is not routine or targeted"),
+                },
+            }
+        })
+        .collect()
+});
 
 /// Flags a category command accepts beside `--cases` and `--profile`.
 const SWITCHES: [&str; 2] = ["--list-cases", "--allow-dirty"];
 
 impl Category {
     /// Every category, in documentation order.
-    pub const ALL: [Self; 3] = [Self::Verification, Self::Gateway, Self::Bifrost];
+    pub const ALL: [Self; 4] = [
+        Self::Verification,
+        Self::Gateway,
+        Self::BifrostWrites,
+        Self::BifrostReads,
+    ];
 
     /// The category's command word, as in `benchmark:l1:<name>`.
     #[must_use]
@@ -143,7 +92,8 @@ impl Category {
         match self {
             Self::Verification => "verification",
             Self::Gateway => "gateway",
-            Self::Bifrost => "bifrost",
+            Self::BifrostWrites => "bifrost-writes",
+            Self::BifrostReads => "bifrost-reads",
         }
     }
 
@@ -161,7 +111,7 @@ impl Category {
         match self {
             Self::Verification => Engine::Verification,
             Self::Gateway => Engine::Gateway,
-            Self::Bifrost => Engine::Bifrost,
+            Self::BifrostWrites | Self::BifrostReads => Engine::Bifrost,
         }
     }
 
@@ -171,27 +121,23 @@ impl Category {
     pub const fn valued(self) -> &'static [&'static str] {
         match self {
             Self::Gateway => &["--pace"],
-            Self::Verification | Self::Bifrost => &[],
+            Self::Verification | Self::BifrostWrites | Self::BifrostReads => &[],
         }
     }
 
     /// Every registered case of the category, in registry order: routine
     /// cases first, in the order the routine sweep runs them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the compiled-in `cases.tsv` is malformed, an invariant
+    /// the registry tests hold.
     #[must_use]
     pub fn cases(self) -> Vec<Case> {
-        let table: &[(&str, &str, bool)] = match self {
-            Self::Verification => &VERIFICATION,
-            Self::Gateway => &GATEWAY,
-            Self::Bifrost => &BIFROST,
-        };
-        table
+        CASES
             .iter()
-            .map(|(family, id, routine)| Case {
-                category: self,
-                family,
-                id,
-                routine: *routine,
-            })
+            .filter(|case| case.category == self)
+            .copied()
             .collect()
     }
 
@@ -293,7 +239,7 @@ impl Case {
     #[must_use]
     pub fn plan_arguments(&self, flags: &[String]) -> Vec<String> {
         let mut arguments = vec!["capacity".to_owned()];
-        if self.category == Category::Bifrost {
+        if self.category.engine() == Engine::Bifrost {
             arguments.push(self.family.to_owned());
         }
         arguments.extend(["--steps".to_owned(), self.id.to_owned()]);
@@ -449,7 +395,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            selectors(&sweep(Category::Bifrost, &[])),
+            selectors(&sweep(Category::BifrostWrites, &[])),
             [
                 "otlp-spans-c1",
                 "otlp-spans-c64",
@@ -459,6 +405,11 @@ mod tests {
                 "otlp-logs-c64",
                 "native-write-c1",
                 "native-write-c64",
+            ]
+        );
+        assert_eq!(
+            selectors(&sweep(Category::BifrostReads, &[])),
+            [
                 "point-memtable-c1",
                 "point-memtable-c64",
                 "point-staged-c1",
@@ -466,6 +417,8 @@ mod tests {
                 "point-c64",
                 "full-scan-c1",
                 "span-trace-c64",
+                "span-shredded-c1",
+                "span-long-tail-c1",
                 "ui-sql/memtable-ui-c8",
                 "ui-sql/staged-ui-c8",
                 "ui-sql/published-ui-c8",
@@ -474,7 +427,7 @@ mod tests {
         let counts: Vec<(usize, usize)> = Category::ALL
             .map(|category| (category.routine().len(), category.cases().len()))
             .to_vec();
-        assert_eq!(counts, [(5, 14), (5, 8), (18, 43)]);
+        assert_eq!(counts, [(5, 14), (5, 8), (8, 8), (12, 35)]);
     }
 
     /// `--list-cases` names every exact selector once with its routine or
@@ -482,11 +435,16 @@ mod tests {
     #[test]
     fn listing_names_every_selector_and_status() {
         assert_eq!(
-            resolve(Category::Bifrost, &line(&["--list-cases"])),
+            resolve(Category::BifrostReads, &line(&["--list-cases"])),
             Ok(Request::List)
         );
-        let listed = Category::Bifrost.list();
-        assert!(listed.starts_with("bifrost L1 cases (18 routine, 25 targeted)\n"));
+        let listed = Category::BifrostReads.list();
+        assert!(listed.starts_with("bifrost-reads L1 cases (12 routine, 23 targeted)\n"));
+        assert!(listed.contains("span-shredded-c1\tparquet\troutine\n"));
+        assert!(
+            !listed.contains("otlp-spans-c1"),
+            "writes are their own category"
+        );
         assert!(listed.contains("ui-sql/memtable-ui-c8\tui-sql\troutine\n"));
         assert!(listed.contains("ui-sql-10x/memtable-ui-c8\tui-sql-10x\ttargeted\n"));
         assert!(listed.contains("ui-sql-learned/published-ui-c1\tui-sql-learned\ttargeted\n"));
@@ -513,7 +471,7 @@ mod tests {
         );
         assert!(
             resolve(
-                Category::Bifrost,
+                Category::BifrostReads,
                 &line(&["--list-cases", "--cases", "point-c1"])
             )
             .is_err()
@@ -525,7 +483,7 @@ mod tests {
     #[test]
     fn explicit_selection_keeps_request_order() {
         let selection = sweep(
-            Category::Bifrost,
+            Category::BifrostReads,
             &[
                 "--cases",
                 "ui-sql-10x/staged-ui-c1,point-c64,hot/point-staged-c1",
@@ -560,13 +518,23 @@ mod tests {
         let refused = |category: Category, rest: &[&str]| {
             resolve(category, &line(rest)).expect_err("refused")
         };
-        assert!(refused(Category::Bifrost, &["--cases", "memtable-ui-c8"]).contains("ambiguous"));
         assert!(
-            refused(Category::Bifrost, &["--cases", "memtable-ui-c8"])
+            refused(Category::BifrostReads, &["--cases", "memtable-ui-c8"]).contains("ambiguous")
+        );
+        assert!(
+            refused(Category::BifrostReads, &["--cases", "memtable-ui-c8"])
                 .contains("`ui-sql-learned/memtable-ui-c8`")
         );
         assert!(
             refused(Category::Gateway, &["--cases", "point-c1"]).contains("not a gateway case")
+        );
+        assert!(
+            refused(Category::BifrostReads, &["--cases", "otlp-logs-c1"])
+                .contains("not a bifrost-reads case")
+        );
+        assert!(
+            refused(Category::BifrostWrites, &["--cases", "point-c1"])
+                .contains("not a bifrost-writes case")
         );
         assert!(
             refused(
@@ -620,7 +588,7 @@ mod tests {
     #[test]
     fn a_case_plans_identically_in_every_selection() {
         let plans = |rest: &[&str]| {
-            sweep(Category::Bifrost, rest)
+            sweep(Category::BifrostWrites, rest)
                 .cases
                 .into_iter()
                 .map(|case| (case.selector(), case.plan_arguments(&[])))

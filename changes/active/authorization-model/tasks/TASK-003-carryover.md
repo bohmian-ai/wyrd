@@ -3,29 +3,41 @@ id: TASK-003-carryover
 kind: implementation
 status: proposed
 spec: SPEC-authorization-model
-spec_revision: 7
-requirements: [REQ-002, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018]
-acceptance: [AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013]
+spec_revision: 11
+requirements: [REQ-002, REQ-011, REQ-012, REQ-013, REQ-014, REQ-017, REQ-018, REQ-019, REQ-020]
+acceptance: [AC-004, AC-005, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014, AC-015]
 depends_on: [TASK-003]
 ---
 
 # Complete onboarding, platform console and remaining social login
 
+**Current ownership (maintainer-approved 2026-11-23, spec revision 11):** this
+carryover owns cycles **1–16** and their existing evidence. Cycles **17–18 are
+DEFERRED** from launch. Cycles **19–20 are TRANSFERRED** to
+[TASK-004](TASK-004-company-sso-and-launch-verification.md), which has no
+linking/removal prerequisite. Finish the retained work; no historical statement
+that all twenty cycles must finish overrides this scope decision. Earlier
+revision/staged-migration descriptions below are historical context, not current
+migration authority or permission to edit an applied migration.
+
 After this task, an operator can establish a usable human admin without an IdP,
 visitors can create verified workspaces when enabled, and returning people can
 find workspace links and reset existing passwords through verified contacts.
 The delivered UI and clients consume the same Rust methods, provisioning and
-session owners; linking, invalidation and required company SSO complete the
-remaining social-login journey. Pre-registered operators can sign in to the
-platform console without a browser-held bootstrap key. Nothing ships until all
-cycles are complete; each capability is built once in its final form.
+session owners. Required company SSO and final connected verification are owned
+by TASK-004; self-service linking and removal are deferred. Pre-registered
+operators can sign in to the platform console without a browser-held bootstrap
+key. Retained launch work must be complete; each capability is built once in
+its final form.
 
 ## Inputs, ownership and dependencies
 
-Implement [approved spec revision 7](../spec.md), using finalized
+Implement the retained scope under [approved spec revision 11](../spec.md), using
+finalized
 [onboarding](../design/onboarding.md) (End-to-end journeys, HTTP contracts and
 configuration, Proofs/persistence/abuse, all eight decisions) and
-[social login](../design/social-login.md) (explicit linking/removal and company SSO).
+[social login](../design/social-login.md) (retained login/invitation behavior;
+linking/removal is deferred and company enforcement belongs to TASK-004).
 Revision 7 records the maintainer's explicitly approved 2026-11-21 platform-console
 and build-once decisions in REQ-018 and Revision history; those supplement the
 finalized onboarding/social design without inventing retroactive design notes.
@@ -97,7 +109,8 @@ No cycle creates an interim contract, pending-row signup implementation or
 provisioning/session engine for a later cycle to replace. Shared owners take the
 final local/external proof union and persistence purposes from the outset;
 later cycles add consumers/transport-specific proof, not replacement machinery.
-The original TASK-003 cycles 7–10 remain the final four cycles here.
+The original TASK-003 cycles 7–10 became cycles 17–20 below; their current
+deferral/transfer markers govern, not their historical acceptance text.
 
 ### 1. Trusted source, IPv6 /64 and missing-source refusal
 
@@ -1277,6 +1290,10 @@ Focused runner: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db
 
 ### 17. An existing User explicitly connects another sign-in method
 
+**Status: DEFERRED — maintainer-approved 2026-11-23.** Not required for launch
+or TASK-004. Retained below as future scope; do not execute its proof or build
+linking/password-add UI, endpoints or orchestration.
+
 **Reuses:** Cycles 4–5 password/method owners, cycle 16 approved account pages and existing bound identity linking; preserve the same User/grants.
 
 **Maps to:** REQ-012, REQ-015; AC-006.
@@ -1303,6 +1320,12 @@ observe preservation, not just identity row counts.
 
 ### 18. Removing or disabling a method invalidates its original credentials
 
+**Status: DEFERRED — maintainer-approved 2026-11-23.** Self-service removal and
+its combined cycle are not required for launch or TASK-004. Existing invalidation
+required by shipped operator controls and required SSO is retained in REQ-012/016
+and TASK-004; deferral never permits a disabled provider to keep authenticating.
+The original scenario below is retained as future scope, not an execution instruction.
+
 **Reuses:** Cycle 17 linked methods, cycle 5 policy/availability contract and existing browser/CLI anchors; extend their original invalidation checks.
 
 **Maps to:** REQ-011, REQ-012, REQ-015; preserves REQ-002; AC-006.
@@ -1325,64 +1348,17 @@ enforcement. Observe both selected invalidation and surviving credentials.
 
 ### 19. A tenant adopts company SSO without a password or social bypass
 
-**Reuses:** Cycles 5 and 17–18 methods, linking and invalidation plus existing company-connection lifecycle; extend the same policy owner and pages.
-
-**Maps to:** REQ-016; preserves REQ-002/REQ-004/REQ-005; AC-006.
-
-With linked Users and some unlinked accounts, a tenant admin freshly proves the
-tested Active company connection, sees the unlinked-account warning and enables
-require-company-SSO. Enablement without that proof or usable tested connection
-refuses. Allowed-method UI changes and direct password/social starts, racing
-callbacks and invitation enrollment cannot bypass policy. Existing password/social
-browser sessions and CLI renewal become unusable under established freshness;
-company sign-in and policy-compliant invitations still work.
-
-Replace/deactivate the company connection or interrupt it: policy remains enabled
-and login refuses without password/social fallback. Preserve company revision
-and issuer/subject ownership rules. Disabling policy does not resurrect revoked
-sessions. Repeat through another replica; tenant policy never affects another
-tenant or platform login. Exercise existing API-key/recovery paths unchanged.
-Do not assert immediate revocation from upstream IdP removal alone.
-
-**Proof:** Tier-1 tenant settings/login and device renewal journeys, including
-production UI, against real policy persistence. Initially fail on the missing
-human adoption flow and any unconnected completion/session/renewal consumers;
-reuse cycle 5's final evaluator and cycles 17–18's anchors/invalidation rather
-than introduce another policy implementation. If those checks already pass,
-record their connected regression proof without inventing RED. Hidden buttons
-alone do not pass.
+**Status: TRANSFERRED — 2026-11-23.** Execute only
+[TASK-004](TASK-004-company-sso-and-launch-verification.md), scenarios 1–5.
+Company provisioning plus existing grants/group mapping replaces the old
+linking-cycle prerequisite. REQ-016 and retained AC-006 govern.
 
 ### 20. Delivered surfaces and real providers complete the same journey
 
-**Reuses:** All earlier cycles and completed TASK-003 outputs; verify the connected shipped surfaces and real-provider compatibility without rebuilding them.
-
-**Maps to:** REQ-002, REQ-011–REQ-018; AC-004–AC-013 and the spec's shipped-surface safeguards.
-
-Using the operator setup, sent invitation, tenant User and grants produced above,
-complete production UI login, explicit CLI device-code approval and subsequent
-real Rust/Python/TypeScript client resource access. Exercise shipped HTTP/MCP
-management/read boundaries through their own typed consumers and denial behavior;
-do not make cookie authentication available on additional protocols. Verify
-generated/exported contracts match the Rust owners and Node retains no exchange
-or credential authority. Preserve scoped permissions/ceilings, local/company
-login, recovery and authorization regression cases at touched boundaries.
-
-Perform real Google and GitHub operator smoke tests for registration instructions,
-consent and callback compatibility. Record the configured flow and observed
-result without secrets; controlled-provider tests do not establish this external
-compatibility. No hosted SMTP provider test is required. Read updated operator
-and user instructions against the actual delivered actions and refusal messages.
-
-**Proof:** Tier-1 production UI/CLI/SDK/MCP journeys using their existing runners,
-plus live-provider smoke and contract checks. This connects earlier cycle outputs
-to actual consumers; disconnected fixtures or build success alone cannot pass.
-Record missing live-provider access as a material verification limitation rather
-than claiming those smoke tests ran.
-
-Local SMTP requires no hosted provider credential; real Google/GitHub smoke
-remains distinct and must honestly record unavailable external access. This
-cycle verifies the operator views delivered in cycle 16; it builds no second
-provider/SMTP/settings UI and introduces no new credential channel.
+**Status: TRANSFERRED — 2026-11-23.** Execute only
+[TASK-004](TASK-004-company-sso-and-launch-verification.md), scenarios 6–7.
+Carryover cycles 1–16 supply actual onboarding/platform outputs; final connected
+UI/CLI/SDK/HTTP/MCP and live-provider proof belong there, not to duplicate cycles.
 
 ## Verification owners and handoff
 
@@ -1439,12 +1415,14 @@ This carryover contains no new implementation or execution result, and does not
 authorize staging, committing or pushing.
 
 Planning validation: the completed TASK-003 cycles remain dependency evidence;
-all open cycle-6 work, revision-5 controls and original cycles 7–10 are owned here.
+all open cycle-6 work and revision-5 controls are retained here; original cycles
+7–10 now have the explicit deferral/transfer markers above.
 No code, migration, test, mock, stage, commit or push is part of this planning edit.
 Mock extension approval and live-provider smoke access are future execution gates,
 not unresolved product decisions. Platform sign-in semantics and route ownership
 are approved; mock appearance approval and live-provider evidence remain future
-execution gates. Nothing ships until every cycle is complete.
+execution gates. The revision-11 ownership notice supersedes the historical
+requirement that every carryover cycle finish before launch.
 
 
 Documentation handoff (2026-11-21): the bounded independent comprehension pass

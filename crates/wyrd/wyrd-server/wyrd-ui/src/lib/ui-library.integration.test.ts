@@ -2487,7 +2487,8 @@ let releaseModel = () => {};
 const reviewing = serverTest({ perTest: true, verificationRuntime: true, provider: () => new Promise((resolve) => (releaseModel = () => resolve(judgeReply('{"done":true}')))) });
 
 reviewing('TASK-006: a pending approval waits beside a step still running, then beside the missing input once it parks, with no verdict', async ({ server: _ }) => {
-  // Setup: `release-beside-review` runs for the `release-desk` Service. Its `release` approval waits for a person, its `ci` input is still to come, and its `review-notes` agent step waits on a model that has not answered.
+  // Setup: `release-beside-review` runs for the `release-desk` Service. Its `release` approval waits for a person, its `ci` input is still to come for
+  // its `ci-review` step and `green` requirement, and its `review-notes` agent step waits on a model that has not answered.
   const admin = WyrdClient.connect();
   await configureGateway(admin);
   const cards = await Cards.connect({ client: admin });
@@ -2502,12 +2503,17 @@ reviewing('TASK-006: a pending approval waits beside a step still running, then 
     if (submitted.kind !== 'queued') throw new Error('release-beside-review queues an execution');
     const executionId = submitted.execution.id;
 
-    // While the notes review runs, the server records the approval pending beside it and no result. It reports parked inputs only once nothing can run, so no input is named yet.
+    // While the notes review runs, the server records the approval pending beside it, the two tasks waiting for `ci`, and no result.
+    // Nothing has parked, so its parked summary is empty, and the blocked `ci-review` has no invocation.
     const principals = await Principals.connect({ client: admin });
     const serviceViewer = { role: 'viewer', scope: { card: { family: { kind: 'Service', name: 'release-desk' } } } };
     const { credential } = await principals.createServicePrincipal({ name: 'beside-review-reader', assignments: [serviceViewer] } as never);
     const reader = WyrdClient.connect({ credential });
     const read = () => loadExecution({ executionId }, { executor: nodeExecutor(reader) });
+    const ciWaits = [
+      { task_id: 'ci-review', slots: ['ci'] },
+      { task_id: 'green', slots: ['ci'] }
+    ];
     const steps = (loaded: Awaited<ReturnType<typeof read>>) => {
       const view = render(VerificationExecution, loaded);
       const head = within(view.container).getByRole('region', { name: 'Execution' });
@@ -2524,24 +2530,48 @@ reviewing('TASK-006: a pending approval waits beside a step still running, then 
     await vi.waitFor(
       async () => {
         const { status, invocations } = data(await read(), 'reader while reviewing');
-        expect([status.status, status.waiting, status.result, status.approvals?.map((each) => [each.step_id, each.status])]).toEqual(['running', undefined, undefined, [['release', 'pending']]]);
+        expect([status.status, status.waiting, status.result, status.approvals?.map((each) => [each.step_id, each.status]), status.input_waits]).toEqual([
+          'running',
+          undefined,
+          undefined,
+          [['release', 'pending']],
+          ciWaits
+        ]);
         expect(invocations?.state === 'populated' && invocations.data.items.map((item) => [item.producer.step_id, item.state])).toEqual([['review-notes', 'started']]);
       },
       { timeout: 30_000, interval: 200 }
     );
-    // The shared component shows the running notes review apart from the waiting approval, and no verdict.
-    expect(steps(await read())).toEqual({ input: null, approval: 'waiting for approval', verdict: 'none while running', steps: ['Step review-notes started', 'Step release ◷waiting for approval'] });
+    // Without the definition, the shared component shows the running notes review, the waiting approval and each reported task waiting for `ci`, and no verdict.
+    const waitingTasks = ['Task ci-review ◷waiting for input ci', 'Task green ◷waiting for input ci'];
+    expect(steps(await read())).toEqual({ input: 'waiting for input ci', approval: 'waiting for approval', verdict: 'none while running', steps: ['Step review-notes started', 'Step release ◷waiting for approval', ...waitingTasks] });
+    // With the definition, the same reported waits place the consuming step and the whole-Verifier requirement as waiting for `ci`.
+    const defined = async (node: string) => {
+      const view = render(VerificationExecution, await loadExecution({ executionId, node }, { executor: nodeExecutor(admin) }));
+      const note = view.container.querySelector('[data-waiting-input]')?.textContent?.replace(/\s+/g, ' ').trim();
+      view.unmount();
+      return note;
+    };
+    expect(await defined('step:ci-review')).toBe('Waiting for input ci. The execution started without it; this step starts when the evidence is provided. Nothing here is judged until then.');
+    expect(await defined('req:green')).toBe('Waiting for input ci. The execution started without it; this requirement is judged when the evidence is provided. Nothing here is judged until then.');
+    expect(await defined('step:review-notes')).toBeUndefined();
 
     // Once the model answers, the notes review succeeds and the same execution parks: the missing input and the pending approval are separate reasons, still with no verdict.
     releaseModel();
     await vi.waitFor(
       async () => {
         const { status } = data(await read(), 'reader once parked');
-        expect([status.execution_id, status.status, status.waiting, status.result, status.approvals?.map((each) => [each.step_id, each.status])]).toEqual([executionId, 'waiting', ['ci'], undefined, [['release', 'pending']]]);
+        expect([status.execution_id, status.status, status.waiting, status.result, status.approvals?.map((each) => [each.step_id, each.status]), status.input_waits]).toEqual([
+          executionId,
+          'waiting',
+          ['ci'],
+          undefined,
+          [['release', 'pending']],
+          ciWaits
+        ]);
       },
       { timeout: 30_000, interval: 200 }
     );
-    expect(steps(await read())).toEqual({ input: 'waiting for input ci', approval: 'waiting for approval', verdict: 'none while running', steps: ['Step review-notes succeeded', 'Step release ◷waiting for approval'] });
+    expect(steps(await read())).toEqual({ input: 'waiting for input ci', approval: 'waiting for approval', verdict: 'none while running', steps: ['Step review-notes succeeded', 'Step release ◷waiting for approval', ...waitingTasks] });
   } finally {
     releaseModel();
     await state.shutdown();

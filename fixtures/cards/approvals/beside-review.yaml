@@ -1,5 +1,6 @@
 # A release sign-off that waits for a person and for CI evidence while a
-# review of the release notes is still running beside it.
+# review of the release notes is still running beside it; a CI review and the
+# green requirement each wait for that evidence.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
@@ -19,6 +20,15 @@ spec:
         kind: agent
         agent: ./notes-reviewer.yaml
         inputs: {section: item, index: item_index}
+    - id: ci-review
+      action:
+        kind: code
+        entrypoint: review
+        inputs: {ci: inputs.ci}
+        source:
+          inline: |
+            def review(ci):
+                return {"status": ci["status"]}
   requirements:
     - id: green
       statement: CI is green

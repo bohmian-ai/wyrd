@@ -45,6 +45,22 @@
   }
 
   const DRIFT_WORDS: Record<CardTypes.DriftVerdict, string> = { NoDrift: 'no drift', Drift: 'drift', Inconclusive: 'inconclusive' };
+  /** Why a recorded GitHub delivery did not finish, or why its Check shows no report. */
+  const DELIVERY_REASONS: Record<CardTypes.GithubDeliveryReason, string> = {
+    superseded: 'a newer source superseded it',
+    access_removed: 'repository access was removed',
+    github_refused: 'GitHub refused the write',
+    github_unavailable: 'GitHub stayed unavailable through every retry',
+    report_ambiguous: 'more than one code review report, so none is shown',
+    report_invalid: 'the code review report is invalid, so it is not shown'
+  };
+  /** Why a finding's anchor was listed in the Check summary instead of inline. */
+  const ANCHOR_PROBLEMS: Record<CardTypes.AnchorProblemReason, string> = {
+    anchor_commit_mismatch: 'anchor names another commit',
+    anchor_path_unknown: 'no such file in the change',
+    anchor_source_unavailable: 'file source not retained',
+    anchor_out_of_range: 'lines beyond the file'
+  };
   const WORDS = { input: 'Input', step: 'Step', req: 'Requirement', task: 'Task' } as const;
   /** The most characters of one JSON or text value a preview draws. */
   const PREVIEW = 65_536;
@@ -339,6 +355,23 @@
                 #{pull.number}
               {/if}
               <span class="muted">head {pull.head.sha.slice(0, 7)}</span>
+            </dd>
+          </div>
+        {/if}
+        {#if status.github_delivery}
+          {@const delivery = status.github_delivery}
+          <div class="fact">
+            <dt>GitHub delivery</dt>
+            <dd data-github-delivery={delivery.status}>
+              <StatusMark value={delivery.status} label={delivery.status === 'pending' ? 'pending' : undefined} />
+              {#if delivery.reason}<span class="muted">{DELIVERY_REASONS[delivery.reason]}</span>{/if}
+              {#if delivery.problems?.length}
+                <ul class="problems" aria-label="Findings listed in the Check summary">
+                  {#each delivery.problems as problem (problem.finding)}
+                    <li><span class="mono">{problem.finding}</span> <span class="muted">{ANCHOR_PROBLEMS[problem.reason]}</span></li>
+                  {/each}
+                </ul>
+              {/if}
             </dd>
           </div>
         {/if}
@@ -691,6 +724,12 @@
   .tag b {
     color: var(--text);
     font-weight: 400;
+  }
+  .problems {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: 12px;
   }
   .banner {
     margin: 0;

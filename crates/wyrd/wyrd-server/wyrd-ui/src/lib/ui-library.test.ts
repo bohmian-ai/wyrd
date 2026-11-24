@@ -4162,6 +4162,77 @@ test('an execution of a pull request names it and opens the review set that admi
   expect(render(VerificationExecution, other).container).not.toHaveTextContent('Pull request');
 });
 
+test("a pull request execution shows its recorded GitHub delivery apart from its verdict, and other work shows none", async () => {
+  // Setup: one settled pull request execution whose recorded verdict stays the same across every delivery outcome.
+  const admitted = { host: 'github.com', repository_id: '718204331', number: 482, base: { ref: 'main', sha: 'b1' }, head: { ref: 'refund-window', sha: '9f2c1ab0c4' }, generation: 'g1', members: [EXECUTIONS.settled] };
+  const settledStatus = executionStatus[EXECUTIONS.settled];
+  const open = async (github_delivery?: CardTypes.GithubDelivery, refuse?: string) => {
+    const reads = fixtureRecording((request) =>
+      request.op === 'verification.get_execution'
+        ? { ok: true, value: { ...settledStatus, pull_request: admitted, ...(github_delivery === undefined ? {} : { github_delivery }) } }
+        : request.op === refuse
+          ? { ok: false, problem: { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 } }
+          : undefined
+    );
+    const loaded = await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: reads.executor });
+    return { reads, view: render(VerificationExecution, loaded) };
+  };
+  const delivery = (view: { container: HTMLElement }) => view.container.querySelector('[data-github-delivery]');
+  const verdict = settledStatus.result?.outcome.verdict;
+
+  // Action and outcome: each recorded outcome reads as itself, beside the unchanged status and verdict.
+  const delivered = await open({ status: 'delivered' });
+  expect(delivery(delivered.view)).toHaveAttribute('data-github-delivery', 'delivered');
+  expect(within(delivered.view.container).getByText('GitHub delivery')).toBeInTheDocument();
+  expect(delivery(delivered.view)).toHaveTextContent('delivered');
+  expect(delivered.view.container.querySelector('[data-verdict]')).toHaveAttribute('data-verdict', verdict);
+  expect(delivered.view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', settledStatus.status);
+  delivered.view.unmount();
+
+  // A provider refusal is a recorded delivery failure, not a failed verification; refused anchors are named, not moved.
+  const failed = await open({ status: 'failed', reason: 'github_refused', problems: [{ finding: 'f-2', reason: 'anchor_out_of_range' }] });
+  expect(delivery(failed.view)).toHaveAttribute('data-github-delivery', 'failed');
+  expect(delivery(failed.view)).toHaveTextContent('failed');
+  expect(delivery(failed.view)).toHaveTextContent('GitHub refused the write');
+  expect(delivery(failed.view)).toHaveTextContent('f-2');
+  expect(delivery(failed.view)).toHaveTextContent('lines beyond the file');
+  expect(failed.view.container.querySelector('[data-verdict]')).toHaveAttribute('data-verdict', verdict);
+  expect(failed.view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', settledStatus.status);
+  failed.view.unmount();
+
+  const skipped = await open({ status: 'skipped', reason: 'superseded' });
+  expect(delivery(skipped.view)).toHaveAttribute('data-github-delivery', 'skipped');
+  expect(delivery(skipped.view)).toHaveTextContent('a newer source superseded it');
+  skipped.view.unmount();
+
+  // Nothing recorded yet reads as pending, never as queued verification work.
+  const pending = await open({ status: 'pending' });
+  expect(delivery(pending.view)).toHaveTextContent('pending');
+  expect(delivery(pending.view)).not.toHaveTextContent('queued');
+  pending.view.unmount();
+
+  // An unreadable Verifier definition does not erase the readable delivery.
+  const undefinedVerifier = await open({ status: 'failed', reason: 'github_unavailable' }, 'cards.get_by_ref');
+  expect(delivery(undefinedVerifier.view)).toHaveTextContent('GitHub stayed unavailable through every retry');
+  undefinedVerifier.view.unmount();
+
+  // No delivery read is added: the status read is the only source.
+  expect(delivered.reads.calls.filter((call) => call.request.op === 'verification.get_execution')).toHaveLength(1);
+
+  // Work that is not from a pull request has no delivery section.
+  const plain = await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: fixtureRecording().executor });
+  const other = render(VerificationExecution, plain);
+  expect(other.container).not.toHaveTextContent('GitHub delivery');
+  expect(other.container.querySelector('[data-github-delivery]')).toBeNull();
+  other.unmount();
+
+  // A refused status read is that refusal, never a fabricated provider state.
+  const refused = fixtureRecording((request) => (request.op === 'verification.get_execution' ? { ok: false, problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 } } : undefined));
+  const unread = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: refused.executor }));
+  expect(unread.container).toHaveTextContent('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  expect(unread.container).not.toHaveTextContent('GitHub delivery');
+});
+
 test('an execution whose Verifier definition is refused still lets a reader select what was recorded', async () => {
   // Setup: a settled execution the reader may open, and a Verifier Card the reader may not.
   const refusal = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };

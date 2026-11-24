@@ -1220,6 +1220,7 @@ export const EXECUTION_MARKS: Readonly<Record<string, ExecutionMark>> = {
   failed: ['✕', 'failed', 'danger'],
   inconclusive: ['?', 'inconclusive', 'muted'],
   succeeded: ['✓', 'succeeded', 'ok'],
+  delivered: ['✓', 'delivered', 'ok'],
   skipped: ['–', 'skipped', 'muted'],
   not_applicable: ['–', 'not applicable', 'muted'],
   'no drift': ['✓', 'no drift', 'ok'],

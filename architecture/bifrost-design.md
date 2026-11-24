@@ -480,9 +480,9 @@ typed columns:
   and publication facts, including bounded authored JSON in its existing sensitive value
   semantics. It preserves server-assigned event identity, execution sequence/cut and
   producer indices/attempt. A `status` event records a queued execution's lifecycle
-  transition after its queue commit and is never a checkpoint; a terminal one carries
-  the sanitized terminal error, so work that never checkpointed keeps its status and
-  error once its queue row is gone. Extend its versioned metadata for authoritative terminal
+  transition after its queue commit and is never a checkpoint; a cancellation's carries
+  the sanitized error the cancellation recorded, so work that never checkpointed keeps
+  its status and error once its queue row is gone. Extend its versioned metadata for authoritative terminal
   selection: exact result ID or null, full sanitized error and recorded
   tenant/Verifier/subject/repository/actor identity; inspectable invocation/disposition
   records; complete file/directory manifests with private verified File associations,

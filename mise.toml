@@ -1362,7 +1362,7 @@ until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $credentials -nt $s
   sleep 1
 done
 rm -f "$started"
-printf '\nUI ready     %s/t/dev/login (sign in as development / development)\n\n' "$ui"
+printf '\nUI ready     %s/t/dev/login (sign in as development / development-local)\n\n' "$ui"
 until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
   kill -0 "${pids[0]}" 2>/dev/null || { echo "MockServer exited before it was ready" >&2; exit 1; }
   sleep 1
@@ -1394,7 +1394,7 @@ else
   reviews="not started: setup FAILED"
 fi
 printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
-printf 'UI           %s/t/dev/login (sign in as development / development)\n' "$ui"
+printf 'UI           %s/t/dev/login (sign in as development / development-local)\n' "$ui"
 printf 'example app  %s\n' "$example"
 printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
 printf 'batch        %s\n' "$batch"

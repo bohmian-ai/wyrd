@@ -2288,7 +2288,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
   const browser = await chromium.launch();
   try {
     // The UI's sign-in is reported ready before the example app is set up or its batch sent.
-    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login (sign in as development / development)'), { timeout: 1_500_000, interval: 1_000 });
+    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login (sign in as development / development-local)'), { timeout: 1_500_000, interval: 1_000 });
     expect(output()).not.toMatch(/batch {8}/);
     expect(statSync(join(config, 'credentials.toml')).mode & 0o777).toBe(0o600);
 
@@ -2296,7 +2296,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     const page = await (await browser.newContext()).newPage();
     await page.goto('http://127.0.0.1:3000/t/dev/login');
     await page.getByLabel('Username').fill('development');
-    await page.getByLabel('Password').fill('development');
+    await page.getByLabel('Password').fill('development-local');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await page.waitForURL('http://127.0.0.1:3000/t/dev');
     await page.goto('http://127.0.0.1:3000/t/dev/settings/account');
@@ -2307,7 +2307,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     expect(output(), log).toContain('batch        passed');
     // Pull request review registration runs beside the app and batch without holding either up.
     expect(output()).toContain('review       registers bohmian-ai/wyrd-example-py once GitHub is connected');
-    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as development / development)');
+    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as development / development-local)');
     expect(output()).not.toContain('/login/api-key');
     for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);
 

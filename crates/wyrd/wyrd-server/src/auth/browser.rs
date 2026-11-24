@@ -970,20 +970,21 @@ fn discovery_cookie(headers: &HeaderMap) -> Option<&str> {
 ///
 /// Answers `202` alike for every address and sets the `wyrd_discovery`
 /// flow cookie the same browser presents to verify. The message names no
-/// workspace.
+/// workspace and is sent after the answer, so neither its relay's outcome
+/// nor its latency reaches the response.
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a mail relay;
 /// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address;
 /// `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` once the source's email window is
-/// exhausted; `503` when the store, key or relay fails.
+/// exhausted; `503` when the store or key fails.
 #[utoipa::path(
     post,
     path = "/auth/browser/workspaces/request",
     request_body = DiscoveryRequest,
     responses(
-        (status = 202, description = "A proof was mailed; the flow cookie is set",
-          body = ProofStatusResponse,
+        (status = 202, description = "Admitted; a proof is mailed after the answer, unless the \
+          address's window withholds it. The flow cookie is set", body = ProofStatusResponse,
           headers(("Set-Cookie" = String, description = "The `wyrd_discovery` flow cookie"))),
         (status = 400, description = "Invalid body or address (WYRD_SPEC_400_VALIDATION)",
           body = WyrdProblem),
@@ -992,7 +993,7 @@ fn discovery_cookie(headers: &HeaderMap) -> Option<&str> {
         (status = 429, description = "The source's email window is exhausted; nothing was mailed \
           (WYRD_AUTH_429_EMAIL_ATTEMPTS)", body = WyrdProblem,
           headers(("Retry-After" = String, description = "Whole seconds until the window ends"))),
-        (status = 503, description = "The store, key or relay is unavailable \
+        (status = 503, description = "The store or key is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     security(()),

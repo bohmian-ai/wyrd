@@ -278,10 +278,12 @@ test('a verified address finds its workspaces by link or pasted code', async () 
   try {
     await page.goto(`${journey.origin}/workspaces`);
     expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Find your workspaces');
+    // The proof is mailed after the answer, so wait for the message beyond the signup one.
+    let before = await mailCount(owner);
     await page.getByLabel('Email').fill(owner);
     await page.getByRole('button', { name: 'Email me a link' }).click();
     await page.getByRole('heading', { name: 'Check your email' }).waitFor();
-    const before = await mailCount(owner);
+    await expect.poll(() => mailCount(owner)).toBe(++before);
 
     // The mailed link lists the workspace as a link to its own sign-in page, then leaves no proof in the address bar.
     const link = mailedLink(await newestMail(owner));

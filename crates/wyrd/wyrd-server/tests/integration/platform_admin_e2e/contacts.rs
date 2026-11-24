@@ -215,6 +215,22 @@ pub(super) async fn mailed_proof(api: &str, address: &str) -> (String, String) {
     (proof, text.clone())
 }
 
+/// The proof and text of the message to `address` after its `before`
+/// earlier ones. Discovery mails after its answer, so this polls Mailpit for
+/// up to ten seconds.
+///
+/// # Panics
+/// Panics when no further message arrives in time.
+async fn next_proof(api: &str, address: &str, before: usize) -> (String, String) {
+    for _ in 0..100 {
+        if mail_to(api, address).await.len() > before {
+            return mailed_proof(api, address).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no further message to {address} arrived");
+}
+
 /// `slug`'s verified contacts: address and revision.
 pub(super) async fn contacts(superuser: &sqlx::PgPool, slug: &str) -> Vec<(String, i64)> {
     sqlx::query_as(
@@ -461,6 +477,7 @@ async fn directory_entries(superuser: &sqlx::PgPool) -> i64 {
 /// # Panics
 /// Panics when the request is not accepted or no proof arrives.
 async fn discover(srv: &WyrdTestServer, api: &str, email: &str) -> (StatusCode, Value, String) {
+    let before = mail_to(api, email).await.len();
     let (status, binding, body) = browser(
         srv,
         "/auth/browser/workspaces/request",
@@ -472,7 +489,7 @@ async fn discover(srv: &WyrdTestServer, api: &str, email: &str) -> (StatusCode, 
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(body, json!({ "status": "check_email" }));
     let binding = binding.expect("a discovery binding cookie");
-    let (proof, _) = mailed_proof(api, email).await;
+    let (proof, _) = next_proof(api, email, before).await;
     let (status, read, body) = browser(
         srv,
         "/auth/browser/workspaces/verify",
@@ -558,6 +575,7 @@ async fn a_visitor_discovers_only_live_workspaces_for_a_verified_address() {
     );
 
     // 2. and 3. A proof read in another browser discloses nothing.
+    let before = mail_to(&api, shared).await.len();
     let (status, binding, _) = browser(
         &srv,
         "/auth/browser/workspaces/request",
@@ -568,7 +586,7 @@ async fn a_visitor_discovers_only_live_workspaces_for_a_verified_address() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(binding.is_some());
-    let (proof, text) = mailed_proof(&api, shared).await;
+    let (proof, text) = next_proof(&api, shared, before).await;
     for name in ["north", "south", "east", "west"] {
         assert!(!text.contains(name), "the mail names no workspace: {text}");
     }
@@ -602,6 +620,7 @@ async fn a_visitor_discovers_only_live_workspaces_for_a_verified_address() {
     assert!(workspaces(&page).is_empty());
 
     // 4. The same browser repeating its verification reads the same page.
+    let before = mail_to(&api, shared).await.len();
     let (status, binding, _) = browser(
         &srv,
         "/auth/browser/workspaces/request",
@@ -612,7 +631,7 @@ async fn a_visitor_discovers_only_live_workspaces_for_a_verified_address() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let binding = binding.expect("a binding");
-    let (proof, _) = mailed_proof(&api, shared).await;
+    let (proof, _) = next_proof(&api, shared, before).await;
     for _ in 0..2 {
         let (status, _, page) = browser(
             &srv,
@@ -707,7 +726,7 @@ async fn email_requests_are_admitted_before_any_mail_is_sent() {
         assert_eq!(body, json!({ "status": "check_email" }));
     }
     assert_eq!(
-        mail_to(&api, asked).await.len(),
+        within_propagation(&5, || async { mail_to(&api, asked).await.len() }).await,
         5,
         "the address budget stops mail"
     );
@@ -752,6 +771,128 @@ async fn email_requests_are_admitted_before_any_mail_is_sent() {
     assert_eq!(n, 5, "five contact requests per account are admitted");
     assert_throttled(status, retry_after.as_deref(), &body);
     assert!(mail_to(&api, "jo5.budget@example.test").await.is_empty());
+}
+
+/// Point the deployment's mail relay at `port` on this host, without TLS.
+async fn relay_to(srv: &WyrdTestServer, session: &str, port: u16) {
+    let (status, relay) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(session),
+            Some(json!({ "host": "127.0.0.1", "port": port, "tls": "none", "sender": "accounts@wyrd.test" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{relay}");
+}
+
+/// A discovery answer shows nothing of its address's mail, whatever the
+/// relay does:
+///   1. with a relay that accepts connections and never answers, an address
+///      below its budget and one past it both get the generic `202` at once;
+///   2. with a relay that refuses connections, both still get the generic
+///      `202`;
+///   3. with a working relay, the address below its budget is mailed once
+///      and the one past it is not mailed.
+///
+/// # Panics
+/// Panics when an answer differs between the two addresses, waits on the
+/// relay, or mail goes where its budget forbids.
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_answers_alike_whatever_the_relay_does() {
+    let (srv, operator) = contact_server("harbor").await;
+    let discover_from = |client: &'static str, email: &'static str| {
+        let srv = &srv;
+        async move {
+            let started = std::time::Instant::now();
+            let (status, _, flow, body) = browser_from(
+                srv,
+                client,
+                "/auth/browser/workspaces/request",
+                &[],
+                "wyrd_discovery",
+                &json!({ "email": email }),
+            )
+            .await;
+            (status, flow.is_some(), body, started.elapsed())
+        }
+    };
+    let generic = (
+        StatusCode::ACCEPTED,
+        true,
+        json!({ "status": "check_email" }),
+    );
+    let answer = |reply: &(StatusCode, bool, Value, std::time::Duration)| {
+        (reply.0, reply.1, reply.2.clone())
+    };
+    // The relay's ten-second SMTP timeout would show in a waited answer.
+    let at_once = std::time::Duration::from_secs(3);
+
+    // 1. A relay that never answers delays neither address.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a stalling relay binds");
+    let stalled_port = stalled.local_addr().expect("relay address").port();
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((socket, _)) = stalled.accept().await {
+            open.push(socket);
+        }
+    });
+    relay_to(&srv, &operator, stalled_port).await;
+    let suppressed = "kit.suppressed@example.test";
+    for _ in 0..5 {
+        discover_from("198.51.100.21", suppressed).await;
+    }
+    for (client, email) in [
+        ("198.51.100.22", "lou.below@example.test"),
+        ("198.51.100.23", suppressed),
+    ] {
+        let reply = discover_from(client, email).await;
+        assert_eq!(answer(&reply), generic, "{email}");
+        assert!(
+            reply.3 < at_once,
+            "{email} waited {:?} on the relay",
+            reply.3
+        );
+    }
+
+    // 2. A relay that refuses connections changes neither answer.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a port binds");
+    let closed_port = closed.local_addr().expect("port").port();
+    drop(closed);
+    relay_to(&srv, &operator, closed_port).await;
+    for (client, email) in [
+        ("198.51.100.24", "max.below@example.test"),
+        ("198.51.100.25", suppressed),
+    ] {
+        let reply = discover_from(client, email).await;
+        assert_eq!(answer(&reply), generic, "{email}");
+        assert!(
+            reply.3 < at_once,
+            "{email} waited {:?} on the relay",
+            reply.3
+        );
+    }
+    held.abort();
+
+    // 3. A working relay mails the address below its budget only.
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let below = "ned.below@example.test";
+    for (client, email) in [("198.51.100.26", below), ("198.51.100.27", suppressed)] {
+        assert_eq!(
+            answer(&discover_from(client, email).await),
+            generic,
+            "{email}"
+        );
+    }
+    next_proof(&api, below, 0).await;
+    assert!(
+        mail_to(&api, suppressed).await.is_empty(),
+        "the address past its budget is never mailed"
+    );
 }
 
 /// A contact flow belongs to the User and tenant that began it:
@@ -1000,6 +1141,7 @@ async fn only_a_live_discovery_proof_reads_workspaces() {
     assert!(read.is_none(), "no read cookie");
 
     // 2. A discovery proof is not a contact proof.
+    let before = mail_to(&api, known).await.len();
     let (status, flow, _) = browser(
         &srv,
         "/auth/browser/workspaces/request",
@@ -1010,7 +1152,7 @@ async fn only_a_live_discovery_proof_reads_workspaces() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let discovery_flow = flow.expect("a discovery flow cookie");
-    let (discovery_proof, _) = mailed_proof(&api, known).await;
+    let (discovery_proof, _) = next_proof(&api, known, before).await;
     let (status, _, body) = browser(
         &srv,
         "/auth/browser/email/verify",

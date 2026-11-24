@@ -15,7 +15,6 @@
 
 use secrecy::SecretString;
 use serde_json::json;
-use tokio::sync::Semaphore;
 use url::Url;
 use wyrd_spec::auth::{ContactRequest, SecretBearer, Sha256Hex};
 use wyrd_spec::error::WyrdError;
@@ -25,7 +24,7 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::queries::platform::signup::{SignupAdmissionScope, admit_signup};
 
-use super::{SIGNUP_WINDOW, SignupEnvelope, SocialSignIn, source_unknown};
+use super::{SIGNUP_WINDOW, SignupEnvelope, SocialSignIn, send_after_answer, source_unknown};
 use crate::browser_sessions::{BrowserSession, BrowserSessions, random_secret, session_invalid};
 use crate::error::store_error;
 use crate::mail::{ApplicationMail, EmailAddress};
@@ -40,13 +39,6 @@ const RESET_SOURCE_ATTEMPTS: i32 = 30;
 /// Reset messages sent per tenant account in one window; later requests are
 /// answered the same and send nothing.
 const RESET_ACCOUNT_ATTEMPTS: i32 = 3;
-
-/// Reset sends one process runs at once; a request beyond them sends
-/// nothing, and its caller asks again.
-const RESET_SENDS: usize = 16;
-
-/// The process's reset-send permits.
-static RESET_SENDERS: Semaphore = Semaphore::const_new(RESET_SENDS);
 
 impl SocialSignIn {
     /// Mail a proof of `request.email` to that address for the User signed
@@ -273,7 +265,7 @@ impl SocialSignIn {
     /// Start mailing a reset code for `username` at `tenant` and return at
     /// once, before anything about the account is read.
     ///
-    /// The send runs afterwards on one of the process's bounded reset
+    /// The send runs afterwards on one of the process's bounded send
     /// permits; with none free, or when the process stops, the request sends
     /// nothing and is not retried. The caller has admitted the request and
     /// checked that the tenant offers password reset.
@@ -285,20 +277,12 @@ impl SocialSignIn {
         username: String,
         origin: &Url,
     ) {
-        let Ok(permit) = RESET_SENDERS.try_acquire() else {
-            tracing::warn!("every reset send permit is busy; a reset request sent nothing");
-            return;
-        };
         let (social, sessions, mail, origin) =
             (self.clone(), sessions.clone(), mail.clone(), origin.clone());
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = social
+        send_after_answer("password reset", async move {
+            social
                 .mail_password_reset(&sessions, &mail, &tenant, &username, &origin)
                 .await
-            {
-                tracing::warn!(error = %error, "a password reset was not sent");
-            }
         });
     }
 

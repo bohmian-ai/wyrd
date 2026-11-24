@@ -1309,7 +1309,14 @@ impl DevServer {
     /// Refuses failed setup or an unrecognizable response. Committed setup may
     /// remain; cancellation never reissues or rolls it back.
     async fn provision(&self, tenant: &TenantSlug) -> Result<ProvisionedTenant, WyrdCliError> {
-        let setup = self
+        let failed = || {
+            dev_error(
+                "setup",
+                "rerun with the same tenant; committed setup remains in the database",
+            )
+        };
+        let password = generated_admin_password();
+        let mut child = self
             .command()
             .args([
                 "setup",
@@ -1317,19 +1324,34 @@ impl DevServer {
                 tenant.as_str(),
                 "--server",
                 &self.endpoint,
+                "--admin-username",
+                LOCAL_ADMIN_USERNAME,
+                "--admin-password-stdin",
             ])
-            .output()
-            .await
-            .map_err(|_| {
-                dev_error(
-                    "setup",
-                    "rerun with the same tenant; committed setup remains in the database",
-                )
-            })?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| failed())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let line = Zeroizing::new(format!("{}\n", password.expose_secret()));
+            // Setup for an already-active tenant exits without reading stdin,
+            // so a closed pipe is not a failure; the exit status decides.
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, line.as_bytes()).await;
+        }
+        let setup = child.wait_with_output().await.map_err(|_| failed())?;
         let setup_succeeded = setup.status.success();
         let printed = SecretString::from(String::from_utf8(setup.stdout)
             .map_err(|_| dev_error("setup response", "the installed server returned invalid output; check its compatible release before rerunning"))?);
         disclose_root(printed.expose_secret(), &self.diagnostics);
+        if setup_succeeded
+            && printed
+                .expose_secret()
+                .lines()
+                .any(|line| line == format!("admin_username: {LOCAL_ADMIN_USERNAME}"))
+        {
+            self.disclose_admin(tenant, &password);
+        }
         if !setup_succeeded {
             return Err(dev_error(
                 "setup",
@@ -1337,6 +1359,24 @@ impl DevServer {
             ));
         }
         ProvisionedTenant::parse(printed.expose_secret())
+    }
+
+    /// Disclose the first-use administrator's generated initial password,
+    /// once, only to the invoking terminal, with the UI page it signs in at.
+    /// Without a terminal the password is never shown; the notice names the
+    /// recovery that the saved tenant key still allows.
+    fn disclose_admin(&self, tenant: &TenantSlug, password: &SecretString) {
+        let login = format!("http://{}/t/{}/login", self.inputs.ui, tenant.as_str());
+        if to_terminal(&format!(
+            "Tenant administrator (shown once; store securely):\n  username: {LOCAL_ADMIN_USERNAME}\n  password: {}\n  sign in: {login}",
+            password.expose_secret()
+        ))
+        .is_err()
+        {
+            self.diagnostics.notice(&format!(
+                "Tenant administrator `{LOCAL_ADMIN_USERNAME}` was created, but no invoking terminal received its initial password; sign in at {login} with the saved API key and issue `{LOCAL_ADMIN_USERNAME}` a password reset."
+            ));
+        }
     }
 
     /// Observe the owned server and UI; every unsolicited exit of either is a
@@ -1513,6 +1553,35 @@ impl ProvisionedTenant {
     }
 }
 
+/// Username of the human administrator first use creates for the tenant.
+const LOCAL_ADMIN_USERNAME: &str = "admin";
+
+/// A fresh random initial password for the first-use administrator: 24
+/// alphanumeric characters (about 143 bits), inside the server's password
+/// policy and never in its common-password list.
+fn generated_admin_password() -> SecretString {
+    use rand::distr::{Alphanumeric, SampleString as _};
+    SecretString::from(Alphanumeric.sample_string(&mut rand::rng(), 24))
+}
+
+/// Write a one-time secret disclosure to the invoking terminal only: stderr
+/// when it is a terminal, else the process's controlling terminal. A
+/// redirected stream never receives it.
+///
+/// # Errors
+/// Returns an IO error when no terminal is attached or the write fails.
+fn to_terminal(text: &str) -> std::io::Result<()> {
+    let stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let mut stderr = stderr.lock();
+        writeln!(stderr, "{text}")?;
+        return stderr.flush();
+    }
+    let mut terminal = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    writeln!(terminal, "{text}")?;
+    terminal.flush()
+}
+
 /// Disclose a newly initialized root only to the invoking terminal.
 /// An unavailable terminal reports recovery guidance as a notice; tenant
 /// persistence continues.
@@ -1520,24 +1589,14 @@ fn disclose_root(printed: &str, diagnostics: &Diagnostics) {
     if let Some(root) = printed
         .lines()
         .find(|line| line.starts_with("wyrd_global_"))
+        && to_terminal(&format!(
+            "Platform administrative credential (store securely):\n{root}"
+        ))
+        .is_err()
     {
-        if let Ok(mut terminal) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-            if writeln!(
-                terminal,
-                "Platform administrative credential (store securely):\n{root}"
-            )
-            .and_then(|()| terminal.flush())
-            .is_err()
-            {
-                diagnostics.notice(
-                    "Platform root initialized, but its credential could not be delivered to the terminal; use wyrd-server recover-root when platform administration is needed.",
-                );
-            }
-        } else {
-            diagnostics.notice(
-                "Platform root initialized. No invoking terminal was available for disclosure; use wyrd-server recover-root when platform administration is needed.",
-            );
-        }
+        diagnostics.notice(
+            "Platform root initialized, but no invoking terminal received its credential; use wyrd-server recover-root when platform administration is needed.",
+        );
     }
 }
 

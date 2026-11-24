@@ -386,6 +386,35 @@ impl LocalDev {
         );
     }
 
+    /// Sign the first-use `admin` User in with `password` through the
+    /// production UI's password form, as a browser does.
+    ///
+    /// # Panics
+    /// Panics when the sign-in is refused or sets no session.
+    async fn sign_in_with_password(&self, password: &str) {
+        let origin = format!("http://{}", self.ui);
+        let signed_in = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("browser client")
+            .post(format!("{origin}/t/local/login?/password"))
+            .header("origin", &origin)
+            .header("accept", "text/html")
+            .form(&[("username", "admin"), ("password", password)])
+            .send()
+            .await
+            .expect("password sign-in");
+        assert_eq!(signed_in.status(), 303, "password sign-in redirects");
+        assert!(
+            signed_in
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|cookie| !cookie.is_empty()),
+            "password sign-in sets the session cookie"
+        );
+    }
+
     /// Run a fresh `wyrd <args>` that reads the saved local files, piping
     /// `stdin` to it as the quickstart does for a managed secret.
     ///
@@ -1595,6 +1624,52 @@ async fn serving(endpoint: &str) -> bool {
 /// the MCP `setup` prompt through the installed proxy, which refuses other
 /// names and arguments.
 ///
+/// First use on a terminal creates the tenant's `admin` User with a generated
+/// password shown once, only on that terminal, beside its UI sign-in page;
+/// the password signs in through the production UI. A rerun discloses
+/// nothing and leaves that password working.
+///
+/// # Panics
+/// Panics when the disclosure is missing, repeated, or the password does
+/// not sign in through the UI before and after the rerun.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
+async fn init_first_use_discloses_admin_password_once() {
+    let local = LocalDev::new().await;
+    let init = || {
+        let mut command = local.command();
+        command.args(["init", "--tenant", "local", "--non-interactive"]);
+        Guided::spawn(command)
+    };
+    let mut first = init();
+    first.expect("Local Wyrd ready at ").await;
+    let shown = |label: &str| {
+        first
+            .printed
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(label))
+            .map(str::to_owned)
+    };
+    assert_eq!(shown("username: ").as_deref(), Some("admin"));
+    let password = shown("password: ").expect("the initial password is shown");
+    assert_eq!(
+        shown("sign in: "),
+        Some(format!("http://{}/t/local/login", local.ui))
+    );
+    local.sign_in_with_password(&password).await;
+    first.interrupt().await;
+
+    let mut rerun = init();
+    rerun.expect("Local Wyrd ready at ").await;
+    assert!(
+        !rerun.printed.contains("Tenant administrator") && !rerun.printed.contains(&password),
+        "a rerun discloses nothing: {}",
+        rerun.printed
+    );
+    local.sign_in_with_password(&password).await;
+    rerun.interrupt().await;
+}
+
 /// `wyrd init guided` on a terminal starts only the chosen installed agent,
 /// after readiness and its MCP connection, in the project directory with
 /// the literal prompt and the terminal. More than one `--host`, a missing

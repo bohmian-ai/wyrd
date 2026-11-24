@@ -195,7 +195,10 @@ Enter your database URL and a tenant name when asked, and decline the other offe
 Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
 ```
 
-It also prints a root credential once. Save it; it recovers a lost tenant key.
+It also prints two secrets once, on the terminal only. Save both:
+
+- a root credential, which recovers a lost tenant key;
+- the password of the tenant's `admin` user, with the page where you sign in to the Wyrd UI.
 
 **Start it without prompts:**
 

@@ -2304,8 +2304,12 @@ of the replacement's and is then inherited; this rare interval is accepted and n
 PostgreSQL ownership table closes it. An attempt's execution failure is recorded
 in the state with the execution's exact identity before the queue settles it, so
 retained reads of it need neither the queue row nor the source Cards. A
-cancellation or revocation settles only the queue row, which owns that status; a
-running holder learns of it through its lost token and records nothing more.
+cancellation or revocation settles the queue row, which coordinates live work and
+writes no revision. After that commit its owner stages a terminal `status` event
+with the status, the sanitized terminal error and the execution's exact Verifier
+and subject, so retained reads of work that never checkpointed need neither the
+queue row nor a checkpoint. A running holder learns of the cancellation through
+its lost token and records nothing more.
 
 Queue leases renew on the PostgreSQL clock; expiry never revives an old lease.
 The background lease-renewal owner sets each claim's local lost/cancelled token
@@ -2367,7 +2371,11 @@ Dedicated execution reads check current caller grants on the trusted retained
 authorization parent, plus explicit sensitive-content controls, without requiring
 source Card retrieval or leftover queue rows. At acceptance, the parent is the
 subject Card for ordinary verification, the Verifier for subjectless direct work,
-and the Repository for PR work and all members. Exact and family identity survive
+and the Repository for PR work and all members. Once the queue row is gone, an
+execution's accepted identity proves its parent; for work that never
+checkpointed, its retained input record does, and its newest terminal `status`
+event answers its status and terminal error. A status event never authorizes on
+its own. Exact and family identity survive
 with inputs, outputs, events, results, evidence and approvals. Unknown/inaccessible
 objects are indistinguishable; unprovable parents remain hidden even from admins.
 Parent visibility governs reads/downloads/lists/search/counts before aggregation

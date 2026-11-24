@@ -2640,6 +2640,64 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
 });
 
 /** Connect installation 101 from Settings as the signed-in administrator on `page`. */
+reviewing('TASK-006: an approver reads each waiting approval in the execution page and approves one and rejects another through its buttons', async ({ server }) => {
+  // Setup: `release-signoff` runs on pull request 7 of `acme/web`, parked on its `review` and `release` approvals and its deferred `ci` input.
+  const github = server.githubApp;
+  github.addInstallation(101, [{ id: 2, fullName: 'acme/web' }]);
+  github.addUser('octo', [101]);
+  github.signIn('octo');
+  github.installTarget(101);
+  const tenant = server.tenantSlug;
+  const adminKey = server.bootstrapService(['admin'], 'approval_ui_admin');
+  const admin = WyrdClient.connect({ credential: adminKey });
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const base = `${bff.url}/t/${tenant}`;
+    const page = await signIn(browser, bff.url, tenant, adminKey);
+    await connectGithub(page, base);
+    await (await Cards.connect({ client: admin })).declareFromPath(fixture('cards/approvals/repeated-repository.yaml'));
+    github.setPullRequest(2, 7, 'b2'.repeat(20), 'a1'.repeat(20));
+    const [executionId] = (await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '2', number: 7 }, 'task-006-browser')).executions;
+    const execution = await verify.Execution.connect(executionId, { client: admin });
+    const occurrences = async () => (await execution.status()).approvals ?? [];
+    await vi.waitFor(async () => expect((await occurrences()).map((each) => each.status)).toEqual(['pending', 'pending']), { timeout: 30_000, interval: 200 });
+    const [review, release] = await occurrences();
+
+    // The page says it waits for input, with no verdict, and marks both approval steps waiting.
+    await page.goto(`${base}/verify/executions/${executionId}?node=step%3Areview`);
+    const reviewBox = page.locator(`[data-approval="${review.approval_id}"]`);
+    await expect.poll(() => reviewBox.textContent()).toContain('Reviewed?');
+    expect(await page.locator('[data-verdict]').textContent()).toBe('no verdict recorded');
+    await expect.poll(() => page.getByText('Waiting for input').count()).toBe(1);
+    await captureRepositories(page, 'execution-approval-pending');
+
+    // Approve the review with a reason through its button: the receipt is reported and the reread shows it approved.
+    await reviewBox.getByLabel('Reason (optional)').fill('reviewed the diff');
+    await reviewBox.getByRole('button', { name: 'Approve' }).click();
+    await expect.poll(() => reviewBox.textContent(), { timeout: 30_000 }).toMatch(/Recorded approved by \S+ at \S+\. The same execution continues/);
+    await expect.poll(() => reviewBox.locator('[data-approval-status]').textContent()).toContain('approved');
+    expect(await reviewBox.getByRole('button', { name: 'Approve' }).count()).toBe(0);
+
+    // Reject the release with no reason from its own step, using the keyboard: only that occurrence is decided.
+    await page.goto(`${base}/verify/executions/${executionId}?node=step%3Arelease`);
+    const releaseBox = page.locator(`[data-approval="${release.approval_id}"]`);
+    await releaseBox.getByRole('button', { name: 'Reject' }).focus();
+    await page.keyboard.press('Enter');
+    await expect.poll(() => releaseBox.locator('[data-approval-status]').textContent(), { timeout: 30_000 }).toContain('rejected');
+    expect((await occurrences()).map((each) => [each.approval_id, each.status, each.reason])).toEqual([
+      [review.approval_id, 'approved', 'reviewed the diff'],
+      [release.approval_id, 'rejected', null]
+    ]);
+    expect((await execution.status()).execution_id).toBe(executionId);
+    await captureRepositories(page, 'execution-approval-decided');
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});
+
 async function connectGithub(page: Page, base: string) {
   await page.goto(`${base}/settings/integrations/github`);
   await page.getByRole('button', { name: 'Connect GitHub' }).click();

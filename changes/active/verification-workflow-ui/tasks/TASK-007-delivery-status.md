@@ -119,11 +119,26 @@ fixtures alone cannot establish queue-free retained projection.
    pass. Commit `5215b54d9`. **Mechanical deviation:** no owner deletes terminal
    `wyrd.verifier_executions` rows, so the server tier deletes the row directly
    and SDK/UI tiers use the new test seam `remove_settled_execution_row`.
-   **FAIL — open gap (see Handoff):** an execution cancelled before it ran
-   (superseded, closed, draft, access lost, public cancel of pending work,
-   refused member) writes no checkpoint, so after cleanup
-   `retained()` cannot prove its parent and returns
-   `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` even for the tenant admin.
+   Work that never checkpointed (superseded, draft, closed or access-lost
+   members; one claimed and fenced, the rest never ran): **RED** with
+   `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` after cleanup
+   (`pg_github_pull_requests.rs`, read after the queue-row delete). Fix
+   (commit `70f4d5b6d`, design `999245ba5`): input records now store the
+   subject's `subject_kind`/`subject_name` (read beside the queue row at
+   admission), each cancellation stores its queue error on its terminal
+   `status` event, and `retained()` proves the parent from the input record and
+   takes status/error from the newest terminal `status` event once the queue
+   row is gone; such work is read-only. **GREEN:** the end of
+   `pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook`
+   deletes all ten cancelled rows and asserts `status`, `error`,
+   `pull_request` and `github_delivery` unchanged
+   (`cmd('test(=pg_github_pull_requests::pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook)')`).
+   Regression: `-E 'test(/^pg_(github|durable_verifier_work|verification_|deferred_evidence)/)'`
+   197 passed; wyrd-sql `pg_verifier_executions` 42 passed; `wyrd-server --lib`
+   680 passed; `lints`, `check:tenant-isolation`, `check:deps`,
+   `git diff --check` clean. **Limit:** records written before `70f4d5b6d`
+   carry no subject kind/name, so such work stays hidden after cleanup;
+   refused PR members still record no error on their status event.
 
 
 2. **Preserve authority and public consumers.** Against those same retained
@@ -192,8 +207,10 @@ fixtures alone cannot establish queue-free retained projection.
    mapping). `mise run ui:check` GREEN (119 tests). Commit `ef5c858eb`.
    Real records: the uncommitted TASK-007 test in `ui-library.integration.test.ts`
    (`WYRD_UI_INTEGRATION=1`, `removeSettledExecutionRow`, Node and MCP executors,
-   Repository family viewer) is **FAIL**: the superseded member reads 404 after
-   cleanup (scenario 1 gap).
+   Repository family viewer) was **RED** (the superseded member read 404 after
+   cleanup) and is **GREEN** after `70f4d5b6d` with `ts:build:testing` rebuilt
+   (`uiInt('src/lib/ui-library.integration.test.ts', 'TASK-007')`); commit
+   `b0f398bf4`.
 
 
 4. **Follow actual provider outcomes without re-verifying.** Use existing

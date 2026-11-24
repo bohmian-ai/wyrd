@@ -37,6 +37,7 @@
   const ended = $derived(issue === PROBLEMS.disabled || issue === PROBLEMS.expired || issue === PROBLEMS.contactNoMail);
   const userError = $derived(local && checked && !username.trim() ? 'Enter a username.' : '');
   const pwError = $derived(local && checked ? passwordError(password) : '');
+  const contactError = $derived(contactSent || !contactEmail ? '' : emailError(contactEmail));
   const busy = $derived(phase !== 'idle');
 
   onMount(async () => {
@@ -126,7 +127,9 @@
       {:else}
         <form class="fields" novalidate onsubmit={sendContact}>
           <label for="contact-email">Email to confirm</label>
-          <input id="contact-email" class="app-input" type="email" autocomplete="email" bind:value={contactEmail} />
+          <input id="contact-email" class="app-input" type="email" autocomplete="email" bind:value={contactEmail}
+            aria-invalid={contactError ? 'true' : undefined} aria-describedby={contactError ? 'contact-error' : undefined} />
+          {#if contactError}<p class="field-error" id="contact-error">⊘ {contactError}</p>{/if}
           <button class="app-control wide" type="submit">Send a link</button>
         </form>
       {/if}
@@ -144,7 +147,7 @@
       <label for="slug">URL slug</label>
       <input id="slug" class="app-input mono" name="slug" required minlength="3" maxlength="63" autocomplete="off" autocapitalize="none" spellcheck="false" readonly={busy}
         aria-invalid={slugProblem || takenSlug ? 'true' : undefined}
-        aria-describedby="slug-url slug-hint{slugProblem ? ' slug-error' : ''}" bind:value={slug} oninput={reslug} />
+        aria-describedby="slug-url slug-hint{slugProblem ? ' slug-error' : ''}{takenSlug ? ' problem' : ''}" bind:value={slug} oninput={reslug} />
       <p id="slug-url">Workspace URL <code>/t/{slug || '<slug>'}</code></p>
       {#if slugProblem}
         <p class="field-error" id="slug-error">⊘ {slugProblem}</p>
@@ -162,7 +165,7 @@
         <PasswordInput id="password" name="password" required autocomplete="new-password" readonly={busy}
           aria-invalid={pwError ? 'true' : undefined} aria-describedby="password-hint{pwError ? ' password-error' : ''}" bind:value={password} />
         {#if pwError}<p class="field-error" id="password-error">⊘ {pwError}</p>{/if}
-        <p id="password-hint">15 to 128 characters; a passphrase of several words works well. You sign in to this workspace with this username and password.</p>
+        <p id="password-hint">15 to 128 characters. You sign in to this workspace with this username and password.</p>
       {/if}
 
       <button class="app-control primary wide" type="submit" disabled={busy} aria-busy={phase === 'creating' ? 'true' : undefined}>
@@ -182,5 +185,8 @@
   }
   [role='status']:empty {
     display: none;
+  }
+  button[type='submit'] {
+    margin-top: 6px;
   }
 </style>

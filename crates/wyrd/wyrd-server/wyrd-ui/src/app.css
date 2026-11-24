@@ -101,3 +101,18 @@ body {
 .app-problem code {
   font: 10px var(--font-mono);
 }
+
+/* Field-level refusal: aria-invalid marks the field; the ⊘ line beneath carries the reason in words. */
+.app-input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+.app-input[readonly] {
+  opacity: 0.6;
+}
+p.field-error,
+p.done {
+  color: var(--text);
+}
+.ok {
+  color: var(--ok);
+}

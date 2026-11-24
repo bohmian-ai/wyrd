@@ -17,12 +17,15 @@
     doneHeading,
     verify,
     restart,
+    problem = null,
     done
   }: {
     heading: string;
     doneHeading: string;
     verify: (proof: string) => Promise<WyrdProblem | null>;
     restart: [href: string, label: string];
+    /** A refusal after the proof was accepted, such as an expired list read. */
+    problem?: WyrdProblem | null;
     done: Snippet;
   } = $props();
 
@@ -46,7 +49,7 @@
   });
 </script>
 
-<Entry heading={phase === 'done' ? doneHeading : heading} {issue}>
+<Entry heading={phase === 'done' ? doneHeading : heading} issue={issue ?? problem}>
   {#if phase === 'checking'}
     <p class="center" role="status" aria-busy="true">Checking the link…</p>
   {:else if phase === 'paste'}

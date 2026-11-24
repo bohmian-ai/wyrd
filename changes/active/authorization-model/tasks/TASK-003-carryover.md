@@ -1346,6 +1346,33 @@ after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
    `/auth/device` ("Login approved"), the device code redeems, and the
    redeemed token reads `/v1/principals/me` as `teammate`. All 7 onboarding
    journey tests pass.
+7. **Mock alignment sweep.** Every onboarding page and state was screenshotted
+   from the production BFF over the real journey host (dark and light, 1280
+   and 390 wide) beside the mock's `selfcheck.mjs --shots` captures. Fixed:
+   the entry card's narrow-screen padding, underlined footer links, `<b>` and
+   inline `<code>` styling, and the shared field-refusal rules (invalid
+   border, read-only fade, `p.field-error`/`p.done`, `.ok`) now live once in
+   `app.css` as the mock defines them; the problem carries `id="problem"` so a
+   taken slug points at it; the workspace page's password hint is the mock's
+   words, its contact-email field shows its own refusal, and its submit button
+   has the mock's spacing; the reset page checks the new password's length in
+   place and shows "Setting password…"; the expired workspace list shows its
+   refusal in the card's problem slot; the Account section's "Sign in again"
+   state links to sign-in. Remaining deviations, each with its reason:
+   - "Signed in with GitHub as <email>" shows no address: `GET
+     /auth/signup/proof` reports only the method (approved reading 1).
+   - The workspace page shows "Checking this browser's sign-in…" while that
+     read is in flight; the mock knows the method synchronously.
+   - No Turnstile widget and no "below" in the challenge remediation, and the
+     workspace-limit remediation names no number: the public methods answer
+     carries no challenge site key and the refusal carries no cap.
+   - Password fields use the existing `PasswordInput` (with Show), the
+     component every production password field uses.
+   - A 5xx keeps the existing entry card's "✕ Sign-in unavailable" state; the
+     mock defines no server-failure state.
+   - The card sits 33px higher: the mock reserves that for its preview strip.
+   - The Recovery email section is as wide as the Account page's other
+     sections; the mock shows it alone on a placeholder page.
 
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and

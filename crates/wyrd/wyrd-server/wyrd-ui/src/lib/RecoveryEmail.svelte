@@ -48,8 +48,10 @@
       <code>{issue.code}</code>
     </div>
   {/if}
-  {#if sent}
-    <div class="stack"><CheckEmail address={email.trim()} onverify={async (code) => openProof(verifyPage, code)} again="?" /></div>
+  {#if issue === PROBLEMS.recent}
+    <a class="app-control primary" href="/t/{encodeURIComponent(tenant)}/login">Sign in again</a>
+  {:else if sent}
+    <div class="stack"><CheckEmail address={email.trim()} onverify={async (code) => openProof(verifyPage, code)} again="/t/{encodeURIComponent(tenant)}/settings/account" /></div>
   {:else if issue !== PROBLEMS.contactOff}
     <form class="stack" novalidate onsubmit={request}>
       <label for="recovery-email">Email</label>
@@ -81,13 +83,6 @@
     font: 12px/18px var(--font-sans);
     color: var(--muted);
   }
-  .field-error,
-  .stack :global(p.done) {
-    color: var(--text);
-  }
-  .stack :global(.ok) {
-    color: var(--ok);
-  }
   .stack {
     display: grid;
     gap: 8px;
@@ -110,10 +105,8 @@
   .stack :global(label) {
     font: var(--weight-strong) 11px var(--font-mono);
   }
+  a.app-control,
   button.app-control {
     justify-self: start;
-  }
-  [aria-invalid='true'] {
-    border-color: var(--danger);
   }
 </style>

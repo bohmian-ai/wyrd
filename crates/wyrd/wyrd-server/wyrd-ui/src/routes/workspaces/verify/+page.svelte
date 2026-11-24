@@ -37,11 +37,8 @@
 </script>
 
 <svelte:head><title>Your workspaces · Wyrd</title></svelte:head>
-<Proof heading="Find your workspaces" doneHeading="Your workspaces" {verify} restart={['/workspaces', 'Request a new link']}>
+<Proof heading="Find your workspaces" doneHeading="Your workspaces" {verify} restart={['/workspaces', 'Request a new link']} problem={issue}>
   {#snippet done()}
-    {#if issue}
-      <div class="app-problem" role="alert" data-state="unauthorized"><strong>⊘ {issue.title}</strong><p>{issue.remediation}</p></div>
-    {/if}
     {#if shown.length}
       <p class="center">Sign in to each workspace on its own page. This list stays readable for five minutes.</p>
       <ul aria-label="Workspaces for this address">

@@ -263,7 +263,7 @@ behavior remains test-first.
        panel.
      Asserted in [U1], [P1] and [B1] (`data-blocked`, `data-decision-notice`,
      `data-viewer-note`, `g.dep.awaited`, "not provided yet").
-   - Differences that remain, awaiting the maintainer's ruling:
+   - Differences that remain, with the maintainer's ruling (2026-11-24):
      1. Expires reads "with this execution · at its deadline, on cancellation,
         or when newer work supersedes it". There is no Requested row. The wire
         (`ApprovalOccurrenceState`) carries neither timestamp.
@@ -276,6 +276,9 @@ behavior remains test-first.
         and Action / Depends on / Invocation rows) is the earlier tasks' step
         inspector, which shows "Step review · Recorded invocations" and "No
         invocation of this step is recorded yet."; unchanged here.
+     Ruling: 1 and 2 are accepted as wire limits; no server change is made in
+     this change. 3 and 4 are follow-up fixes to the tasks that own the header
+     (TASK-005) and the step inspector (TASK-004/005), not TASK-006 scope.
    - Not reproduced: the integrated `development environment lifecycle`
      journey refuses to start while another local service holds port 8000.
      Every other journey in both integration files passed (24/24 and 21/22).

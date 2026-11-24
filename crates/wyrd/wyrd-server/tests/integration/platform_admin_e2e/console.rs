@@ -900,6 +900,137 @@ async fn a_registered_operator_signs_in_to_the_console_through_platform_oidc() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
 }
 
+/// Remove the platform OIDC connection through the API-token channel.
+///
+/// # Panics
+/// Panics when removal is refused.
+async fn remove_platform_oidc(srv: &WyrdTestServer, api: &str) {
+    let (status, body) = social_call(
+        srv,
+        social_request(Method::DELETE, "/platform/oidc/connection", Some(api), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Removing the platform OIDC connection ends its browser authority for
+/// good, however it is installed again:
+///   1. after removal and a reinstall at the same issuer, the old OIDC
+///      session stays refused, and a login or re-authentication begun before
+///      removal cannot finish, though the provider answers it;
+///   2. a password session and the API-token channel keep working, and a
+///      fresh OIDC sign-in succeeds;
+///   3. after removal and a reinstall at a different issuer, a session from
+///      the earlier connection stays refused.
+///
+/// # Panics
+/// Panics when an old session or login outlives removal, or a preserved way
+/// in stops working.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_platform_oidc_ends_its_sessions_for_good() {
+    let (srv, _root, api) = console_server().await;
+    let provider = wiremock::MockServer::start().await;
+    let issuer = provider.uri();
+    let mount =
+        |reply| super::mount_platform_provider(&provider, super::platform_key_set("mock-1"), reply);
+    let token_for =
+        |nonce: &str| super::platform_token_reply(&issuer, nonce, super::PLATFORM_CLIENT, "mock-1");
+    mount(wiremock::ResponseTemplate::new(500)).await;
+    configure_platform_oidc(&srv, &api, &issuer).await;
+    let (status, body) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/admins",
+            Some(&api),
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    register_password_operator(&srv, &api, "keeper").await;
+    let kept = signed_in(&srv, "keeper", OPERATOR_PASSWORD).await;
+
+    let oidc_session = |begun: BegunOidc| {
+        let (srv, issuer) = (&srv, &issuer);
+        async move {
+            let reply = oidc_callback(srv, &[&begun.binding], &begun.state, issuer).await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+            reply.cookie(PLATFORM_COOKIE).expect("platform cookie")
+        }
+    };
+    let begun = begin_oidc(&srv).await;
+    mount(token_for(&begun.nonce)).await;
+    let session = oidc_session(begun).await;
+    let pending = begin_oidc(&srv).await;
+    let reply = browser(
+        &srv,
+        Method::POST,
+        "/platform/browser/oidc/reauth",
+        &[&session],
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let reauth_binding = reply.cookie(LOGIN_COOKIE).expect("reauth binding");
+    let reauth_url = url::Url::parse(reply.body["authorization_url"].as_str().expect("url"))
+        .expect("url parses");
+    let reauth: std::collections::HashMap<String, String> =
+        reauth_url.query_pairs().into_owned().collect();
+
+    // 1. Same-issuer reinstall revives nothing begun before removal.
+    remove_platform_oidc(&srv, &api).await;
+    configure_platform_oidc(&srv, &api, &issuer).await;
+    assert_eq!(
+        session_status(&srv, &session).await,
+        StatusCode::UNAUTHORIZED
+    );
+    mount(token_for(&pending.nonce)).await;
+    let reply = oidc_callback(&srv, &[&pending.binding], &pending.state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert!(reply.cookie(PLATFORM_COOKIE).is_none());
+    mount(token_for(&reauth["nonce"])).await;
+    let reply = oidc_callback(
+        &srv,
+        &[&session, &reauth_binding],
+        &reauth["state"],
+        &issuer,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert_eq!(
+        session_status(&srv, &session).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 2. Password and API-token access survive; a fresh sign-in works.
+    assert_eq!(session_status(&srv, &kept).await, StatusCode::OK);
+    let (status, body) = social_call(
+        &srv,
+        social_request(Method::GET, "/platform/tenants", Some(&api), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let begun = begin_oidc(&srv).await;
+    mount(token_for(&begun.nonce)).await;
+    let fresh = oidc_session(begun).await;
+    assert_eq!(session_status(&srv, &fresh).await, StatusCode::OK);
+
+    // 3. A reinstall at another issuer does not revive it either.
+    remove_platform_oidc(&srv, &api).await;
+    let elsewhere = wiremock::MockServer::start().await;
+    super::mount_platform_provider(
+        &elsewhere,
+        super::platform_key_set("mock-2"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    configure_platform_oidc(&srv, &api, &elsewhere.uri()).await;
+    assert_eq!(session_status(&srv, &fresh).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(session_status(&srv, &kept).await, StatusCode::OK);
+}
+
 /// Make the session `cookie` names hold no fresh proof, as if its last
 /// sign-in or re-authentication were six minutes ago.
 ///

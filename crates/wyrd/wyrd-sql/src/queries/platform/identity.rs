@@ -132,18 +132,32 @@ pub async fn upsert_platform_oidc_connection(
 
 /// Remove the platform OIDC connection.
 ///
-/// Returns whether a connection was present. Removal never touches platform
-/// principals or their grants: federated login is an additional way in, and
-/// taking it away must leave the global credential working.
+/// Returns whether a connection was present. Removing one also revokes every
+/// platform browser session it anchored and deletes every unfinished platform
+/// login and re-authentication, in the same statement: a reinstall starts
+/// again at revision 1, so the revision alone cannot keep them ended. Removal
+/// never touches password sessions, platform principals or their grants:
+/// federated login is an additional way in, and taking it away must leave the
+/// global credential working.
 ///
 /// # Errors
-/// Returns [`SqlError::Query`] when the delete fails.
+/// Returns [`SqlError::Query`] when the statement fails.
 pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Result<bool, SqlError> {
-    sqlx::query("DELETE FROM platform.oidc_connection")
-        .execute(&mut **conn.transaction())
-        .await
-        .map(|done| done.rows_affected() > 0)
-        .map_err(SqlError::from)
+    sqlx::query_scalar(
+        "WITH removed AS (
+             DELETE FROM platform.oidc_connection RETURNING revision
+         ), logins AS (
+             DELETE FROM platform.login_state WHERE EXISTS (SELECT 1 FROM removed)
+         ), sessions AS (
+             UPDATE platform.browser_sessions SET revoked_at = statement_timestamp()
+              WHERE connection_revision IS NOT NULL AND revoked_at IS NULL
+                AND EXISTS (SELECT 1 FROM removed)
+         )
+         SELECT EXISTS (SELECT 1 FROM removed)",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
 }
 
 /// Compare-and-swap of the platform connection's sealed secret.

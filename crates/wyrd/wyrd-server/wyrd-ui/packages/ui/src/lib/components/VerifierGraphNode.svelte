@@ -29,14 +29,14 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
   import { getContext } from 'svelte';
+  import StatusMark from './StatusMark.svelte';
 
   let { data }: { data: GraphNodeData } = $props();
   const graph = getContext<GraphSelection>(SELECTION);
-  const GLYPHS = { neutral: '○', ok: '✓', warn: '!', danger: '✕', running: '●' } as const;
 </script>
 
 {#snippet recorded(state: NodeState | undefined)}
-  {#if state}<span class="state" data-status={state.word} data-tone={state.tone}><span aria-hidden="true">{GLYPHS[state.tone]}</span> {state.word}</span>{/if}
+  {#if state}<span class="state" data-status={state.value}><StatusMark value={state.value} label={state.word} /></span>{/if}
 {/snippet}
 
 {#if data.type === 'stage'}
@@ -142,24 +142,8 @@
     color: var(--muted);
   }
   .state {
-    --tone: var(--muted);
     flex: none;
     margin-left: auto;
-    color: var(--tone);
-    font: 11px var(--font-mono);
-    white-space: nowrap;
-  }
-  .state[data-tone='ok'] {
-    --tone: var(--ok);
-  }
-  .state[data-tone='warn'] {
-    --tone: var(--warn);
-  }
-  .state[data-tone='danger'] {
-    --tone: var(--danger);
-  }
-  .state[data-tone='running'] {
-    --tone: var(--declare);
   }
   .state + .kind {
     margin-left: 0;

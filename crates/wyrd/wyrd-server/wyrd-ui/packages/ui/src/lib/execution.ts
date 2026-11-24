@@ -252,10 +252,14 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
   };
 }
 
-/** A recorded state as its node shows it: a word, the tone its glyph and colour follow, and whether it recedes. */
+/**
+ * A recorded state as its node shows it: the `EXECUTION_MARKS` value its glyph,
+ * word and tone come from, the words that replace that word when items differ,
+ * and whether it recedes.
+ */
 export interface NodeState {
-  readonly word: string;
-  readonly tone: 'neutral' | 'ok' | 'warn' | 'danger' | 'running';
+  readonly value: string;
+  readonly word?: string;
   readonly dim?: boolean;
 }
 
@@ -273,13 +277,11 @@ export function attemptsOf(items: readonly Invocation[], step: string): Invocati
   return [...last.values()];
 }
 
-const OUTCOME_TONES = { passed: 'ok', failed: 'danger', inconclusive: 'warn', not_applicable: 'neutral' } as const;
-const STEP_TONES = { succeeded: 'ok', failed: 'danger', skipped: 'neutral' } as const;
-
-/** One word for several recorded values: the value they share, else how many of them are `bad`. */
-function together(values: readonly string[], bad: string): string {
-  if (new Set(values).size === 1) return values[0].replace('_', ' ');
-  return `${values.filter((value) => value === bad).length} of ${values.length} ${bad}`;
+/** One state for several recorded values: the value they share, else a failure, counted, when any failed. */
+function together(values: readonly string[]): Pick<NodeState, 'value' | 'word'> {
+  if (new Set(values).size === 1) return { value: values[0] };
+  const failed = values.filter((value) => value === 'failed').length;
+  return { value: failed ? 'failed' : values[0], word: `${failed} of ${values.length} failed` };
 }
 
 /**
@@ -290,7 +292,7 @@ function together(values: readonly string[], bad: string): string {
  */
 export function executionStates(graph: DefinitionGraph, status: VerificationExecutionState, items: readonly Invocation[]): Record<string, NodeState> {
   const done = settled(status.status);
-  const idle: NodeState = { word: done ? 'not run' : 'pending', tone: 'neutral', dim: done };
+  const idle: NodeState = { value: done ? 'not run' : 'not started', dim: done };
   const states: Record<string, NodeState> = {};
   for (const step of graph.steps) {
     const latest = new Map<string, Invocation>();
@@ -299,18 +301,17 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
     const speculation = last.find((item) => item.speculation !== 'none')?.speculation;
     const dim = speculation === 'discarded' || speculation === 'blocked';
     if (last.length === 0) states[step.key] = idle;
-    else if (last.some((item) => item.state === 'started')) states[step.key] = done ? { word: 'not finished', tone: 'neutral', dim: true } : { word: 'running', tone: 'running', dim };
+    else if (last.some((item) => item.state === 'started')) states[step.key] = done ? { value: 'not finished', dim: true } : { value: 'running', dim };
     else {
       const recorded = last.map((item) => (item.state === 'action' ? item.status : item.state === 'requirement' ? item.outcome : 'started'));
-      const word = together(recorded, 'failed');
-      states[step.key] = { word, tone: recorded.includes('failed') ? 'danger' : (STEP_TONES[recorded[0] as keyof typeof STEP_TONES] ?? 'neutral'), dim };
+      states[step.key] = { ...together(recorded), dim };
     }
   }
   for (const requirement of [...graph.steps.flatMap((step) => step.requirements), ...graph.requirements]) {
     const judged = status.result?.outcome.requirements.filter((each) => each.id === requirement.id).map((each) => each.outcome);
     const recorded = judged?.length ? judged : attemptsOf(items, requirement.id).flatMap((item) => (item.state === 'requirement' ? [item.outcome] : []));
-    if (recorded.length === 0) states[requirement.key] = { word: 'not judged', tone: 'neutral', dim: done };
-    else states[requirement.key] = { word: together(recorded, 'failed'), tone: recorded.includes('failed') ? 'danger' : OUTCOME_TONES[recorded[0]] };
+    if (recorded.length === 0) states[requirement.key] = { value: 'not judged', dim: done };
+    else states[requirement.key] = together(recorded);
   }
   return states;
 }

@@ -383,6 +383,21 @@ proof, not manufactured failures.
      `ui:check` exit 0; mock `selfcheck.mjs` passed; [U1] library 22
      passed; [D2]-file Verify, execution, Alice and exact-execution journeys 4
      passed.
+   - One mapping for every execution value (maintainer decision, 2026-11-24:
+     "one mapping", the mock's `ACTION`/`OUTCOME` marks). `EXECUTION_MARKS`
+     (`observe.ts`) replaces `EXECUTION_STATUS` and `EXECUTION_VERDICT` and
+     also names step statuses, requirement outcomes, drift words and the
+     graph's not-started, not-run, not-finished and not-judged states;
+     `StatusMark` (`value`, `badge`, `label`) draws it in the graph nodes,
+     the inspector's outcome and the drift table too. Deleted:
+     `execution.ts` `OUTCOME_TONES`/`STEP_TONES`, the node's `GLYPHS` and
+     tone CSS, `VerificationExecution` `OUTCOME_TONES`/`DRIFT_TONES`.
+     Inconclusive reads `?` muted, skipped and not applicable `–` muted, an
+     idle step "not started". RED: [U2] "execution states mark…" received
+     `{ word: 'pending', tone: 'neutral' }`; "an execution reads with one
+     mark per recorded value…" `expected [] to deeply equal [['✓succeeded',
+     'ok']]`. GREEN: [U2] 47 passed; `mise run ui:check` 113 passed; [D2]
+     exact-execution and exact-Verifier journeys 2 passed.
    - Diagnosis: the Verify journey ("the Verify dashboard filters…",
      `ui-pages.integration.test.ts:1969`) failed with the first row's status
      `○queued` → `●running` after Back. Codex `gpt-6.1-sol` medium,
@@ -441,8 +456,8 @@ proof, not manufactured failures.
      Fix site: none in code; `mise exec -- cargo build --locked -p wyrd-cli
      --bin wyrd`, then [D2] 1 passed. No diagnostician: the fix touches no
      test, timing or code.
-   - Status: navigation and hosts PASS. FAIL (open): AC-009 is not met until
-     the maintainer rules on each listed mock difference.
+   - Status: PASS. AC-009: the maintainer accepted the listed mock
+     differences (2026-11-24).
 
 ## Verification and handoff
 

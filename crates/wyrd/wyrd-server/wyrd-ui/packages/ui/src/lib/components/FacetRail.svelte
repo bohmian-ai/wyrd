@@ -13,7 +13,7 @@
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
-  import { EXECUTION_STATUS, FACET_VALUES, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
+  import { EXECUTION_MARKS, FACET_VALUES, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { numeric } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
@@ -60,7 +60,7 @@
                     class:error={failing(column, value) || (column === 'status_code' && value !== null && numeric(value) === 2) || (column === 'severity_text' && severityLevel(number) === 'error')}
                     class:warn={column === 'severity_text' && severityLevel(number) === 'warn'}
                      title={labels[String(value)] ? String(value) : undefined}
-                    >{value === null ? (column === 'verdict' ? 'no recorded verdict' : 'not set') : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : column === 'status' && input.signal === 'executions' ? (EXECUTION_STATUS[String(value)]?.[1] ?? String(value)) : (labels[String(value)] ?? String(value))}</span
+                    >{value === null ? (column === 'verdict' ? 'no recorded verdict' : 'not set') : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : column === 'status' && input.signal === 'executions' ? (EXECUTION_MARKS[String(value)]?.[1] ?? String(value)) : (labels[String(value)] ?? String(value))}</span
                   >
                   <span class="count">{fmtCount(numeric(n))}</span>
                 </button>

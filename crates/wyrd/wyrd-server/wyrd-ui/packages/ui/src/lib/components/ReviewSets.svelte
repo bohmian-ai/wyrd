@@ -121,8 +121,8 @@
                 <tr>
                   <td><div class="cellbox">{@render nav({ name: 'record.open', input: { execution_id: member.execution_id } }, fmtShortId(member.execution_id), member.execution_id)}</div></td>
                   <td><div class="cellbox">{#if verifier && definition}{@render nav({ name: 'card.open', input: { card_ref: definition } }, labels[verifier], verifier)}{:else if verifier}<span class="mono" title={verifier}>{fmtShortId(verifier)}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
-                  <td><div class="cellbox">{#if member.status}<StatusMark status={member.status} />{:else}<span class="muted">record not retained</span>{/if}</div></td>
-                  <td><div class="cellbox">{#if member.verdict}<StatusMark verdict={member.verdict} />{:else}<span class="muted">none</span>{/if}</div></td>
+                  <td><div class="cellbox">{#if member.status}<StatusMark value={member.status} />{:else}<span class="muted">record not retained</span>{/if}</div></td>
+                  <td><div class="cellbox">{#if member.verdict}<StatusMark value={member.verdict} badge />{:else}<span class="muted">none</span>{/if}</div></td>
                   <td><div class="cellbox">{#if member.failed.length}<span class="mono c-danger">{member.failed.join(', ')}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
                 </tr>
               {/each}

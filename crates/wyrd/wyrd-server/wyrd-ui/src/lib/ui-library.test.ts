@@ -521,7 +521,7 @@ test('TASK-003: Validated portable rendering', async () => {
     chip.unmount();
   }
   for (const [verdict, text] of [['passed', '✓passed'], ['failed', '✕failed'], ['inconclusive', '?inconclusive']] as const) {
-    const pill = render(StatusMark, { verdict });
+    const pill = render(StatusMark, { value: verdict, badge: true });
     expect(pill.container).toHaveTextContent(text);
     pill.unmount();
   }
@@ -2990,25 +2990,25 @@ test('execution states mark the declared graph with recorded progress', () => {
   // Running: the last attempt of a retried step counts, a started step runs, the rest wait; nothing is judged.
   const running = executionStates(graph, executionStatus.exec_running, [invocation('read-photo', ok), invocation('score', bad), invocation('score', ok, 2), invocation('classify', { state: 'started' })]);
   expect(running).toEqual({
-    'step:read-photo': { word: 'succeeded', tone: 'ok', dim: false },
-    'step:score': { word: 'succeeded', tone: 'ok', dim: false },
-    'step:classify': { word: 'running', tone: 'running', dim: false },
-    'step:summarise': { word: 'pending', tone: 'neutral', dim: false },
-    'req:classified': { word: 'not judged', tone: 'neutral', dim: false },
-    'req:policy-followed': { word: 'not judged', tone: 'neutral', dim: false },
-    'req:has-answer': { word: 'not judged', tone: 'neutral', dim: false }
+    'step:read-photo': { value: 'succeeded', dim: false },
+    'step:score': { value: 'succeeded', dim: false },
+    'step:classify': { value: 'running', dim: false },
+    'step:summarise': { value: 'not started', dim: false },
+    'req:classified': { value: 'not judged', dim: false },
+    'req:policy-followed': { value: 'not judged', dim: false },
+    'req:has-answer': { value: 'not judged', dim: false }
   });
   // Settled: the compact result judges requirements; a step that never ran says so, and a started step is not running.
   const settled = executionStates(graph, executionStatus.exec_settled, [invocation('read-photo', { state: 'action', status: 'skipped' }), invocation('classify', { state: 'started' })]);
   expect(settled).toMatchObject({
-    'step:read-photo': { word: 'skipped', tone: 'neutral' },
-    'step:score': { word: 'not run', dim: true },
-    'step:classify': { word: 'not finished', dim: true },
-    'req:classified': { word: 'passed', tone: 'ok' },
-    'req:policy-followed': { word: 'failed', tone: 'danger' }
+    'step:read-photo': { value: 'skipped' },
+    'step:score': { value: 'not run', dim: true },
+    'step:classify': { value: 'not finished', dim: true },
+    'req:classified': { value: 'passed' },
+    'req:policy-followed': { value: 'failed' }
   });
   // Before a result is visible a recorded requirement attempt is the judgment shown.
-  expect(executionStates(graph, executionStatus.exec_running, [invocation('policy-followed', { state: 'requirement', outcome: 'inconclusive' })])['req:policy-followed']).toEqual({ word: 'inconclusive', tone: 'warn' });
+  expect(executionStates(graph, executionStatus.exec_running, [invocation('policy-followed', { state: 'requirement', outcome: 'inconclusive' })])['req:policy-followed']).toEqual({ value: 'inconclusive' });
   // Fan-out and repetition stay one node: mixed items count failures; a discarded speculative step recedes.
   const fanned = executionStates(graph, executionStatus.exec_running, [
     invocation('score', ok, 1, 0, 0),
@@ -3017,8 +3017,8 @@ test('execution states mark the declared graph with recorded progress', () => {
     invocation('score', bad, 1, 2, 0),
     invocation('classify', { ...ok, speculation: 'discarded' })
   ]);
-  expect(fanned['step:score']).toEqual({ word: '2 of 4 failed', tone: 'danger', dim: false });
-  expect(fanned['step:classify']).toEqual({ word: 'succeeded', tone: 'ok', dim: true });
+  expect(fanned['step:score']).toEqual({ value: 'failed', word: '2 of 4 failed', dim: false });
+  expect(fanned['step:classify']).toEqual({ value: 'succeeded', dim: true });
 });
 
 test('execution inspector shows recorded state, judgments and outputs as separate facts', async () => {
@@ -3055,8 +3055,8 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(roomy.nodes.map((each) => [each.key, each.height])).toEqual(bare.nodes.map((each) => [each.key, each.height]));
   for (const [index, each] of roomy.nodes.entries()) expect(each.width - bare.nodes[index].width, each.key).toBeGreaterThanOrEqual(0);
   expect(roomy.width).toBeGreaterThan(bare.width);
-  expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('✓ succeeded');
-  expect(node('req:policy-followed').querySelector('[data-status]')).toHaveTextContent('✕ failed');
+  expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('✓succeeded');
+  expect(node('req:policy-followed').querySelector('[data-status]')).toHaveTextContent('✕failed');
   expect(shown.container).toHaveTextContent('Declared dependencies, marked with recorded state.');
 
   // Selecting a node is a host action carrying the whole shareable selection, and shows at once.
@@ -3143,7 +3143,7 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(running.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
   expect(running.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
   expect(running.container).toHaveTextContent('0 of 3 requirements');
-  expect(running.container.querySelector('[data-node="step:classify"] [data-status]')).toHaveTextContent('● running');
+  expect(running.container.querySelector('[data-node="step:classify"] [data-status]')).toHaveTextContent('●running');
   expect(within(running.container).getByRole('region', { name: 'Requirement has-answer' })).toHaveTextContent('Not judged yet.');
   expect(running.container.querySelector('[data-part="Completed details"]')).toHaveTextContent('Details are recorded when the execution completes with a visible result.');
   const cancel = within(running.container).getByRole('button', { name: /Cancel execution/ });
@@ -3185,9 +3185,9 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   const drift = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' })), onaction });
   const table = within(drift.container).getByRole('region', { name: 'Drift features' });
   expect([...table.querySelectorAll('tbody tr')].map((row) => [row.getAttribute('data-feature'), ...[...row.querySelectorAll('td')].slice(1, 4).map((cell) => cell.textContent?.trim())])).toEqual([
-    ['latency_ms', expect.stringContaining('drift'), '0.31', '0.25'],
-    ['cost', expect.stringContaining('inconclusive'), '—', '—'],
-    ['tokens', expect.stringContaining('no drift'), '0.04', '0.25']
+    ['latency_ms', '✕drift', '0.31', '0.25'],
+    ['cost', '?inconclusive', '—', '—'],
+    ['tokens', '✓no drift', '0.04', '0.25']
   ]);
   const spark = table.querySelector('[data-feature="latency_ms"] svg') as SVGElement;
   expect(spark).toHaveAttribute('aria-label', 'latency_ms: 4 recorded scores, this window marked');
@@ -3343,7 +3343,7 @@ test('JSON and YAML blocks are coloured by syntax role without changing their te
   expect(tomlOf('string')).toEqual(['"./review/pr-review.yaml"', '"pull_request"']);
 });
 
-test('an execution reads with one status and verdict mark, in one tone, on Verify, a review set and its own page', async () => {
+test('an execution reads with one mark per recorded value, in one tone, on Verify, a review set, its graph and its inspector', async () => {
   /** Each status or verdict mark under `root`: its text and tone. */
   const marks = (root: Element) => [...root.querySelectorAll('[data-tone]')].map((mark) => [mark.textContent?.trim(), mark.getAttribute('data-tone')]);
 
@@ -3370,7 +3370,21 @@ test('an execution reads with one status and verdict mark, in one tone, on Verif
   const page = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureExecutor }));
   const facts = page.container.querySelector('[data-execution-status]')?.closest('dl') as Element;
   expect(marks(facts)).toEqual([['■completed', 'ok'], ['✕failed', 'danger']]);
+  // Its graph and inspector draw from the same mapping: a step, a requirement and its outcome.
+  const node = (key: string) => page.container.querySelector(`[data-node="${key}"] [data-status]`) as Element;
+  expect(marks(node('step:score'))).toEqual([['✓succeeded', 'ok']]);
+  expect(marks(node('req:policy-followed'))).toEqual([['✕failed', 'danger']]);
+  expect(marks(page.getByRole('region', { name: 'Requirement policy-followed' }))).toContainEqual(['✕failed', 'danger']);
   page.unmount();
+
+  // Values only a graph records read the same way: inconclusive is muted, a skipped step and a requirement that did not apply recede.
+  const shown = render(StatusMark, { value: 'inconclusive' });
+  expect(marks(shown.container)).toEqual([['?inconclusive', 'muted']]);
+  for (const [value, text] of [['skipped', '–skipped'], ['not_applicable', '–not applicable'], ['not started', '○not started'], ['no drift', '✓no drift'], ['drift', '✕drift']]) {
+    await shown.rerender({ value });
+    expect(marks(shown.container), value).toEqual([[text, value === 'no drift' ? 'ok' : value === 'drift' ? 'danger' : 'muted']]);
+  }
+  shown.unmount();
 });
 
 test('an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution', async () => {

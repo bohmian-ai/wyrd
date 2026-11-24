@@ -16,7 +16,6 @@
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
   import Panel from './Panel.svelte';
-  import StatusPill, { type Tone } from './StatusPill.svelte';
   import StatusMark from './StatusMark.svelte';
   import VerifierGraph from './VerifierGraph.svelte';
 
@@ -45,8 +44,6 @@
     onaction?.({ name: 'execution.select', input: value });
   }
 
-  const OUTCOME_TONES: Record<CardTypes.RequirementOutcome, Tone> = { passed: 'ok', failed: 'danger', inconclusive: 'warn', not_applicable: 'neutral' };
-  const DRIFT_TONES: Record<CardTypes.DriftVerdict, Tone> = { NoDrift: 'ok', Drift: 'danger', Inconclusive: 'warn' };
   const DRIFT_WORDS: Record<CardTypes.DriftVerdict, string> = { NoDrift: 'no drift', Drift: 'drift', Inconclusive: 'inconclusive' };
   const WORDS = { input: 'Input', step: 'Step', req: 'Requirement' } as const;
   /** The most characters of one JSON or text value a preview draws. */
@@ -155,7 +152,7 @@
             {@const y = (score: number) => 22 - (score / top) * 20}
             <tr data-feature={feature.feature}>
               <td>{feature.feature}</td>
-              <td><StatusPill tone={DRIFT_TONES[feature.verdict]} label={DRIFT_WORDS[feature.verdict]} /></td>
+              <td><StatusMark value={DRIFT_WORDS[feature.verdict]} /></td>
               <td>{feature.score ?? '—'}</td>
               <td>{feature.threshold ?? '—'}</td>
               <td>
@@ -246,11 +243,11 @@
         {/if}
       {/snippet}
       <dl class="summary">
-        <div class="fact"><dt>Status</dt><dd data-execution-status={status.status}><StatusMark status={status.status} /></dd></div>
+        <div class="fact"><dt>Status</dt><dd data-execution-status={status.status}><StatusMark value={status.status} /></dd></div>
         <div class="fact">
           <dt>Verdict</dt>
           <dd data-verdict={status.result?.outcome.verdict ?? ''}>
-            {#if status.result}<StatusMark verdict={status.result.outcome.verdict} />{:else}<span class="muted">no verdict recorded</span>{/if}
+            {#if status.result}<StatusMark value={status.result.outcome.verdict} badge />{:else}<span class="muted">no verdict recorded</span>{/if}
           </dd>
         </div>
         {#if definition}<div class="fact"><dt>Judged</dt><dd>{judged} of {declared} requirements</dd></div>{/if}
@@ -428,7 +425,7 @@
           {#each judgments as each, index (index)}
             <div class="judgment" data-outcome={each.outcome}>
               <dl>
-                <div class="fact"><dt>Outcome</dt><dd><StatusPill tone={OUTCOME_TONES[each.outcome]} label={each.outcome.replace('_', ' ')} /></dd></div>
+                <div class="fact"><dt>Outcome</dt><dd><StatusMark value={each.outcome} /></dd></div>
                 {@render fact('Statement', each.statement)}
                 {@render fact('Reason', each.reason)}
                 {@render fact('Judged', [each.step ? `step ${each.step}` : '', each.item_index == null ? '' : `item ${each.item_index}`, each.iteration_index == null ? '' : `iteration ${each.iteration_index}`].filter(Boolean).join(' · '))}
@@ -464,8 +461,8 @@
               <li>
                 <button type="button" class="open" disabled={off('execution.open')} onclick={() => onaction?.({ name: 'execution.open', input: { execution_id: member.execution_id } })}>{member.execution_id}</button>
                 {#if member.status?.state === 'populated'}
-                  <StatusMark status={member.status.data.status} />
-                  {#if member.status.data.result}<StatusMark verdict={member.status.data.result.outcome.verdict} />{/if}
+                  <StatusMark value={member.status.data.status} />
+                  {#if member.status.data.result}<StatusMark value={member.status.data.result.outcome.verdict} badge />{/if}
                 {:else if member.status && member.status.state !== 'empty'}
                   <span class="muted">{member.status.problem.title} ({member.status.problem.code})</span>
                 {:else}

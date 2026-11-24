@@ -1198,8 +1198,13 @@ export const NO_VERDICT = 'no verdict';
 
 /** How an execution status or recorded verdict reads: its glyph, its words and its tone. Hue is never the only channel. */
 export type ExecutionMark = readonly [glyph: string, label: string, tone: 'text' | 'muted' | 'run' | 'ok' | 'warn' | 'danger'];
-/** Every retained execution status. `pending` is work accepted and not yet started, which a reader knows as queued. */
-export const EXECUTION_STATUS: Readonly<Record<string, ExecutionMark>> = {
+/**
+ * The one mark of every recorded execution value: an execution's status (`pending`
+ * is work accepted and not yet started, which a reader knows as queued), its
+ * verdict, a step's status, a requirement's outcome, a drift verdict's word,
+ * and the graph's words for a node with nothing recorded yet.
+ */
+export const EXECUTION_MARKS: Readonly<Record<string, ExecutionMark>> = {
   pending: ['○', 'queued', 'muted'],
   running: ['●', 'running', 'run'],
   retrying: ['↻', 'retrying', 'run'],
@@ -1208,14 +1213,22 @@ export const EXECUTION_STATUS: Readonly<Record<string, ExecutionMark>> = {
   errored: ['✕', 'errored', 'danger'],
   timed_out: ['⧗', 'timed out', 'warn'],
   cancelled: ['⊘', 'cancelled', 'muted'],
-  'not recorded': ['○', 'not recorded', 'muted']
-};
-/** Every recorded verdict. */
-export const EXECUTION_VERDICT: Readonly<Record<string, ExecutionMark>> = {
+  'not recorded': ['○', 'not recorded', 'muted'],
   passed: ['✓', 'passed', 'ok'],
   failed: ['✕', 'failed', 'danger'],
-  inconclusive: ['?', 'inconclusive', 'muted']
+  inconclusive: ['?', 'inconclusive', 'muted'],
+  succeeded: ['✓', 'succeeded', 'ok'],
+  skipped: ['–', 'skipped', 'muted'],
+  not_applicable: ['–', 'not applicable', 'muted'],
+  'no drift': ['✓', 'no drift', 'ok'],
+  drift: ['✕', 'drift', 'danger'],
+  'not started': ['○', 'not started', 'muted'],
+  'not run': ['○', 'not run', 'muted'],
+  'not finished': ['○', 'not finished', 'muted'],
+  'not judged': ['○', 'not judged', 'muted']
 };
+/** The verdicts an execution records, in the order a summary counts them. */
+export const EXECUTION_VERDICTS = ['passed', 'failed', 'inconclusive'] as const;
 
 /** How many Verifiers the Verifier chart keys by name; the rest share one series, so its key stays on one line. */
 export const NAMED_VERIFIERS = 3;

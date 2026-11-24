@@ -37,7 +37,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { EXECUTION_VERDICT, KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
+  import { EXECUTION_VERDICTS, KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
@@ -78,7 +78,7 @@
   function tally(members: readonly (readonly unknown[])[]) {
     const at = rows ? columnIndex(rows, 'verdict') : -1;
     const n = (verdict: string | null) => members.filter((row) => row[at] === verdict).length;
-    return [counted(members.length), ...Object.keys(EXECUTION_VERDICT).filter((verdict) => n(verdict)).map((verdict) => `${n(verdict)} ${verdict}`), ...(n(null) ? [`${n(null)} no verdict`] : [])].join(' · ');
+    return [counted(members.length), ...EXECUTION_VERDICTS.filter((verdict) => n(verdict)).map((verdict) => `${n(verdict)} ${verdict}`), ...(n(null) ? [`${n(null)} no verdict`] : [])].join(' · ');
   }
   /** The executions table's `min-width` in its style: below it the table scrolls sideways and the foot says so. */
   const EXECUTIONS_MIN = 880;
@@ -349,9 +349,9 @@
                     {@const value = row[columnIndex(rows, column)]}
                     {#if column === extrasBefore}{@render extras(rows, row, traceCounts)}{/if}<td class:name={signal && column === 'name'} class={pinned(column)}>
                       {#if signal === 'executions' && column === 'verdict'}
-                        {#if EXECUTION_VERDICT[String(value)]}<StatusMark verdict={String(value)} />{:else}<span class="null">none</span>{/if}
+                        {#if value != null}<StatusMark value={String(value)} badge />{:else}<span class="null">none</span>{/if}
                       {:else if signal === 'executions' && column === 'status'}
-                        <StatusMark status={String(value)} title={value === 'not recorded' ? UNSETTLED : undefined} />
+                        <StatusMark value={String(value)} title={value === 'not recorded' ? UNSETTLED : undefined} />
                       {:else if signal === 'executions' && column === 'pull_request' && typeof value === 'string'}
                         <button type="button" class="pull" title="Open the review sets of {value}" onclick={(event) => (event.stopPropagation(), openPull(value, row[columnIndex(rows, 'review_set')]))}>{value}</button>
                       {:else if signal === 'executions' && column === 'head' && typeof value === 'string'}

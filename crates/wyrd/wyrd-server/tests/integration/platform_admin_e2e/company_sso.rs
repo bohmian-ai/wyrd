@@ -896,3 +896,129 @@ async fn required_sso_refuses_every_later_password_and_social_step() {
     assert!(token["access_token"].is_string());
     workspace.company_session("corp-member", &[]).await;
 }
+
+impl Workspace {
+    /// Approve a new device code from `cookie` and redeem it; returns the
+    /// refresh token.
+    ///
+    /// # Panics
+    /// Panics when approval or redemption is refused.
+    async fn refresh_family(&self, cookie: &str) -> String {
+        let (device_code, user_code) = self.device().await;
+        assert_eq!(self.approve(cookie, &user_code).await, StatusCode::OK);
+        let (status, token) = self.redeem(&device_code).await;
+        assert_eq!(status, StatusCode::OK, "redemption: {token}");
+        token["refresh_token"]
+            .as_str()
+            .expect("a refresh token")
+            .to_owned()
+    }
+}
+
+/// Renew `refresh_token` on `srv`; returns the status and the rotated token.
+async fn renew(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode, Option<String>) {
+    let resp = srv
+        .oneshot(form_post(
+            "/auth/token",
+            None,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", "wyrd-cli"),
+            ],
+        ))
+        .await
+        .expect("token responds");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    (status, body["refresh_token"].as_str().map(str::to_owned))
+}
+
+/// Whether the session `cookie` of `slug` is live on `srv`.
+async fn live_on(srv: &WyrdTestServer, slug: &str, cookie: &str) -> bool {
+    let uri = format!("/auth/browser/session?tenant={slug}");
+    srv.oneshot(browser_request(Method::GET, &uri, Some(cookie), None))
+        .await
+        .expect("session responds")
+        .status()
+        == StatusCode::OK
+}
+
+/// Existing credentials stop under required company SSO, and toggling the
+/// policy cannot revive them:
+///   1. after enablement, on a second replica, password and Google browser
+///      sessions are dead and a password refresh family is refused, while a
+///      company session and a company refresh family keep working;
+///   2. after Disable, neither the refused credentials nor the ones never
+///      presented while the policy was on work again;
+///   3. a new password sign-in then works.
+///
+/// # Panics
+/// Panics when a password or social credential outlives the policy or a
+/// company credential is cut off.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_sso_ends_existing_credentials_and_disabling_revives_none() {
+    let workspace = Workspace::start().await;
+    let presented = workspace.password_session("pat-admin", "admin").await;
+    let unpresented = workspace.password_session("pam-viewer", "viewer").await;
+    let google = workspace.google_session("google-sam").await;
+    let company = workspace.company_session("corp-member", &[]).await;
+    let password_refresh = workspace.refresh_family(&presented).await;
+    let unpresented_refresh = workspace.refresh_family(&unpresented).await;
+    let company_refresh = workspace.refresh_family(&company).await;
+    let replica = workspace
+        .srv
+        .start_replica(wyrd_testing::WyrdTestServerBuilder::default())
+        .await
+        .expect("replica boots");
+    let slug = workspace.slug.clone();
+    let (admin, enabled) = workspace.enable().await;
+
+    // 1. On the other replica.
+    assert!(
+        !live_on(&replica, &slug, &presented).await,
+        "password session"
+    );
+    assert!(!live_on(&replica, &slug, &google).await, "Google session");
+    let (status, _) = renew(&replica, &password_refresh).await;
+    assert_ne!(status, StatusCode::OK, "password refresh family");
+    assert!(live_on(&replica, &slug, &company).await, "company session");
+    let (status, company_refresh) = renew(&replica, &company_refresh).await;
+    assert_eq!(status, StatusCode::OK, "company refresh family");
+    let company_refresh = company_refresh.expect("a rotated token");
+
+    // 2. Disable revives nothing.
+    let (status, disabled) = workspace.change(&admin, false, &enabled).await;
+    assert_eq!(status, StatusCode::OK, "disable: {disabled}");
+    for (case, cookie) in [
+        ("refused password", &presented),
+        ("unpresented password", &unpresented),
+        ("Google", &google),
+    ] {
+        assert!(
+            !live_on(&replica, &slug, cookie).await,
+            "{case} session revived"
+        );
+    }
+    for (case, token) in [
+        ("refused", &password_refresh),
+        ("unpresented", &unpresented_refresh),
+    ] {
+        let (status, _) = renew(&replica, token).await;
+        assert_ne!(status, StatusCode::OK, "{case} refresh family revived");
+    }
+    let (status, _) = renew(&replica, &company_refresh).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "company family survives both changes"
+    );
+
+    // 3. New permitted sign-in.
+    let resp = workspace.password_login("pat-admin").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a new password sign-in works"
+    );
+}

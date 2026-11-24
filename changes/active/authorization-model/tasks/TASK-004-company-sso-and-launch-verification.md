@@ -243,6 +243,25 @@ or instantaneous global bearer revocation guarantee. Expected RED is missing
 connected invalidation or resurrection. Tier 1: browser and actual CLI/client
 renewal consumers; tier 2 pins original-anchor and durable invalidation semantics.
 
+Evidence (Rust/HTTP):
+
+- Selector: scenario 1's runner with
+  `-E 'test(=platform_admin_e2e::company_sso::required_sso_ends_existing_credentials_and_disabling_revives_none)'`.
+- TDD VIOLATED: `revoke_non_company_credentials` was written with scenario 1,
+  so the first run passed. Mutation check: with the sweep call removed from
+  `set_login_policy`, the test failed at "refused password session revived".
+  Restored afterwards.
+- GREEN: 1 passed. After enablement, on a second replica:
+  - password and Google sessions are dead, and a password refresh family is
+    refused;
+  - a company session stays live, and a company refresh family rotates.
+  After Disable:
+  - neither the refused credentials nor the never-presented password
+    session or refresh family revive;
+  - the company family still rotates, and a new password sign-in works.
+- Tier 2: `pg_login_policy` (scenario 3) pins the original-anchor and
+  durable sweep semantics. Real CLI/client renewal consumers: pending.
+
 ### 5. Outage, replacement and recovery preserve the tenant boundary
 
 Maps to REQ-002/004/005/011/012/016/018; AC-006/013. With enforcement enabled,

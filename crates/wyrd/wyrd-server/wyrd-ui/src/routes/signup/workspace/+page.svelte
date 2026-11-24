@@ -2,14 +2,15 @@
   Name the workspace this browser's live proof creates. GET /auth/signup/proof
   says how the proof was made: a mailbox proof chooses the first
   administrator's username and password, a provider proof signs in with
-  that provider and sets none.
+  that provider and sets none. A configured challenge renders Cloudflare's
+  Turnstile widget, whose single-use token completion sends.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
   import Entry from '$lib/Entry.svelte';
   import CheckEmail from '$lib/CheckEmail.svelte';
   import PasswordInput from '$lib/PasswordInput.svelte';
-  import { PROBLEMS, PROVIDERS, auth, emailError, passwordError, refusal, slugError, slugify, verifySignup } from '$lib/onboarding';
+  import { PROBLEMS, PROVIDERS, auth, emailError, passwordError, refusal, slugError, slugify, turnstile, verifySignup } from '$lib/onboarding';
   import type { WyrdProblem } from '$lib/server/problem';
   import type { PageProps } from './$types';
   let { data }: PageProps = $props();
@@ -27,6 +28,8 @@
   let contactEmail = $state('');
   let contactSent = $state(false);
   let contactProven = $state(false);
+  let challengeToken = $state('');
+  let widget: string | undefined;
 
   const local = $derived(method === 'email');
   const contactProblem = $derived(data.mail ? PROBLEMS.contact : PROBLEMS.contactNoMail);
@@ -45,6 +48,31 @@
     if (answer.status === 200 && typeof answer.body?.method === 'string') method = answer.body.method;
     else issue = answer.status === 401 ? PROBLEMS.expired : refusal(answer);
   });
+
+  /**
+   * Render the Turnstile widget for `sitekey` into `element`, unless the
+   * element is gone by the time the script loads; its token is single-use.
+   */
+  function challengeWidget(element: HTMLElement, sitekey: string) {
+    let gone = false;
+    turnstile()
+      .then((api) => {
+        if (gone) return;
+        const clear = () => (challengeToken = '');
+        widget = api.render(element, { sitekey, action: 'signup', callback: (token: string) => (challengeToken = token), 'expired-callback': clear, 'error-callback': clear });
+      })
+      // An unloadable widget leaves no token; Rust refuses the completion as a failed challenge.
+      .catch(() => {});
+    return {
+      destroy() {
+        gone = true;
+        const rendered = widget;
+        widget = undefined;
+        challengeToken = '';
+        if (rendered !== undefined) void turnstile().then((api) => api.remove(rendered));
+      }
+    };
+  }
 
   function rename(typed: string) {
     if (suggested) slug = slugify(typed);
@@ -84,10 +112,16 @@
     const answer = await auth('/auth/signup/complete', {
       slug,
       display_name: name.trim(),
-      ...(local ? { local_credentials: { username: username.trim(), password } } : {})
+      ...(local ? { local_credentials: { username: username.trim(), password } } : {}),
+      ...(challengeToken ? { challenge_token: challengeToken } : {})
     });
     if (answer.status !== 200) {
       issue = completionRefusal(answer);
+      // Siteverify spent the token; the widget issues a fresh one.
+      if (widget !== undefined) {
+        challengeToken = '';
+        (await turnstile()).reset(widget);
+      }
       phase = 'idle';
       return;
     }
@@ -168,6 +202,8 @@
         <p id="password-hint">15 to 128 characters. You sign in to this workspace with this username and password.</p>
       {/if}
 
+      {#if data.challenge}<div class="turnstile" data-testid="turnstile" use:challengeWidget={data.challenge}></div>{/if}
+
       <button class="app-control primary wide" type="submit" disabled={busy} aria-busy={phase === 'creating' ? 'true' : undefined}>
         {phase === 'creating' ? 'Creating workspace…' : 'Create workspace'}
       </button>
@@ -185,6 +221,9 @@
   }
   [role='status']:empty {
     display: none;
+  }
+  .turnstile {
+    margin: 6px 0;
   }
   button[type='submit'] {
     margin-top: 6px;

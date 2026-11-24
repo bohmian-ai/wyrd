@@ -18,6 +18,8 @@ export type LoginMethods = {
   password_reset: boolean;
   email_verification_required: boolean;
   signup_providers: SocialProvider[];
+  /** The configured signup challenge's public Turnstile site key; absent without one. */
+  signup_challenge_site_key?: string;
 };
 
 const sessionPrefix = 'wyrd_session_';

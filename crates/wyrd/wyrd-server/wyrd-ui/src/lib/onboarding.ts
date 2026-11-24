@@ -7,6 +7,38 @@
  */
 import type { WyrdProblem } from '$lib/server/problem';
 
+/** The part of Cloudflare's explicit-render Turnstile API the signup page uses. */
+export type Turnstile = {
+  render(element: HTMLElement, options: Record<string, unknown>): string | undefined;
+  reset(widget: string): void;
+  remove(widget: string): void;
+};
+
+/** Turnstile's script; `render=explicit` leaves rendering to the page. */
+const TURNSTILE_SCRIPT = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+
+/** The one in-flight or finished script load; a failed load is forgotten so a later call retries. */
+let loading: Promise<Turnstile> | undefined;
+
+/** Cloudflare's Turnstile API, loading its script at most once at a time. */
+export function turnstile(): Promise<Turnstile> {
+  const loaded = (globalThis as { turnstile?: Turnstile }).turnstile;
+  if (loaded) return Promise.resolve(loaded);
+  loading ??= new Promise<Turnstile>((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = TURNSTILE_SCRIPT;
+    script.async = true;
+    script.onload = () => resolve((globalThis as { turnstile?: Turnstile }).turnstile as Turnstile);
+    script.onerror = () => {
+      script.remove();
+      loading = undefined;
+      reject(new Error('the Turnstile script did not load'));
+    };
+    document.head.append(script);
+  });
+  return loading;
+}
+
 /** One `/auth/*` answer: its status and parsed JSON body, if any. */
 export type AuthAnswer = { status: number; body: Record<string, unknown> | null };
 
@@ -40,7 +72,7 @@ export const PROBLEMS = {
   failed: worded(401, '', 'Sign-in was not confirmed', 'The provider did not confirm who you are, so no workspace was created. Try again.'),
   taken: worded(409, 'WYRD_SPEC_409_CONFLICT', 'That URL is already taken', 'Choose a different URL slug and create the workspace again.'),
   limit: worded(403, 'WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT', 'Workspace limit reached', 'This account already owns the maximum number of workspaces. Sign in to an existing workspace, or contact the operator to raise the limit.'),
-  challenge: worded(403, 'WYRD_AUTH_403_SIGNUP_CHALLENGE', 'Challenge not passed', 'Complete the challenge, then create the workspace again.'),
+  challenge: worded(403, 'WYRD_AUTH_403_SIGNUP_CHALLENGE', 'Challenge not passed', 'Complete the challenge below, then create the workspace again.'),
   disabled: worded(401, 'WYRD_AUTH_401_INVALID_TOKEN', 'Workspace signup is no longer available', 'The operator turned off signup, or this sign-in method, after you started. No workspace was created.'),
   expired: worded(400, 'WYRD_AUTH_400_INVALID_STATE', 'This signup expired', 'Start again to confirm who you are, then name your workspace.'),
   contact: worded(409, 'WYRD_SPEC_409_CONFLICT', 'Confirm an email address to continue', 'GitHub did not share a verified email address. Confirm one by email; you still sign in with GitHub and set no password.'),

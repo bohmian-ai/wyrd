@@ -2156,23 +2156,8 @@ async fn pull_request_inspection_requires_repository_read() {
         )
         .await
         .expect("role seeds");
-    let Bootstrap::User {
-        jwt: repository_only,
-        ..
-    } = server
-        .bootstrap_user("pr-repository-only", &["pr_repository_only"])
-        .await
-        .expect("reader bootstraps")
-    else {
-        panic!("user bootstrap returned a non-user principal");
-    };
-    let (code, scoped) = read_as(&deployment, &repository_only, &status).await;
-    assert_eq!(code, StatusCode::OK, "{scoped}");
-    for field in ["status", "pull_request", "result", "github_delivery"] {
-        assert_eq!(scoped[field], body[field], "{field}: {scoped}");
-    }
     let principal = server
-        .bootstrap_user("pr-repository-revoked", &[])
+        .bootstrap_user("pr-repository-reader", &[])
         .await
         .expect("reader bootstraps");
     // A direct grant, which revocation removes; provider-sourced bindings
@@ -2181,14 +2166,18 @@ async fn pull_request_inspection_requires_repository_read() {
         .grant_role(&principal, "pr_repository_only")
         .await
         .expect("the role is granted");
-    let Bootstrap::User { jwt: revoked, .. } = &principal else {
+    let Bootstrap::User { jwt: reader, .. } = &principal else {
         panic!("user bootstrap returned a non-user principal");
     };
     let granted = wyrd_testing::principal::within_propagation(&StatusCode::OK, || async {
-        read_as(&deployment, revoked, &status).await.0
+        read_as(&deployment, reader, &status).await.0
     })
     .await;
     assert_eq!(granted, StatusCode::OK, "the granted reader reads it");
+    let (_, scoped) = read_as(&deployment, reader, &status).await;
+    for field in ["status", "pull_request", "result", "github_delivery"] {
+        assert_eq!(scoped[field], body[field], "{field}: {scoped}");
+    }
     server
         .revoke_role(&principal, "pr_repository_only")
         .await
@@ -2197,7 +2186,7 @@ async fn pull_request_inspection_requires_repository_read() {
     // cache's notification, within its propagation bound. With no
     // executions grant left the route itself refuses, naming no execution.
     let refused = wyrd_testing::principal::within_propagation(&StatusCode::FORBIDDEN, || async {
-        read_as(&deployment, revoked, &status).await.0
+        read_as(&deployment, reader, &status).await.0
     })
     .await;
     assert_eq!(
@@ -2205,7 +2194,7 @@ async fn pull_request_inspection_requires_repository_read() {
         StatusCode::FORBIDDEN,
         "the revoked reader is refused"
     );
-    let (_, body) = read_as(&deployment, revoked, &status).await;
+    let (_, body) = read_as(&deployment, reader, &status).await;
     assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC", "{body}");
 
     let foreign = server

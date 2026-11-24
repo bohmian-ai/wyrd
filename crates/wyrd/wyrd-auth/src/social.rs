@@ -1109,7 +1109,8 @@ pub struct TenantLogin {
 }
 
 /// The methods `settings`, the `enabled` providers and a configured `mail`
-/// relay make usable, for `tenant` or, without one, the deployment root.
+/// relay make usable, for `tenant` or, without one, the deployment root,
+/// with the configured challenge's public site key.
 ///
 /// Password, returning providers and reset belong to a tenant and are never
 /// offered at the root; creation and discovery are deployment-wide.
@@ -1142,6 +1143,9 @@ fn available_methods(
             local_signup,
             email_verification_required: true,
             signup_providers,
+            signup_challenge_site_key: settings
+                .signup_challenge
+                .map(|challenge| challenge.site_key),
         },
     }
 }

@@ -1411,6 +1411,12 @@ Focused runner: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db
 
 **Maintainer decisions (2026-11-23, cycle 16 part A):** approved — a relay save that changes the username without a password is refused with 400 rather than dropping the stored password; `oidc: true` means a platform OIDC connection row exists (no secret decryption on the anonymous read).
 
+#### Cycle 16 evidence (Part C: challenge site key and mock server failure)
+
+Maintainer-approved 2026-11-23: publish the Turnstile site key on the public methods answer; add a server-failure state to the mock.
+
+- **Site key on `GET /auth/browser/methods`.** Selector `platform_admin_e2e::signup::the_methods_report_publishes_the_challenge_site_key` (Part A's focused runner). RED: with a challenge configured, `report["signup_challenge_site_key"]` was `null` where `"0x4AAA-site"` was expected (signup.rs assertion in step 2). GREEN: without a challenge the key is absent; with one, the root and a tenant's report carry exactly the stored site key and never the secret; clearing the challenge removes it. Owner: `available_methods` reads the site key already loaded by `SocialSignIn::settings`; wire field `CreationMethods::signup_challenge_site_key` (omitted when `None`, so every existing exact-report assertion is unchanged). Regression: `test(/^platform_admin_e2e::(methods|signup)::/) | test(/pg_browser_sessions/)` 26 passed. `mise run codegen:regen` changed nothing (no generated projection carries this type). TDD: PASS.
+
 ### 17. An existing User explicitly connects another sign-in method
 
 **Status: DEFERRED — maintainer-approved 2026-11-23.** Not required for launch

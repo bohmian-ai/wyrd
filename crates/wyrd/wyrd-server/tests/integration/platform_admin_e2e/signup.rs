@@ -2666,6 +2666,70 @@ async fn a_configured_challenge_gates_browser_creation() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// The public methods report publishes a configured challenge's site key so
+/// the signup page can render its widget, and never its secret:
+///   1. without a challenge the report carries no site key;
+///   2. with one it carries exactly the stored site key at the root and on a
+///      tenant's page, and no secret;
+///   3. clearing the challenge removes the site key again.
+///
+/// # Panics
+/// Panics when the report omits the site key, carries the secret, or keeps
+/// a cleared key.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_methods_report_publishes_the_challenge_site_key() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server(&google).await;
+    let tenant = srv.pg_fixture().tenant_slug().to_owned();
+    let methods = |uri: String| {
+        let srv = &srv;
+        async move {
+            let (status, body) =
+                social_call(srv, social_request(Method::GET, &uri, None, None)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    let settings = |body: Value| {
+        let (srv, session) = (&srv, &session);
+        async move {
+            let (status, body) = social_call(
+                srv,
+                social_request(
+                    Method::PUT,
+                    "/platform/login-settings",
+                    Some(session),
+                    Some(body),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    };
+    let root = || methods("/auth/browser/methods".to_owned());
+
+    // 1. No challenge, no site key.
+    let before = root().await;
+    assert!(before.get("signup_challenge_site_key").is_none(), "{before}");
+
+    // 2. A configured challenge publishes its site key only.
+    settings(json!({ "password_enabled": true, "signup_enabled": true,
+        "signup_challenge": { "site_key": "0x4AAA-site", "secret": "turnstile-secret" } }))
+    .await;
+    for report in [
+        root().await,
+        methods(format!("/auth/browser/methods?tenant={tenant}")).await,
+    ] {
+        assert_eq!(report["signup_challenge_site_key"], "0x4AAA-site", "{report}");
+        assert!(!report.to_string().contains("turnstile-secret"), "{report}");
+    }
+
+    // 3. Clearing the challenge removes it.
+    settings(json!({ "password_enabled": true, "signup_enabled": true })).await;
+    let cleared = root().await;
+    assert!(cleared.get("signup_challenge_site_key").is_none(), "{cleared}");
+}
+
 /// The verified contact of every User of workspace `slug`: username or
 /// external subject, address, and whether the User has a password.
 async fn contacts(superuser: &sqlx::PgPool, slug: &str) -> Vec<(String, bool)> {

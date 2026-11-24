@@ -2,6 +2,7 @@
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
   let connections = $derived(data.connections);
+  let policy = $derived(data.policy);
   let candidate = $derived(connections?.candidate ?? null);
   let tested = $derived(
     !!candidate?.tested_until &&
@@ -28,6 +29,9 @@
     <strong>{form.problem.status === 403 ? '⊘' : '✕'} {form.problem.title}</strong>
     <p>{form.problem.remediation}</p>
     <code>{form.problem.code}</code>
+    {#if form.problem.code === 'WYRD_AUTH_403_RECENT_LOGIN_REQUIRED'}
+      <p><a href={`/t/${encodeURIComponent(data.tenant.key)}/login`}>Sign in through your company</a>, then return here and confirm again.</p>
+    {/if}
   </div>
 {/if}
 
@@ -50,6 +54,32 @@
       <p>Register this exact redirect URI with your identity provider's Web application.</p>
       <code>{connections.callback_url}</code>
     </section>
+
+    {#if policy}
+      {@const users = policy.users_without_company_identity}
+      <section>
+        <h2>Require company SSO</h2>
+        <dl>
+          <dt>Policy</dt><dd class:ok={policy.require_company_sso}>{policy.require_company_sso ? '✓ Required' : '– Not required'}</dd>
+          <dt>Revision</dt><dd>{policy.revision}</dd>
+        </dl>
+        <p>When required, people sign in only through the active company connection. Password and social sign-in, and the sessions and devices they approved, stop at once.</p>
+        <p class="warn">! {users} active {users === 1 ? 'account' : 'accounts'} cannot sign in through your company. Matching email never links accounts: a password or social account stays separate, with its own roles, keys and history.</p>
+        {#if policy.connection}
+          <form class="stack" method="POST" action="?/policy">
+            <input type="hidden" name="require" value={String(!policy.require_company_sso)} />
+            <input type="hidden" name="revision" value={policy.revision} />
+            <input type="hidden" name="connectionId" value={policy.connection.id} />
+            <input type="hidden" name="connectionRevision" value={policy.connection.revision} />
+            <label><input type="checkbox" name="confirm" required /> {policy.require_company_sso ? 'Allow password and social sign-in again' : 'Require company SSO for every person'}</label>
+            <p>Needs a company sign-in in the last five minutes.</p>
+            <button class="app-control primary" type="submit" disabled={!policy.ready && !policy.require_company_sso}>{policy.require_company_sso ? 'Disable' : 'Enable'}</button>
+          </form>
+        {:else}
+          <p>An active company connection is needed to change this policy.</p>
+        {/if}
+      </section>
+    {/if}
 
     <section>
       <h2>Active connection</h2>

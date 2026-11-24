@@ -23,6 +23,14 @@ export type Connections = {
   candidate: ConnectionView | null;
   callback_url: string | null;
 };
+/** `GET /v1/identity/login-policy`: whether company SSO is the only human sign-in method. */
+export type LoginPolicy = {
+  require_company_sso: boolean;
+  revision: number;
+  connection: { id: string; revision: number } | null;
+  ready: boolean;
+  users_without_company_identity: number;
+};
 
 /** Call the tenant connection API as the signed-in principal; non-2xx becomes a safe problem. */
 async function call(
@@ -38,13 +46,19 @@ async function call(
 
 export const load: PageServerLoad = async ({ locals }) => {
   // Connection administration is a server contract; the development identity has no server session.
-  if (!locals.browserSession) return { connections: null, problem: problem('upstream') };
+  if (!locals.browserSession)
+    return { connections: null, policy: null, problem: problem('upstream') };
+  const session = locals.browserSession;
   try {
-    const response = await call(locals.browserSession, 'GET', '/identity/oidc/connections');
-    return { connections: (await response.json()) as Connections, problem: null };
+    const [connections, policy] = await Promise.all(
+      ['/identity/oidc/connections', '/identity/login-policy'].map(async (path) =>
+        (await call(session, 'GET', path)).json()
+      )
+    );
+    return { connections: connections as Connections, policy: policy as LoginPolicy, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
-    return { connections: null, problem: safeProblem(cause) };
+    return { connections: null, policy: null, problem: safeProblem(cause) };
   }
 }
 
@@ -138,6 +152,23 @@ export const actions: Actions = {
         recovery_api_key: text(form, 'recoveryApiKey')
       })
     ),
+  /**
+   * Require or stop requiring company SSO at the policy and connection revisions the page showed.
+   * Rust checks the fresh company sign-in; an unconfirmed form changes nothing.
+   */
+  policy: (event) =>
+    mutate(event, (form, session) => {
+      if (form.get('confirm') !== 'on') reject('validation');
+      const connectionId = text(form, 'connectionId');
+      if (!/^[0-9a-f-]{36}$/i.test(connectionId)) reject('validation');
+      const connectionRevision = Number(form.get('connectionRevision'));
+      if (!Number.isSafeInteger(connectionRevision) || connectionRevision < 0) reject('validation');
+      return call(session, 'PUT', '/identity/login-policy', {
+        require_company_sso: text(form, 'require') === 'true',
+        expected_revision: revision(form),
+        expected_connection: { id: connectionId, revision: connectionRevision }
+      });
+    }),
   deactivate: (event) =>
     mutate(event, (_, session) =>
       call(session, 'POST', '/identity/oidc/active/deactivate')

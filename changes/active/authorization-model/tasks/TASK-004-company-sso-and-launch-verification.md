@@ -140,7 +140,15 @@ Evidence (Rust/HTTP):
 - Mechanical deviation: the controlled company IdP lives in
   `platform_admin_e2e/company_sso.rs` (test-support build with Google
   fixtures), not `identity_e2e.rs`, which compiles without test-support.
-- Production settings UI: pending.
+- Production settings UI, tier 1 (shared with scenario 2):
+  `production-auth.integration.test.ts` › `production required company SSO
+  settings`, run through `WYRD_UI_FILTER='required company SSO'` with `production_ui_bff_journey` (the `test:identity:ui:suite` command). It runs on two BFF replicas in front of
+  two Wyrd replicas with real Keycloak.
+  - RED: `expected '<!doctype html>…' to match /\d+ active accounts? cannot
+    sign in through your company/`; settings rendered no policy.
+  - GREEN: the Keycloak admin reads `– Not required` and the warning count on
+    replica 1. The warning states that matching email never links accounts.
+    The full file passes 6/6.
 
 ### 2. A company administrator enables and disables enforcement
 
@@ -179,7 +187,36 @@ Evidence (Rust/HTTP):
   and readiness under `lock_human_connection_slot` plus the policy row
   `FOR UPDATE`, then writes and sweeps in one transaction. A refusal commits
   only its audit decision.
-- Missing/unusable connection: see scenario 5. Production settings UI: pending.
+- Missing/unusable connection: see scenario 5.
+- Production settings UI: scenario 1's UI selector.
+  - An unconfirmed Enable returns 400 and nothing changes. The reader is
+    refused with 403.
+  - The tenant owner's API-key recovery session gets 403
+    `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` and a "Sign in through your company"
+    link to the tenant login. Nothing is replayed; the admin returns and
+    confirms again.
+  - A confirmed Enable through BFF 0 reads back `✓ Required` at revision+1
+    through BFF 1, and the login page renders no password form.
+  - A stale form returns 409. The BFF projects the uncatalogued
+    `CONNECTION_CONFLICT` as `WYRD_SPEC_409_CONFLICT` ("Refresh… and retry"),
+    and the policy is unchanged.
+  - A confirmed Disable with the fresh company sign-in reads back
+    `– Not required`.
+  - The time-aged stale-proof case is pinned at HTTP tier (above). The
+    browser journey cannot age a session.
+- Mechanical deviation: the existing login page has no return target, so the
+  refusal links to the tenant login rather than back to settings.
+- Visual: the section reuses the page's existing `section`/`dl`/`.stack`/
+  `.app-control` styles and the `--ok`/`--warn` tokens with glyphs. No
+  light/dark capture was taken: material limitation.
+- Lane repair: `ui:check` failed on `ui-library.test.ts`.
+  - Symptom: `TSCONFIG_ERROR … examples/ui-app/.svelte-kit/tsconfig.json`
+    not found.
+  - Cause: the test imports `examples/ui-app` source, whose tsconfig extends
+    a file only `svelte-kit sync` generates, and the lane never synced that
+    workspace member.
+  - Fix site: the UI `test` script now syncs the example before `vitest run`.
+  - Result: `mise run ui:check` passes 105 tests.
 
 ### 3. Required SSO cannot be bypassed at a later login step
 

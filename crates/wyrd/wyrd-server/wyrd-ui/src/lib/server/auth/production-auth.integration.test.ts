@@ -32,6 +32,8 @@ type Journey = {
   switchTenants: { keycloak: string; second: string; peer: string };
   replacementTenant: string;
   replacementOwnerKey: string;
+  /** A recovery API key for the peer switch tenant's headless owner. */
+  peerOwnerKey: string;
   /** Each provider's login form fields: Keycloak's admin and reader, and Dex's user. */
   users: Record<'admin' | 'reader' | 'dex', Record<string, string>>;
 };
@@ -825,4 +827,74 @@ test('production SSO account settings', async () => {
   } finally {
     await chrome.close();
   }
+}, journeyTimeout);
+
+test('production required company SSO settings', async () => {
+  // The switch journey is done with this tenant; nothing after it signs in here.
+  const tenant = journey.switchTenants.peer;
+  const settings = `/t/${tenant}/settings`;
+  const policyOf = async (browser: Browser, replica: 0 | 1) => {
+    const html = await (await browser.go(replica, settings)).text();
+    const form = /<form[^>]*action="\?\/policy"[\s\S]*?<\/form>/.exec(html)?.[0] ?? '';
+    const field = (name: string) => new RegExp(`name="${name}"[^>]*value="([^"]*)"`).exec(form)?.[1];
+    return {
+      html,
+      required: html.includes('✓ Required'),
+      fields: {
+        require: field('require')!,
+        revision: field('revision')!,
+        connectionId: field('connectionId')!,
+        connectionRevision: field('connectionRevision')!
+      }
+    };
+  };
+
+  // A company administrator reads the policy and its account warning on either replica.
+  const alice = new Browser();
+  await ssoLogin(alice, journey.users.admin, 0, 1, tenant);
+  const before = await policyOf(alice, 1);
+  expect(before.required).toBe(false);
+  expect(before.html).toMatch(/\d+ active accounts? cannot sign in through your company/);
+  expect(before.fields.require).toBe('true');
+
+  // Enabling needs the explicit confirmation; without it nothing changes.
+  const unconfirmed = await alice.go(0, `${settings}?/policy`, { form: before.fields });
+  expect(unconfirmed.status).toBe(400);
+  expect((await policyOf(alice, 1)).required).toBe(false);
+
+  // A reader is refused, and so is an operator's recovery session: neither proves a company sign-in.
+  const bob = new Browser();
+  await ssoLogin(bob, journey.users.reader, 1, 0, tenant);
+  const confirmed = { ...before.fields, confirm: 'on' };
+  expect((await bob.go(0, `${settings}?/policy`, { form: confirmed })).status).toBe(403);
+  const operator = new Browser();
+  await operator.go(0, `/t/${tenant}/login/api-key`, { form: { apiKey: journey.peerOwnerKey } });
+  const recovery = await operator.go(1, `${settings}?/policy`, { form: confirmed });
+  expect(recovery.status).toBe(403);
+  const refusal = await recovery.text();
+  expect(refusal).toContain('WYRD_AUTH_403_RECENT_LOGIN_REQUIRED');
+  // The refusal offers a company sign-in; nothing is replayed after it.
+  expect(refusal).toContain(`href="/t/${tenant}/login"`);
+  expect((await policyOf(alice, 0)).required).toBe(false);
+
+  // The confirmed change from replica 0 is the persisted policy on replica 1.
+  const enabled = await alice.go(0, `${settings}?/policy`, { form: confirmed });
+  expect(enabled.status, await enabled.clone().text()).toBe(200);
+  const after = await policyOf(alice, 1);
+  expect(after.required).toBe(true);
+  expect(after.fields.require).toBe('false');
+  expect(Number(after.fields.revision)).toBe(Number(before.fields.revision) + 1);
+  const login = await (await alice.go(1, `/t/${tenant}/login`)).text();
+  expect(login).not.toContain('name="password"');
+
+  // A form read before the change is stale: it conflicts and changes nothing.
+  const stale = await alice.go(1, `${settings}?/policy`, { form: { ...confirmed, require: 'false' } });
+  expect(stale.status).toBe(409);
+  expect(await stale.text()).toContain('WYRD_SPEC_409_CONFLICT');
+  expect((await policyOf(alice, 0)).required).toBe(true);
+
+  // Ordinary Disable with the fresh company sign-in, confirmed.
+  const disabled = await alice.go(1, `${settings}?/policy`, { form: { ...after.fields, confirm: 'on' } });
+  expect(disabled.status).toBe(200);
+  expect((await policyOf(alice, 0)).required).toBe(false);
 }, journeyTimeout);

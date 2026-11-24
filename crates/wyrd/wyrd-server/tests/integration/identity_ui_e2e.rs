@@ -561,7 +561,7 @@ async fn production_ui_bff_journey() {
         DEX_ALICE,
     )
     .await;
-    sso_tenant(
+    let peer_owner_key = sso_tenant(
         &srv,
         &server,
         &host,
@@ -604,6 +604,7 @@ async fn production_ui_bff_journey() {
         },
         "replacementTenant": REPLACEMENT_TENANT,
         "replacementOwnerKey": replacement_owner_key,
+        "peerOwnerKey": peer_owner_key,
         "users": {
             "admin": { "username": "alice", "password": "alice-password" },
             "reader": { "username": "bob", "password": "wyrd-test" },

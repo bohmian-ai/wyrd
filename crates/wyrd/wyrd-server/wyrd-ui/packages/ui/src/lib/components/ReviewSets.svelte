@@ -9,9 +9,10 @@
 <script lang="ts">
   import type { ActionIntent, ActionProps } from '../contract.js';
   import { fmtInstant, fmtShortId, parseInstant } from '../format.js';
-  import { EXECUTION_STATUS, EXECUTION_VERDICT, REVIEW_SET_ROWS, type ReviewSet, type ReviewSetsProps } from '../observe.js';
+  import { REVIEW_SET_ROWS, type ReviewSet, type ReviewSetsProps } from '../observe.js';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
+  import StatusMark from './StatusMark.svelte';
   import RepositorySheet from './RepositorySheet.svelte';
 
   /**
@@ -115,15 +116,13 @@
             </thead>
             <tbody>
               {#each set.members as member (member.execution_id)}
-                {@const status = member.status ? (EXECUTION_STATUS[member.status] ?? ['', member.status, 'text']) : undefined}
-                {@const verdict = member.verdict ? EXECUTION_VERDICT[member.verdict] : undefined}
                 {@const verifier = member.verifier_card_uid}
                 {@const definition = verifierRef(verifier ? labels[verifier] : undefined)}
                 <tr>
                   <td><div class="cellbox">{@render nav({ name: 'record.open', input: { execution_id: member.execution_id } }, fmtShortId(member.execution_id), member.execution_id)}</div></td>
                   <td><div class="cellbox">{#if verifier && definition}{@render nav({ name: 'card.open', input: { card_ref: definition } }, labels[verifier], verifier)}{:else if verifier}<span class="mono" title={verifier}>{fmtShortId(verifier)}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
-                  <td><div class="cellbox">{#if status}<span class="st c-{status[2]}"><span aria-hidden="true">{status[0]}</span>{status[1]}</span>{:else}<span class="muted">record not retained</span>{/if}</div></td>
-                  <td><div class="cellbox">{#if verdict}<span class="badge c-{verdict[2]}"><span aria-hidden="true">{verdict[0]}</span>{verdict[1]}</span>{:else}<span class="muted">none</span>{/if}</div></td>
+                  <td><div class="cellbox">{#if member.status}<StatusMark status={member.status} />{:else}<span class="muted">record not retained</span>{/if}</div></td>
+                  <td><div class="cellbox">{#if member.verdict}<StatusMark verdict={member.verdict} />{:else}<span class="muted">none</span>{/if}</div></td>
                   <td><div class="cellbox">{#if member.failed.length}<span class="mono c-danger">{member.failed.join(', ')}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
                 </tr>
               {/each}

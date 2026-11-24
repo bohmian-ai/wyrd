@@ -32,7 +32,7 @@ export { default as RecordDetail } from './components/RecordDetail.svelte';
 export { default as EmptyState } from './components/EmptyState.svelte';
 export { default as ActionButton } from './components/ActionButton.svelte';
 export { default as CardRefChip } from './components/CardRefChip.svelte';
-export { default as VerdictPill } from './components/VerdictPill.svelte';
+export { default as StatusMark } from './components/StatusMark.svelte';
 export { default as StatusPill, CARD_TONES, type Tone } from './components/StatusPill.svelte';
 export { default as Sparkline } from './components/Sparkline.svelte';
 export { default as DurationBar } from './components/DurationBar.svelte';

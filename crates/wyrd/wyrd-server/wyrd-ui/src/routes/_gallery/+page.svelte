@@ -15,7 +15,7 @@
     EmptyState,
     Sparkline,
     StatusPill,
-    VerdictPill,
+    StatusMark,
     type ActionIntent,
     type ActionState
   } from 'wyrd-ai-ui';
@@ -394,7 +394,7 @@
       <div class="row">
         <StatusPill label="neutral" /><StatusPill tone="ok" label="active" /><StatusPill tone="warn" label="deprecated" />
         <StatusPill tone="danger" label="failed" /><StatusPill tone="running" label="pending" />
-        <VerdictPill verdict="passed" /><VerdictPill verdict="failed" /><VerdictPill verdict="inconclusive" />
+        <StatusMark verdict="passed" /><StatusMark verdict="failed" /><StatusMark verdict="inconclusive" />
         <CardRefChip cardRef={card} /><CardRefChip cardRef={card} href="#chip" />
         <Sparkline points={[3, 5, 4, 8, 6, 9]} label="Runs this week" />
       </div>

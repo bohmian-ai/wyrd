@@ -240,7 +240,7 @@ export function completedExecution() {
 
 /* ---------- Vocabulary: wire value → glyph, readable word, token class ---------- */
 
-export const LIFECYCLE = { pending: ['○', 'queued', 'c-muted'], running: ['●', 'running', 'c-run'], completed: ['■', 'completed', 'c-text'],
+export const LIFECYCLE = { pending: ['○', 'queued', 'c-muted'], running: ['●', 'running', 'c-run'], completed: ['■', 'completed', 'c-ok'],
   errored: ['✕', 'errored', 'c-danger'], timed_out: ['⧗', 'timed out', 'c-warn'], cancelled: ['⊘', 'cancelled', 'c-muted'] };
 export const VERDICT = { passed: ['✓', 'passed', 'c-ok'], failed: ['✕', 'failed', 'c-danger'], inconclusive: ['?', 'inconclusive', 'c-muted'] };
 export const ACTION = { waiting: ['○', 'not started', 'c-muted'], running: ['●', 'running', 'c-run'], started: ['●', 'running', 'c-run'],

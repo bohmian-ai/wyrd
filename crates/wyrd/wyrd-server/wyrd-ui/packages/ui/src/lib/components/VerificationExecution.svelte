@@ -17,7 +17,7 @@
   import EmptyState from './EmptyState.svelte';
   import Panel from './Panel.svelte';
   import StatusPill, { type Tone } from './StatusPill.svelte';
-  import VerdictPill from './VerdictPill.svelte';
+  import StatusMark from './StatusMark.svelte';
   import VerifierGraph from './VerifierGraph.svelte';
 
   let { input, result, actions = {}, onaction }: VerificationExecutionProps & ActionProps = $props();
@@ -45,16 +45,6 @@
     onaction?.({ name: 'execution.select', input: value });
   }
 
-  const STATUS_TONES: Record<CardTypes.VerificationExecutionStatus, Tone> = {
-    pending: 'neutral',
-    running: 'running',
-    retrying: 'running',
-    waiting: 'warn',
-    completed: 'ok',
-    cancelled: 'neutral',
-    timed_out: 'danger',
-    errored: 'danger'
-  };
   const OUTCOME_TONES: Record<CardTypes.RequirementOutcome, Tone> = { passed: 'ok', failed: 'danger', inconclusive: 'warn', not_applicable: 'neutral' };
   const DRIFT_TONES: Record<CardTypes.DriftVerdict, Tone> = { NoDrift: 'ok', Drift: 'danger', Inconclusive: 'warn' };
   const DRIFT_WORDS: Record<CardTypes.DriftVerdict, string> = { NoDrift: 'no drift', Drift: 'drift', Inconclusive: 'inconclusive' };
@@ -256,11 +246,11 @@
         {/if}
       {/snippet}
       <dl class="summary">
-        <div class="fact"><dt>Status</dt><dd data-execution-status={status.status}><StatusPill tone={STATUS_TONES[status.status]} label={status.status.replace('_', ' ')} /></dd></div>
+        <div class="fact"><dt>Status</dt><dd data-execution-status={status.status}><StatusMark status={status.status} /></dd></div>
         <div class="fact">
           <dt>Verdict</dt>
           <dd data-verdict={status.result?.outcome.verdict ?? ''}>
-            {#if status.result}<VerdictPill verdict={status.result.outcome.verdict} />{:else}<span class="muted">no verdict recorded</span>{/if}
+            {#if status.result}<StatusMark verdict={status.result.outcome.verdict} />{:else}<span class="muted">no verdict recorded</span>{/if}
           </dd>
         </div>
         {#if definition}<div class="fact"><dt>Judged</dt><dd>{judged} of {declared} requirements</dd></div>{/if}
@@ -474,8 +464,8 @@
               <li>
                 <button type="button" class="open" disabled={off('execution.open')} onclick={() => onaction?.({ name: 'execution.open', input: { execution_id: member.execution_id } })}>{member.execution_id}</button>
                 {#if member.status?.state === 'populated'}
-                  <StatusPill tone={STATUS_TONES[member.status.data.status]} label={member.status.data.status.replace('_', ' ')} />
-                  {#if member.status.data.result}<VerdictPill verdict={member.status.data.result.outcome.verdict} />{/if}
+                  <StatusMark status={member.status.data.status} />
+                  {#if member.status.data.result}<StatusMark verdict={member.status.data.result.outcome.verdict} />{/if}
                 {:else if member.status && member.status.state !== 'empty'}
                   <span class="muted">{member.status.problem.title} ({member.status.problem.code})</span>
                 {:else}

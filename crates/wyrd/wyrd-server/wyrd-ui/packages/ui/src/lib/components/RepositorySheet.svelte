@@ -304,8 +304,7 @@
     padding: 0;
     border-bottom: 1px solid var(--border-soft);
   }
-  .repo :global(.outs td span.mono),
-  .repo :global(.outs td .st) {
+  .repo :global(.outs td span.mono) {
     white-space: nowrap;
   }
   .repo :global(.outs tbody tr:hover td) {

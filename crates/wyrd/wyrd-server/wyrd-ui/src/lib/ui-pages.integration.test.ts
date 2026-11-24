@@ -1957,7 +1957,9 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     // Open a row and come back: the same rows of the same list, at the same scroll position.
     await page.setViewportSize({ width: 1280, height: 420 });
     await rows.last().scrollIntoViewIfNeeded();
-    const before = { url: page.url(), first: await rows.first().textContent(), scroll: await page.evaluate(() => window.scrollY) };
+    // The first row by everything but its status, which the runner may still move on while capacity is contended.
+    const identity = () => rows.first().locator('td:not(.pin-status)').allTextContents();
+    const before = { url: page.url(), first: await identity(), scroll: await page.evaluate(() => window.scrollY) };
     expect(before.scroll).toBeGreaterThan(0);
     await rows.last().click();
     await page.waitForURL(/\/verify\/executions\//);
@@ -1966,7 +1968,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.waitForURL(before.url);
     await expect.poll(() => rows.count()).toBe(57);
     // Card names stream in after the rows.
-    await expect.poll(() => rows.first().textContent()).toBe(before.first);
+    await expect.poll(identity).toEqual(before.first);
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(before.scroll);
     await page.setViewportSize({ width: 1280, height: 720 });
 

@@ -82,7 +82,7 @@ import {
   StatStrip,
   TraceWaterfall,
   StatusPill,
-  VerdictPill,
+  StatusMark,
   type CardRef,
   type Executor,
   type QueryResult,
@@ -520,8 +520,8 @@ test('TASK-003: Validated portable rendering', async () => {
     expect(chip.getByRole('link')).toHaveAttribute('title', `${kind}/ranker@1.4.2`);
     chip.unmount();
   }
-  for (const [verdict, text] of [['passed', '✓passed'], ['failed', '✕failed'], ['inconclusive', '!inconclusive']] as const) {
-    const pill = render(VerdictPill, { verdict });
+  for (const [verdict, text] of [['passed', '✓passed'], ['failed', '✕failed'], ['inconclusive', '?inconclusive']] as const) {
+    const pill = render(StatusMark, { verdict });
     expect(pill.container).toHaveTextContent(text);
     pill.unmount();
   }
@@ -3341,6 +3341,36 @@ test('JSON and YAML blocks are coloured by syntax role without changing their te
   expect(tomlOf('comment')).toEqual(['# wyrd.toml, "quoted" 1']);
   expect(tomlOf('key')).toEqual(['repository.verified_by', 'verifier', 'runs_on', 'kind']);
   expect(tomlOf('string')).toEqual(['"./review/pr-review.yaml"', '"pull_request"']);
+});
+
+test('an execution reads with one status and verdict mark, in one tone, on Verify, a review set and its own page', async () => {
+  /** Each status or verdict mark under `root`: its text and tone. */
+  const marks = (root: Element) => [...root.querySelectorAll('[data-tone]')].map((mark) => [mark.textContent?.trim(), mark.getAttribute('data-tone')]);
+
+  // Verify's list: a completed failure, a completed inconclusive result and a cancelled execution.
+  const list = render(RecordTable, { input: { signal: 'executions' }, result: { state: 'populated', data: { rows: executions } }, labels: verifierLabels });
+  expect(marks(list.getAllByRole('row')[1])).toEqual([['■completed', 'ok'], ['✕failed', 'danger']]);
+  expect(marks(list.getAllByRole('row')[3])).toEqual([['■completed', 'ok'], ['?inconclusive', 'muted']]);
+  expect(marks(list.getAllByRole('row')[4])).toEqual([['⊘cancelled', 'muted']]);
+  list.unmount();
+
+  // A review set: a running member and a completed failure.
+  const history = [admitted('g1', '2026-10-01T10:00:00Z', 'e1', ['e1', 'e2'], 'a1', 'Refund window')];
+  const members = [
+    ['e1', 'v1', 'running', null, null, null],
+    ['e2', 'v2', 'completed', 'failed', 'r2', JSON.stringify({ requirements: [{ id: 'approves', outcome: 'failed' }] })]
+  ];
+  const set = render(ReviewSets, await loadReviewSets(PULL, { executor: reviewReads(history, members).executor }));
+  const [running, completed] = set.getAllByRole('row').slice(1);
+  expect(marks(running)).toEqual([['●running', 'run']]);
+  expect(marks(completed)).toEqual([['■completed', 'ok'], ['✕failed', 'danger']]);
+  set.unmount();
+
+  // The execution's own page: the same completed failure.
+  const page = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureExecutor }));
+  const facts = page.container.querySelector('[data-execution-status]')?.closest('dl') as Element;
+  expect(marks(facts)).toEqual([['■completed', 'ok'], ['✕failed', 'danger']]);
+  page.unmount();
 });
 
 test('an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution', async () => {

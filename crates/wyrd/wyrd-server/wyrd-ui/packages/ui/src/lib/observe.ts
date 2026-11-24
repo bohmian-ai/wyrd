@@ -1204,7 +1204,7 @@ export const EXECUTION_STATUS: Readonly<Record<string, ExecutionMark>> = {
   running: ['●', 'running', 'run'],
   retrying: ['↻', 'retrying', 'run'],
   waiting: ['◷', 'waiting', 'warn'],
-  completed: ['■', 'completed', 'text'],
+  completed: ['■', 'completed', 'ok'],
   errored: ['✕', 'errored', 'danger'],
   timed_out: ['⧗', 'timed out', 'warn'],
   cancelled: ['⊘', 'cancelled', 'muted'],

@@ -37,11 +37,12 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { EXECUTION_STATUS, EXECUTION_VERDICT, KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
+  import { EXECUTION_VERDICT, KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
   import ActionNote from './ActionNote.svelte';
+  import StatusMark from './StatusMark.svelte';
   import DurationBar from './DurationBar.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill, { type Tone } from './StatusPill.svelte';
@@ -348,11 +349,9 @@
                     {@const value = row[columnIndex(rows, column)]}
                     {#if column === extrasBefore}{@render extras(rows, row, traceCounts)}{/if}<td class:name={signal && column === 'name'} class={pinned(column)}>
                       {#if signal === 'executions' && column === 'verdict'}
-                        {@const mark = EXECUTION_VERDICT[String(value)]}
-                        {#if mark}<span class="badge tone-{mark[2]}"><span aria-hidden="true">{mark[0]}</span>{mark[1]}</span>{:else}<span class="null">none</span>{/if}
+                        {#if EXECUTION_VERDICT[String(value)]}<StatusMark verdict={String(value)} />{:else}<span class="null">none</span>{/if}
                       {:else if signal === 'executions' && column === 'status'}
-                        {@const mark = EXECUTION_STATUS[String(value)] ?? ['', String(value), 'text']}
-                        <span class="st tone-{mark[2]}" title={value === 'not recorded' ? UNSETTLED : undefined}><span aria-hidden="true">{mark[0]}</span>{mark[1]}</span>
+                        <StatusMark status={String(value)} title={value === 'not recorded' ? UNSETTLED : undefined} />
                       {:else if signal === 'executions' && column === 'pull_request' && typeof value === 'string'}
                         <button type="button" class="pull" title="Open the review sets of {value}" onclick={(event) => (event.stopPropagation(), openPull(value, row[columnIndex(rows, 'review_set')]))}>{value}</button>
                       {:else if signal === 'executions' && column === 'head' && typeof value === 'string'}
@@ -677,38 +676,6 @@
   }
   .null {
     color: var(--muted);
-  }
-  .st,
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font: 12px var(--font-mono);
-    white-space: nowrap;
-  }
-  .badge {
-    padding: 0 6px;
-    border: 2px solid currentColor;
-    border-radius: var(--r);
-    font: 11px/16px var(--font-mono);
-  }
-  .tone-text {
-    color: var(--text);
-  }
-  .tone-muted {
-    color: var(--muted);
-  }
-  .tone-run {
-    color: var(--declare);
-  }
-  .tone-ok {
-    color: var(--ok);
-  }
-  .tone-warn {
-    color: var(--warn);
-  }
-  .tone-danger {
-    color: var(--danger);
   }
   [data-signal='executions'] table {
     min-width: 880px;

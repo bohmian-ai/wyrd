@@ -371,6 +371,26 @@ proof, not manufactured failures.
      banner are real links with the shared focus ring; touch targets are the
      full set row. Long content: rows wrap at 390 and the member table scrolls
      inside its own region (390 capture).
+   - One status and verdict mapping (maintainer decision, 2026-11-24: the
+     mock's marks everywhere, with completed green). `EXECUTION_STATUS` and
+     `EXECUTION_VERDICT` (`observe.ts`) are the only mapping; `StatusMark`
+     draws it on Verify's list, review sets and the execution page. Deleted:
+     the execution page's `STATUS_TONES`, `VerdictPill`, and the list's and
+     review set's own tone classes; the mock's `LIFECYCLE.completed` is now
+     `c-ok`. Review sets gain the running colour they lacked. RED: [U2] "an
+     execution reads with one status and verdict mark…" `expected [] to
+     deeply equal [['■completed', 'ok'], …]`. GREEN: [U2]/[P1] 69 passed;
+     `ui:check` exit 0; mock `selfcheck.mjs` passed; [U1] library 22
+     passed; [D2]-file Verify, execution, Alice and exact-execution journeys 4
+     passed.
+   - Diagnosis: the Verify journey ("the Verify dashboard filters…",
+     `ui-pages.integration.test.ts:1969`) failed with the first row's status
+     `○queued` → `●running` after Back. Codex `gpt-6.1-sol` medium,
+     read-only: the test compared the row's whole text, status included; under
+     memory contention the runner records `running` before refusing capacity
+     (`runner.rs:1569`), so status may move while the list is away. Not caused
+     by this change. Fix site: the test compares the row by every cell but
+     status; URL, count, Card names and scroll stay asserted. Then 4 passed.
    - Remaining differences from the mock, for the maintainer's ruling:
      1. set ids are the retained generation, shortened (mock `rs-482-3`;
         kept by an earlier decision);

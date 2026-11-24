@@ -252,8 +252,9 @@ SDK journeys. Record actual new test names and exact focused commands once added
 - Tier 2: `pg_principal_roles::directory_projects_names_methods_roles_and_counts`
   (`pg_principal_roles.rs:847`), `pg_admin_principals::pg_tests::role_holders_filter_count_and_member_count_alike`
   (`pg_admin_principals.rs:1257`), `pg_openapi_contract::principal_read_projections_publish_their_contract`
-  (`pg_openapi_contract.rs:644`); platform console cookie scheme declared in `f24b3d6a5`
-  (all 27 `pg_openapi_contract` tests pass; `codegen:check` clean).
+  (`pg_openapi_contract.rs:644`); platform console cookie scheme `wyrdPlatformBrowserSession` on the three console
+  session routes (`de7635a14`, merged from PR 244 in `8cc9b03d3`, replacing this task's
+  `f24b3d6a5`).
 - Rust SDK: `principal_roles::administrators_read_people_roles_and_counts`
   (`sdks/wyrd-sdk-rust/tests/integration/principal_roles.rs:423`).
 - Python (`c85ceae22`, 14/14): `test_a_role_filter_pages_this_tenants_holders_with_their_counts`,
@@ -451,7 +452,15 @@ colour, copy-field contrast, overlay focus ring, row control alignment, phone ro
 wrap, brand and "(you)" spacing, radio alignment, avatar centring, account column
 width, plain-link underline, role chip wrap, phone section strip).
 
-Remaining differences, for maintainer ruling:
+After merging PR 244 (`8cc9b03d3`) and adopting the verification workflow
+branch's `dev:full` and example-app pin (`b7b63ea14`): `codegen:check`,
+`pg_openapi_contract` + `platform_admin_e2e`, `test:principals:integration`,
+`ui:check`, `docs:check`, the `development environment lifecycle` journey and
+`git diff --check` passed. `test:wyrd`: 3032/3034; the capacity sweep teardown
+test raced its paused clock and is fixed; `pg_verification_routes::staging_refusal_recovers_the_same_enqueue_identity`
+passes alone and timed out (504) once under the full lane's load.
+
+Remaining differences; the maintainer approved all twelve as listed (2026-11-24):
 1. The rail keeps the disabled "Find or ask…" control from the shared shell.
 2. At 390 the shell keeps a top navigation bar; the mock hides the rail.
 3. No Secrets count in the section list (no server count exists).

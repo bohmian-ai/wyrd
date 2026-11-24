@@ -1,0 +1,4130 @@
+{
+  "protocol": "wyrd-l1-case",
+  "protocol_version": 1,
+  "category": "bifrost-writes",
+  "family": "writes-parquet",
+  "case": "otlp-spans-1k-c1",
+  "selector": "otlp-spans-1k-c1",
+  "mode": "standard",
+  "profile": null,
+  "started_at": "2026-11-24T01:12:52.241394893Z",
+  "record": {
+    "schema_version": 3,
+    "engine": "bifrost",
+    "experiment": "writes-parquet",
+    "level": 1,
+    "question": "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?",
+    "started_at": "2026-11-24T01:12:55.239394541Z",
+    "finished_at": "2026-11-24T01:16:25.690424478Z",
+    "elapsed_seconds": 213.449413938,
+    "commit": "16932b9a30fce6e59dca912d7853a7cc5a92b882",
+    "dirty": false,
+    "dirty_override": false,
+    "diff_sha256": null,
+    "host": {
+      "os": "linux",
+      "os_version": "Linux (Pop!_OS 24.04)",
+      "arch": "x86_64",
+      "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+      "logical_cpus": 32,
+      "memory_bytes": 98742124544,
+      "storage": "file:// store in a temporary directory on the local filesystem",
+      "fingerprint": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux"
+    },
+    "build": {
+      "profile": "release",
+      "rustflags": "-C force-frame-pointers=yes",
+      "debug": "line-tables-only",
+      "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "server": {
+        "name": "wyrd-server",
+        "bytes": 1384033000,
+        "modified": "2026-11-24T00:46:48.716622944Z"
+      },
+      "driver": {
+        "name": "capacity",
+        "bytes": 1086367152,
+        "modified": "2026-11-24T00:51:10.168948421Z"
+      }
+    },
+    "command": {
+      "args": [
+        "l1",
+        "bifrost",
+        "writes-parquet",
+        "--steps",
+        "otlp-spans-1k-c1"
+      ],
+      "config": {
+        "WYRD_DATABASE_URL": "<set>",
+        "WYRD_DB_MAX_CONNECTIONS": "8",
+        "WYRD_DB_MAX_CONNECTIONS_VALA": "8",
+        "WYRD_PLATFORM_DATABASE_URL": "<set>",
+        "WYRD_TEST_DATABASE_ADMIN_URL": "<set>",
+        "WYRD_TEST_POSTGRES_PROJECT": "wyrd-l1-20261124t010747915z-3"
+      }
+    },
+    "variables": {
+      "clients": [
+        1,
+        64
+      ]
+    },
+    "controls": {
+      "timing": {
+        "warmup_seconds": 30,
+        "repetition_seconds": 30,
+        "repetitions": 3,
+        "budget_seconds": 590,
+        "minimum_seconds": 0,
+        "phases": {
+          "setup_seconds": 240,
+          "warmup_seconds": 30,
+          "measurement_seconds": 90,
+          "drain_seconds": 150,
+          "teardown_seconds": 60,
+          "persist_seconds": 20
+        }
+      },
+      "validity": {
+        "host_busy_fraction": 0.1,
+        "host_sample_seconds": 10,
+        "driver_cores": 8.0,
+        "driver_fraction": 0.8,
+        "lateness_p99_us": 5000.0,
+        "p99_samples": 1000,
+        "p95_samples": 200
+      },
+      "values": {
+        "fixture": {
+          "native": "native-2m: events rows into bifrost.datasets.events_ingest, 2000000 rows per day, fresh ids every window",
+          "spans": "spans-2m: GenAI/HTTP spans into bifrost.traces.spans, 2000000 spans per day, fresh ids every window",
+          "spans_1k": "spans-1k-2m: the spans-2m spans at about 1 KiB of OTLP wire each (Kubernetes and SDK resource attributes, twelve more span attributes, a prompt and a log event per span) into bifrost.traces.spans, 2000000 spans per day, ids distinct from spans-2m, fresh ids every window",
+          "logs": "logs-2m: bulky Kubernetes logs into bifrost.logs.records, 2000000 records per day, fresh ids every window"
+        },
+        "limits": "server defaults on the whole host except WYRD_MAX_FILE_RETENTION_TIME=30; no resource quota",
+        "timing": {
+          "recorder": "wyrd-benchmark is the server's only metrics recorder: counters, gauges, and diagnostic histograms are read from the same snapshots as the timings, with no Prometheus recorder or exporter; a duration with both a timing and a production histogram is recorded only as the timing",
+          "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
+          "clock": "std::time::Instant: the OS monotonic clock",
+          "precision": "3 significant digits; each percentile is judged on its whole bucket's bounds",
+          "range_ns": [
+            1,
+            137438953472
+          ],
+          "scan_range": [
+            1,
+            1125899906842624
+          ],
+          "max_series": 256,
+          "max_scan_series": 64,
+          "max_metric_series": 1024,
+          "metric_histograms": "fixed-point billionths: a _seconds histogram in range_ns, any other in [1, 4611686018427387904] billionths of its value, so fractional ratios and decimal costs keep their value",
+          "percentile": "nearest rank ceil(q * N) over the window's distribution",
+          "server_env": {
+            "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1"
+          },
+          "tracing": "operator span export stays at its default (disabled); no span is required for timing",
+          "assignment": "every request carries its closed case and the repetition or admission phase that admitted it, attached when its request span opens; a window takes the observations recorded between its opening snapshot and one taken after its admitted cohort drained, so a late completion stays in its admitted cohort; each cohort's judged-outcome count must equal the completions the driver saw, other outcomes (retried or refused attempts) are counted beside it; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, scans that are not the answered cohort's, or a replaced process makes it invalid",
+          "measurement": "work, wall seconds, and server and driver CPU stop at the admission stop, before the requests then in flight drain; their completions count as late work beside the measured work, and their latency stays in the final cohort",
+          "evidence": "each window's full opening and drained snapshots are kept under the run's target artifacts as timings/<step>/<phase>.json; the record keeps each cohort's reconciliation and each percentile's rank and bucket bounds",
+          "timer_resolution_ns": 20
+        },
+        "workload": "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer"
+      },
+      "selection": null
+    },
+    "criteria": {
+      "metrics": [
+        {
+          "id": "cores",
+          "unit": "cores",
+          "boundary": "C/T: server CPU-seconds of the declared processes per wall second of the window",
+          "direction": null,
+          "derive": {
+            "kind": "cores"
+          }
+        },
+        {
+          "id": "requests",
+          "unit": "requests",
+          "boundary": "successful requests in the window: answered queries or acknowledged write requests",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "errors",
+          "unit": "errors",
+          "boundary": "failed requests of every stable code",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "server_failures",
+          "unit": "requests",
+          "boundary": "server timings at the step's boundary whose outcome is not `success`, counted in their own outcome series and never judged",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "wrong_results",
+          "unit": "queries",
+          "boundary": "answered queries whose rows differ from the exact answer",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "p50_ms",
+          "unit": "ms",
+          "boundary": "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' nearest-rank bucket bounds of the server's timing histograms",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "p95_ms",
+          "unit": "ms",
+          "boundary": "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' nearest-rank bucket bounds of the server's timing histograms",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "p99_ms",
+          "unit": "ms",
+          "boundary": "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' nearest-rank bucket bounds of the server's timing histograms",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "client_p50_ms",
+          "unit": "ms",
+          "boundary": "diagnostic only: client send until its terminal or durable acknowledgement, never judged",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "client_p95_ms",
+          "unit": "ms",
+          "boundary": "diagnostic only: client send until its terminal or durable acknowledgement, never judged",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "client_p99_ms",
+          "unit": "ms",
+          "boundary": "diagnostic only: client send until its terminal or durable acknowledgement, never judged",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "queries",
+          "unit": "queries",
+          "boundary": "exactly answered queries in the window; read steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "scanned_rows_per_query",
+          "unit": "rows/query",
+          "boundary": "mean rows each successful query's own executed-plan file scans output (`bifrost.oracle.stream` `rows_scanned` on its trace); read steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "scanned_bytes_per_query",
+          "unit": "B/query",
+          "boundary": "mean bytes each successful query's own executed plan scanned (`bifrost.oracle.stream` `bytes_scanned` on its trace); read steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "rows",
+          "unit": "rows",
+          "boundary": "durably acknowledged rows in the window; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "retained_mib",
+          "unit": "MiB",
+          "boundary": "uncompressed Arrow bytes Scribe inserted into memtables (`bifrost_scribe_memtable_bytes_inserted_total`) between the window open and its measured stop, the CPU interval, 2^20 bytes; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "wire_bytes",
+          "unit": "B",
+          "boundary": "encoded OTLP protobuf bytes of acknowledged exports, before framing and compression; OTLP steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "wire_bytes_per_row",
+          "unit": "B/row",
+          "boundary": "`wire_bytes` per durably acknowledged row of the same window: the measured OTLP payload size; OTLP steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "published_files",
+          "unit": "files",
+          "boundary": "Parquet files Scribe published (`bifrost_scribe_publication_files_total`) between the window open and its measured stop, the CPU interval: the publication the window's server CPU paid for, zero when none ran; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "published_mib",
+          "unit": "MiB",
+          "boundary": "Parquet MiB Scribe published (`bifrost_scribe_publication_bytes_total`) between the window open and its measured stop, 2^20 bytes; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "wal_bytes_per_row",
+          "unit": "B/row",
+          "boundary": "WAL record bytes Scribe appended (`bifrost_scribe_wal_append_bytes_total`) between the window open and its measured stop, per acknowledged row of the window; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "staged_bytes_per_row",
+          "unit": "B/row",
+          "boundary": "encoded staged-run bytes Scribe wrote (`bifrost_scribe_persistence_encoded_bytes_total`) between the window open and its measured stop, per acknowledged row of the window; staging lags acknowledgement, so the bytes may stage earlier rows; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "published_bytes_per_row",
+          "unit": "B/row",
+          "boundary": "Parquet bytes Scribe published (`bifrost_scribe_publication_bytes_total`) between the window open and its measured stop, per acknowledged row of the window; publication lags acknowledgement; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "wal_syncs",
+          "unit": "syncs",
+          "boundary": "WAL `fdatasync` calls (`bifrost_scribe_wal_fsync_total`) between the window open and its measured stop; a sync an earlier one already covered is not counted; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "stage_syncs",
+          "unit": "syncs",
+          "boundary": "staged file and directory fsyncs (`bifrost_scribe_stage_fsyncs_total`) between the window open and its measured stop; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "memtable_backlog_mib",
+          "unit": "MiB",
+          "boundary": "Arrow MiB still in active and immutable memtables (`bifrost_scribe_active_memtable_bytes`, `bifrost_scribe_immutable_memtable_bytes`) at the measured stop, 2^20 bytes; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "staged_backlog_mib",
+          "unit": "MiB",
+          "boundary": "staged MiB not yet published (`bifrost_scribe_staging_live_bytes`) at the measured stop, 2^20 bytes; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "visibility_p99_ms",
+          "unit": "ms",
+          "boundary": "acknowledgement until the rows are queryable",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "storage_ratio",
+          "unit": "ratio",
+          "boundary": "the path's table growth in published Parquet bytes per retained Arrow byte inserted while one 200,000-row sample of the path loaded before the windows, settled with the read fixture; the inserted bytes include server-internal rows written meanwhile, and WAL, staging, and catalog bytes are excluded; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "scaling",
+          "unit": "ratio",
+          "boundary": "Q_N/(N × Q_1) of `rate`",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "base_rate",
+          "unit": "requests/s",
+          "boundary": "the one-client step's `rate`",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "scaled_rate",
+          "unit": "requests/s",
+          "boundary": "the 64-client step's `rate`",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "rate",
+          "unit": "requests/s",
+          "boundary": "successful requests per wall second",
+          "direction": "higher",
+          "derive": {
+            "kind": "rate",
+            "work": "requests",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "queries_per_s_per_vcpu",
+          "unit": "queries/s/vCPU",
+          "boundary": "(W/T)/P: exactly answered queries per wall second per provisioned vCPU",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_vcpu",
+            "work": "queries",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "queries_per_cpu_s",
+          "unit": "queries/cpu-s",
+          "boundary": "W/C: exactly answered queries per server CPU-second used",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_cpu",
+            "work": "queries",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "cpu_ms_per_query",
+          "unit": "ms/query",
+          "boundary": "server CPU per exactly answered query",
+          "direction": "lower",
+          "derive": {
+            "kind": "cpu_per",
+            "work": "queries",
+            "scale": 1000.0
+          }
+        },
+        {
+          "id": "input_mib_per_s_per_vcpu",
+          "unit": "MiB/s/vCPU",
+          "boundary": "(W/T)/P: the headline ingest rate: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per wall second per provisioned vCPU; OTLP steps only",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_vcpu",
+            "work": "wire_bytes",
+            "scale": 9.5367431640625e-7
+          }
+        },
+        {
+          "id": "input_mib_per_cpu_s",
+          "unit": "MiB/cpu-s",
+          "boundary": "W/C: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per server CPU-second used; OTLP steps only",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_cpu",
+            "work": "wire_bytes",
+            "scale": 9.5367431640625e-7
+          }
+        },
+        {
+          "id": "rows_per_s",
+          "unit": "rows/s",
+          "boundary": "durably acknowledged rows per wall second",
+          "direction": "higher",
+          "derive": {
+            "kind": "rate",
+            "work": "rows",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "rows_per_s_per_vcpu",
+          "unit": "rows/s/vCPU",
+          "boundary": "(W/T)/P: durably acknowledged rows per wall second per provisioned vCPU",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_vcpu",
+            "work": "rows",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "rows_per_cpu_s",
+          "unit": "rows/cpu-s",
+          "boundary": "W/C: durably acknowledged rows per server CPU-second used",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_cpu",
+            "work": "rows",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "cpu_us_per_row",
+          "unit": "µs/row",
+          "boundary": "server CPU per durably acknowledged row",
+          "direction": "lower",
+          "derive": {
+            "kind": "cpu_per",
+            "work": "rows",
+            "scale": 1000000.0
+          }
+        },
+        {
+          "id": "memory_per_mib_s",
+          "unit": "B/(MiB/s)",
+          "boundary": "sampled peak server resident bytes per retained Arrow MiB/s achieved; a sampled peak, not an exact OS high-water mark",
+          "direction": "lower",
+          "derive": {
+            "kind": "memory_per",
+            "work": "retained_mib"
+          }
+        },
+        {
+          "id": "stored_mib_per_s_per_vcpu",
+          "unit": "MiB/s/vCPU",
+          "boundary": "(W/T)/P: uncompressed Arrow MiB the server stored per wall second per provisioned vCPU; it falls when the schema stores less per row, so it is not an ingest rate",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_vcpu",
+            "work": "retained_mib",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "stored_mib_per_cpu_s",
+          "unit": "MiB/cpu-s",
+          "boundary": "W/C: uncompressed Arrow MiB the server stored per server CPU-second used; not an ingest rate",
+          "direction": "higher",
+          "derive": {
+            "kind": "per_cpu",
+            "work": "retained_mib",
+            "scale": 1.0
+          }
+        },
+        {
+          "id": "phase_scribe_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_scribe_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_admission_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.admission` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_admission_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.admission` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_decode_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.decode` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_decode_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.decode` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_preprocess_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.preprocess` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_preprocess_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.preprocess` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_shard_wait_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.shard_wait` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_shard_wait_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.shard_wait` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_wal_append_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.wal_append` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_wal_append_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.wal_append` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_wal_sync_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.wal_sync` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_wal_sync_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.wal_sync` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_visibility_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.visibility` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_visibility_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.visibility` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_ack_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.scribe.write.ack` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_ack_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.scribe.write.ack` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_otlp_decode_p50_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p50 of the window's successful `bifrost.otlp.traces.decode` or `bifrost.otlp.logs.decode` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "phase_otlp_decode_p99_ms",
+          "unit": "ms",
+          "boundary": "server diagnostic: nearest-rank p99 of the window's successful `bifrost.otlp.traces.decode` or `bifrost.otlp.logs.decode` times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.count",
+          "unit": "observations",
+          "boundary": "driver: `client.otlp.export` start until its successful end, the cohort's calls",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.p50_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` start until its successful end, the cohort's calls",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.p95_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` start until its successful end, the cohort's calls",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.p99_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` start until its successful end, the cohort's calls",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.mean_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` start until its successful end, the cohort's calls",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.build.count",
+          "unit": "observations",
+          "boundary": "driver: `client.otlp.export` `build` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.build.p50_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `build` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.build.p95_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `build` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.build.p99_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `build` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.build.mean_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `build` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.token.count",
+          "unit": "observations",
+          "boundary": "driver: `client.otlp.export` `token` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.token.p50_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `token` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.token.p95_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `token` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.token.p99_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `token` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.token.mean_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `token` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.export.count",
+          "unit": "observations",
+          "boundary": "driver: `client.otlp.export` `export` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.export.p50_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `export` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.export.p95_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `export` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.export.p99_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `export` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        },
+        {
+          "id": "diagnostic.driver.client.otlp.export.export.mean_us",
+          "unit": "µs",
+          "boundary": "driver: `client.otlp.export` `export` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed",
+          "direction": null,
+          "derive": null
+        }
+      ],
+      "criteria": [
+        {
+          "id": "no-errors",
+          "metric": "errors",
+          "steps": [
+            "otlp-spans-1k-c1"
+          ],
+          "rule": {
+            "op": "le",
+            "limit": 0.0,
+            "over": "every"
+          },
+          "percentile": null
+        }
+      ]
+    },
+    "steps": [
+      {
+        "id": "otlp-spans-1k-c1",
+        "params": {
+          "clients": 1,
+          "op": "otlp-spans-1k",
+          "window_seconds": 10
+        },
+        "status": "measured",
+        "timing": {
+          "warmup_seconds": 30,
+          "repetition_seconds": 30,
+          "repetitions": 3,
+          "budget_seconds": 590,
+          "minimum_seconds": 0,
+          "phases": {
+            "setup_seconds": 240,
+            "warmup_seconds": 30,
+            "measurement_seconds": 90,
+            "drain_seconds": 150,
+            "teardown_seconds": 60,
+            "persist_seconds": 20
+          }
+        },
+        "repetitions": [
+          {
+            "seconds": 30.056791811,
+            "processes": [
+              "wyrd-server"
+            ],
+            "server_cpu_seconds": 35.41,
+            "peak_memory_bytes": 2134663168,
+            "opening_memory_bytes": 1130721280,
+            "memory_interval_ms": 10,
+            "driver_cpu_seconds": 17.11,
+            "provisioned_vcpus": 32,
+            "metrics": {
+              "busy_retries": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "client_p50_ms": {
+                "value": 16.075,
+                "above": null,
+                "samples": 1785,
+                "reason": null
+              },
+              "client_p95_ms": {
+                "value": 22.142,
+                "above": null,
+                "samples": 1785,
+                "reason": null
+              },
+              "client_p99_ms": {
+                "value": 30.619,
+                "above": null,
+                "samples": 1785,
+                "reason": null
+              },
+              "cores": {
+                "value": 1.1781031130222241,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "cpu_ms_per_query": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "cpu_us_per_row": {
+                "value": 38.76690372757847,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.count": {
+                "value": 1785.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.mean_us": {
+                "value": 1239.7053170868348,
+                "above": 1238.783856022409,
+                "samples": 1785,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p50_us": {
+                "value": 1168.383,
+                "above": 1167.359,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p95_us": {
+                "value": 1693.695,
+                "above": 1692.671,
+                "samples": 1785,
+                "rank": 1696,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p99_us": {
+                "value": 1903.615,
+                "above": 1902.591,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.count": {
+                "value": 1785.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.count": {
+                "value": 1785.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.mean_us": {
+                "value": 15552.293005602241,
+                "above": 15542.74814509804,
+                "samples": 1785,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p50_us": {
+                "value": 14802.943,
+                "above": 14794.751,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p95_us": {
+                "value": 21020.671,
+                "above": 21004.287,
+                "samples": 1785,
+                "rank": 1696,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p99_us": {
+                "value": 29032.447,
+                "above": 29016.063,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.mean_us": {
+                "value": 16802.805247619046,
+                "above": 16791.654112605043,
+                "samples": 1785,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p50_us": {
+                "value": 16072.703,
+                "above": 16064.511,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p95_us": {
+                "value": 22134.783,
+                "above": 22118.399,
+                "samples": 1785,
+                "rank": 1696,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p99_us": {
+                "value": 30621.695,
+                "above": 30605.311,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.count": {
+                "value": 1785.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.mean_us": {
+                "value": 4.92687675070028,
+                "above": 4.924347899159664,
+                "samples": 1785,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p50_us": {
+                "value": 5.011,
+                "above": 5.007,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p95_us": {
+                "value": 7.115,
+                "above": 7.111,
+                "samples": 1785,
+                "rank": 1696,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p99_us": {
+                "value": 8.967,
+                "above": 8.959,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "drain_seconds": {
+                "value": 0.012485838,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "errors": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "input_mib_per_cpu_s": {
+                "value": 25.934209152993024,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "input_mib_per_s_per_vcpu": {
+                "value": 0.9547866417784545,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "late_requests": {
+                "value": 1.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "late_rows": {
+                "value": 512.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "max_ms": {
+                "value": 54.165503,
+                "above": 54.132735,
+                "samples": 1785,
+                "rank": 1785,
+                "reason": null
+              },
+              "memory_per_mib_s": {
+                "value": 20675311.09057958,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "memtable_backlog_mib": {
+                "value": 407.74003410339355,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "p50_ms": {
+                "value": 12.902399,
+                "above": 12.894207,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "p95_ms": {
+                "value": 18.972671,
+                "above": 18.956287,
+                "samples": 1785,
+                "rank": 1696,
+                "reason": null
+              },
+              "p99_ms": {
+                "value": 26.836991,
+                "above": 26.820607,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_ack_p50_ms": {
+                "value": 0.010695,
+                "above": 0.010687,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_ack_p99_ms": {
+                "value": 0.030687,
+                "above": 0.030671,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_admission_p50_ms": {
+                "value": 0.084671,
+                "above": 0.084607,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_admission_p99_ms": {
+                "value": 0.140159,
+                "above": 0.140031,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_decode_p50_ms": {
+                "value": 0.397567,
+                "above": 0.397311,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_decode_p99_ms": {
+                "value": 0.632319,
+                "above": 0.631807,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_otlp_decode_p50_ms": {
+                "value": 0.903167,
+                "above": 0.902655,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_otlp_decode_p99_ms": {
+                "value": 1.382399,
+                "above": 1.381375,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_preprocess_p50_ms": {
+                "value": 1.049599,
+                "above": 1.048575,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_preprocess_p99_ms": {
+                "value": 1.590271,
+                "above": 1.589247,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_scribe_p50_ms": {
+                "value": 6.856703,
+                "above": 6.852607,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_scribe_p99_ms": {
+                "value": 20.496383,
+                "above": 20.479999,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_shard_wait_p50_ms": {
+                "value": 0.077119,
+                "above": 0.077055,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_shard_wait_p99_ms": {
+                "value": 6.750207,
+                "above": 6.746111,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_visibility_p50_ms": {
+                "value": 1.547263,
+                "above": 1.546239,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_visibility_p99_ms": {
+                "value": 2.736127,
+                "above": 2.734079,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_wal_append_p50_ms": {
+                "value": 2.930687,
+                "above": 2.928639,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_wal_append_p99_ms": {
+                "value": 4.521983,
+                "above": 4.517887,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "phase_wal_sync_p50_ms": {
+                "value": 0.475391,
+                "above": 0.475135,
+                "samples": 1785,
+                "rank": 893,
+                "reason": null
+              },
+              "phase_wal_sync_p99_ms": {
+                "value": 9.543679,
+                "above": 9.535487,
+                "samples": 1785,
+                "rank": 1768,
+                "reason": null
+              },
+              "published_bytes_per_row": {
+                "value": 76.40874505149944,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "published_files": {
+                "value": 9.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "published_mib": {
+                "value": 66.55918025970459,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "queries_per_cpu_s": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "queries_per_s_per_vcpu": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "rate": {
+                "value": 59.35430538355403,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "requests": {
+                "value": 1784.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "retained_mib": {
+                "value": 3103.2726011276245,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows": {
+                "value": 913408.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_cpu_s": {
+                "value": 25795.199096300483,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_s": {
+                "value": 30389.404356379662,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_s_per_vcpu": {
+                "value": 949.6688861368644,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "server_failures": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "stage_syncs": {
+                "value": 198.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "staged_backlog_mib": {
+                "value": 106.80721473693848,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "staged_bytes_per_row": {
+                "value": 125.04070579631446,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "storage_ratio": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "measured by the `parquet` experiment after its settlement; a write window never waits for publication"
+              },
+              "stored_mib_per_cpu_s": {
+                "value": 87.63831124336699,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "stored_mib_per_s_per_vcpu": {
+                "value": 3.2264677279944136,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "visibility_p99_ms": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+              },
+              "wal_bytes_per_row": {
+                "value": 289.12967042110427,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wal_syncs": {
+                "value": 2797.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wire_bytes": {
+                "value": 962939161.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wire_bytes_per_row": {
+                "value": 1054.2267650381866,
+                "above": null,
+                "samples": null,
+                "reason": null
+              }
+            },
+            "arrivals": null,
+            "invalid": [],
+            "observations": [
+              "server timing: 28869 observations in 20 series, 0 scanned queries",
+              "driver timing: 1785 observations in 1 series, 0 scanned queries"
+            ],
+            "reconciliation": [
+              {
+                "role": "server",
+                "boundary": "bifrost.otlp.traces",
+                "outcome": "success",
+                "case": "otlp-spans-1k",
+                "phase": "repetition-1",
+                "expected": 1785,
+                "recorded": 1785
+              },
+              {
+                "role": "driver",
+                "boundary": "client.otlp.export",
+                "outcome": "success",
+                "case": "otlp-spans-1k",
+                "phase": "repetition-1",
+                "expected": 1785,
+                "recorded": 1785
+              }
+            ]
+          },
+          {
+            "seconds": 30.050178829,
+            "processes": [
+              "wyrd-server"
+            ],
+            "server_cpu_seconds": 35.7,
+            "peak_memory_bytes": 2184888320,
+            "opening_memory_bytes": 1995403264,
+            "memory_interval_ms": 10,
+            "driver_cpu_seconds": 16.17,
+            "provisioned_vcpus": 32,
+            "metrics": {
+              "busy_retries": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "client_p50_ms": {
+                "value": 15.927,
+                "above": null,
+                "samples": 1798,
+                "reason": null
+              },
+              "client_p95_ms": {
+                "value": 20.556,
+                "above": null,
+                "samples": 1798,
+                "reason": null
+              },
+              "client_p99_ms": {
+                "value": 28.376,
+                "above": null,
+                "samples": 1798,
+                "reason": null
+              },
+              "cores": {
+                "value": 1.1880128968000558,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "cpu_ms_per_query": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "cpu_us_per_row": {
+                "value": 38.80164858096828,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.count": {
+                "value": 1798.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.mean_us": {
+                "value": 1167.81917352614,
+                "above": 1166.9601952169078,
+                "samples": 1798,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p50_us": {
+                "value": 1098.751,
+                "above": 1097.727,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p95_us": {
+                "value": 1645.567,
+                "above": 1644.543,
+                "samples": 1798,
+                "rank": 1709,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p99_us": {
+                "value": 1879.039,
+                "above": 1878.015,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.count": {
+                "value": 1798.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.count": {
+                "value": 1798.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.mean_us": {
+                "value": 15507.350208008898,
+                "above": 15497.450642380423,
+                "samples": 1798,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p50_us": {
+                "value": 14704.639,
+                "above": 14696.447,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p95_us": {
+                "value": 19415.039,
+                "above": 19398.655,
+                "samples": 1798,
+                "rank": 1709,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p99_us": {
+                "value": 26853.375,
+                "above": 26836.991,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.mean_us": {
+                "value": 16684.524205784204,
+                "above": 16673.344355394882,
+                "samples": 1798,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p50_us": {
+                "value": 15925.247,
+                "above": 15917.055,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p95_us": {
+                "value": 20561.919,
+                "above": 20545.535,
+                "samples": 1798,
+                "rank": 1709,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p99_us": {
+                "value": 28377.087,
+                "above": 28360.703,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.count": {
+                "value": 1798.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.mean_us": {
+                "value": 4.267669076751947,
+                "above": 4.265718576195773,
+                "samples": 1798,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p50_us": {
+                "value": 3.967,
+                "above": 3.965,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p95_us": {
+                "value": 6.655,
+                "above": 6.651,
+                "samples": 1798,
+                "rank": 1709,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p99_us": {
+                "value": 8.351,
+                "above": 8.343,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "drain_seconds": {
+                "value": 0.012688003,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "errors": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "input_mib_per_cpu_s": {
+                "value": 25.90969977926473,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "input_mib_per_s_per_vcpu": {
+                "value": 0.961908046562002,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "late_requests": {
+                "value": 1.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "late_rows": {
+                "value": 512.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "max_ms": {
+                "value": 67.239935,
+                "above": 67.174399,
+                "samples": 1798,
+                "rank": 1798,
+                "reason": null
+              },
+              "memory_per_mib_s": {
+                "value": 20554230.24348108,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "memtable_backlog_mib": {
+                "value": 618.8287630081177,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "p50_ms": {
+                "value": 12.877823,
+                "above": 12.869631,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "p95_ms": {
+                "value": 17.596415,
+                "above": 17.580031,
+                "samples": 1798,
+                "rank": 1709,
+                "reason": null
+              },
+              "p99_ms": {
+                "value": 24.657919,
+                "above": 24.641535,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_ack_p50_ms": {
+                "value": 0.009111,
+                "above": 0.009103,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_ack_p99_ms": {
+                "value": 0.027375,
+                "above": 0.027359,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_admission_p50_ms": {
+                "value": 0.076031,
+                "above": 0.075967,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_admission_p99_ms": {
+                "value": 0.141567,
+                "above": 0.141439,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_decode_p50_ms": {
+                "value": 0.379135,
+                "above": 0.378879,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_decode_p99_ms": {
+                "value": 0.633343,
+                "above": 0.632831,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_otlp_decode_p50_ms": {
+                "value": 0.892415,
+                "above": 0.891903,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_otlp_decode_p99_ms": {
+                "value": 1.397759,
+                "above": 1.396735,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_preprocess_p50_ms": {
+                "value": 1.027071,
+                "above": 1.026559,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_preprocess_p99_ms": {
+                "value": 1.695743,
+                "above": 1.694719,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_scribe_p50_ms": {
+                "value": 6.844415,
+                "above": 6.840319,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_scribe_p99_ms": {
+                "value": 17.104895,
+                "above": 17.088511,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_shard_wait_p50_ms": {
+                "value": 0.069759,
+                "above": 0.069695,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_shard_wait_p99_ms": {
+                "value": 3.469311,
+                "above": 3.467263,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_visibility_p50_ms": {
+                "value": 1.429503,
+                "above": 1.428479,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_visibility_p99_ms": {
+                "value": 2.512895,
+                "above": 2.510847,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_wal_append_p50_ms": {
+                "value": 2.904063,
+                "above": 2.902015,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_wal_append_p99_ms": {
+                "value": 4.571135,
+                "above": 4.567039,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "phase_wal_sync_p50_ms": {
+                "value": 0.586239,
+                "above": 0.585727,
+                "samples": 1798,
+                "rank": 899,
+                "reason": null
+              },
+              "phase_wal_sync_p99_ms": {
+                "value": 6.868991,
+                "above": 6.864895,
+                "samples": 1798,
+                "rank": 1781,
+                "reason": null
+              },
+              "published_bytes_per_row": {
+                "value": 113.86639842445743,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "published_files": {
+                "value": 13.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "published_mib": {
+                "value": 99.91109275817871,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "queries_per_cpu_s": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "queries_per_s_per_vcpu": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "rate": {
+                "value": 59.79997690615407,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "requests": {
+                "value": 1797.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "retained_mib": {
+                "value": 3194.295478820801,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows": {
+                "value": 920064.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_cpu_s": {
+                "value": 25772.100840336134,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_s": {
+                "value": 30617.588175950885,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_s_per_vcpu": {
+                "value": 956.7996304984651,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "server_failures": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "stage_syncs": {
+                "value": 246.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "staged_backlog_mib": {
+                "value": 100.17819499969482,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "staged_bytes_per_row": {
+                "value": 116.74978153693657,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "storage_ratio": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "measured by the `parquet` experiment after its settlement; a write window never waits for publication"
+              },
+              "stored_mib_per_cpu_s": {
+                "value": 89.47606383251542,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "stored_mib_per_s_per_vcpu": {
+                "value": 3.3218349308729174,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "visibility_p99_ms": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+              },
+              "wal_bytes_per_row": {
+                "value": 289.22553539753756,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wal_syncs": {
+                "value": 2833.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wire_bytes": {
+                "value": 969907930.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wire_bytes_per_row": {
+                "value": 1054.1744161275737,
+                "above": null,
+                "samples": null,
+                "reason": null
+              }
+            },
+            "arrivals": null,
+            "invalid": [],
+            "observations": [
+              "server timing: 29210 observations in 20 series, 0 scanned queries",
+              "driver timing: 1798 observations in 1 series, 0 scanned queries"
+            ],
+            "reconciliation": [
+              {
+                "role": "server",
+                "boundary": "bifrost.otlp.traces",
+                "outcome": "success",
+                "case": "otlp-spans-1k",
+                "phase": "repetition-2",
+                "expected": 1798,
+                "recorded": 1798
+              },
+              {
+                "role": "driver",
+                "boundary": "client.otlp.export",
+                "outcome": "success",
+                "case": "otlp-spans-1k",
+                "phase": "repetition-2",
+                "expected": 1798,
+                "recorded": 1798
+              }
+            ]
+          },
+          {
+            "seconds": 30.05713269,
+            "processes": [
+              "wyrd-server"
+            ],
+            "server_cpu_seconds": 30.51,
+            "peak_memory_bytes": 2250108928,
+            "opening_memory_bytes": 1338236928,
+            "memory_interval_ms": 10,
+            "driver_cpu_seconds": 15.160000000000004,
+            "provisioned_vcpus": 32,
+            "metrics": {
+              "busy_retries": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "client_p50_ms": {
+                "value": 18.671,
+                "above": null,
+                "samples": 1582,
+                "reason": null
+              },
+              "client_p95_ms": {
+                "value": 22.05,
+                "above": null,
+                "samples": 1582,
+                "reason": null
+              },
+              "client_p99_ms": {
+                "value": 31.038,
+                "above": null,
+                "samples": 1582,
+                "reason": null
+              },
+              "cores": {
+                "value": 1.0150668832809415,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "cpu_ms_per_query": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "cpu_us_per_row": {
+                "value": 37.69123576850095,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.count": {
+                "value": 1582.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.mean_us": {
+                "value": 1134.762206068268,
+                "above": 1133.9615467762326,
+                "samples": 1582,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p50_us": {
+                "value": 1068.031,
+                "above": 1067.007,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p95_us": {
+                "value": 1616.895,
+                "above": 1615.871,
+                "samples": 1582,
+                "rank": 1503,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.build.p99_us": {
+                "value": 1821.695,
+                "above": 1820.671,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.count": {
+                "value": 1582.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.count": {
+                "value": 1582.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.mean_us": {
+                "value": 17820.654170670037,
+                "above": 17807.398836283184,
+                "samples": 1582,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p50_us": {
+                "value": 17465.343,
+                "above": 17448.959,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p95_us": {
+                "value": 20774.911,
+                "above": 20758.527,
+                "samples": 1582,
+                "rank": 1503,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.export.p99_us": {
+                "value": 29884.415,
+                "above": 29868.031,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.mean_us": {
+                "value": 18964.59809987358,
+                "above": 18949.375028445007,
+                "samples": 1582,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p50_us": {
+                "value": 18661.375,
+                "above": 18644.991,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p95_us": {
+                "value": 22052.863,
+                "above": 22036.479,
+                "samples": 1582,
+                "rank": 1503,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.p99_us": {
+                "value": 31031.295,
+                "above": 31014.911,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.count": {
+                "value": 1582.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.mean_us": {
+                "value": 4.004498103666245,
+                "above": 4.002744627054361,
+                "samples": 1582,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p50_us": {
+                "value": 3.737,
+                "above": 3.735,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p95_us": {
+                "value": 6.483,
+                "above": 6.479,
+                "samples": 1582,
+                "rank": 1503,
+                "reason": null
+              },
+              "diagnostic.driver.client.otlp.export.token.p99_us": {
+                "value": 8.247,
+                "above": 8.239,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "drain_seconds": {
+                "value": 0.015648242,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "errors": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "input_mib_per_cpu_s": {
+                "value": 26.67700887234318,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "input_mib_per_s_per_vcpu": {
+                "value": 0.8462171328533568,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "late_requests": {
+                "value": 1.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "late_rows": {
+                "value": 512.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "max_ms": {
+                "value": 63.275007,
+                "above": 63.242239,
+                "samples": 1582,
+                "rank": 1582,
+                "reason": null
+              },
+              "memory_per_mib_s": {
+                "value": 24059024.577323366,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "memtable_backlog_mib": {
+                "value": 321.8746089935303,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "p50_ms": {
+                "value": 15.728639,
+                "above": 15.720447,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "p95_ms": {
+                "value": 18.874367,
+                "above": 18.857983,
+                "samples": 1582,
+                "rank": 1503,
+                "reason": null
+              },
+              "p99_ms": {
+                "value": 28.278783,
+                "above": 28.262399,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_ack_p50_ms": {
+                "value": 0.010295,
+                "above": 0.010287,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_ack_p99_ms": {
+                "value": 0.031423,
+                "above": 0.031407,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_admission_p50_ms": {
+                "value": 0.074559,
+                "above": 0.074495,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_admission_p99_ms": {
+                "value": 0.144895,
+                "above": 0.144767,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_decode_p50_ms": {
+                "value": 0.365823,
+                "above": 0.365567,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_decode_p99_ms": {
+                "value": 0.688127,
+                "above": 0.687615,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_otlp_decode_p50_ms": {
+                "value": 0.887807,
+                "above": 0.887295,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_otlp_decode_p99_ms": {
+                "value": 1.414143,
+                "above": 1.413119,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_preprocess_p50_ms": {
+                "value": 1.015295,
+                "above": 1.014783,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_preprocess_p99_ms": {
+                "value": 1.648639,
+                "above": 1.647615,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_scribe_p50_ms": {
+                "value": 9.322495,
+                "above": 9.314303,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_scribe_p99_ms": {
+                "value": 21.790719,
+                "above": 21.774335,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_shard_wait_p50_ms": {
+                "value": 0.083263,
+                "above": 0.083199,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_shard_wait_p99_ms": {
+                "value": 4.825087,
+                "above": 4.820991,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_visibility_p50_ms": {
+                "value": 1.531903,
+                "above": 1.530879,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_visibility_p99_ms": {
+                "value": 2.496511,
+                "above": 2.494463,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_wal_append_p50_ms": {
+                "value": 2.899967,
+                "above": 2.897919,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_wal_append_p99_ms": {
+                "value": 4.505599,
+                "above": 4.501503,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "phase_wal_sync_p50_ms": {
+                "value": 2.336767,
+                "above": 2.334719,
+                "samples": 1582,
+                "rank": 791,
+                "reason": null
+              },
+              "phase_wal_sync_p99_ms": {
+                "value": 6.193151,
+                "above": 6.189055,
+                "samples": 1582,
+                "rank": 1567,
+                "reason": null
+              },
+              "published_bytes_per_row": {
+                "value": 118.40604122193233,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "published_files": {
+                "value": 12.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "published_mib": {
+                "value": 91.40622615814209,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "queries_per_cpu_s": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "queries_per_s_per_vcpu": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "work reading `queries` is missing"
+              },
+              "rate": {
+                "value": 52.59982767837327,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "requests": {
+                "value": 1581.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "retained_mib": {
+                "value": 2811.0791606903076,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows": {
+                "value": 809472.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_cpu_s": {
+                "value": 26531.366764995084,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_s": {
+                "value": 26931.111771327116,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "rows_per_s_per_vcpu": {
+                "value": 841.5972428539724,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "server_failures": {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "stage_syncs": {
+                "value": 220.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "staged_backlog_mib": {
+                "value": 82.16613388061523,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "staged_bytes_per_row": {
+                "value": 97.12480357566413,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "storage_ratio": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "measured by the `parquet` experiment after its settlement; a write window never waits for publication"
+              },
+              "stored_mib_per_cpu_s": {
+                "value": 92.13632122878752,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "stored_mib_per_s_per_vcpu": {
+                "value": 2.9226415133336565,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "visibility_p99_ms": {
+                "value": null,
+                "above": null,
+                "samples": null,
+                "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+              },
+              "wal_bytes_per_row": {
+                "value": 289.52419231301394,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wal_syncs": {
+                "value": 2504.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wire_bytes": {
+                "value": 853452302.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              "wire_bytes_per_row": {
+                "value": 1054.33208560642,
+                "above": null,
+                "samples": null,
+                "reason": null
+              }
+            },
+            "arrivals": null,
+            "invalid": [],
+            "observations": [
+              "server timing: 25835 observations in 20 series, 0 scanned queries",
+              "driver timing: 1582 observations in 1 series, 0 scanned queries"
+            ],
+            "reconciliation": [
+              {
+                "role": "server",
+                "boundary": "bifrost.otlp.traces",
+                "outcome": "success",
+                "case": "otlp-spans-1k",
+                "phase": "repetition-3",
+                "expected": 1582,
+                "recorded": 1582
+              },
+              {
+                "role": "driver",
+                "boundary": "client.otlp.export",
+                "outcome": "success",
+                "case": "otlp-spans-1k",
+                "phase": "repetition-3",
+                "expected": 1582,
+                "recorded": 1582
+              }
+            ]
+          }
+        ],
+        "aggregate": {
+          "seconds": 90.16410333,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 101.62,
+          "peak_memory_bytes": 2250108928,
+          "opening_memory_bytes": 1130721280,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 48.440000000000005,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 16.799,
+              "above": 16.783,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 21.647,
+              "above": 21.631,
+              "samples": 5165,
+              "rank": 4907,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 29.855,
+              "above": 29.839,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "cores": {
+              "value": 1.1270560705081434,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 38.4495471716389,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.build.p50_us": {
+              "value": 1106.943,
+              "above": 1105.919,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.build.p95_us": {
+              "value": 1659.903,
+              "above": 1658.879,
+              "samples": 5165,
+              "rank": 4907,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.build.p99_us": {
+              "value": 1874.943,
+              "above": 1873.919,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.export.p50_us": {
+              "value": 15589.375,
+              "above": 15581.183,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.export.p95_us": {
+              "value": 20414.463,
+              "above": 20398.079,
+              "samples": 5165,
+              "rank": 4907,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.export.p99_us": {
+              "value": 28573.695,
+              "above": 28557.311,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.p50_us": {
+              "value": 16793.599,
+              "above": 16777.215,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.p95_us": {
+              "value": 21643.263,
+              "above": 21626.879,
+              "samples": 5165,
+              "rank": 4907,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.p99_us": {
+              "value": 29851.647,
+              "above": 29835.263,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.token.p50_us": {
+              "value": 4.271,
+              "above": 4.267,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.token.p95_us": {
+              "value": 6.823,
+              "above": 6.819,
+              "samples": 5165,
+              "rank": 4907,
+              "reason": null
+            },
+            "diagnostic.driver.client.otlp.export.token.p99_us": {
+              "value": 8.543,
+              "above": 8.535,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "input_mib_per_cpu_s": {
+              "value": 26.14861414015375,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "input_mib_per_s_per_vcpu": {
+              "value": 0.920967321938605,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 67.239935,
+              "above": 67.174399,
+              "samples": 5165,
+              "rank": 5165,
+              "reason": null
+            },
+            "memory_per_mib_s": {
+              "value": 22273236.467297956,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 13.819903,
+              "above": 13.811711,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 18.563071,
+              "above": 18.546687,
+              "samples": 5165,
+              "rank": 4907,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 26.542079,
+              "above": 26.525695,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_ack_p50_ms": {
+              "value": 0.010031,
+              "above": 0.010023,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_ack_p99_ms": {
+              "value": 0.030239,
+              "above": 0.030223,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_admission_p50_ms": {
+              "value": 0.078463,
+              "above": 0.078399,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_admission_p99_ms": {
+              "value": 0.140927,
+              "above": 0.140799,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_decode_p50_ms": {
+              "value": 0.386303,
+              "above": 0.386047,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_decode_p99_ms": {
+              "value": 0.650239,
+              "above": 0.649727,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_otlp_decode_p50_ms": {
+              "value": 0.893951,
+              "above": 0.893439,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_otlp_decode_p99_ms": {
+              "value": 1.398783,
+              "above": 1.397759,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_preprocess_p50_ms": {
+              "value": 1.035263,
+              "above": 1.034751,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_preprocess_p99_ms": {
+              "value": 1.646591,
+              "above": 1.645567,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_scribe_p50_ms": {
+              "value": 7.704575,
+              "above": 7.700479,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_scribe_p99_ms": {
+              "value": 19.202047,
+              "above": 19.185663,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_shard_wait_p50_ms": {
+              "value": 0.075327,
+              "above": 0.075263,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_shard_wait_p99_ms": {
+              "value": 4.804607,
+              "above": 4.800511,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_visibility_p50_ms": {
+              "value": 1.508351,
+              "above": 1.507327,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_visibility_p99_ms": {
+              "value": 2.541567,
+              "above": 2.539519,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_wal_append_p50_ms": {
+              "value": 2.912255,
+              "above": 2.910207,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_wal_append_p99_ms": {
+              "value": 4.530175,
+              "above": 4.526079,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "phase_wal_sync_p50_ms": {
+              "value": 0.605695,
+              "above": 0.605183,
+              "samples": 5165,
+              "rank": 2583,
+              "reason": null
+            },
+            "phase_wal_sync_p99_ms": {
+              "value": 8.790015,
+              "above": 8.781823,
+              "samples": 5165,
+              "rank": 5114,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 57.25116547887262,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 5162.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 9108.647240638733,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 2642944.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 26008.10864003149,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 29312.596725182782,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 916.018647661962,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "stored_mib_per_cpu_s": {
+              "value": 89.63439520408122,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "stored_mib_per_s_per_vcpu": {
+              "value": 3.1569684137839293,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "wire_bytes": {
+              "value": 2786299393.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": []
+        },
+        "summary": {
+          "busy_retries": {
+            "unit": "",
+            "median": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 0.0,
+            "max": 0.0,
+            "spread": 0.0
+          },
+          "client_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 16.075,
+              "above": null,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": 15.927,
+            "max": 18.671,
+            "spread": 2.7439999999999998
+          },
+          "client_p95_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 22.05,
+              "above": null,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": 20.556,
+            "max": 22.142,
+            "spread": 1.5859999999999985
+          },
+          "client_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 30.619,
+              "above": null,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": 28.376,
+            "max": 31.038,
+            "spread": 2.661999999999999
+          },
+          "cores": {
+            "unit": "cores",
+            "median": {
+              "value": 1.1781031130222241,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1.0150668832809415,
+            "max": 1.1880128968000558,
+            "spread": 0.17294601351911432
+          },
+          "cpu_ms_per_query": {
+            "unit": "ms/query",
+            "median": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "cpu_us_per_row": {
+            "unit": "µs/row",
+            "median": {
+              "value": 38.76690372757847,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 37.69123576850095,
+            "max": 38.80164858096828,
+            "spread": 1.110412812467331
+          },
+          "diagnostic.driver.client.otlp.export.build.count": {
+            "unit": "observations",
+            "median": {
+              "value": 1785.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1582.0,
+            "max": 1798.0,
+            "spread": 216.0
+          },
+          "diagnostic.driver.client.otlp.export.build.mean_us": {
+            "unit": "µs",
+            "median": {
+              "value": 1167.81917352614,
+              "above": 1166.9601952169078,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.build.p50_us": {
+            "unit": "µs",
+            "median": {
+              "value": 1098.751,
+              "above": 1097.727,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.build.p95_us": {
+            "unit": "µs",
+            "median": {
+              "value": 1645.567,
+              "above": 1644.543,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.build.p99_us": {
+            "unit": "µs",
+            "median": {
+              "value": 1879.039,
+              "above": 1878.015,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.count": {
+            "unit": "observations",
+            "median": {
+              "value": 1785.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1582.0,
+            "max": 1798.0,
+            "spread": 216.0
+          },
+          "diagnostic.driver.client.otlp.export.export.count": {
+            "unit": "observations",
+            "median": {
+              "value": 1785.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1582.0,
+            "max": 1798.0,
+            "spread": 216.0
+          },
+          "diagnostic.driver.client.otlp.export.export.mean_us": {
+            "unit": "µs",
+            "median": {
+              "value": 15552.293005602241,
+              "above": 15542.74814509804,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.export.p50_us": {
+            "unit": "µs",
+            "median": {
+              "value": 14802.943,
+              "above": 14794.751,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.export.p95_us": {
+            "unit": "µs",
+            "median": {
+              "value": 20774.911,
+              "above": 20758.527,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.export.p99_us": {
+            "unit": "µs",
+            "median": {
+              "value": 29032.447,
+              "above": 29016.063,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.mean_us": {
+            "unit": "µs",
+            "median": {
+              "value": 16802.805247619046,
+              "above": 16791.654112605043,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.p50_us": {
+            "unit": "µs",
+            "median": {
+              "value": 16072.703,
+              "above": 16064.511,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.p95_us": {
+            "unit": "µs",
+            "median": {
+              "value": 22052.863,
+              "above": 22036.479,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.p99_us": {
+            "unit": "µs",
+            "median": {
+              "value": 30621.695,
+              "above": 30605.311,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.token.count": {
+            "unit": "observations",
+            "median": {
+              "value": 1785.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1582.0,
+            "max": 1798.0,
+            "spread": 216.0
+          },
+          "diagnostic.driver.client.otlp.export.token.mean_us": {
+            "unit": "µs",
+            "median": {
+              "value": 4.267669076751947,
+              "above": 4.265718576195773,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.token.p50_us": {
+            "unit": "µs",
+            "median": {
+              "value": 3.967,
+              "above": 3.965,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.token.p95_us": {
+            "unit": "µs",
+            "median": {
+              "value": 6.655,
+              "above": 6.651,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "diagnostic.driver.client.otlp.export.token.p99_us": {
+            "unit": "µs",
+            "median": {
+              "value": 8.351,
+              "above": 8.343,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "drain_seconds": {
+            "unit": "",
+            "median": {
+              "value": 0.012688003,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 0.012485838,
+            "max": 0.015648242,
+            "spread": 0.003162403999999999
+          },
+          "errors": {
+            "unit": "errors",
+            "median": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 0.0,
+            "max": 0.0,
+            "spread": 0.0
+          },
+          "input_mib_per_cpu_s": {
+            "unit": "MiB/cpu-s",
+            "median": {
+              "value": 25.934209152993024,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 25.90969977926473,
+            "max": 26.67700887234318,
+            "spread": 0.767309093078449
+          },
+          "input_mib_per_s_per_vcpu": {
+            "unit": "MiB/s/vCPU",
+            "median": {
+              "value": 0.9547866417784545,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 0.8462171328533568,
+            "max": 0.961908046562002,
+            "spread": 0.11569091370864526
+          },
+          "late_requests": {
+            "unit": "",
+            "median": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1.0,
+            "max": 1.0,
+            "spread": 0.0
+          },
+          "late_rows": {
+            "unit": "",
+            "median": {
+              "value": 512.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 512.0,
+            "max": 512.0,
+            "spread": 0.0
+          },
+          "max_ms": {
+            "unit": "",
+            "median": {
+              "value": 63.275007,
+              "above": 63.242239,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "memory_per_mib_s": {
+            "unit": "B/(MiB/s)",
+            "median": {
+              "value": 20675311.09057958,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 20554230.24348108,
+            "max": 24059024.577323366,
+            "spread": 3504794.333842285
+          },
+          "memtable_backlog_mib": {
+            "unit": "MiB",
+            "median": {
+              "value": 407.74003410339355,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 321.8746089935303,
+            "max": 618.8287630081177,
+            "spread": 296.9541540145874
+          },
+          "p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 12.902399,
+              "above": 12.894207,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "p95_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 18.874367,
+              "above": 18.857983,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 26.836991,
+              "above": 26.820607,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_ack_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.010295,
+              "above": 0.010287,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_ack_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.030687,
+              "above": 0.030671,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_admission_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.076031,
+              "above": 0.075967,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_admission_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.141567,
+              "above": 0.141439,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_decode_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.379135,
+              "above": 0.378879,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_decode_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.633343,
+              "above": 0.632831,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_otlp_decode_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.892415,
+              "above": 0.891903,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_otlp_decode_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 1.397759,
+              "above": 1.396735,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_preprocess_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 1.027071,
+              "above": 1.026559,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_preprocess_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 1.648639,
+              "above": 1.647615,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_scribe_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 6.856703,
+              "above": 6.852607,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_scribe_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 20.496383,
+              "above": 20.479999,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_shard_wait_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.077119,
+              "above": 0.077055,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_shard_wait_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 4.825087,
+              "above": 4.820991,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_visibility_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 1.531903,
+              "above": 1.530879,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_visibility_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 2.512895,
+              "above": 2.510847,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_wal_append_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 2.904063,
+              "above": 2.902015,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_wal_append_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 4.521983,
+              "above": 4.517887,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_wal_sync_p50_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 0.586239,
+              "above": 0.585727,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "phase_wal_sync_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": 6.868991,
+              "above": 6.864895,
+              "samples": 1582,
+              "reason": null
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "published_bytes_per_row": {
+            "unit": "B/row",
+            "median": {
+              "value": 113.86639842445743,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 76.40874505149944,
+            "max": 118.40604122193233,
+            "spread": 41.99729617043289
+          },
+          "published_files": {
+            "unit": "files",
+            "median": {
+              "value": 12.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 9.0,
+            "max": 13.0,
+            "spread": 4.0
+          },
+          "published_mib": {
+            "unit": "MiB",
+            "median": {
+              "value": 91.40622615814209,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 66.55918025970459,
+            "max": 99.91109275817871,
+            "spread": 33.35191249847412
+          },
+          "queries_per_cpu_s": {
+            "unit": "queries/cpu-s",
+            "median": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "queries_per_s_per_vcpu": {
+            "unit": "queries/s/vCPU",
+            "median": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "rate": {
+            "unit": "requests/s",
+            "median": {
+              "value": 59.35430538355403,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 52.59982767837327,
+            "max": 59.79997690615407,
+            "spread": 7.200149227780798
+          },
+          "requests": {
+            "unit": "requests",
+            "median": {
+              "value": 1784.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1581.0,
+            "max": 1797.0,
+            "spread": 216.0
+          },
+          "retained_mib": {
+            "unit": "MiB",
+            "median": {
+              "value": 3103.2726011276245,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 2811.0791606903076,
+            "max": 3194.295478820801,
+            "spread": 383.21631813049316
+          },
+          "rows": {
+            "unit": "rows",
+            "median": {
+              "value": 913408.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 809472.0,
+            "max": 920064.0,
+            "spread": 110592.0
+          },
+          "rows_per_cpu_s": {
+            "unit": "rows/cpu-s",
+            "median": {
+              "value": 25795.199096300483,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 25772.100840336134,
+            "max": 26531.366764995084,
+            "spread": 759.2659246589501
+          },
+          "rows_per_s": {
+            "unit": "rows/s",
+            "median": {
+              "value": 30389.404356379662,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 26931.111771327116,
+            "max": 30617.588175950885,
+            "spread": 3686.4764046237688
+          },
+          "rows_per_s_per_vcpu": {
+            "unit": "rows/s/vCPU",
+            "median": {
+              "value": 949.6688861368644,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 841.5972428539724,
+            "max": 956.7996304984651,
+            "spread": 115.20238764449277
+          },
+          "server_failures": {
+            "unit": "requests",
+            "median": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 0.0,
+            "max": 0.0,
+            "spread": 0.0
+          },
+          "stage_syncs": {
+            "unit": "syncs",
+            "median": {
+              "value": 220.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 198.0,
+            "max": 246.0,
+            "spread": 48.0
+          },
+          "staged_backlog_mib": {
+            "unit": "MiB",
+            "median": {
+              "value": 100.17819499969482,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 82.16613388061523,
+            "max": 106.80721473693848,
+            "spread": 24.641080856323242
+          },
+          "staged_bytes_per_row": {
+            "unit": "B/row",
+            "median": {
+              "value": 116.74978153693657,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 97.12480357566413,
+            "max": 125.04070579631446,
+            "spread": 27.915902220650324
+          },
+          "storage_ratio": {
+            "unit": "ratio",
+            "median": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; a write window never waits for publication"
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "stored_mib_per_cpu_s": {
+            "unit": "MiB/cpu-s",
+            "median": {
+              "value": 89.47606383251542,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 87.63831124336699,
+            "max": 92.13632122878752,
+            "spread": 4.498009985420538
+          },
+          "stored_mib_per_s_per_vcpu": {
+            "unit": "MiB/s/vCPU",
+            "median": {
+              "value": 3.2264677279944136,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 2.9226415133336565,
+            "max": 3.3218349308729174,
+            "spread": 0.39919341753926085
+          },
+          "visibility_p99_ms": {
+            "unit": "ms",
+            "median": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "min": null,
+            "max": null,
+            "spread": null
+          },
+          "wal_bytes_per_row": {
+            "unit": "B/row",
+            "median": {
+              "value": 289.22553539753756,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 289.12967042110427,
+            "max": 289.52419231301394,
+            "spread": 0.394521891909676
+          },
+          "wal_syncs": {
+            "unit": "syncs",
+            "median": {
+              "value": 2797.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 2504.0,
+            "max": 2833.0,
+            "spread": 329.0
+          },
+          "wire_bytes": {
+            "unit": "B",
+            "median": {
+              "value": 962939161.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 853452302.0,
+            "max": 969907930.0,
+            "spread": 116455628.0
+          },
+          "wire_bytes_per_row": {
+            "unit": "B/row",
+            "median": {
+              "value": 1054.2267650381866,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "min": 1054.1744161275737,
+            "max": 1054.33208560642,
+            "spread": 0.15766947884617366
+          }
+        },
+        "criteria": [
+          {
+            "criterion": "no-errors",
+            "observed": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "`errors` was not read"
+            },
+            "values": [
+              {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              },
+              {
+                "value": 0.0,
+                "above": null,
+                "samples": null,
+                "reason": null
+              }
+            ],
+            "outcome": "met",
+            "reason": null,
+            "applicable": true
+          }
+        ],
+        "verdict": "VALID",
+        "reasons": []
+      }
+    ],
+    "validity": {
+      "thresholds": {
+        "host_busy_fraction": 0.1,
+        "host_sample_seconds": 10,
+        "driver_cores": 8.0,
+        "driver_fraction": 0.8,
+        "lateness_p99_us": 5000.0,
+        "p99_samples": 1000,
+        "p95_samples": 200
+      },
+      "host_before": {
+        "logical_cpus": 32,
+        "seconds": 10.03763111,
+        "other_cores": 0.46318941615521897,
+        "busiest": [
+          [
+            "claude",
+            0.05091090679168701
+          ],
+          [
+            "qemu-system-x86",
+            0.04891439914703369
+          ],
+          [
+            "ghostty",
+            0.03993012428283691
+          ],
+          [
+            "claude",
+            0.024956326484680175
+          ]
+        ]
+      },
+      "host_after": {
+        "logical_cpus": 32,
+        "seconds": 10.037365925,
+        "other_cores": 0.38015652641654146,
+        "busiest": [
+          [
+            "qemu-system-x86",
+            0.05986716747283936
+          ],
+          [
+            "ghostty",
+            0.03592030286788941
+          ],
+          [
+            "claude",
+            0.0309313702583313
+          ],
+          [
+            "claude",
+            0.021951296329498292
+          ]
+        ]
+      },
+      "budget_seconds": 590,
+      "minimum_seconds": 0,
+      "elapsed_seconds": 213.449413938,
+      "reasons": []
+    },
+    "verdict": "VALID",
+    "reasons": [],
+    "artifacts": {
+      "directory": "/home/thorrester/Documents/GitHub/wyrd-worktrees/github-verifier-pipelines-task-004/target/benchmarks/l1/bifrost-writes/20261124t010747915z/03-writes-parquet-otlp-spans-1k-c1",
+      "profile": {
+        "requested": false,
+        "mode": null,
+        "roles": [],
+        "complete": false,
+        "captures": [],
+        "notes": [],
+        "symbols": []
+      }
+    },
+    "mode": "full",
+    "lifecycle": {
+      "allowances": {
+        "setup_seconds": 240,
+        "warmup_seconds": 30,
+        "measurement_seconds": 90,
+        "drain_seconds": 150,
+        "teardown_seconds": 60,
+        "persist_seconds": 20
+      },
+      "setup_seconds": 19.00632411,
+      "warmup_seconds": 30.0,
+      "measurement_seconds": 90.0,
+      "drain_seconds": 73.154188059,
+      "teardown_seconds": 11.094816848,
+      "persist_seconds": null,
+      "windows": [
+        {
+          "phase": "warmup",
+          "admitted_seconds": 30.0,
+          "drained_seconds": 62.496715585
+        },
+        {
+          "phase": "repetition-1",
+          "admitted_seconds": 30.0,
+          "drained_seconds": 0.181869945
+        },
+        {
+          "phase": "repetition-2",
+          "admitted_seconds": 30.0,
+          "drained_seconds": 0.184695405
+        },
+        {
+          "phase": "repetition-3",
+          "admitted_seconds": 30.0,
+          "drained_seconds": 0.190390203
+        }
+      ],
+      "owned": [
+        {
+          "role": "server",
+          "pid": 1032309,
+          "started_unix": 1795482785
+        },
+        {
+          "role": "driver",
+          "pid": 1031639,
+          "started_unix": 1795482775
+        }
+      ],
+      "outstanding": {
+        "memtable_bytes": 337509990.0,
+        "staged_members": 16.0,
+        "staged_bytes": 77211134.0,
+        "outstanding_claims": 0.0,
+        "outbox_pending": 0.0
+      }
+    }
+  },
+  "cleanup": {
+    "project": "wyrd-l1-20261124t010747915z-3",
+    "storage_root": "/home/thorrester/Documents/GitHub/wyrd-worktrees/github-verifier-pipelines-task-004/target/benchmarks/l1/bifrost-writes/20261124t010747915z/03-writes-parquet-otlp-spans-1k-c1/tmp",
+    "confirmed": true,
+    "seconds": 11.094816848,
+    "preexisting": [],
+    "surviving": []
+  },
+  "verdict": "VALID",
+  "reasons": []
+}

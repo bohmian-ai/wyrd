@@ -1,0 +1,88 @@
+{
+  "protocol": "wyrd-l1-sweep",
+  "protocol_version": 1,
+  "category": "bifrost-writes",
+  "invocation": [
+    "l1",
+    "bifrost-writes"
+  ],
+  "mode": "standard",
+  "profile": null,
+  "explicit": false,
+  "started_at": "2026-11-24T01:07:47.915905110Z",
+  "finished_at": "2026-11-24T01:31:13.180965689Z",
+  "cases": [
+    {
+      "selector": "otlp-spans-c1",
+      "family": "writes-parquet",
+      "case": "otlp-spans-c1",
+      "status": "valid",
+      "record": "01-writes-parquet-otlp-spans-c1.json",
+      "reasons": [],
+      "persist_seconds": 0.006868207
+    },
+    {
+      "selector": "otlp-spans-c64",
+      "family": "writes-parquet",
+      "case": "otlp-spans-c64",
+      "status": "valid",
+      "record": "02-writes-parquet-otlp-spans-c64.json",
+      "reasons": [],
+      "persist_seconds": 0.005063462
+    },
+    {
+      "selector": "otlp-spans-1k-c1",
+      "family": "writes-parquet",
+      "case": "otlp-spans-1k-c1",
+      "status": "valid",
+      "record": "03-writes-parquet-otlp-spans-1k-c1.json",
+      "reasons": [],
+      "persist_seconds": 0.005358115
+    },
+    {
+      "selector": "otlp-spans-1k-c64",
+      "family": "writes-parquet",
+      "case": "otlp-spans-1k-c64",
+      "status": "valid",
+      "record": "04-writes-parquet-otlp-spans-1k-c64.json",
+      "reasons": [],
+      "persist_seconds": 0.006290254
+    },
+    {
+      "selector": "otlp-logs-c1",
+      "family": "writes-parquet",
+      "case": "otlp-logs-c1",
+      "status": "valid",
+      "record": "05-writes-parquet-otlp-logs-c1.json",
+      "reasons": [],
+      "persist_seconds": 0.00490994
+    },
+    {
+      "selector": "otlp-logs-c64",
+      "family": "writes-parquet",
+      "case": "otlp-logs-c64",
+      "status": "valid",
+      "record": "06-writes-parquet-otlp-logs-c64.json",
+      "reasons": [],
+      "persist_seconds": 0.005136041
+    },
+    {
+      "selector": "native-write-c1",
+      "family": "writes-parquet",
+      "case": "native-write-c1",
+      "status": "valid",
+      "record": "07-writes-parquet-native-write-c1.json",
+      "reasons": [],
+      "persist_seconds": 0.004916432
+    },
+    {
+      "selector": "native-write-c64",
+      "family": "writes-parquet",
+      "case": "native-write-c64",
+      "status": "valid",
+      "record": "08-writes-parquet-native-write-c64.json",
+      "reasons": [],
+      "persist_seconds": 0.005104238
+    }
+  ]
+}

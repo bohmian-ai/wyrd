@@ -895,6 +895,161 @@ async fn discovery_answers_alike_whatever_the_relay_does() {
     );
 }
 
+/// The flow cookie `pair` (`name=value`) resealed with its original email
+/// deadline one second past, through the deployment's own envelope key, as
+/// if fifteen minutes had gone by before its first use.
+///
+/// # Panics
+/// Panics when the cookie is not an envelope this deployment sealed.
+async fn past_its_deadline(srv: &WyrdTestServer, pair: &str) -> String {
+    use base64::Engine as _;
+    let codec = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let key = wyrd_auth::derivation::PlatformKey::new(
+        srv.state()
+            .postgres
+            .operator_pool()
+            .expect("serving operator pool"),
+        srv.state().auth.kms.clone(),
+    );
+    let (name, value) = pair.split_once('=').expect("cookie pair");
+    let sealed = codec.decode(value).expect("a base64url envelope");
+    let plain = key
+        .open("signup-envelope", &sealed)
+        .await
+        .expect("the key opens")
+        .expect("an envelope this deployment sealed");
+    let mut envelope: Value = serde_json::from_slice(&plain).expect("envelope json");
+    let deadline = envelope["expires_at"].as_i64().expect("an email deadline");
+    assert!(
+        deadline > chrono::Utc::now().timestamp(),
+        "the proof is still live"
+    );
+    envelope["expires_at"] = json!(chrono::Utc::now().timestamp() - 1);
+    let resealed = key
+        .seal(
+            "signup-envelope",
+            &serde_json::to_vec(&envelope).expect("encodes"),
+        )
+        .await
+        .expect("the key seals");
+    format!("{name}={}", codec.encode(resealed))
+}
+
+/// An emailed proof presented first after its original deadline grants
+/// nothing:
+///   1. a contact proof with its own flow, past the deadline, is refused
+///      as expired and the contact and its revision stay as they were;
+///   2. a discovery proof with its own flow, past the deadline, is refused
+///      as expired, sets no read cookie and spends nothing, so no read
+///      deadline begins;
+///   3. the same proofs with their flows still live verify, so the refusals
+///      came from the deadline alone.
+///
+/// # Panics
+/// Panics when an expired proof changes a contact or grants a read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_emailed_proof_past_its_deadline_is_refused_on_first_use() {
+    let (srv, operator) = contact_server("harbor").await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let known = "pia.expiry@example.test";
+    let replacement = "quin.expiry@example.test";
+    verify_admin_contact(&srv, &api, "harbor", known).await;
+    assert_eq!(
+        within_propagation(&1, || directory_entries(&superuser)).await,
+        1
+    );
+    let expired = |body: &Value| {
+        assert_eq!(body["code"], "WYRD_AUTH_400_INVALID_STATE", "{body}");
+    };
+
+    // 1. A contact proof past its deadline replaces nothing.
+    let session = sign_in(&srv, "harbor").await;
+    let (status, flow, body) = browser(
+        &srv,
+        "/auth/browser/email/request",
+        &[&session],
+        "wyrd_contact",
+        &json!({ "tenant": "harbor", "email": replacement }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let contact_flow = flow.expect("a contact flow cookie");
+    let (proof, _) = mailed_proof(&api, replacement).await;
+    let late = past_its_deadline(&srv, &contact_flow).await;
+    let contact_verify = |flow: String| {
+        let (srv, session, proof) = (&srv, &session, proof.clone());
+        async move {
+            browser(
+                srv,
+                "/auth/browser/email/verify",
+                &[session, &flow],
+                "wyrd_contact",
+                &json!({ "tenant": "harbor", "proof": proof }),
+            )
+            .await
+        }
+    };
+    let (status, _, body) = contact_verify(late).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    expired(&body);
+    assert_eq!(
+        contacts(&superuser, "harbor").await,
+        [(known.to_owned(), 1)],
+        "the contact and its revision are unchanged"
+    );
+
+    // 2. A discovery proof past its deadline reads nothing and spends nothing.
+    let before = mail_to(&api, known).await.len();
+    let (status, flow, body) = browser(
+        &srv,
+        "/auth/browser/workspaces/request",
+        &[],
+        "wyrd_discovery",
+        &json!({ "email": known }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let flow = flow.expect("a discovery flow cookie");
+    let (discovery_proof, _) = next_proof(&api, known, before).await;
+    let discovery_verify = |flow: String| {
+        let (srv, proof) = (&srv, discovery_proof.clone());
+        async move {
+            browser(
+                srv,
+                "/auth/browser/workspaces/verify",
+                &[&flow],
+                "wyrd_discovery",
+                &json!({ "proof": proof }),
+            )
+            .await
+        }
+    };
+    let (status, read, body) = discovery_verify(past_its_deadline(&srv, &flow).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    expired(&body);
+    assert!(read.is_none(), "no read cookie");
+    let spent: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.discovery_proofs")
+        .fetch_one(&superuser)
+        .await
+        .expect("spent proofs count");
+    assert_eq!(spent, 0, "the expired proof was not spent");
+
+    // 3. The live flows verify the same proofs.
+    let (status, _, body) = contact_verify(contact_flow).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        contacts(&superuser, "harbor").await,
+        [(replacement.to_owned(), 2)]
+    );
+    let (status, read, body) = discovery_verify(flow).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(read.is_some(), "a read cookie");
+}
+
 /// A contact flow belongs to the User and tenant that began it:
 ///   1. another User of the same tenant, signed in and recent, presenting
 ///      the flow cookie and its proof is refused and nothing is stored;

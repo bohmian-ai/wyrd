@@ -4573,19 +4573,19 @@ A schedule runs as the Service's own account, and only while that account has re
 **Python**
 
 ```bash
-uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+uv run wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 **Rust**
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 **TypeScript**
 
 ```bash
-pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+pnpm wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 Copy the credential it prints into an environment variable for the next step:

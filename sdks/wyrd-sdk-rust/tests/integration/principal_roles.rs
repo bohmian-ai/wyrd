@@ -923,7 +923,7 @@ async fn a_family_bound_viewer_queries_only_that_familys_records() {
         Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
             .await;
     for path in [
-        fixture("../examples/quickstart/support-reply.yaml"),
+        fixture("../examples/setup-check/support-reply.yaml"),
         fixture("cards/scoped_peer_reads/other-reply.yaml"),
     ] {
         let state = WyrdState::declare_with(

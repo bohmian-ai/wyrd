@@ -1,6 +1,7 @@
 <!-- #/t/<slug>/reset: ask for a reset code at the verified recovery email, or paste one (mailed or administrator-issued). -->
 <script>
   import Entry from './Entry.svelte';
+  import PasswordInput from './PasswordInput.svelte';
   import { P, passwordError } from './data.js';
   let { tenant, query } = $props();
   // App re-creates the page on every hash change, so reading the props once is the whole lifetime.
@@ -60,7 +61,7 @@
       <input id="reset-code" class="app-input mono" type="password" name="resetCode" autocomplete="off" readonly={setting} bind:value={code} />
       <p>{canRequest ? 'Paste the code from the email, or one an administrator gave you.' : 'Ask a tenant administrator for a reset code.'} It works once, for fifteen minutes.</p>
       <label for="new-password">New password</label>
-      <input id="new-password" class="app-input" type="password" name="newPassword" autocomplete="new-password" readonly={setting} bind:value={password}
+      <PasswordInput id="new-password" name="newPassword" autocomplete="new-password" readonly={setting} bind:value={password}
         aria-invalid={pwError ? 'true' : undefined} aria-describedby="pw-hint{pwError ? ' pw-error' : ''}" />
       {#if pwError}<p class="field-error" id="pw-error">⊘ {pwError}</p>{/if}
       <p id="pw-hint">15 to 128 characters. Setting it signs you out everywhere and ends CLI sign-ins; API keys keep working.</p>

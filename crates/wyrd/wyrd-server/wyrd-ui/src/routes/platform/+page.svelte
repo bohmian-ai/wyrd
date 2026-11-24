@@ -1,5 +1,6 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
+  import PasswordInput from '$lib/PasswordInput.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
   // The form posts as a full page load, so a refusal renders a fresh page with this cleared.
@@ -15,7 +16,7 @@
       <label for="username">Username</label>
       <input id="username" class="app-input" name="username" required autocomplete="username" readonly={!!busy} defaultValue={form && 'username' in form ? form.username : ''} />
       <label for="password">Password</label>
-      <input id="password" class="app-input" type="password" name="password" required autocomplete="current-password" readonly={!!busy} />
+      <PasswordInput id="password" name="password" required autocomplete="current-password" readonly={!!busy} />
       <button class="app-control primary wide" type="submit" disabled={!!busy} aria-busy={busy === 'password' ? 'true' : undefined}>{busy === 'password' ? 'Signing in…' : 'Sign in'}</button>
     </form>
   {/if}

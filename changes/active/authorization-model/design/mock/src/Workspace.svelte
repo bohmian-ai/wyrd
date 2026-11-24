@@ -2,6 +2,7 @@
      names only the proof method, so the page says which provider and never which address. -->
 <script>
   import Entry from './Entry.svelte';
+  import PasswordInput from './PasswordInput.svelte';
   import CheckEmail from './CheckEmail.svelte';
   import { PROVIDERS, IDENTITIES, PROBLEMS, P, TAKEN, slugify, slugError, passwordError, emailError } from './data.js';
   let { query } = $props();
@@ -136,7 +137,7 @@
           aria-invalid={userError ? 'true' : undefined} aria-describedby={userError ? 'username-error' : undefined} bind:value={username} />
         {#if userError}<p class="field-error" id="username-error">⊘ {userError}</p>{/if}
         <label for="password">Your password</label>
-        <input id="password" class="app-input" type="password" name="password" required autocomplete="new-password" readonly={busy}
+        <PasswordInput id="password" name="password" required autocomplete="new-password" readonly={busy}
           aria-invalid={pwError ? 'true' : undefined} aria-describedby="password-hint{pwError ? ' password-error' : ''}" bind:value={password} />
         {#if pwError}<p class="field-error" id="password-error">⊘ {pwError}</p>{/if}
         <p id="password-hint">15 to 128 characters. You sign in to this workspace with this username and password.</p>

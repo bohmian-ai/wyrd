@@ -3651,6 +3651,11 @@ withConsole('a platform operator signs in to the console with a password', async
     await page.waitForURL(`${bff.url}/platform`);
     expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Platform admin');
     expect(await page.getByText('For operators of this Wyrd deployment.', { exact: false }).count()).toBe(1);
+    // The password field reveals and hides its value, as every other sign-in password field does.
+    await page.getByRole('button', { name: 'Show password' }).click();
+    expect(await page.getByLabel('Password').getAttribute('type')).toBe('text');
+    await page.getByRole('button', { name: 'Hide password' }).click();
+    expect(await page.getByLabel('Password').getAttribute('type')).toBe('password');
 
     // An unknown name, a wrong password and the root key each refuse alike and set no cookie.
     for (const [username, password] of [['nobody', OPERATOR_PASSWORD], ['ops-oncall', 'not the password'], ['ops-oncall', root]]) {
@@ -3747,6 +3752,8 @@ withConsole('a stale console session confirms the operator before suspending a w
     await dialog.waitFor();
     expect(await dialog.textContent()).toContain(`Suspending ${slug} is a destructive platform change.`);
     expect(await status()).toBe('active');
+    await dialog.getByRole('button', { name: 'Show password' }).click();
+    expect(await dialog.getByLabel('Your password').getAttribute('type')).toBe('text');
 
     // Another operator's password and a wrong one refuse; the workspace stays active.
     for (const password of ['garnet otter 16', 'not the password']) {

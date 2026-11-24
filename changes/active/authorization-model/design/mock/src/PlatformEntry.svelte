@@ -3,6 +3,7 @@
      /platform/browser/methods says whether platform OIDC exists; the SSO button shows only when it does. -->
 <script>
   import Entry from './Entry.svelte';
+  import PasswordInput from './PasswordInput.svelte';
   import { P, PROBLEMS, platformSession } from './data.js';
   let { callback = false, query } = $props();
   // App re-creates the page on every hash change, so reading the props once is the whole lifetime.
@@ -60,7 +61,7 @@
       <label for="username">Username</label>
       <input id="username" class="app-input" name="username" autocomplete="username" readonly={!!busy} bind:value={username} />
       <label for="password">Password</label>
-      <input id="password" class="app-input" type="password" name="password" autocomplete="current-password" readonly={!!busy} bind:value={password} />
+      <PasswordInput id="password" name="password" autocomplete="current-password" readonly={!!busy} bind:value={password} />
       <button class="app-control primary wide" type="submit" disabled={!!busy} aria-busy={busy === 'password' ? 'true' : undefined} data-testid="platform-signin">{busy === 'password' ? 'Signing in…' : 'Sign in'}</button>
     </form>
     {#if oidc}

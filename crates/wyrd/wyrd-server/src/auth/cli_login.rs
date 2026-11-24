@@ -197,10 +197,10 @@ pub async fn device_page(Query(query): Query<DeviceQuery>) -> Response {
         &format!(
             "<h1>Approve a Wyrd CLI login</h1><p>Approve only if this code is shown in your own \
              terminal.</p><form method=\"post\" action=\"{DEVICE_VERIFICATION_PATH}\">\
-             <input type=\"hidden\" name=\"tenant\" value=\"{tenant}\"><label>Code \
-             <input name=\"user_code\" value=\"{user_code}\" autocomplete=\"off\" required>\
-             </label> <button name=\"decision\" value=\"approve\">Approve and sign in</button> \
-             <button name=\"decision\" value=\"deny\">Deny</button></form>",
+             <input type=\"hidden\" name=\"tenant\" value=\"{tenant}\"><label for=\"user_code\">Code\
+             </label><input id=\"user_code\" name=\"user_code\" value=\"{user_code}\" autocomplete=\"off\" \
+             required><button class=\"primary\" name=\"decision\" value=\"approve\">Approve and sign in\
+             </button><button name=\"decision\" value=\"deny\">Deny</button></form>",
             tenant = query.tenant.as_str(),
         ),
     )
@@ -332,13 +332,50 @@ async fn signed_in(
         .and_then(|session| session.anchor.map(|anchor| (session, anchor))))
 }
 
-/// A plain HTML page with `body`, which may not be framed.
+/// The Wyrd mark, inline so a device page needs no asset route.
+const LOGO: &str = "<svg width=\"28\" height=\"28\" viewBox=\"0 0 100 100\" aria-hidden=\"true\">\
+    <path d=\"M42 92 L30 92 L6 8 L22 8 Z\" fill=\"#7a8cff\" stroke=\"#0b0c12\" stroke-width=\"2\"/>\
+    <path d=\"M58 92 L70 92 L94 8 L78 8 Z\" fill=\"#7a8cff\" stroke=\"#0b0c12\" stroke-width=\"2\"/>\
+    <path d=\"M44 8 h12 v84 h-12 z\" fill=\"#c5f23b\" stroke=\"#0b0c12\" stroke-width=\"2\"/></svg>";
+
+/// The sign-in entry card's look (wyrd-ui `Entry.svelte` and `app.css`, with the
+/// brand theme's light and dark tokens), inlined so the server-rendered device
+/// pages match every other sign-in page.
+const ENTRY_STYLE: &str = ":root{--bg:#f5f6f8;--surface:#fff;--text:#101014;--muted:#62626d;\
+    --border:#d9dde5;--declare:#4d5ef0;--declare-ink:#fff;--weight-strong:700;\
+    --font-sans:\"Familjen Grotesk\",system-ui,sans-serif;\
+    --font-mono:\"Fragment Mono\",ui-monospace,monospace;color-scheme:light dark}\
+    @media (prefers-color-scheme: dark){:root{--bg:#0b0c12;--surface:#12141c;--text:#e6e4da;\
+    --muted:#8f92a5;--border:#252838;--declare:#7a8cff;--declare-ink:#0b0c12;--weight-strong:600}}\
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-sans)}\
+    .entry{min-height:100dvh;display:grid;place-items:center;padding:64px 24px}\
+    .card{width:100%;max-width:420px;display:grid;gap:20px;padding:32px;background:var(--surface);\
+    border:2px solid var(--border);border-top:4px solid var(--declare);border-radius:2px}\
+    header{display:flex;align-items:center;justify-content:center;gap:10px}\
+    .wordmark{font:600 18px var(--font-sans)}\
+    .product{font:var(--weight-strong) 10px var(--font-mono);border:2px solid var(--border);border-radius:2px;\
+    padding:4px 12px;background:var(--declare);color:var(--declare-ink)}\
+    h1{margin:0;font:var(--weight-strong) 24px var(--font-sans);text-align:center}\
+    p{margin:0;font:12px/18px var(--font-sans);color:var(--muted);text-align:center}\
+    form{display:grid;gap:10px}label{font:var(--weight-strong) 11px var(--font-mono)}\
+    input,button{min-height:32px;border:1px solid var(--border);border-radius:2px;padding:12px 16px;\
+    background:var(--surface);color:var(--text);font:13px var(--font-sans);width:100%}\
+    input{padding:6px 10px;font:12px var(--font-mono)}button{cursor:pointer}\
+    button.primary{border-color:var(--declare);background:var(--declare);color:var(--declare-ink);\
+    font-weight:var(--weight-strong)}:focus-visible{outline:2px solid var(--declare);outline-offset:3px}\
+    @media (max-width:767px){.entry{padding:32px 16px}.card{padding:28px 20px}}";
+
+/// A device page with `body` inside the branded sign-in card, which may not be framed.
 pub(crate) fn page(status: StatusCode, body: &str) -> Response {
     let mut response = (
         status,
         Html(format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Wyrd CLI login</title>\
-             </head><body>{body}</body></html>"
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+             <title>Wyrd CLI login</title><style>{ENTRY_STYLE}</style></head><body>\
+             <main class=\"entry\"><div class=\"card\"><header>{LOGO}\
+             <span class=\"wordmark\">Wyrd</span><span class=\"product\">WYRD</span></header>\
+             {body}</div></main></body></html>"
         )),
     )
         .into_response();
@@ -394,4 +431,24 @@ pub async fn revoke(
         .revoke(&request.token, client, request_id.as_str())
         .await?;
     Ok(no_store(StatusCode::OK, ()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every device page renders inside the branded sign-in card, in light and dark.
+    #[tokio::test]
+    async fn device_pages_render_in_the_branded_entry_card() {
+        let response = page(StatusCode::OK, "<h1>Login approved</h1>");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("an in-memory body reads");
+        let html = String::from_utf8(bytes.to_vec()).expect("the page is UTF-8");
+        assert!(html.contains("<main class=\"entry\"><div class=\"card\">"));
+        assert!(html.contains("<span class=\"wordmark\">Wyrd</span>"));
+        assert!(html.contains("<h1>Login approved</h1>"));
+        assert!(html.contains("--declare:#4d5ef0"));
+        assert!(html.contains("@media (prefers-color-scheme: dark)"));
+    }
 }

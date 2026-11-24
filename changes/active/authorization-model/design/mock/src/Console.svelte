@@ -3,6 +3,7 @@
 <script>
   import logo from '../../../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/logo.svg';
   import Problem from './Problem.svelte';
+  import PasswordInput from './PasswordInput.svelte';
   import { P, PROVIDERS, TENANTS, SOCIAL, RELAY, LOGIN_SETTINGS, platformSession } from './data.js';
   let { view, query } = $props();
   // App re-creates the page on every hash change, so reading the props once is the whole lifetime.
@@ -159,7 +160,7 @@
         {#if session.method === 'password'}
           <form class="stack" novalidate onsubmit={reauthPasswordSubmit}>
             <label for="reauth-password">Your password</label>
-            <input id="reauth-password" class="app-input" type="password" autocomplete="current-password" readonly={confirming} bind:value={reauthPassword} />
+            <PasswordInput id="reauth-password" autocomplete="current-password" readonly={confirming} bind:value={reauthPassword} />
             <div class="row">
               <button class="app-control primary" type="submit" disabled={confirming} aria-busy={confirming ? 'true' : undefined} data-testid="reauth-confirm">{confirming ? 'Confirming…' : 'Confirm'}</button>
               <button class="app-control" type="button" onclick={() => { pending = null; confirming = false; }}>Cancel</button>

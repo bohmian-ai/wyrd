@@ -1598,13 +1598,22 @@ GREEN:
 - Provider text from Rust is sample data, not a deviation.
 
 **Justified deviations (final):**
-1. **Show button on new-password fields** (`/signup/workspace` with an email proof, `/t/{slug}/reset`). These fields use the existing `PasswordInput`, as the tenant sign-in, invitation signup and Account pages on the same card do. The mock draws a plain field. The console's re-auth and relay fields are plain, as in the mock.
+1. ~~Show button on new-password fields~~ Resolved by the maintainer ruling below: every human password field has Show, in production and the mock.
 2. **Turnstile.** Production renders Cloudflare's widget from the published site key, and the widget brings its own look. The mock keeps a labelled placeholder that simulates passing.
 3. **Recovery email width.** The section is as wide as the Account page's other sections. The mock shows it alone on a placeholder page; the section's own layout is identical.
 4. **Root and tenant sign-in pages** are existing pages. The mock draws placeholders for both and does not redesign them.
 5. **Preview strip.** The mock reserves 33px for chrome that is not product, so production pages start 33px higher.
 6. **Native `required`** on the reset request and the console forms, so they work as plain posts without script. The mock focuses the empty field instead. The two look the same until someone submits an empty field.
 7. **Password form hidden when `methods.password` is false** on `/platform`. Rust's methods read forces this, and the mock has no such state.
+
+**Maintainer rulings after the sweep (2026-11-24):**
+- **Show on every human password field.** The `/platform` password and the console re-auth password now use `PasswordInput`. The mock gained `PasswordInput.svelte` and uses it on `/platform`, re-auth, `/signup/workspace` and reset, which removes deviation 1. Secret fields (client secret, relay password, Turnstile secret key) stay plain write-only inputs.
+  - RED: the console journeys (`ui-pages.integration.test.ts` "a platform operator signs in to the console with a password" and "a stale console session confirms the operator before suspending a workspace") failed with `locator.click: Timeout 30000ms` on the button named "Show password": 2 failed, 4 passed.
+  - GREEN: the same command passed 6/6. The mock build and selfcheck passed (17 checks).
+- **`/auth/device` is styled in place.** The maintainer chose a styled page over moving it into wyrd-ui. `cli_login::page` now renders every device page (approve, approved, denied, refused, code not accepted) inside the entry card. It inlines the brand's light and dark tokens and the Wyrd mark, and the code field has a real `<label for>`.
+  - RED: `cargo nextest run -p wyrd-server --lib -E 'test(=auth::cli_login::tests::device_pages_render_in_the_branded_entry_card)'` panicked: `html.contains("<main class=\"entry\"><div class=\"card\">")` was false.
+  - GREEN: the test passes. The "Alice is given payments…" journey (which uses the device page) passed 1/1. `test:identity:ui` passed 2/2, clippy `-D warnings` was clean, and `ui:check` passed. Screenshots at 1280 and 390 wide, light and dark, match the entry card.
+  - Limit: the page falls back to system fonts, because it serves no font assets. The mock has no device state.
 
 
 ### 17. An existing User explicitly connects another sign-in method

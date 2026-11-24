@@ -60,9 +60,10 @@
   };
 </script>
 
-<p class="lead">Shared Google and GitHub.com sign-in for every workspace. Register the client in the provider console first. A saved client is a new, untested revision that no page offers until a real sign-in tests it and you enable it.</p>
 {#if problem}<ConsoleProblem issue={problem} />{/if}
 <div role="status" aria-live="polite">{#if notice}<p class="done" data-testid="notice"><span class="ok">✓</span> {notice}</p>{/if}</div>
+
+<p class="lead">Shared Google and GitHub.com sign-in for every workspace. Register the client in the provider console first. A saved client is a new, untested revision that no page offers until a real sign-in tests it and you enable it.</p>
 
 {#each data.providers as p (p.provider)}
   <section aria-labelledby="provider-{p.provider}" data-testid="provider-{p.provider}">

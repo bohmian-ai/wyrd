@@ -462,10 +462,16 @@ impl BrowserSessions {
 /// Store a new session for `verified`'s principal created through
 /// `authority` on `conn`, and return it with its cookie value.
 ///
-/// The caller commits `conn`; nothing is visible until it does.
+/// The caller commits `conn`; nothing is visible until it does. A password
+/// or social session is refused at the insert while the tenant requires
+/// company SSO, so a completion that passed its earlier method check while a
+/// policy change committed still creates nothing, and the caller's rollback
+/// undoes any User it provisioned.
 ///
 /// # Errors
-/// Returns [`WyrdError::AuthVerifyUnavailable`] when the insert fails.
+/// Returns [`WyrdError::MethodUnavailable`] for a password or social session
+/// while company SSO is required, and [`WyrdError::AuthVerifyUnavailable`]
+/// when the insert fails.
 pub(crate) async fn create_session(
     conn: &mut TenantConn<'_>,
     verified: VerifiedToken,
@@ -481,7 +487,11 @@ pub(crate) async fn create_session(
         BROWSER_SESSION_TTL,
     )
     .await
-    .map_err(store_error)?;
+    .map_err(store_error)?
+    .ok_or_else(|| WyrdError::MethodUnavailable {
+        message: "this workspace requires company SSO; sign in through your company".to_owned(),
+        details: json!({ "reason": "method_unavailable" }),
+    })?;
     let credential = match authority {
         BrowserSessionAuthority::Connection(_) => BrowserCredential::Sso,
         BrowserSessionAuthority::ApiKey(_) => BrowserCredential::ApiKey,

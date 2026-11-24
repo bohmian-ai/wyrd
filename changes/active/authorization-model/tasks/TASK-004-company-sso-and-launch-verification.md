@@ -194,6 +194,41 @@ Expected RED is an unconnected completion/policy consumer. Tier 1: production
 login/invitation/device pages, actual HTTP and real CLI consumer with controlled
 providers and repository Postgres; carry forward valid cycle-5 evaluator proof.
 
+Evidence (Rust/HTTP):
+
+- Selector: scenario 1's runner with
+  `-E 'test(=platform_admin_e2e::company_sso::required_sso_refuses_every_later_password_and_social_step)'`.
+- RED: a Google sign-in begun while optional and finished after enablement
+  returned 303 with a session (`company_sso.rs`, "returning Google sign-in").
+- GREEN: 1 passed, with no session and no User for:
+  - Google sign-in and Google invitation enrollment begun while optional;
+  - password invitation signup (403);
+  - password sign-in (403 `method_unavailable`);
+  - a new Google start (403).
+  A device code approved by password before enablement redeems no token, and
+  a password session cannot approve. A company-approved device code redeems,
+  and company sign-in works.
+- Enforcement owners:
+  - `insert_browser_session` refuses a password/social row in the same
+    statement while required, and `create_session` maps that refusal to
+    `MethodUnavailable`; the enclosing enrollment rolls back.
+  - `live_browser_session` refuses password/social sessions while required.
+  - `issue_human_access` refuses a Password anchor while required, which
+    covers device redemption and refresh renewal.
+  - Starts use the cycle-5 evaluator unchanged.
+- Tier 2: `mise exec -- cargo nextest run --locked -p wyrd-sql --test
+  integration -E 'test(/^pg_login_policy::/)'` (same env) passed 1.
+  `pg_login_policy::pg_tests::required_sso_ends_racing_password_sessions_for_good`
+  commits a session inserted before the policy commit only after the
+  policy's sweep. That session is not live while required; an insert under
+  the policy records nothing; Disable revives neither it nor the session
+  swept at enable; a new session works. This pin was written after the
+  guard (TDD VIOLATED for this tier-2 case).
+- Invitations: every invitation redemption names a social provider or a
+  password, so none completes under the policy. Company first-login
+  provisioning is the compliant path. Production login/invitation/device
+  pages and the real CLI consumer: pending.
+
 ### 4. Existing credentials stop, and toggling policy cannot revive them
 
 Maps to REQ-002/004/005/012/016; AC-006. Before enablement issue real browser

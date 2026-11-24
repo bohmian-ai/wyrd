@@ -33,6 +33,7 @@ use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditDelegationStep;
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
+use wyrd_sql::queries::auth::login_policy;
 use wyrd_sql::queries::auth::{
     ApiKeyOwner, api_key_owner, human_connection_is_active, insert_human_refresh_token,
     local_credential_for_update, lock_human_connection_slot, lock_refresh_family,
@@ -1050,8 +1051,9 @@ impl TenantTokenIssuer {
     /// A provider anchor then takes the tenant's connection slot lock — the
     /// lock every connection lifecycle mutation takes — and requires that
     /// exact revision to still be Active. A local anchor locks the User's
-    /// password row and requires its revision unchanged, so a password change
-    /// or reset committed on any replica cuts the session off.
+    /// password row and requires its revision unchanged and the tenant not to
+    /// require company SSO, so a password change or reset, or a policy change,
+    /// committed on any replica cuts the session off.
     ///
     /// # Errors
     /// Returns [`IssuanceError::ConnectionInactive`] when the anchor is no
@@ -1081,10 +1083,15 @@ impl TenantTokenIssuer {
                 .await
                 .map_err(store_error)?
             }
-            HumanLoginAnchor::Password(revision) => local_credential_for_update(conn, principal_id)
-                .await
-                .map_err(store_error)?
-                .is_some_and(|credential| credential.password_revision == revision),
+            HumanLoginAnchor::Password(revision) => {
+                local_credential_for_update(conn, principal_id)
+                    .await
+                    .map_err(store_error)?
+                    .is_some_and(|credential| credential.password_revision == revision)
+                    && !login_policy::requires_company_sso(conn)
+                        .await
+                        .map_err(store_error)?
+            }
         };
         if !current {
             return Err(IssuanceError::ConnectionInactive);

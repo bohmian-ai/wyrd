@@ -267,27 +267,35 @@ impl Workspace {
 
     /// Invite one person as a `viewer` and begin their Google enrollment.
     async fn begin_google_invitation(&self) -> BegunSocialLogin {
-        let (status, issued) = self
-            .bearer(
-                Method::POST,
-                "/v1/principals/users/invitations",
-                Some(json!({
-                    "recipients": ["social@example.test"],
-                    "assignments": [{ "role": "viewer", "scope": "all" }],
-                })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "invitation: {issued}");
-        let code = issued["invitations"][0]["invitation_link"]
-            .as_str()
-            .and_then(|link| link.split_once("#invitation="))
-            .map(|(_, code)| code.to_owned())
-            .expect("the link carries its code");
+        let code = self.invitation_code().await;
         begin_google(
             &self.srv,
             json!({ "tenant": self.slug, "provider": "google", "invitation_code": code }),
         )
         .await
+    }
+
+    /// Invite one person as a `viewer`; returns the link's code.
+    ///
+    /// # Panics
+    /// Panics when the invitation is refused.
+    async fn invitation_code(&self) -> String {
+        let (status, issued) = self
+            .bearer(
+                Method::POST,
+                "/v1/principals/users/invitations",
+                Some(json!({
+                    "recipients": ["invitee@example.test"],
+                    "assignments": [{ "role": "viewer", "scope": "all" }],
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "invitation: {issued}");
+        issued["invitations"][0]["invitation_link"]
+            .as_str()
+            .and_then(|link| link.split_once("#invitation="))
+            .map(|(_, code)| code.to_owned())
+            .expect("the link carries its code")
     }
 
     /// Answer the next Google token request for `begun` as `subject`.
@@ -677,4 +685,214 @@ async fn a_company_administrator_enables_and_disables_required_sso() {
         StatusCode::OK,
         "password sign-in works again"
     );
+}
+
+impl Workspace {
+    /// Require company SSO through a fresh company administrator sign-in;
+    /// returns that administrator's session and the enabled view.
+    ///
+    /// # Panics
+    /// Panics when the change is refused.
+    async fn enable(&self) -> (String, Value) {
+        let admin = self.company_session("corp-admin", &[ADMINS]).await;
+        let read = self.policy(&admin).await;
+        let (status, enabled) = self.change(&admin, true, &read).await;
+        assert_eq!(status, StatusCode::OK, "enable: {enabled}");
+        (admin, enabled)
+    }
+
+    /// Start a CLI device authorization; returns its device and user codes.
+    ///
+    /// # Panics
+    /// Panics when the authorization is refused.
+    async fn device(&self) -> (String, String) {
+        let resp = self
+            .srv
+            .oneshot(form_post(
+                "/auth/device_authorization",
+                None,
+                &[("client_id", "wyrd-cli"), ("tenant", &self.slug)],
+            ))
+            .await
+            .expect("device authorization responds");
+        assert_eq!(resp.status(), StatusCode::OK, "device authorization");
+        let device = body_json(resp).await;
+        (
+            device["device_code"]
+                .as_str()
+                .expect("device code")
+                .to_owned(),
+            device["user_code"].as_str().expect("user code").to_owned(),
+        )
+    }
+
+    /// Approve `user_code` from the browser holding `cookie`.
+    async fn approve(&self, cookie: &str, user_code: &str) -> StatusCode {
+        self.srv
+            .oneshot(form_post(
+                "/auth/device",
+                Some(cookie),
+                &[
+                    ("tenant", &self.slug),
+                    ("user_code", user_code),
+                    ("decision", "approve"),
+                ],
+            ))
+            .await
+            .expect("approval responds")
+            .status()
+    }
+
+    /// Poll the token endpoint for `device_code`.
+    async fn redeem(&self, device_code: &str) -> (StatusCode, Value) {
+        let resp = self
+            .srv
+            .oneshot(form_post(
+                "/auth/token",
+                None,
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", device_code),
+                    ("client_id", "wyrd-cli"),
+                ],
+            ))
+            .await
+            .expect("token responds");
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    /// Finish the Google login `begun` against the reply already mounted;
+    /// returns the status and any session set.
+    async fn finish(&self, begun: &BegunSocialLogin) -> (StatusCode, Option<String>) {
+        let (status, _, cookie) =
+            finish_google_session(&self.srv, begun, &self.google.uri(), &self.slug).await;
+        (status, cookie)
+    }
+
+    /// How many Users the fixture tenant holds.
+    async fn users(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1")
+            .bind(self.srv.data_tenant_id().as_uuid())
+            .fetch_one(&self.superuser)
+            .await
+            .expect("Users count")
+    }
+}
+
+/// A browser form `POST` to `uri` from the deployment origin.
+fn form_post(uri: &str, cookie: Option<&str>, pairs: &[(&str, &str)]) -> Request<Body> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    builder.body(Body::from(body)).expect("request builds")
+}
+
+/// Required company SSO cannot be bypassed at a later login step:
+///   1. a Google sign-in and a Google invitation enrollment begun while
+///      optional are refused at their callbacks, setting no session and
+///      creating no User;
+///   2. a password invitation signup, a password sign-in and a new Google
+///      start are refused directly over HTTP;
+///   3. a device code a password session approved before the change redeems
+///      nothing, and a password session cannot approve a new one;
+///   4. a company sign-in and a company-approved device code still work.
+///
+/// # Panics
+/// Panics when a disallowed path acts or a company path is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_sso_refuses_every_later_password_and_social_step() {
+    let workspace = Workspace::start().await;
+    workspace.google_session("google-sam").await;
+    let password = workspace.password_session("pat-admin", "admin").await;
+    let returning = begin_google(
+        &workspace.srv,
+        json!({ "tenant": workspace.slug, "provider": "google" }),
+    )
+    .await;
+    workspace.answer_google(&returning, "google-sam").await;
+    let enrolling = workspace.begin_google_invitation().await;
+    let pending_code = workspace.invitation_code().await;
+    let (approved_device, approved_user_code) = workspace.device().await;
+    assert_eq!(
+        workspace.approve(&password, &approved_user_code).await,
+        StatusCode::OK,
+        "the password session approves while optional"
+    );
+    let (open_device, open_user_code) = workspace.device().await;
+    let (admin, _) = workspace.enable().await;
+    let users = workspace.users().await;
+
+    // 1. Completions begun while optional.
+    let (status, session) = workspace.finish(&returning).await;
+    assert!(session.is_none(), "returning Google sign-in: {status}");
+    workspace.answer_google(&enrolling, "google-new").await;
+    let (status, session) = workspace.finish(&enrolling).await;
+    assert!(session.is_none(), "Google enrollment: {status}");
+    assert_eq!(workspace.users().await, users, "no User is created");
+
+    // 2. Direct HTTP starts and one-step completions.
+    let resp = workspace
+        .srv
+        .oneshot(browser_post(
+            "/auth/browser/password/signup",
+            None,
+            json!({
+                "tenant": workspace.slug,
+                "invitation_code": pending_code,
+                "username": "late-invitee",
+                "password": password_of("late-invitee"),
+            }),
+        ))
+        .await
+        .expect("signup responds");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "password invitation");
+    assert!(session_cookie(&resp, &workspace.slug).is_none());
+    let resp = workspace.password_login("pat-admin").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "password sign-in");
+    let refused = body_json(resp).await;
+    assert_eq!(
+        refused["details"]["reason"], "method_unavailable",
+        "{refused}"
+    );
+    let resp = workspace
+        .srv
+        .oneshot(browser_post(
+            "/auth/browser/login",
+            None,
+            json!({ "tenant": workspace.slug, "provider": "google" }),
+        ))
+        .await
+        .expect("login responds");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "Google start");
+    assert_eq!(workspace.users().await, users, "no User is created");
+
+    // 3. Password device authority.
+    let (status, token) = workspace.redeem(&approved_device).await;
+    assert_ne!(status, StatusCode::OK, "password-approved device: {token}");
+    assert!(token.get("access_token").is_none(), "{token}");
+    assert_ne!(
+        workspace.approve(&password, &open_user_code).await,
+        StatusCode::OK,
+        "a password session cannot approve"
+    );
+
+    // 4. Company paths still work.
+    assert_eq!(
+        workspace.approve(&admin, &open_user_code).await,
+        StatusCode::OK
+    );
+    let (status, token) = workspace.redeem(&open_device).await;
+    assert_eq!(status, StatusCode::OK, "company-approved device: {token}");
+    assert!(token["access_token"].is_string());
+    workspace.company_session("corp-member", &[]).await;
 }

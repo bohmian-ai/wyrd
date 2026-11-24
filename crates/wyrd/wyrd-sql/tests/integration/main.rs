@@ -14,6 +14,8 @@ mod pg_drift_baselines;
 mod pg_gateway_usage;
 /// Tenant GitHub installation slots, revision fences and login state.
 mod pg_github_installations;
+/// Required company SSO and its credential sweep.
+mod pg_login_policy;
 mod pg_login_state;
 mod pg_migration;
 mod pg_operator_connections;

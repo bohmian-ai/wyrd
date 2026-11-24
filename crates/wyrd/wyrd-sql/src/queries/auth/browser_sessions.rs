@@ -25,14 +25,18 @@ const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r"
 ";
 
 /// Record one session owned by the RLS tenant; `PostgreSQL` derives its
-/// absolute expiry from the bound lifetime in seconds.
+/// absolute expiry from the bound lifetime in seconds. A password or social
+/// session is not recorded while the tenant requires company SSO, so a
+/// completion racing a policy change never outlives it.
 const INSERT_BROWSER_SESSION_SQL: &str = r"
     INSERT INTO wyrd.auth_browser_sessions (
         session_hash, data_tenant_id, principal_id, connection_id,
         connection_revision, api_key_id, password_revision, social_provider,
         social_provider_revision, social_identity_id, expires_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-              statement_timestamp() + ($11 * interval '1 second'))
+    ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             statement_timestamp() + ($11 * interval '1 second')
+       WHERE ($7::bigint IS NULL AND $8::text IS NULL)
+          OR NOT EXISTS (SELECT 1 FROM wyrd.auth_login_policies WHERE require_company_sso)
     RETURNING expires_at
 ";
 
@@ -40,7 +44,9 @@ const INSERT_BROWSER_SESSION_SQL: &str = r"
 /// it has one, is itself unrevoked and unexpired, and whose local password
 /// revision, when it has one, is still its User's current revision, and
 /// whose linked social identity, when it has one, still belongs to the
-/// session's User (removing the identity deletes the session). `recent`
+/// session's User (removing the identity deletes the session), and that is
+/// not a password or social session while the tenant requires company SSO.
+/// `recent`
 /// is whether the session was created in the last five minutes.
 const LIVE_BROWSER_SESSION_SQL: &str = r"
     SELECT s.principal_id, s.connection_id, s.connection_revision, s.api_key_id,
@@ -69,6 +75,10 @@ const LIVE_BROWSER_SESSION_SQL: &str = r"
             OR (u.password_hash IS NOT NULL
                 AND u.password_revision = s.password_revision))
        AND (s.social_identity_id IS NULL OR i.user_id = s.principal_id)
+       AND ((s.password_revision IS NULL AND s.social_provider IS NULL)
+            OR NOT EXISTS (SELECT 1 FROM wyrd.auth_login_policies p
+                            WHERE p.data_tenant_id = s.data_tenant_id
+                              AND p.require_company_sso))
 ";
 
 /// Revoke the live session with this hash.
@@ -160,7 +170,8 @@ struct LiveRow {
 
 /// Insert a browser session keyed by `session_hash` for `principal_id`,
 /// created through `authority`, whose absolute expiry `PostgreSQL` derives
-/// from `ttl`, and return that expiry.
+/// from `ttl`, and return that expiry; `None`, recording nothing, for a
+/// password or social `authority` while the tenant requires company SSO.
 ///
 /// First purges this tenant's expired sessions. The table refuses a lifetime
 /// above twelve hours and a reused session hash.
@@ -173,7 +184,7 @@ pub async fn insert_browser_session(
     principal_id: Uuid,
     authority: BrowserSessionAuthority,
     ttl: Duration,
-) -> Result<DateTime<Utc>, sqlx::Error> {
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     let tenant = conn.data_tenant_id().as_uuid();
     sqlx::query(PURGE_EXPIRED_BROWSER_SESSIONS_SQL)
         .execute(&mut **conn.transaction())
@@ -196,9 +207,10 @@ pub async fn insert_browser_session(
         .bind(social.map(|anchor| anchor.provider_revision))
         .bind(social.map(|anchor| anchor.identity_id))
         .bind(ttl.as_secs_f64())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .and_then(|row| sqlx::Row::try_get(&row, "expires_at"))
+        .fetch_optional(&mut **conn.transaction())
+        .await?
+        .map(|row| sqlx::Row::try_get(&row, "expires_at"))
+        .transpose()
 }
 
 /// This tenant's unexpired, unrevoked session with `session_hash`, when its

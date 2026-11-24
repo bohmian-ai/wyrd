@@ -1354,6 +1354,27 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   "Confirm it is you" and changes nothing until the operator's password
   confirms; a blank secret keeps the stored challenge; turning the challenge
   off removes it (`signup_challenge: null`). TDD: PASS.
+- **S7 official host routes the console to the BFF.** RED: with the
+  shipped `nginx.conf.template` rendered in `nginx:stable` and each
+  upstream replaced by a stub that answers its own name, `/platform`,
+  `/platform/ui`, `/platform/ui/`, `/platform/ui/providers` and
+  `/platform/ui/callback` all answered `rust`. GREEN: after the exact
+  `/platform`, `/platform/__data.json` and `/platform/ui` locations and the
+  `^~ /platform/ui/` prefix, those answer `ui`, while
+  `/platform/browser/methods`, `/platform/browser/session`,
+  `/platform/tenants` and `/platform/uix` still answer `rust` and `/` and
+  `/platformx` stay `ui`. `/platform/__data.json` is the entry's page data,
+  so client-side navigation back to `/platform` reaches the BFF. The cookie
+  side was proven in S1: through a recording hop, every BFF call to Rust
+  carried only `wyrd_platform_session` or `wyrd_platform_login`, although the
+  browser also held a tenant session. `test:server:startup:dev` gained
+  `platform_console_routes` (entry HTML headed Platform admin, 303 to
+  `/platform` for the console subtree without a session, Rust's methods and
+  401 problem+json for `/platform/browser/session` and `/platform/tenants`).
+  That lane did not run here: the release `rustc` for `wyrd-server` was
+  SIGKILLed three times while the official image was building, once with
+  `CARGO_BUILD_JOBS=2`. TDD: the routing scenario went RED to GREEN with
+  the stub probe; the startup lane check is unrun.
 - **Mock alignment sweep.** Each production page and state was captured in
   light and dark at 1280 and 390 wide (entry, refused sign-in, ended session,
   refused SSO return, overview, password and SSO re-auth, refused re-auth,

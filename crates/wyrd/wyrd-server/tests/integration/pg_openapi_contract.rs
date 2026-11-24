@@ -31,6 +31,9 @@ const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 /// The served name of the tenant browser-session cookie scheme.
 const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";
 
+/// The served name of the platform console session cookie scheme.
+const PLATFORM_SESSION_SCHEME: &str = "wyrdPlatformSession";
+
 /// The requirement of an operation that accepts the access token or, without
 /// one, a browser session.
 fn token_or_browser_session() -> Value {
@@ -930,6 +933,11 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
         );
     }
 
+    let console = &document["components"]["securitySchemes"][PLATFORM_SESSION_SCHEME];
+    assert_eq!(console["type"], "apiKey");
+    assert_eq!(console["in"], "cookie");
+    assert_eq!(console["name"], "wyrd_platform_session");
+
     let mut cleared = BTreeSet::new();
     let mut cookie_paths = BTreeSet::new();
     let mut bearer_only_v1 = BTreeSet::new();
@@ -947,6 +955,13 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
                     "{method} {path} offers the browser session outside the tenant HTTP surface"
                 );
                 cookie_paths.insert(path.clone());
+                continue;
+            }
+            if overridden == &serde_json::json!([{ PLATFORM_SESSION_SCHEME: [] }]) {
+                assert!(
+                    path.starts_with("/platform/browser/"),
+                    "{method} {path} requires the console session outside the console routes"
+                );
                 continue;
             }
             // utoipa renders `security(())` as one empty requirement object,
@@ -2443,6 +2458,7 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
 
     let mut cleared = 0_usize;
     let mut browser_probes = 0_usize;
+    let mut platform_sessions = 0_usize;
     let mut defects: Vec<String> = Vec::new();
     for (path, item) in document["paths"].as_object().expect("paths object") {
         for method in METHODS {
@@ -2470,7 +2486,10 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
 
             let security = operation.get("security");
             let accepts_cookie = security == Some(&token_or_browser_session());
-            if security.is_some() && !accepts_cookie {
+            let platform_session =
+                security == Some(&serde_json::json!([{ PLATFORM_SESSION_SCHEME: [] }]));
+            let clears = security.is_some() && !accepts_cookie && !platform_session;
+            if clears {
                 cleared += 1;
                 if code == "WYRD_AUTH_401_UNAUTHENTICATED" {
                     defects.push(format!(
@@ -2480,11 +2499,13 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
                 }
             } else if code != "WYRD_AUTH_401_UNAUTHENTICATED" {
                 defects.push(format!(
-                    "{method} {path} inherits the document-wide security requirement but \
-                     answered {status} ({code}) without a token"
+                    "{method} {path} requires a credential but answered {status} ({code}) \
+                     without one"
                 ));
             }
-            if security.is_some() && !accepts_cookie {
+            platform_sessions += usize::from(platform_session);
+            // A tenant session cookie is no platform console session.
+            if clears || platform_session {
                 continue;
             }
 
@@ -2526,6 +2547,10 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
     assert!(
         browser_probes > 0,
         "some operations accept a browser session"
+    );
+    assert!(
+        platform_sessions > 0,
+        "some console operations require a platform session"
     );
     assert!(defects.is_empty(), "{}", defects.join("\n"));
 

@@ -258,7 +258,7 @@ async fn password_login(
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
-    security(()),
+    security(("wyrdPlatformSession" = [])),
     tag = "Platform"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -493,7 +493,7 @@ fn browser_session(caller: PlatformCaller) -> Result<PlatformBrowserSession, Wyr
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
-    security(()),
+    security(("wyrdPlatformSession" = [])),
     tag = "Platform"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -549,7 +549,7 @@ async fn password_reauth(
         (status = 503, description = "The provider is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
-    security(()),
+    security(("wyrdPlatformSession" = [])),
     tag = "Platform"
 )]
 #[tracing::instrument(level = "debug", skip_all)]

@@ -3768,7 +3768,8 @@ withConsole('a stale console session confirms the operator before suspending a w
     const late = page.waitForResponse('**/platform/ui/reauth');
     release();
     expect((await late).status()).toBe(204);
-    await page.waitForTimeout(500);
+    // Any change the late confirmation applied would be a request; wait until none is in flight.
+    await page.waitForLoadState('networkidle');
     expect(await status()).toBe('active');
     expect(await dialog.count()).toBe(0);
     expect(await page.getByTestId(`status-${slug}`).textContent()).toContain('active');
@@ -3918,7 +3919,8 @@ withConsole('the console tests a provider revision before enabling it', async ({
     await expect.poll(() => googleCard.textContent()).toContain('Test revision 2 before enabling it.');
     release();
     await (await stale).waitForEvent('close');
-    await page.waitForTimeout(1500);
+    // The console has finished with that test once its button reads Test sign-in again.
+    await googleCard.getByRole('button', { name: 'Test sign-in' }).waitFor();
     expect(await state.textContent()).toBe('◌ untested · not offered');
     expect(await notice.textContent()).not.toContain('is tested');
     await context.unroute(`${google.issuer}/authorize**`);
@@ -3947,6 +3949,76 @@ withConsole('the console tests a provider revision before enabling it', async ({
     expect(await notice.textContent()).toContain('Google is offered on sign-in and signup pages.');
     const html = await serverHtml(page, `${bff.url}/platform/ui/providers`);
     for (const secret of ['google-secret-one', 'google-secret-two', 'google-secret-three']) expect(html).not.toContain(secret);
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});
+
+/**
+ * The Mail relay view starts with no relay, saves one whose password is
+ * never shown, keeps the stored password when a save leaves it blank,
+ * removes username and password only when the operator asks, and reports a
+ * test send as the relay's acceptance or its error, never as delivery.
+ */
+withConsole('the console keeps a relay password unless the operator removes it', async ({ server }) => {
+  const api = await platformApi(server.baseUrl, server.initializePlatformRoot());
+  await registerOperator(api, 'ops-oncall', OPERATOR_PASSWORD);
+  const mailpitPort = Number((process.env.WYRD_TEST_MAILPIT_SMTP ?? '').split(':').pop());
+  expect(mailpitPort).toBeGreaterThan(0);
+  const stored = async () => (await api('GET', '/platform/mail')).body.relay as { username: string | null; password_set: boolean } | null;
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
+    await page.getByRole('navigation', { name: 'Console' }).getByRole('link', { name: 'Mail relay' }).click();
+    await page.waitForURL(`${bff.url}/platform/ui/mail`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Mail relay');
+    expect(await page.getByTestId('no-relay').textContent()).toContain('– No relay. Wyrd emails nothing');
+    expect(await page.getByRole('button', { name: 'Send test' }).count()).toBe(0);
+    const relay = page.getByTestId('relay');
+    const notice = page.getByRole('status').first();
+
+    await page.getByLabel('Host').fill('127.0.0.1');
+    await page.getByLabel('Port').fill(String(mailpitPort));
+    await page.getByLabel('Security').selectOption('none');
+    await page.getByLabel('Username').fill('relay-user');
+    await page.getByLabel('Password', { exact: true }).fill('relay-pass-one');
+    await page.getByLabel('Sender address').fill('no-reply@example.test');
+    await page.getByRole('button', { name: 'Save relay' }).click();
+    await expect.poll(() => notice.textContent()).toContain('Mail relay saved.');
+    expect(await relay.textContent()).toContain('✓ stored, never shown');
+    expect(await relay.textContent()).toContain(`127.0.0.1:${mailpitPort}`);
+    expect(await page.getByLabel('Password', { exact: true }).inputValue()).toBe('');
+    expect(await serverHtml(page, `${bff.url}/platform/ui/mail`)).not.toContain('relay-pass-one');
+
+    // A blank password keeps the stored one.
+    await page.getByLabel('Sender address').fill('relay@example.test');
+    await page.getByRole('button', { name: 'Save relay' }).click();
+    await expect.poll(() => relay.textContent()).toContain('relay@example.test');
+    expect(await relay.textContent()).toContain('✓ stored, never shown');
+    expect(await stored()).toMatchObject({ username: 'relay-user', password_set: true });
+
+    // Removal is explicit: it drops the username and the password it was sealed to.
+    await page.getByLabel('Remove the stored username and password').check();
+    await page.getByRole('button', { name: 'Save relay' }).click();
+    await expect.poll(() => relay.textContent()).toContain('– none');
+    expect(await stored()).toMatchObject({ username: null, password_set: false });
+
+    // A test send reports the relay's acceptance, not delivery.
+    await page.getByLabel('Recipient').fill('ops@example.test');
+    await page.getByRole('button', { name: 'Send test' }).click();
+    await expect.poll(() => page.getByTestId('test-result').textContent()).toContain('✓ The relay accepted the message. That does not prove it reached the inbox.');
+
+    // A relay that refuses the connection is reported with its error.
+    await page.getByLabel('Port').fill('9');
+    await page.getByRole('button', { name: 'Save relay' }).click();
+    await expect.poll(() => relay.textContent()).toContain('127.0.0.1:9');
+    await page.getByRole('button', { name: 'Send test' }).click();
+    await expect.poll(() => page.getByTestId('test-result').textContent()).toContain('✕ The relay did not accept the message.');
+    expect(await page.getByTestId('test-result').locator('code').textContent()).not.toBe('');
   } finally {
     await browser.close();
     bff.stop();

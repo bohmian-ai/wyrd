@@ -76,7 +76,7 @@
     <form class="stack" method="POST" action="?/save" use:enhance={reauth.guard(`Replacing the ${names[p.provider]} client`)}>
       <input type="hidden" name="provider" value={p.provider} />
       <label for="client-id-{p.provider}">Client ID</label>
-      <input id="client-id-{p.provider}" class="app-input mono" name="client_id" required autocomplete="off" spellcheck="false" value={p.client_id ?? ''} />
+      <input id="client-id-{p.provider}" class="app-input mono" name="client_id" required autocomplete="off" spellcheck="false" defaultValue={p.client_id ?? ''} />
       <label for="client-secret-{p.provider}">Client secret</label>
       <input id="client-secret-{p.provider}" class="app-input mono" name="client_secret" type="password" required autocomplete="off" />
       <p>{p.client_id ? 'The stored secret is never shown. Saving replaces the client and starts a new untested revision.' : 'Stored sealed and never shown again.'}</p>

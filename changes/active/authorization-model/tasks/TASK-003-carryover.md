@@ -1332,6 +1332,19 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   against a revision replaced through the API refuses as "This provider
   changed" (`WYRD_SPEC_409_CONFLICT`); the current revision tested then
   enables to "✓ enabled · offered". TDD: PASS.
+- **S5 mail relay view**
+  (`the console keeps a relay password unless the operator removes it`),
+  on part A's kept-password `PUT /platform/mail`, against the lane's Mailpit.
+  RED: `/platform/ui/mail` had no page. GREEN: 1 passed (after two
+  diagnosed fixes: a form reset blanked `value=` fields, so they use
+  `defaultValue`; `field()` refuses an empty optional username/password).
+  Proves the no-relay state and no test form; a saved relay shows
+  "✓ stored, never shown" and the password never reaches the page; a save
+  with a blank password keeps it (Rust `password_set: true`); the explicit
+  "Remove the stored username and password" control removes both (Rust
+  `username: null, password_set: false`); a test send reports Mailpit's
+  acceptance as "not proof it reached the inbox"; a refused connection reports
+  "✕ The relay did not accept the message." with its error. TDD: PASS.
 
 ### 17. An existing User explicitly connects another sign-in method
 

@@ -21,8 +21,12 @@ export class ConsoleReauth {
   issue = $state.raw<WyrdProblem | null>(null);
   confirming = $state(false);
 
-  /** An `enhance` callback for a destructive form labelled `label`: a stale-proof refusal asks; every other result updates the page. */
-  guard(label: string): SubmitFunction {
+  /**
+   * An `enhance` callback for a destructive form labelled `label`: a
+   * stale-proof refusal asks; every other result updates the page, resetting
+   * the form after a success unless `reset` is false.
+   */
+  guard(label: string, reset = true): SubmitFunction {
     return ({ formElement }) =>
       async ({ result, update }) => {
         const problem = result.type === 'failure' ? (result.data?.problem as WyrdProblem | undefined) : undefined;
@@ -32,7 +36,7 @@ export class ConsoleReauth {
           this.confirming = false;
           return;
         }
-        await update();
+        await update({ reset });
       };
   }
 

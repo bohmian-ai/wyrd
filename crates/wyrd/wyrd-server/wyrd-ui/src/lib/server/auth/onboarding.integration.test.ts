@@ -100,9 +100,8 @@ function mailedLink(text: string): string {
   return link!;
 }
 
-/** A name no earlier run of this journey used, for addresses and slugs. */
-/** Sign in to the journey workspace with a password and wait for its home page. */
-async function signIn(page: Page, username: string, password: string): Promise<void> {
+/** Sign in to workspace `slug` with a password and wait for its home page. */
+async function signIn(page: Page, slug: string, username: string, password: string): Promise<void> {
   await page.goto(`${journey.origin}/t/${slug}/login`);
   await page.getByLabel('Username').fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
@@ -119,10 +118,45 @@ async function cliForm(page: Page, path: string, fields: Record<string, string>)
   );
 }
 
+/** Distinguishes this run's addresses and slugs from earlier runs against the same Mailpit. */
 const run = Date.now().toString(36);
-/** The address and workspace the signup journey creates; later journeys use them. */
-const owner = `owner-${run}@example.test`;
-const slug = `journey-${run}`;
+
+/** A workspace created through the email signup pages, and its administrator. */
+type Workspace = { slug: string; name: string; owner: string; username: string; password: string };
+
+/**
+ * Set up a workspace the way a visitor does: email signup, the mailed link,
+ * then naming it with an administrator password. The owner's address is the
+ * workspace's verified recovery email, so discovery and reset reach it.
+ */
+async function signedUpWorkspace(label: string): Promise<Workspace> {
+  await enableMailAndSignup();
+  const ws = {
+    slug: `${label}-${run}`,
+    name: `Journey ${label}`,
+    owner: `${label}-${run}@example.test`,
+    username: 'owner',
+    password: 'correct horse battery staple'
+  };
+  const { context, page } = await visitor();
+  try {
+    await page.goto(`${journey.origin}/signup`);
+    await page.getByLabel('Email').fill(ws.owner);
+    await page.getByRole('button', { name: 'Continue with email' }).click();
+    await page.getByRole('heading', { name: 'Check your email' }).waitFor();
+    await page.goto(mailedLink(await newestMail(ws.owner)));
+    await page.getByRole('link', { name: 'Name your workspace' }).click();
+    await page.getByLabel('Workspace name').fill(ws.name);
+    await page.getByLabel('URL slug').fill(ws.slug);
+    await page.getByLabel('Your username').fill(ws.username);
+    await page.getByLabel('Your password', { exact: true }).fill(ws.password);
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.waitForURL(`${journey.origin}/t/${ws.slug}`);
+  } finally {
+    await context.close();
+  }
+  return ws;
+}
 
 test('the root page offers creation and discovery only when they are usable', async () => {
   const { context, page } = await visitor();
@@ -150,6 +184,8 @@ test('the root page offers creation and discovery only when they are usable', as
 
 test('an emailed proof creates a workspace whose administrator signs in with a passphrase', async () => {
   await enableMailAndSignup();
+  const owner = `owner-${run}@example.test`;
+  const slug = `journey-${run}`;
   const { context, page } = await visitor();
   try {
     await page.goto(`${journey.origin}/signup`);
@@ -203,6 +239,7 @@ test('an emailed proof creates a workspace whose administrator signs in with a p
 }, journeyTimeout);
 
 test('a verified address finds its workspaces by link or pasted code', async () => {
+  const { slug, name, owner } = await signedUpWorkspace('discovery');
   const { context, page } = await visitor();
   try {
     await page.goto(`${journey.origin}/workspaces`);
@@ -221,7 +258,7 @@ test('a verified address finds its workspaces by link or pasted code', async () 
     const listed = page.getByRole('list', { name: 'Workspaces for this address' }).getByRole('link');
     expect(await listed.count()).toBe(1);
     expect(await listed.getAttribute('href')).toBe(`${journey.origin}/t/${slug}/login`);
-    expect(await listed.textContent()).toContain('Journey Research');
+    expect(await listed.textContent()).toContain(name);
 
     // A second request in a new browser, with the code pasted instead of the link opened.
     const pasted = await visitor();
@@ -235,7 +272,7 @@ test('a verified address finds its workspaces by link or pasted code', async () 
       await pasted.page.getByLabel('Code from the email').fill(code);
       await pasted.page.getByRole('button', { name: 'Verify' }).click();
       await pasted.page.getByRole('heading', { name: 'Your workspaces', exact: true }).waitFor();
-      await pasted.page.getByRole('link', { name: /Journey Research/ }).click();
+      await pasted.page.getByRole('link', { name }).click();
       await pasted.page.waitForURL(`${journey.origin}/t/${slug}/login`);
     } finally {
       await pasted.context.close();
@@ -246,6 +283,7 @@ test('a verified address finds its workspaces by link or pasted code', async () 
 }, journeyTimeout);
 
 test('a password account resets its password with a mailed code', async () => {
+  const { slug, owner } = await signedUpWorkspace('reset');
   const { context, page } = await visitor();
   try {
     // A password-only workspace offers no company SSO, and points to reset.
@@ -278,10 +316,12 @@ test('a password account resets its password with a mailed code', async () => {
 }, journeyTimeout);
 
 test('a signed-in administrator verifies a recovery email from the account page', async () => {
+  const ws = await signedUpWorkspace('recovery');
+  const slug = ws.slug;
   const { context, page } = await visitor();
   const recovery = `recovery-${run}@example.test`;
   try {
-    await signIn(page, 'owner', 'a brand new passphrase for owner');
+    await signIn(page, slug, ws.username, ws.password);
 
     await page.goto(`${journey.origin}/t/${slug}/settings/account`);
     const section = page.getByRole('region', { name: 'Recovery email' });
@@ -301,6 +341,7 @@ test('a signed-in administrator verifies a recovery email from the account page'
 }, journeyTimeout);
 
 test('a signed-out browser opening a recovery email link is told to sign in', async () => {
+  const { slug } = await signedUpWorkspace('signed-out');
   const { context, page } = await visitor();
   try {
     await page.goto(`${journey.origin}/t/${slug}/contact/verify#proof=not-a-proof`);
@@ -312,10 +353,12 @@ test('a signed-out browser opening a recovery email link is told to sign in', as
 }, journeyTimeout);
 
 test('the administrator invites a teammate who enrolls and approves a CLI sign-in', async () => {
+  const ws = await signedUpWorkspace('invite');
+  const slug = ws.slug;
   const teammate = `teammate-${run}@example.test`;
   const admin = await visitor();
   try {
-    await signIn(admin.page, 'owner', 'a brand new passphrase for owner');
+    await signIn(admin.page, slug, ws.username, ws.password);
     await admin.page.goto(`${journey.origin}/t/${slug}/settings/access?tab=users`);
     const invite = admin.page.getByRole('form', { name: 'Invite users' });
     await invite.getByLabel('Email addresses').fill(teammate);

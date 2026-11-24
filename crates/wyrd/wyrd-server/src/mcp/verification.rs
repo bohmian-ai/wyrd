@@ -162,7 +162,8 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
              outcome, reason, actual, citations, custom data, and drift detail. A pull \
              request execution also carries github_delivery: its Check and review delivery \
              outcome (pending, delivered, skipped or failed) and safe reason, separate from \
-             the verdict. A just-enqueued execution may briefly be not found, and a completed one may \
+             the verdict. An open execution also lists input_waits: each step or requirement \
+             that is waiting for deferred input, with the input slots it is waiting on. A just-enqueued execution may briefly be not found, and a completed one may \
              briefly lack its result; poll again. \
              Requires executions:read on the execution's trusted parent: the subject Card, the \
              Repository for pull request work, or the Verifier for subjectless direct work.",

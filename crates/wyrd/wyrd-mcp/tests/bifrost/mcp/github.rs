@@ -651,8 +651,9 @@ mod pg_tests {
     }
 
     /// An agent finds a pull request execution waiting for its deferred
-    /// `ci` input, publishes the evidence for the repository slug and head
-    /// commit, and the same execution completes; publishing again replays
+    /// `ci` input, with requirement `green` reported as the task waiting
+    /// for it, publishes the evidence for the repository slug and head
+    /// commit, and the same execution completes with no task waits left; publishing again replays
     /// the receipt, and different content is refused as a conflict.
     ///
     /// # Errors
@@ -678,6 +679,10 @@ mod pg_tests {
         );
         let waiting = opened.until(|state| state["status"] == "waiting").await?;
         assert_eq!(waiting["waiting"], json!(["ci"]));
+        assert_eq!(
+            waiting["input_waits"],
+            json!([{"task_id": "green", "slots": ["ci"]}])
+        );
 
         let accepted = structured(
             agent
@@ -694,6 +699,7 @@ mod pg_tests {
             .until(|state| state["status"] == "completed" && !state["result"].is_null())
             .await?;
         assert_eq!(completed["result"]["outcome"]["verdict"], "passed");
+        assert!(completed["input_waits"].is_null(), "{completed}");
         let replayed = structured(
             agent
                 .call_tool(Opened::publish(json!({"status": "green"}))?)

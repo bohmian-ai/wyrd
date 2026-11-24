@@ -2951,3 +2951,121 @@ async fn every_signup_creator_gets_a_verified_contact() {
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["details"]["reason"], "contact_required");
 }
+
+/// Read `GET /auth/signup/proof` from `client` with `cookie`; returns the
+/// status and body.
+async fn proof_method(srv: &WyrdTestServer, cookie: Option<&str>) -> (StatusCode, Value) {
+    let peer: IpAddr = "10.7.0.1".parse().expect("peer address");
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/signup/proof")
+        .header(header::HOST, SOCIAL_HOST)
+        .header(CLIENT_HEADER, "203.0.113.80")
+        .extension(axum::extract::ConnectInfo(SocketAddr::new(peer, 40_000)));
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    let resp = srv
+        .oneshot(builder.body(Body::empty()).expect("request builds"))
+        .await
+        .expect("proof read responds");
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+/// The proof step reports how this browser proved itself, so the workspace
+/// form knows whether to ask for local credentials:
+///   1. without a completion cookie, or with a forged one, the read answers
+///      `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`;
+///   2. a Google, GitHub or email proof reads back as exactly
+///      `{"method": "google" | "github" | "email"}`, naming no address;
+///   3. reading consumes nothing: it repeats, and the proof still creates
+///      its workspace;
+///   4. an expired proof reads as no proof.
+///
+/// # Panics
+/// Panics when a proof reads, refuses or is consumed differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_proof_step_reports_its_method() {
+    let google = wiremock::MockServer::start().await;
+    let github = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server_with(
+        &google,
+        wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            github_url: Some(github.uri()),
+            github_api_url: Some(github.uri()),
+            turnstile_siteverify_url: None,
+        },
+    )
+    .await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // 1. No live proof, no method.
+    for cookie in [None, Some("wyrd_signup=forged")] {
+        let (status, body) = proof_method(&srv, cookie).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{cookie:?}: {body}");
+        assert_eq!(
+            body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+            "{body}"
+        );
+    }
+
+    // 2 and 3. Each proof names its method, repeatably, and still creates.
+    let google_proof = prove_signup(&srv, &google, "google-method").await;
+    for _ in 0..2 {
+        let (status, body) = proof_method(&srv, Some(&google_proof)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({ "method": "google" }));
+    }
+    let (status, _, created) = complete_with(
+        &srv,
+        &google_proof,
+        "203.0.113.81",
+        &json!({ "slug": "google-method", "display_name": "Google" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the read consumed nothing: {created}"
+    );
+
+    super::enable_github(&srv, &session, &github).await;
+    let (_, github_proof) = github_signup(
+        &srv,
+        &github,
+        5151,
+        json!([{ "email": "octo-method@example.test", "primary": true, "verified": true }]),
+    )
+    .await;
+    let github_proof = github_proof.expect("completion cookie");
+    let (status, body) = proof_method(&srv, Some(&github_proof)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "method": "github" }));
+
+    let api = relay_to_mailpit(&srv, &session).await;
+    let address = format!("method-{}@example.test", uuid::Uuid::new_v4().simple());
+    let (email_proof_cookie, _) = email_proof(&srv, &api, &address, "203.0.113.82").await;
+    let (status, body) = proof_method(&srv, Some(&email_proof_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "method": "email" }));
+
+    // 4. An expired proof is no proof.
+    sqlx::query(
+        "UPDATE platform.signup_attempts SET expires_at = statement_timestamp() - interval '1 second'
+          WHERE subject = '5151'",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the GitHub proof expires");
+    let (status, body) = proof_method(&srv, Some(&github_proof)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+        "{body}"
+    );
+}

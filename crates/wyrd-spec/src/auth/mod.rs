@@ -39,7 +39,7 @@ pub use browser::{
     DiscoveryRequest, DiscoveryVerifyRequest, LocalCredentials, PasswordChangeRequest,
     PasswordLoginRequest, PasswordResetCodeRequest, PasswordResetRequest, PasswordSignupRequest,
     ProofStatus, ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest,
-    SignupCompleteResponse, SignupVerifyRequest,
+    SignupCompleteResponse, SignupProofMethod, SignupProofResponse, SignupVerifyRequest,
 };
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{

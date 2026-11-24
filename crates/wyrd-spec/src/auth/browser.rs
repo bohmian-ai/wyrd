@@ -132,6 +132,30 @@ pub struct ProofStatusResponse {
     pub status: ProofStatus,
 }
 
+/// How a live signup proof was made: a mailbox, or a shared provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SignupProofMethod {
+    /// A mailbox proof; completion needs `local_credentials`.
+    Email,
+    /// A Google proof; completion refuses `local_credentials`.
+    Google,
+    /// A GitHub proof; completion refuses `local_credentials`.
+    Github,
+}
+
+/// Response of `GET /auth/signup/proof`: how this browser's live completion
+/// proof was made, so the workspace form asks only for what completion
+/// needs. It names no address or identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupProofResponse {
+    /// The proof's method.
+    pub method: SignupProofMethod,
+}
+
 /// Body of `POST /auth/signup/verify`: the proof an email signup message
 /// carried, presented by the browser that began it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -86,7 +86,7 @@ switches light and dark.
 | `#/t/<slug>/login?reset=done` | Back at sign-in after `204`; reset never signs in |
 | `#/platform` | Entry, heading "Platform admin": operator username and password, then Sign in with platform SSO when platform OIDC is configured |
 | `#/platform?sso=off` | No platform OIDC: the SSO button is not shown |
-| `#/platform?preview=refused` / `throttled` / `nosso` / `ended` / `unavailable` | `401 UNAUTHENTICATED` / `429 SIGN_IN_ATTEMPTS` / `404` platform OIDC removed since the page loaded (no button) / session ended / any 5xx |
+| `#/platform?preview=refused` / `throttled` / `nosso` / `ended` / `unavailable` | `401 UNAUTHENTICATED` / `429 SIGN_IN_ATTEMPTS` / `404` platform OIDC removed since the page loaded (no button) / session ended / a sign-in answered with any 5xx |
 | `#/platform/ui/callback` | Platform SSO return: a sign-in opens the console; `?preview=refused` is an unregistered identity (`401`), `reauth` a confirmed re-authentication, `popup` the re-authentication pop-up handing back to the console |
 | `#/platform/ui` | Console overview: safe session metadata and workspaces with Suspend and Resume |
 | `#/platform/ui?preview=reauth` (`&method=oidc`) | Fresh-proof prompt before a destructive change, by password or forced platform SSO |

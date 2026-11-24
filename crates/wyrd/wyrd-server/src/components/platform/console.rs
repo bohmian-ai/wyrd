@@ -29,7 +29,7 @@ use wyrd_auth::platform_sessions::{
 };
 use wyrd_spec::auth::{
     LoginInitResponse, PlatformBrowserSessionView, PlatformCallbackRequest,
-    PlatformPasswordLoginRequest, PlatformPasswordReauthRequest,
+    PlatformPasswordLoginRequest, PlatformPasswordReauthRequest, PlatformSignInMethods,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
@@ -63,6 +63,45 @@ pub fn platform_console_router() -> OpenApiRouter<AppState> {
         .routes(routes!(oidc_callback))
         .routes(routes!(password_reauth))
         .routes(routes!(oidc_reauth))
+        .routes(routes!(methods))
+}
+
+/// `GET /platform/browser/methods` — the sign-in methods the signed-out
+/// platform entry may offer.
+///
+/// `password` is available wherever platform sessions are configured;
+/// `oidc` is true exactly when a platform OIDC connection exists, so
+/// `POST /platform/browser/oidc/login` would not answer `404`. Needs no
+/// session and reveals nothing about which operators exist.
+///
+/// # Errors
+/// `500 WYRD_SPEC_500_INTERNAL` when the platform store read fails.
+#[utoipa::path(
+    get,
+    path = "/platform/browser/methods",
+    responses(
+        (status = 200, description = "The methods the platform entry may offer",
+          body = PlatformSignInMethods),
+        (status = 500, description = "The platform store read failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn methods(State(state): State<AppState>) -> Result<Response, WyrdErrorResponse> {
+    let oidc = match state.auth.platform_login.as_ref() {
+        Some(login) => login.configured().await.map_err(login_error)?,
+        None => false,
+    };
+    Ok(with_cookies(
+        StatusCode::OK,
+        Vec::new(),
+        Json(PlatformSignInMethods {
+            password: platform_sessions(&state).is_ok(),
+            oidc,
+        }),
+    ))
 }
 
 /// Name of the cookie binding a platform OIDC browser login to the browser

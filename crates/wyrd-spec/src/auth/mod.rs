@@ -39,7 +39,7 @@ pub use browser::{
     DiscoveryRequest, DiscoveryVerifyRequest, LocalCredentials, PasswordChangeRequest,
     PasswordLoginRequest, PasswordResetCodeRequest, PasswordResetRequest, PasswordSignupRequest,
     ProofStatus, ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest,
-    SignupCompleteResponse, SignupVerifyRequest,
+    SignupCompleteResponse, SignupProofMethod, SignupProofResponse, SignupVerifyRequest,
 };
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{
@@ -62,8 +62,9 @@ pub use platform_identity::{
     ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformBrowserMethod,
     PlatformBrowserSessionView, PlatformCallbackRequest, PlatformClientAuth, PlatformLoginRequest,
     PlatformOidcConnectionView, PlatformPasswordLoginRequest, PlatformPasswordReauthRequest,
-    PlatformPrincipalListResponse, PlatformPrincipalSummary, RegisterPlatformAdminRequest,
-    RegisterPlatformAdminResponse, SetPlatformPasswordRequest, SetPlatformPrincipalStatusRequest,
+    PlatformPrincipalListResponse, PlatformPrincipalSummary, PlatformSignInMethods,
+    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SetPlatformPasswordRequest,
+    SetPlatformPrincipalStatusRequest,
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;

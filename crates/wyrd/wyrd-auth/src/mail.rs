@@ -101,14 +101,18 @@ impl ApplicationMail {
     /// Validate, seal and store `request` as the relay, replacing any
     /// earlier relay, for a caller platform authorization already allowed.
     ///
+    /// A request without a password keeps the stored one while its username
+    /// is unchanged; one without a username removes it.
+    ///
     /// The password is sealed before the audited operator transaction opens,
     /// so no transaction waits on the key service; a refused seal leaves the
     /// committed relay unchanged.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an empty host, a zero port, an
-    /// unparsable sender, a password without a username, a password on a
-    /// deployment without `[kms]` or a seal the key service refuses, and
+    /// unparsable sender, a password without a username, a changed username
+    /// without its password, a password on a deployment without `[kms]` or
+    /// a seal the key service refuses, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the write fails.
     pub async fn configure(
         &self,
@@ -155,7 +159,7 @@ impl ApplicationMail {
                 )
             }
         };
-        let row = MailRelayRow {
+        let mut row = MailRelayRow {
             host: host.to_owned(),
             port: i32::from(request.port),
             tls: request.tls.as_str().to_owned(),
@@ -168,7 +172,15 @@ impl ApplicationMail {
             .begin_platform_audited()
             .await
             .map_err(store_error)?;
-        put_mail_relay(&mut conn, &row).await.map_err(store_error)?;
+        row.password_enc = put_mail_relay(&mut conn, &row)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| {
+                validation(
+                    "a new username needs its password; send the password with it",
+                    "password",
+                )
+            })?;
         conn.commit().await.map_err(store_error)?;
         Ok(MailSettings {
             relay: Some(view(&row)),

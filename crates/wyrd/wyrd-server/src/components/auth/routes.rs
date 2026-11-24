@@ -76,6 +76,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::auth::social::callback))
         .routes(routes!(crate::auth::social::signup))
         .routes(routes!(crate::auth::social::signup_verify))
+        .routes(routes!(crate::auth::social::signup_proof))
         .routes(routes!(crate::auth::social::signup_complete))
         .routes(routes!(callback))
         .routes(routes!(token))

@@ -430,7 +430,8 @@ async fn read_mail(
 }
 
 /// Replace the application-mail relay; the password is sealed and never
-/// returned.
+/// returned. Omitting the password keeps the stored one while the username
+/// is unchanged; omitting the username removes it.
 ///
 /// # Errors
 /// Returns `400` for an invalid relay and a stable Wyrd error when the caller
@@ -442,7 +443,8 @@ async fn read_mail(
     responses(
         (status = 200, description = "The stored relay, without its password", body = MailSettings),
         (status = 400, description = "Empty host, zero port, invalid sender, a password without \
-          a username, or no sealing key (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+          a username, a changed username without its password, or no sealing key \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),

@@ -268,6 +268,9 @@ pub struct ConfigureMailRelayRequest {
     #[serde(default)]
     pub username: Option<String>,
     /// Password for `username`; sealed before storage and never returned.
+    /// Omit it to keep the stored password while `username` is unchanged;
+    /// a changed `username` needs its password. Omitting `username`
+    /// removes the stored password.
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub password: Option<SecretBearer>,

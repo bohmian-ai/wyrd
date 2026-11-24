@@ -38,6 +38,7 @@ use wyrd_spec::auth::{
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
+use wyrd_sql::row_types::auth::HumanLoginAnchor;
 
 use crate::auth::social::available_methods;
 use crate::auth::source::RequestSource;
@@ -49,9 +50,10 @@ use crate::state::AppState;
 /// Request extension marking recent human sign-in proof: the request was
 /// authenticated by a password or provider browser session created at most
 /// five minutes ago. Bearer, API-key and recovery-session requests never
-/// carry it.
+/// carry it. It holds the session's login anchor, `None` for a social
+/// session, so a handler can require proof through one exact connection.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RecentHumanLogin;
+pub(crate) struct RecentHumanLogin(pub(crate) Option<HumanLoginAnchor>);
 
 /// Prefix of every tenant browser-session cookie name; the rest is the
 /// tenant's route key.

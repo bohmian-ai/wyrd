@@ -141,7 +141,7 @@ async fn authenticate_browser_session(
             if session.recent {
                 request
                     .extensions_mut()
-                    .insert(crate::auth::browser::RecentHumanLogin);
+                    .insert(crate::auth::browser::RecentHumanLogin(session.anchor));
             }
             request
                 .extensions_mut()

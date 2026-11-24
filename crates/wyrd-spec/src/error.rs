@@ -738,7 +738,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
         status = 403,
         title = "Recent sign-in required",
-        remediation = "Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one."
+        remediation = "Sign in again with a method the operation accepts, then retry within five minutes; an API key or recovery session cannot prove a recent sign-in."
     )]
     RecentLoginRequired {
         /// Human-readable error message.

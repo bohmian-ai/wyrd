@@ -118,6 +118,30 @@ anonymous method reads reveal no count or account directory. Missing read/warnin
 is the expected RED. Tier 1: extend server identity/browser integration and
 production UI journey owners; tier 2 pins tenant isolation/count semantics.
 
+Evidence (Rust/HTTP):
+
+- Runner: `t.sh` = repository test Postgres + Mailpit + Keycloak/Dex env, then
+  `mise exec -- cargo nextest run --locked "$@"`. Selector:
+  `-p wyrd-server --features test-support --test integration -E
+  'test(=platform_admin_e2e::company_sso::a_company_administrator_reads_the_policy_and_its_account_warning)'`.
+- RED: `GET /v1/identity/login-policy` from the company admin's browser
+  session returned 401 `WYRD_AUTH_401_UNAUTHENTICATED` (no such route).
+- GREEN: 1 passed. Assertions are in `platform_admin_e2e/company_sso.rs`:
+  the exact view (not required, revision 0, Active id/revision, ready, count);
+  403 RBAC for a password viewer; no count or user keys in anonymous
+  `/auth/browser/methods`. The count is 3: the fixture's seeded admin, a
+  password User and a Google User. It excludes two company Users, a suspended
+  User, the headless Service and another tenant's User, which proves tier-2
+  tenant/count semantics through RLS.
+- Owners: `HumanConnections::login_policy`, `wyrd_sql::queries::auth::login_policy`
+  (`users_without_identity` matches identities by the Active issuer),
+  `components/admin/identity.rs::read_login_policy`, wire types
+  `LoginPolicyView`/`LoginPolicyConnection` in `wyrd-spec`.
+- Mechanical deviation: the controlled company IdP lives in
+  `platform_admin_e2e/company_sso.rs` (test-support build with Google
+  fixtures), not `identity_e2e.rs`, which compiles without test-support.
+- Production settings UI: pending.
+
 ### 2. A company administrator enables and disables enforcement
 
 Maps to REQ-016, preserving REQ-002/004/005; AC-006. Through real company login

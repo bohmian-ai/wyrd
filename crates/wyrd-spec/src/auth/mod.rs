@@ -45,7 +45,8 @@ pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocatio
 pub use human_connection::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
     HUMAN_SUBJECT_CLAIM, HumanClientAuth, HumanConnectionState, HumanConnectionView,
-    HumanConnectionsResponse, refuse_human_trusted_issuer,
+    HumanConnectionsResponse, LoginPolicyChange, LoginPolicyConnection, LoginPolicyView,
+    refuse_human_trusted_issuer,
 };
 pub use oidc::{
     AbsoluteUrl, CallbackQuery, ConnectionTester, IssuerUrl, LoginInitResponse, LoginInitiation,

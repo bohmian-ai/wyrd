@@ -25,6 +25,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::principal::within_propagation;
 
+mod company_sso;
 mod console;
 mod contacts;
 mod methods;

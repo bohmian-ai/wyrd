@@ -2710,7 +2710,10 @@ async fn the_methods_report_publishes_the_challenge_site_key() {
 
     // 1. No challenge, no site key.
     let before = root().await;
-    assert!(before.get("signup_challenge_site_key").is_none(), "{before}");
+    assert!(
+        before.get("signup_challenge_site_key").is_none(),
+        "{before}"
+    );
 
     // 2. A configured challenge publishes its site key only.
     settings(json!({ "password_enabled": true, "signup_enabled": true,
@@ -2720,14 +2723,20 @@ async fn the_methods_report_publishes_the_challenge_site_key() {
         root().await,
         methods(format!("/auth/browser/methods?tenant={tenant}")).await,
     ] {
-        assert_eq!(report["signup_challenge_site_key"], "0x4AAA-site", "{report}");
+        assert_eq!(
+            report["signup_challenge_site_key"], "0x4AAA-site",
+            "{report}"
+        );
         assert!(!report.to_string().contains("turnstile-secret"), "{report}");
     }
 
     // 3. Clearing the challenge removes it.
     settings(json!({ "password_enabled": true, "signup_enabled": true })).await;
     let cleared = root().await;
-    assert!(cleared.get("signup_challenge_site_key").is_none(), "{cleared}");
+    assert!(
+        cleared.get("signup_challenge_site_key").is_none(),
+        "{cleared}"
+    );
 }
 
 /// The verified contact of every User of workspace `slug`: username or

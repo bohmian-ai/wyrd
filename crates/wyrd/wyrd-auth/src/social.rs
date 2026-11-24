@@ -36,8 +36,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
     EnableSocialProviderRequest, IssuerUrl, LocalCredentials, LoginMethodsResponse, LoginSettings,
-    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SignupChallenge, SocialProvider,
-    SocialProviderState, SocialProviderView, SocialProvidersResponse,
+    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SignupChallenge, SignupProofMethod,
+    SocialProvider, SocialProviderState, SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -2040,6 +2040,44 @@ impl SocialSignIn {
             creator_key,
             claimed,
         }))
+    }
+
+    /// How the live proof held by `completion` was made, for the workspace
+    /// form to ask only for what completion needs.
+    ///
+    /// A pure read: it records, renews and consumes nothing, so the same
+    /// browser may read it again and still complete. It names no address or
+    /// identity.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OneTimeCodeInvalid`] without a completion, or
+    /// for one holding no live proof, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the read fails.
+    pub async fn signup_proof_method(
+        &self,
+        completion: Option<&str>,
+    ) -> Result<SignupProofMethod, WyrdError> {
+        let refused = || WyrdError::OneTimeCodeInvalid {
+            message: "no workspace signup is proven in this browser; start again".to_owned(),
+            details: json!({}),
+        };
+        let completion = completion.ok_or_else(refused)?;
+        let proven = proven_signup(
+            &self.operator,
+            Sha256Hex::digest(completion.as_bytes()).as_bytes(),
+        )
+        .await
+        .map_err(store_error)?
+        .ok_or_else(refused)?;
+        match (proven.proof_kind.as_str(), proven.provider.as_deref()) {
+            ("email", _) => Ok(SignupProofMethod::Email),
+            (_, Some(provider)) => match SocialProvider::parse(provider) {
+                Some(SocialProvider::Google) => Ok(SignupProofMethod::Google),
+                Some(SocialProvider::Github) => Ok(SignupProofMethod::Github),
+                None => Err(refused()),
+            },
+            _ => Err(refused()),
+        }
     }
 
     /// Remove one bounded batch of expired signup admission windows and

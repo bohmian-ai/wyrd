@@ -1264,6 +1264,12 @@ BFF forwards only the platform cookie, never a global key or tenant cookie.
 This is the only new-page implementation cycle; later identity/policy cycles
 extend these approved pages for their respective final behaviors.
 
+#### Cycle 16 evidence (Part A: server contracts for readings 1, 4, 7)
+
+Focused runner: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E "test(=<selector>)"'`.
+
+- **Reading 1, `GET /auth/signup/proof`.** Selector `platform_admin_e2e::signup::the_proof_step_reports_its_method`. RED: the unrouted path answered `401 WYRD_AUTH_401_UNAUTHENTICATED` ("missing X-Wyrd-Access-Token header") where `WYRD_AUTH_401_ONE_TIME_CODE_INVALID` was expected. GREEN: no or forged cookie and an expired proof answer `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`; Google, GitHub and email proofs read exactly `{"method":"google"|"github"|"email"}`; a repeated read still completes the Google workspace. Owner: `SocialSignIn::signup_proof_method` over the existing `proven_signup` completion lookup (the completion cookie is a digest-keyed row, not a `SignupEnvelope`; its liveness is the row's `expires_at`, so `require_live` does not apply). Wire: `SignupProofResponse`/`SignupProofMethod` in `wyrd-spec`; no neighbouring signup endpoint has a CLI/SDK or generated TS projection, so none was added. TDD: PASS.
+
 ### 17. An existing User explicitly connects another sign-in method
 
 **Reuses:** Cycles 4–5 password/method owners, cycle 16 approved account pages and existing bound identity linking; preserve the same User/grants.

@@ -20,7 +20,8 @@ use wyrd_auth::callback::LoginCompletion;
 use wyrd_auth::social::{SIGNUP_EMAIL_TTL, SignupAdmission, TenantLogin};
 use wyrd_spec::auth::{
     BrowserLoginResponse, CreateTenantRequest, ProofStatus, ProofStatusResponse,
-    SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse, SignupVerifyRequest,
+    SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse, SignupProofResponse,
+    SignupVerifyRequest,
 };
 use wyrd_spec::auth::{CallbackQuery, LoginMethodsQuery, LoginMethodsResponse, SocialProvider};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
@@ -402,6 +403,46 @@ pub async fn signup_verify(
         Json(ProofStatusResponse {
             status: ProofStatus::Proven,
         }),
+    ))
+}
+
+/// `GET /auth/signup/proof` — how this browser's live signup proof was made.
+///
+/// Reads the `wyrd_signup` completion cookie a proof step set and answers
+/// its method without consuming it, so the workspace form asks for local
+/// credentials only after an email proof.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` without one completion cookie
+/// holding a live proof; `503` when the store is unavailable.
+#[utoipa::path(
+    get,
+    path = "/auth/signup/proof",
+    responses(
+        (status = 200, description = "The live proof's method", body = SignupProofResponse),
+        (status = 401, description = "No live signup proof in this browser \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn signup_proof(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WyrdErrorResponse> {
+    let mut completions = cookie_pairs(&headers).filter(|(name, _)| *name == SIGNUP_COOKIE);
+    let completion = match (completions.next(), completions.next()) {
+        (Some((_, value)), None) => Some(value),
+        _ => None,
+    };
+    let method = social(&state)?.signup_proof_method(completion).await?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        Vec::new(),
+        Json(SignupProofResponse { method }),
     ))
 }
 

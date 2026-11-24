@@ -284,14 +284,78 @@ test('a signed-in administrator verifies a recovery email from the account page'
   } finally {
     await context.close();
   }
+}, journeyTimeout);
 
-  // Signed out, the same kind of link explains how to finish instead of failing silently.
-  const signedOut = await visitor();
+test('a signed-out browser opening a recovery email link is told to sign in', async () => {
+  const { context, page } = await visitor();
   try {
-    await signedOut.page.goto(`${journey.origin}/t/${slug}/contact/verify#proof=not-a-proof`);
-    await signedOut.page.getByRole('alert').getByText('You are signed out').waitFor();
-    expect(await signedOut.page.getByRole('link', { name: `Sign in to ${slug}` }).getAttribute('href')).toBe(`/t/${slug}/login`);
+    await page.goto(`${journey.origin}/t/${slug}/contact/verify#proof=not-a-proof`);
+    await page.getByRole('alert').getByText('You are signed out').waitFor();
+    expect(await page.getByRole('link', { name: `Sign in to ${slug}` }).getAttribute('href')).toBe(`/t/${slug}/login`);
   } finally {
-    await signedOut.context.close();
+    await context.close();
+  }
+}, journeyTimeout);
+
+test('the administrator invites a teammate who enrolls and approves a CLI sign-in', async () => {
+  const teammate = `teammate-${run}@example.test`;
+  const admin = await visitor();
+  try {
+    await admin.page.goto(`${journey.origin}/t/${slug}/login`);
+    await admin.page.getByLabel('Username').fill('owner');
+    await admin.page.getByLabel('Password', { exact: true }).fill('a brand new passphrase for owner');
+    await admin.page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await admin.page.waitForURL(`${journey.origin}/t/${slug}`);
+    await admin.page.goto(`${journey.origin}/t/${slug}/settings/access?tab=users`);
+    const invite = admin.page.getByRole('form', { name: 'Invite users' });
+    await invite.getByLabel('Email addresses').fill(teammate);
+    await invite.getByLabel('Role').selectOption({ index: 1 });
+    await invite.getByLabel('Scope').selectOption('all');
+    await invite.getByRole('button', { name: 'Create invitations' }).click();
+    await admin.page.getByRole('region', { name: 'Pending invitations' }).getByText(teammate).waitFor();
+  } finally {
+    await admin.context.close();
+  }
+
+  const { context, page } = await visitor();
+  try {
+    const link = /(https?:\/\/\S+#invitation=\S+)/.exec(await newestMail(teammate))?.[1] ?? '';
+    expect(new URL(link).pathname).toBe(`/t/${slug}/signup`);
+    await page.goto(link);
+    await page.getByLabel('Username').fill('teammate');
+    await page.getByLabel('Password', { exact: true }).fill('a teammate passphrase of length');
+    await page.getByRole('button', { name: 'Create account' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+
+    // The CLI starts a device sign-in; the freshly enrolled teammate approves it in this browser.
+    const device = (await page.evaluate(async (tenant) => {
+      const response = await fetch('/auth/device_authorization', {
+        method: 'POST',
+        body: new URLSearchParams({ client_id: 'wyrd-cli', tenant })
+      });
+      return response.json();
+    }, slug)) as { device_code: string; verification_uri_complete: string };
+    await page.goto(device.verification_uri_complete);
+    await page.getByRole('button', { name: 'Approve and sign in' }).click();
+    await page.getByRole('heading', { name: 'Login approved' }).waitFor();
+
+    const token = (await page.evaluate(async (deviceCode) => {
+      const response = await fetch('/auth/token', {
+        method: 'POST',
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+          device_code: deviceCode,
+          client_id: 'wyrd-cli'
+        })
+      });
+      return response.json();
+    }, device.device_code)) as { access_token: string };
+    const me = await fetch(`${journey.server}/v1/principals/me`, {
+      headers: { 'x-wyrd-access-token': `Bearer ${token.access_token}` }
+    });
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as { username: string }).username).toBe('teammate');
+  } finally {
+    await context.close();
   }
 }, journeyTimeout);

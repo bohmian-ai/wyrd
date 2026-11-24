@@ -1330,7 +1330,22 @@ after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
    sees "Recovery email verified" with the fragment cleared; a signed-out
    browser opening a contact link sees "You are signed out" with a "Sign in to
    <slug>" link instead of a redirect. Scenarios 4 and 5 share one commit
-   because they edit the same wording module and journey file.
+   because they edit the same wording module and journey file. The commit
+   hook flagged the combined signed-in/signed-out test as hard to read; the
+   signed-out case is now its own test.
+6. **Teammate invitation, enrollment and CLI device approval.** No
+   production change was needed, so there is no production RED; the two
+   failing runs were test mistakes (the invitation mail carries
+   `#invitation=`, not `#proof=`; a bearer token goes in
+   `x-wyrd-access-token`). GREEN: the signup-created owner signs in, invites
+   a teammate from Access → Invite users with a Role and the "all" scope, and
+   sees the pending invitation; the teammate opens the mailed
+   `/t/<slug>/signup#invitation=…` link in a fresh browser, creates
+   `teammate` with a passphrase and lands in the workspace; a `wyrd-cli`
+   device authorization started from that origin is approved on
+   `/auth/device` ("Login approved"), the device code redeems, and the
+   redeemed token reads `/v1/principals/me` as `teammate`. All 7 onboarding
+   journey tests pass.
 
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and

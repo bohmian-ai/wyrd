@@ -142,9 +142,12 @@ def test_a_person_approves_the_pending_signoff(
     principals = Principals(admin)
 
     def reader(name: str, kind: str, card: str) -> verify.Execution:
-        scope = {"card": {"family": {"kind": kind, "name": card}}}
+        family = {"kind": kind, "name": card}
         created = principals.create_service_principal(
-            {"name": name, "assignments": [{"role": "viewer", "scope": scope}]}
+            {
+                "name": name,
+                "assignments": [{"role": "viewer", "scope": {"card": {"family": family}}}],
+            }
         )
         client = WyrdClient(
             server_url=server.base_url, credential=created["credential"], grpc_url=server.grpc_url

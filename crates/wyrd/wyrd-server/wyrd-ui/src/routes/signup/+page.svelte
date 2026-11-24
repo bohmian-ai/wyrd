@@ -1,7 +1,7 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
   import CheckEmail from '$lib/CheckEmail.svelte';
-  import { PROBLEMS, PROVIDERS, auth, emailError, refusal, verifySignup } from '$lib/onboarding';
+  import { PROBLEMS, PROVIDERS, auth, emailError, openProof, refusal } from '$lib/onboarding';
   import type { WyrdProblem } from '$lib/server/problem';
   import type { PageProps } from './$types';
   let { data }: PageProps = $props();
@@ -37,10 +37,6 @@
     issue = refusal(answer);
   }
 
-  async function verify(proof: string) {
-    issue = await verifySignup(proof);
-    if (!issue) location.assign('/signup/workspace');
-  }
 </script>
 
 <svelte:head><title>Create a workspace · Wyrd</title></svelte:head>
@@ -49,7 +45,7 @@
     <p class="intro" role="status">Creating a workspace is turned off on this deployment. To join an existing workspace, open your invitation link or ask its administrator to invite you.</p>
     <a class="app-control wide" href="/">Sign in to an existing workspace</a>
   {:else if sent}
-    <CheckEmail address={email.trim()} onverify={verify} again="/signup" />
+    <CheckEmail address={email.trim()} onverify={async (code) => openProof('/signup/verify', code)} again="/signup" />
   {:else}
     <p class="intro">Confirm {data.local ? `your email${data.providers.length ? `, or who you are with ${names},` : ''}` : `who you are with ${names},`} then name your workspace. You become its administrator.</p>
     {#if data.local}

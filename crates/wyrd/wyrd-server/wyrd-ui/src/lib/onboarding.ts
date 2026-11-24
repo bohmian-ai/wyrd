@@ -47,13 +47,16 @@ export const PROBLEMS = {
   contactNoMail: worded(409, 'WYRD_SPEC_409_CONFLICT', 'GitHub did not share a verified email address', 'This deployment cannot send email, so this account cannot create a workspace. Verify an email address at GitHub, then start again.'),
   created: worded(409, 'WYRD_SPEC_409_CONFLICT', 'This signup already created a workspace', 'Sign in to the workspace it created from that workspace’s sign-in page.'),
   proofInvalid: worded(401, 'WYRD_AUTH_401_ONE_TIME_CODE_INVALID', 'This link was not accepted', 'Each link works once, and only in the browser that asked for it. Open the newest message in that browser, or start again.'),
+  readExpired: worded(400, 'WYRD_AUTH_400_INVALID_STATE', 'This list expired', 'The list stays readable for five minutes. Request a new link to see it again.'),
+  discoveryOff: worded(403, 'WYRD_AUTH_403_METHOD_UNAVAILABLE', 'Finding workspaces by email is not available', 'This deployment does not send email. Use a saved workspace URL, an invitation link, or ask your administrator.'),
   proofExpired: worded(400, 'WYRD_AUTH_400_INVALID_STATE', 'This link expired', 'Links last fifteen minutes. Start again to get a new one.'),
   unavailable: worded(502, 'WYRD_SPEC_502_UPSTREAM_FAILURE', 'Upstream dependency failed', 'Please try again later.')
 };
 
 /** Throttle titles by server code; Entry tells the person when to retry. */
 const THROTTLES: Record<string, string> = {
-  WYRD_AUTH_429_SIGNUP_ATTEMPTS: 'Too many workspace signups'
+  WYRD_AUTH_429_SIGNUP_ATTEMPTS: 'Too many workspace signups',
+  WYRD_AUTH_429_EMAIL_ATTEMPTS: 'Too many email requests'
 };
 
 /**
@@ -80,12 +83,21 @@ export function refusal(answer: AuthAnswer, known: Record<string, WyrdProblem> =
  */
 export async function verifySignup(proof: string): Promise<WyrdProblem | null> {
   const answer = await auth('/auth/signup/verify', { proof });
-  return answer.status === 200
-    ? null
-    : refusal(answer, {
-        WYRD_AUTH_401_ONE_TIME_CODE_INVALID: PROBLEMS.proofInvalid,
-        WYRD_AUTH_400_INVALID_STATE: PROBLEMS.proofExpired
-      });
+  return answer.status === 200 ? null : refusal(answer, PROOF_REFUSALS);
+}
+
+/** The refusals of a pasted or linked email proof. */
+export const PROOF_REFUSALS = {
+  WYRD_AUTH_401_ONE_TIME_CODE_INVALID: PROBLEMS.proofInvalid,
+  WYRD_AUTH_400_INVALID_STATE: PROBLEMS.proofExpired
+};
+
+/**
+ * Open `page` with a pasted code as its proof fragment, exactly as the
+ * message's link would, so one page verifies both.
+ */
+export function openProof(page: string, code: string): void {
+  location.assign(`${page}#proof=${encodeURIComponent(code)}`);
 }
 
 /** The URL slug a workspace name suggests. */

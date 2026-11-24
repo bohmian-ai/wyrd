@@ -45,8 +45,8 @@
     else issue = answer.status === 401 ? PROBLEMS.expired : refusal(answer);
   });
 
-  function rename() {
-    if (suggested) slug = slugify(name);
+  function rename(typed: string) {
+    if (suggested) slug = slugify(typed);
   }
   function reslug() {
     suggested = false;
@@ -138,7 +138,7 @@
     <form class="fields" novalidate onsubmit={create}>
       <label for="display-name">Workspace name</label>
       <input id="display-name" class="app-input" name="display_name" required maxlength="128" autocomplete="organization" readonly={busy}
-        aria-invalid={nameError ? 'true' : undefined} aria-describedby={nameError ? 'name-error' : undefined} bind:value={name} oninput={rename} />
+        aria-invalid={nameError ? 'true' : undefined} aria-describedby={nameError ? 'name-error' : undefined} bind:value={name} oninput={(event) => rename(event.currentTarget.value)} />
       {#if nameError}<p class="field-error" id="name-error">⊘ {nameError}</p>{/if}
 
       <label for="slug">URL slug</label>

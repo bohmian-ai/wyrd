@@ -1290,6 +1290,19 @@ after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
    Not journey-proven here (no provider fixture in this host): provider
    signup buttons, the GitHub contact branch and the challenge refusal; the
    server evidence in `platform_admin_e2e/signup.rs` covers their Rust side.
+3. **Discovery lists the workspace by link or pasted code.** RED before
+   production edits: `/workspaces` rendered the 404 page. GREEN: the signup
+   address asks on `/workspaces` ("Email me a link", "Check your email"); the
+   mailed `/workspaces/verify#proof=…` link lists exactly one workspace,
+   "Journey Research", linking `<origin>/t/<slug>/login`, with no fragment
+   left; a second browser pastes the mailed code on the request page, which
+   opens the same verify page with that code as its fragment, and follows the
+   listed link to the workspace sign-in. Signup's pasted code now takes the
+   same path (`/signup/verify#proof=<code>`). Two test-side corrections during
+   GREEN, diagnosed from the page text and a temporary directory/contact count
+   (directory 1, contact 1, tenant active): Playwright's heading name match
+   is substring by default ("Find your workspaces" matched "Your workspaces"),
+   now `exact`; and Rust answers `login_url` as an absolute same-origin URL.
 
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and

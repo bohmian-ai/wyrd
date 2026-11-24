@@ -102,6 +102,9 @@ function mailedLink(text: string): string {
 
 /** A name no earlier run of this journey used, for addresses and slugs. */
 const run = Date.now().toString(36);
+/** The address and workspace the signup journey creates; later journeys use them. */
+const owner = `owner-${run}@example.test`;
+const slug = `journey-${run}`;
 
 test('the root page offers creation and discovery only when they are usable', async () => {
   const { context, page } = await visitor();
@@ -130,8 +133,6 @@ test('the root page offers creation and discovery only when they are usable', as
 test('an emailed proof creates a workspace whose administrator signs in with a passphrase', async () => {
   await enableMailAndSignup();
   const { context, page } = await visitor();
-  const owner = `owner-${run}@example.test`;
-  const slug = `journey-${run}`;
   try {
     await page.goto(`${journey.origin}/signup`);
     expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Create a workspace');
@@ -180,5 +181,48 @@ test('an emailed proof creates a workspace whose administrator signs in with a p
     await returning.page.waitForURL(`${journey.origin}/t/${slug}`);
   } finally {
     await returning.context.close();
+  }
+}, journeyTimeout);
+
+test('a verified address finds its workspaces by link or pasted code', async () => {
+  const { context, page } = await visitor();
+  try {
+    await page.goto(`${journey.origin}/workspaces`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Find your workspaces');
+    await page.getByLabel('Email').fill(owner);
+    await page.getByRole('button', { name: 'Email me a link' }).click();
+    await page.getByRole('heading', { name: 'Check your email' }).waitFor();
+    const before = await mailCount(owner);
+
+    // The mailed link lists the workspace as a link to its own sign-in page, then leaves no proof in the address bar.
+    const link = mailedLink(await newestMail(owner));
+    expect(new URL(link).pathname).toBe('/workspaces/verify');
+    await page.goto(link);
+    await page.getByRole('heading', { name: 'Your workspaces', exact: true }).waitFor();
+    expect(page.url()).toBe(`${journey.origin}/workspaces/verify`);
+    const listed = page.getByRole('list', { name: 'Workspaces for this address' }).getByRole('link');
+    expect(await listed.count()).toBe(1);
+    expect(await listed.getAttribute('href')).toBe(`${journey.origin}/t/${slug}/login`);
+    expect(await listed.textContent()).toContain('Journey Research');
+
+    // A second request in a new browser, with the code pasted instead of the link opened.
+    const pasted = await visitor();
+    try {
+      await pasted.page.goto(`${journey.origin}/workspaces`);
+      await pasted.page.getByLabel('Email').fill(owner);
+      await pasted.page.getByRole('button', { name: 'Email me a link' }).click();
+      await pasted.page.getByRole('heading', { name: 'Check your email' }).waitFor();
+      await expect.poll(() => mailCount(owner)).toBe(before + 1);
+      const code = new URL(mailedLink(await newestMail(owner))).hash.slice('#proof='.length);
+      await pasted.page.getByLabel('Code from the email').fill(code);
+      await pasted.page.getByRole('button', { name: 'Verify' }).click();
+      await pasted.page.getByRole('heading', { name: 'Your workspaces', exact: true }).waitFor();
+      await pasted.page.getByRole('link', { name: /Journey Research/ }).click();
+      await pasted.page.waitForURL(`${journey.origin}/t/${slug}/login`);
+    } finally {
+      await pasted.context.close();
+    }
+  } finally {
+    await context.close();
   }
 }, journeyTimeout);

@@ -2846,3 +2846,97 @@ deferred('TASK-005: a Repository grant reads that Repository\'s review sets and 
   await principals.bind({ subject: { principal: { id: viewerId, kind: 'service' } }, role: 'viewer', scope: family });
   await vi.waitFor(async () => expect((await sets(readers.viewer, api)).generations).toEqual([later.generation, earlier.generation]), { timeout: 30_000, interval: 500 });
 });
+
+deferred('TASK-007: a pull request execution keeps its recorded GitHub delivery apart from its verdict after its queue row is removed, through the Node and MCP hosts', async ({ server }) => {
+  // Setup: `acme/api` runs the `ci-gate` Verifier on pull request 7; `acme/web` is another Repository of the same tenant.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  const principals = await Principals.connect({ client: admin });
+  const connection = await GithubConnection.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  const api = (await declarePolicy(cards, github.host, 'acme/api', 'gated')).name;
+  const review = (key: string) => connection.reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, key);
+
+  // Head A is admitted and waits for CI; head B supersedes it, and CI then passes B.
+  const NEWER = 'b3'.repeat(20);
+  github.setPullRequest(1, 7, 'b1'.repeat(20), REVIEW_HEAD);
+  const earlier = await review('task-007-earlier');
+  github.setPullRequest(1, 7, 'b1'.repeat(20), NEWER);
+  const later = await review('task-007-later');
+  const [superseded, current] = [earlier.executions[0], later.executions[0]];
+  github.setPullRequest(2, 7, 'b2'.repeat(20), 'c2'.repeat(20));
+  const other = (await connection.reviewPullRequest({ host: github.host, repository_id: '2', number: 7 }, 'task-007-web')).executions[0];
+  const newer = await verify.Execution.connect(current, { client: admin });
+  let head = '';
+  await vi.waitFor(
+    async () => {
+      const waiting = await newer.status();
+      expect(waiting.waiting).toContain('ci');
+      head = waiting.pull_request?.head.sha ?? '';
+    },
+    { timeout: 30_000, interval: 200 }
+  );
+  await (await verify.Evidence.connect({ client: admin })).publish('ci', { status: 'green' }, { repository: 'acme/api', commit: head });
+  expect((await newer.wait({ timeoutMs: 30_000 })).outcome.verdict).toBe('passed');
+
+  // The recorded delivery of each, read before any cleanup. The superseded execution never reached a delivery attempt, so nothing is recorded for it: it stays pending, never the newer execution's outcome.
+  const status = async (id: string) => (await verify.Execution.connect(id, { client: admin })).status();
+  const before = new Map<string, Awaited<ReturnType<typeof status>>>();
+  await vi.waitFor(
+    async () => {
+      const [earlierState, laterState] = [await status(superseded), await status(current)];
+      expect([earlierState.status, earlierState.github_delivery, laterState.status, laterState.github_delivery?.status]).toEqual([
+        'cancelled',
+        { status: 'pending' },
+        'completed',
+        'delivered'
+      ]);
+      before.set(superseded, earlierState).set(current, laterState);
+    },
+    { timeout: 60_000, interval: 500 }
+  );
+
+  // Action: the scheduling rows of both settled executions are removed while Postgres stays available.
+  server.removeSettledExecutionRow(superseded);
+  server.removeSettledExecutionRow(current);
+  server.flushBifrost();
+
+  // A viewer of the `api` family only, with no Verifier or GitHub configuration grant.
+  const assignments = [{ role: 'viewer', scope: { card: { family: { kind: 'Repository', name: api } } } }] as const;
+  const reader = WyrdClient.connect({ credential: (await principals.createServicePrincipal({ name: 'delivery-reader', assignments })).credential });
+  const mcp = await mcpOver(server.baseUrl, reader);
+  try {
+    for (const [host, executor] of [['node', nodeExecutor(reader)], ['mcp', mcp.executor]] as const) {
+      const requests: WireRequest[] = [];
+      const recording: Executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+      for (const [id, generation, outcome] of [
+        [superseded, earlier.generation, 'pending'],
+        [current, later.generation, 'delivered']
+      ] as const) {
+        const loaded = await loadExecution({ executionId: id, node: 'none' }, { executor: recording });
+        const shown = data(loaded, `${host} ${outcome}`);
+        const recorded = before.get(id)!;
+        // The same pull request, pinned review set, verdict and delivery the execution recorded before cleanup.
+        for (const field of ['status', 'pull_request', 'result', 'github_delivery'] as const) expect(shown.status[field], `${host} ${outcome} ${field}`).toEqual(recorded[field]);
+        expect(shown.status.pull_request?.generation, host).toBe(generation);
+        const view = render(VerificationExecution, loaded);
+        const delivery = view.container.querySelector('[data-github-delivery]');
+        expect(delivery, `${host} ${outcome}`).toHaveAttribute('data-github-delivery', outcome);
+        expect(view.container.querySelector('[data-verdict]'), host).toHaveAttribute('data-verdict', recorded.result?.outcome.verdict ?? '');
+        expect(view.container.querySelector('[data-execution-status]'), host).toHaveAttribute('data-execution-status', recorded.status);
+        if (outcome === 'pending') expect(delivery, host).not.toHaveTextContent('queued');
+        view.unmount();
+      }
+      // Reading is all it does: no write, retry or new verification is requested.
+      const reads = ['verification.get_execution', 'cards.get_by_ref', 'cards.get_by_uid', 'bifrost.query', 'verification.list_invocations'];
+      expect(requests.filter((request) => !reads.includes(request.op)), host).toEqual([]);
+      // Another Repository's execution reads as one that does not exist, with no provider detail.
+      const hidden = await loadExecution({ executionId: other, node: 'none' }, { executor });
+      expect(hidden.result, host).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+      expect(JSON.stringify(hidden.result), host).not.toContain('github_delivery');
+    }
+  } finally {
+    await mcp.close();
+  }
+});

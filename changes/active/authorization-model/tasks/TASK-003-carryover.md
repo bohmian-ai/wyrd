@@ -1251,6 +1251,25 @@ fixtures and actual CLI/client consumers. New page/journey missing-flow assertio
 must fail before production edits; existing signup server evidence is reused, not
 claimed as new RED. Documentation/contract checks complement journeys.
 
+#### Cycle 16 evidence (Part B: tenant onboarding pages)
+
+Journey host: `identity_ui_e2e::onboarding_ui_journey` (one bound server over
+repository Postgres, a production `node build` BFF at a public origin, the
+repository Mailpit as relay) runs `src/lib/server/auth/onboarding.integration.test.ts`
+in real Chromium; it joins `test:identity:ui:suite`. Command:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E "test(=identity_ui_e2e::onboarding_ui_journey)"'`
+after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
+
+1. **Root offers create/find only when usable.** RED before production edits:
+   with mail and signup enabled, `getByRole('link', { name: 'Create a workspace' })`
+   timed out (no link). The same run also showed `/readyz` 503
+   (`forge_coordinator_unavailable` right after bind), which the pages read as
+   "server down"; the journey now waits for readiness before its first page, as
+   an operator would. GREEN: private defaults show neither link and keep the
+   tenant entry; after the operator configures the relay and signup the root
+   page links `/signup` and `/workspaces`. The root load reads the no-tenant
+   `/auth/browser/methods` (`signup`, `email_discovery`).
+
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and
 same-operator re-authentication using cycle 14's Rust-owned session and safe

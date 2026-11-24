@@ -1269,6 +1269,27 @@ after `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`.
    tenant entry; after the operator configures the relay and signup the root
    page links `/signup` and `/workspaces`. The root load reads the no-tenant
    `/auth/browser/methods` (`signup`, `email_discovery`).
+2. **Email signup creates a workspace and signs its administrator in.** Merged
+   teammate A's `GET /auth/signup/proof` first. RED before production edits:
+   `/signup` rendered the 404 page ("Unable to open this workspace", not
+   "Create a workspace"). GREEN: the visitor types an address on `/signup`
+   and sees "Check your email"; the Mailpit message links `/signup/verify#proof=…`;
+   opening it POSTs the proof and the address bar ends at `/signup/verify`
+   with no fragment; "Name your workspace" reads the proof method (`email`)
+   and asks for username and password; the reserved slug `platform` answers
+   "That URL is already taken"; retrying with a new slug sends no second
+   message (one message in the mailbox) and lands signed in on `/t/<slug>`;
+   a fresh browser signs in with the passphrase "correct horse battery
+   staple". The pages call `/auth/*` from the browser, so the BFF forwarder
+   now passes the four Rust flow cookies (`wyrd_signup`, `wyrd_signup_email`,
+   `wyrd_discovery`, `wyrd_contact`). Journey fix during GREEN: Playwright
+   request interception cannot follow a fulfilled 303 for a POST navigation
+   (`chrome-error://`), so Chromium now maps the public origin to the BFF with
+   `--host-rules` and nothing is intercepted. Added after GREEN, not a RED:
+   scenario 1 also asserts `/signup` shows the turned-off state by default.
+   Not journey-proven here (no provider fixture in this host): provider
+   signup buttons, the GitHub contact branch and the challenge refusal; the
+   server evidence in `platform_admin_e2e/signup.rs` covers their Rust side.
 
 
 Deliver the platform entry headed **Platform admin**, platform sign-in and

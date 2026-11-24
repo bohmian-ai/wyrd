@@ -65,6 +65,16 @@ export function stateSource(headers: Headers): void {
 const loginCookie = 'wyrd_login';
 
 /**
+ * The server's onboarding flow cookies: signup proof and completion,
+ * workspace discovery, and recovery-contact proof. Rust scopes each one to
+ * its own `/auth/*` path, so the browser sends it only there.
+ */
+const flowCookies = ['wyrd_signup', 'wyrd_signup_email', 'wyrd_discovery', 'wyrd_contact'];
+
+/** Every cookie a forwarded `/auth/*` request may carry by exact name. */
+const forwardedCookies: ReadonlySet<string> = new Set([loginCookie, ...flowCookies]);
+
+/**
  * Prefix of the server's tenant session cookies, which only `/auth/browser/*`
  * and the CLI login approval at `/auth/device` carry.
  */
@@ -74,7 +84,7 @@ const sessionPrefix = 'wyrd_session_';
  * Send one browser `/auth/*` request to the configured Wyrd server and return
  * its answer unchanged: method, path and query, body, the server's own cookies,
  * redirects (never followed here), and error responses. Every request carries
- * the login binding; the browser-session operations and the CLI login approval
+ * the login binding and the onboarding flow cookies; the browser-session operations and the CLI login approval
  * also carry the tenant session cookies, which the server alone selects,
  * validates, and revokes. That lets a signed-in person approve a terminal's
  * code without a provider.
@@ -97,7 +107,9 @@ export async function forwardAuth(
     .split(';')
     .map((pair) => pair.trim())
     .filter(
-      (pair) => pair.startsWith(`${loginCookie}=`) || (sessions && pair.startsWith(sessionPrefix))
+      (pair) =>
+        forwardedCookies.has(pair.split('=', 1)[0]) ||
+        (sessions && pair.startsWith(sessionPrefix))
     );
   if (forwarded.length) headers.set('cookie', forwarded.join('; '));
   else headers.delete('cookie');

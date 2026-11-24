@@ -111,4 +111,27 @@
   .card :global(.links a) {
     color: var(--muted);
   }
+  .card :global(.or) {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 10px;
+    font: 11px var(--font-mono);
+    color: var(--muted);
+  }
+  .card :global(.or)::before,
+  .card :global(.or)::after {
+    content: '';
+    border-top: 1px solid var(--border-soft);
+  }
+  .card :global(p.field-error),
+  .card :global(p.done) {
+    color: var(--text);
+  }
+  .card :global(.ok) {
+    color: var(--ok);
+  }
+  .card :global([aria-invalid='true']) {
+    border-color: var(--danger);
+  }
 </style>

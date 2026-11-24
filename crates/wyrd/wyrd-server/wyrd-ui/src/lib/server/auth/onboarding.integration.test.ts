@@ -27,7 +27,8 @@ const journeyTimeout = 120_000;
 let chrome: Browser;
 
 beforeAll(async () => {
-  chrome = await chromium.launch();
+  // The public origin is the load balancer: Chromium connects every request for it to the BFF.
+  chrome = await chromium.launch({ args: [`--host-rules=MAP ${new URL(journey.origin).host} ${new URL(journey.bff).host}`] });
   // The pages treat a server that is not ready as down; Forge joins shortly after bind.
   for (let attempt = 0; (await fetch(`${journey.server}/readyz`)).status !== 200; attempt++) {
     if (attempt === 240) throw new Error('the server never became ready');
@@ -64,20 +65,43 @@ async function enableMailAndSignup(): Promise<void> {
   await platform('PUT', '/platform/login-settings', { password_enabled: true, signup_enabled: true });
 }
 
-/**
- * A fresh browser profile at the public origin. The origin is the load
- * balancer: every request Chromium sends to it reaches the BFF.
- */
+/** A fresh browser profile at the public origin. */
 async function visitor(): Promise<{ context: BrowserContext; page: Page }> {
   const context = await chrome.newContext();
-  await context.route(`${journey.origin}/**`, async (route) => {
-    const url = new URL(route.request().url());
-    await route.fulfill({ response: await route.fetch({ url: journey.bff + url.pathname + url.search }) });
-  });
   const page = await context.newPage();
   page.setDefaultTimeout(10_000);
   return { context, page };
 }
+
+/** The text of the newest message Mailpit holds for `address`, waiting for it to arrive. */
+async function newestMail(address: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const search = await fetch(`${journey.mail.api}/api/v1/search?query=${encodeURIComponent(`to:"${address}"`)}`);
+    const { messages } = (await search.json()) as { messages: { ID: string }[] };
+    if (messages.length) {
+      const message = await fetch(`${journey.mail.api}/api/v1/message/${messages[0].ID}`);
+      return ((await message.json()) as { Text: string }).Text;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('no message arrived');
+}
+
+/** How many messages Mailpit holds for `address`. */
+async function mailCount(address: string): Promise<number> {
+  const search = await fetch(`${journey.mail.api}/api/v1/search?query=${encodeURIComponent(`to:"${address}"`)}`);
+  return ((await search.json()) as { messages: unknown[] }).messages.length;
+}
+
+/** The link a proof message carries, its proof in the fragment. */
+function mailedLink(text: string): string {
+  const link = /(https?:\/\/\S+#proof=\S+)/.exec(text)?.[1];
+  expect(link, 'the message links its proof in a fragment').toBeDefined();
+  return link!;
+}
+
+/** A name no earlier run of this journey used, for addresses and slugs. */
+const run = Date.now().toString(36);
 
 test('the root page offers creation and discovery only when they are usable', async () => {
   const { context, page } = await visitor();
@@ -89,6 +113,10 @@ test('the root page offers creation and discovery only when they are usable', as
     expect(await page.getByRole('link', { name: 'Find my workspaces' }).count()).toBe(0);
     // The workspace URL entry stays the way to an existing workspace.
     expect(await page.getByLabel('Tenant').count()).toBe(1);
+    // Signup is off by default, and its page says how to join instead.
+    await page.goto(`${journey.origin}/signup`);
+    await page.getByText('Creating a workspace is turned off on this deployment.').waitFor();
+    expect(await page.getByLabel('Email').count()).toBe(0);
 
     await enableMailAndSignup();
     await page.goto(`${journey.origin}/`);
@@ -96,5 +124,61 @@ test('the root page offers creation and discovery only when they are usable', as
     expect(await page.getByRole('link', { name: 'Find my workspaces' }).getAttribute('href')).toBe('/workspaces');
   } finally {
     await context.close();
+  }
+}, journeyTimeout);
+
+test('an emailed proof creates a workspace whose administrator signs in with a passphrase', async () => {
+  await enableMailAndSignup();
+  const { context, page } = await visitor();
+  const owner = `owner-${run}@example.test`;
+  const slug = `journey-${run}`;
+  try {
+    await page.goto(`${journey.origin}/signup`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Create a workspace');
+    await page.getByLabel('Email').fill(owner);
+    await page.getByRole('button', { name: 'Continue with email' }).click();
+    await page.getByRole('heading', { name: 'Check your email' }).waitFor();
+    expect(await page.getByTestId('check-email').textContent()).toContain(owner);
+
+    // The message links the verify page; opening it there POSTs the proof and clears the fragment.
+    const link = mailedLink(await newestMail(owner));
+    expect(new URL(link).pathname).toBe('/signup/verify');
+    await page.goto(link);
+    await page.getByRole('heading', { name: 'Email confirmed' }).waitFor();
+    expect(page.url()).toBe(`${journey.origin}/signup/verify`);
+    await page.getByRole('link', { name: 'Name your workspace' }).click();
+
+    await page.getByRole('heading', { name: 'Name your workspace' }).waitFor();
+    // GET /auth/signup/proof says the proof is a mailbox, so the form asks for the administrator's sign-in.
+    await expect.poll(() => page.getByTestId('identity').textContent()).toContain('Email confirmed in this browser');
+    await page.getByLabel('Workspace name').fill('Journey Research');
+    expect(await page.getByLabel('URL slug').inputValue()).toBe('journey-research');
+    // A reserved slug is refused as taken; the proof survives for a retry.
+    await page.getByLabel('URL slug').fill('platform');
+    await page.getByLabel('Your username').fill('owner');
+    await page.getByLabel('Your password', { exact: true }).fill('correct horse battery staple');
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.getByRole('alert').getByText('That URL is already taken').waitFor();
+
+    await page.getByLabel('URL slug').fill(slug);
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+    await page.waitForURL(`${journey.origin}/t/${slug}`);
+    // The retry needed no second message, and the creator is signed in to the new workspace.
+    expect(await mailCount(owner)).toBe(1);
+    expect(new URL(page.url()).pathname).toBe(`/t/${slug}`);
+  } finally {
+    await context.close();
+  }
+
+  // The administrator signs in again with the passphrase alone.
+  const returning = await visitor();
+  try {
+    await returning.page.goto(`${journey.origin}/t/${slug}/login`);
+    await returning.page.getByLabel('Username').fill('owner');
+    await returning.page.getByLabel('Password', { exact: true }).fill('correct horse battery staple');
+    await returning.page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await returning.page.waitForURL(`${journey.origin}/t/${slug}`);
+  } finally {
+    await returning.context.close();
   }
 }, journeyTimeout);

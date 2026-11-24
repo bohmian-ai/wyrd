@@ -21,6 +21,8 @@ use super::{
     initialize_platform_root, mount_platform_provider, platform_key_set, platform_session,
     session_cookie, set_google_enabled, social_call, social_request,
 };
+use wyrd_client::auth::{AuthError, TokenExchange};
+use wyrd_spec::auth::SecretBearer;
 
 /// The tenant login-policy route.
 const POLICY: &str = "/v1/identity/login-policy";
@@ -997,9 +999,12 @@ async fn required_sso_ends_existing_credentials_and_disabling_revives_none() {
     let company_refresh = workspace.refresh_family(&company).await;
     let replica = workspace
         .srv
-        .start_replica(wyrd_testing::WyrdTestServerBuilder::default())
+        .start_bound_replica(wyrd_testing::WyrdTestServerBuilder::default())
         .await
         .expect("replica boots");
+    // The CLI's and SDKs' renewal client, over HTTP to the other replica.
+    let client = TokenExchange::new(replica.base_url().expect("bound replica"), 30_000)
+        .expect("exchange builds");
     let slug = workspace.slug.clone();
     let (admin, enabled) = workspace.enable().await;
 
@@ -1009,12 +1014,22 @@ async fn required_sso_ends_existing_credentials_and_disabling_revives_none() {
         "password session"
     );
     assert!(!live_on(&replica, &slug, &google).await, "Google session");
-    let (status, _) = renew(&replica, &password_refresh).await;
-    assert_ne!(status, StatusCode::OK, "password refresh family");
+    let refused = client
+        .refresh(&SecretBearer::new(password_refresh.clone()))
+        .await;
+    assert!(
+        matches!(refused, Err(AuthError::Server(_))),
+        "password refresh family: {refused:?}"
+    );
     assert!(live_on(&replica, &slug, &company).await, "company session");
-    let (status, company_refresh) = renew(&replica, &company_refresh).await;
-    assert_eq!(status, StatusCode::OK, "company refresh family");
-    let company_refresh = company_refresh.expect("a rotated token");
+    let company_refresh = client
+        .refresh(&SecretBearer::new(company_refresh))
+        .await
+        .expect("company refresh family")
+        .refresh_token
+        .expect("a rotated token")
+        .expose()
+        .to_owned();
 
     // 2. Disable revives nothing.
     let (status, disabled) = workspace.change(&admin, false, &enabled).await;

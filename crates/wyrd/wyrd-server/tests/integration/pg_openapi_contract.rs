@@ -369,18 +369,20 @@ async fn github_connection_operations_publish_their_contract() {
 /// The tenant human-connection administration surface is served with its typed
 /// contract and no secret-bearing or unsupported shape.
 ///
-/// Each of the six operations publishes its route-specific refusals as
-/// problem+json; the redacted view and list shapes expose no secret field; the
-/// input schema offers exactly the three supported client-authentication
-/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
-/// its request body; and activation requires the recovery key.
+/// Each of the six connection operations and the two login-policy operations
+/// publishes its route-specific refusals as problem+json; the redacted view
+/// and list shapes expose no secret field; the policy read carries only its
+/// state, revisions, readiness and warning count; the input schema offers
+/// exactly the three supported client-authentication methods (never
+/// `PrivateKeyJwt`); both PUTs publish their typed request bodies; and
+/// activation requires the recovery key.
 #[tokio::test]
 async fn identity_connection_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
-    let operations: [(&str, &str, &[&str]); 6] = [
+    let operations: [(&str, &str, &[&str]); 8] = [
         ("/v1/identity/oidc/connections", "get", &["403", "503"]),
         (
             "/v1/identity/oidc/candidate",
@@ -407,6 +409,12 @@ async fn identity_connection_operations_publish_their_contract() {
             "delete",
             &["403", "404", "503"],
         ),
+        ("/v1/identity/login-policy", "get", &["403", "503"]),
+        (
+            "/v1/identity/login-policy",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
     ];
     for (path, method, statuses) in operations {
         let operation = &document["paths"][path][method];
@@ -432,7 +440,32 @@ async fn identity_connection_operations_publish_their_contract() {
         "the candidate PUT publishes its typed body although it reads raw bytes"
     );
 
+    assert_eq!(
+        document["paths"]["/v1/identity/login-policy"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/LoginPolicyChange",
+        "the policy PUT publishes its typed body although it reads raw bytes"
+    );
+
     let schemas = &document["components"]["schemas"];
+    // The warning is a count: the policy read names no User, identity or secret.
+    let mut policy_fields: Vec<_> = schemas["LoginPolicyView"]["properties"]
+        .as_object()
+        .expect("LoginPolicyView publishes its properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    policy_fields.sort_unstable();
+    assert_eq!(
+        policy_fields,
+        [
+            "connection",
+            "ready",
+            "require_company_sso",
+            "revision",
+            "users_without_company_identity"
+        ]
+    );
     let view_fields = schemas["HumanConnectionView"]["properties"]
         .as_object()
         .expect("HumanConnectionView publishes its properties");

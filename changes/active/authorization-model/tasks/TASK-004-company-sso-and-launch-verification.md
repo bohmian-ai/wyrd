@@ -384,6 +384,41 @@ CLI, SDK and MCP journey owners against WyrdTestServer/repository Postgres,
 Mailpit and controlled provider fixtures. Generated/exported contracts agree with
 Rust; Node never owns token exchange or credential storage.
 
+Evidence:
+
+- Typed contract (structural pin, no RED: the routes came from scenario 1).
+  - Selector: scenario 1's runner with
+    `-E 'test(=pg_openapi_contract::identity_connection_operations_publish_their_contract)'`.
+  - GREEN: `GET`/`PUT /v1/identity/login-policy` publish their problem+json
+    refusals and the typed `LoginPolicyChange` body. `LoginPolicyView`
+    carries exactly `connection, ready, require_company_sso, revision,
+    users_without_company_identity`: no User, identity or secret.
+  - `codegen:check` passes after regenerating the problem catalog.
+- Actual Rust consumer (TDD VIOLATED: the enforcement came from scenario 4,
+  so this assertion had no RED).
+  - Selector: scenario 4's test.
+  - The test now drives `wyrd_client::auth::TokenExchange`, the renewal
+    client the CLI uses, over HTTP to a bound second replica. The Python and
+    TypeScript SDKs use the same client through PyO3 and `native/` (napi).
+  - GREEN: the password family's renewal is refused with
+    `AuthError::Server`, and the company family rotates.
+- Production UI: scenarios 1 and 2. Node calls only the session-cookie
+  `/v1` API; it holds no token.
+- MCP, CLI and SDKs: no projection added.
+  - The policy write stays the browser-session channel: no MCP tool, CLI
+  command or SDK setter, as the contract requires.
+  - The policy read is not projected to MCP or SDK methods, because tenant
+    connection administration has no client projection to extend (`grep`
+    over `wyrd-mcp`, `wyrd-cli`, the Python and TS SDK sources finds none).
+    Typed consumers read it through the OpenAPI contract above.
+- FAIL / open:
+  - Python and TypeScript company-policy journeys were not run.
+  - The no-IdP/no-SMTP local journey (`onboarding_ui_journey`) and
+    `test:identity:journey` were not rerun for this task; they are left for
+    change review.
+  - Real CLI device approval under required SSO is proven only over HTTP
+    (scenario 4 device steps), not through the `wyrd` binary.
+
 ### 7. Real Google/GitHub compatibility and instructions match delivery
 
 Maps to REQ-011/012/014/017/018; AC-004/005/007/013 and shipped-surface safeguards.

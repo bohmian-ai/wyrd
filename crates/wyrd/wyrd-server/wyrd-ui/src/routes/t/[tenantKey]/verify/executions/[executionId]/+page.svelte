@@ -49,10 +49,42 @@
     actions['execution.cancel'] = { state: 'pending' };
     const response = await fetch(`${here}/cancel`, { method: 'POST' }).catch(() => undefined);
     const body = (await response?.json().catch(() => null)) as { status?: unknown; code?: unknown } | null;
-    await invalidateAll();
+    await invalidateAll().catch(() => undefined);
     if (response?.ok && typeof body?.status === 'string') actions['execution.cancel'] = { state: 'success', message: `Recorded status: ${body.status.replace('_', ' ')}` };
     else if (body && typeof body.code === 'string') actions['execution.cancel'] = { state: response?.status === 401 || response?.status === 403 ? 'denied' : 'error', problem: body as unknown as Problem };
     else actions['execution.cancel'] = { state: 'error', problem: { code: 'WYRD_SPEC_500_INTERNAL', title: 'The cancel request did not reach the server.' } };
+  }
+
+  /**
+   * Decide one exact occurrence once. The answer belongs to that occurrence
+   * alone. After a lost or unavailable answer the status is read again and that
+   * occurrence's recorded state decides what is reported; nothing is resent
+   * until the reader asks.
+   */
+  async function decide(input: { execution_id: string; approval_id: string; decision: string; reason?: string }) {
+    const name = 'approval.decide';
+    if (actions[name]?.state === 'pending') return;
+    if (input.execution_id !== data.executionId) return void (actions[name] = { state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION', title: 'The decision names another execution than this page shows.' } });
+    actions[name] = { state: 'pending' };
+    const response = await fetch(`${here}/approvals/${encodeURIComponent(input.approval_id)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: input.decision, ...(input.reason ? { reason: input.reason } : {}) })
+    }).catch(() => undefined);
+    const body = (await response?.json().catch(() => null)) as { status?: unknown; actor_id?: unknown; decided_at?: unknown; code?: unknown } | null;
+    // A failed reread leaves the last status shown; the occurrence below then reads as unknown, never as pending.
+    const reread = await invalidateAll().then(() => true, () => false);
+    if (response?.ok && typeof body?.status === 'string')
+      actions[name] = { state: 'success', message: `Recorded ${body.status} by ${body.actor_id} at ${body.decided_at}. The same execution continues from this decision; its status is read again.` };
+    else if (response && response.status < 500 && body && typeof body.code === 'string')
+      actions[name] = { state: response.status === 401 || response.status === 403 ? 'denied' : 'error', problem: body as unknown as Problem };
+    else {
+      const shown = reread && data.execution?.result.state === 'populated' ? data.execution.result.data.status.approvals?.find((each) => each.approval_id === input.approval_id) : undefined;
+      const code = typeof body?.code === 'string' ? body.code : 'WYRD_SPEC_500_INTERNAL';
+      if (!shown) actions[name] = { state: 'error', problem: { code, title: `Whether ${input.approval_id} was decided is unknown: its status could not be read. Refresh before deciding again.` } };
+      else if (shown.status === 'pending') actions[name] = { state: 'error', problem: { code, title: `No decision is recorded for ${input.approval_id}; submit it again to retry.` } };
+      else actions[name] = { state: 'success', message: `The answer was lost; the server records ${shown.status}${shown.actor_id ? ` by ${shown.actor_id} at ${shown.decided_at}` : ''}.` };
+    }
   }
 
   function onaction(intent: ActionIntent) {
@@ -75,6 +107,8 @@
         return void navigate(valid.name, `${base}/observe?${new URLSearchParams({ trace: input.trace_id as string, ...(input.span_id ? { span: input.span_id as string } : {}) })}`, true);
       case 'execution.cancel':
         return void cancel();
+      case 'approval.decide':
+        return void decide(input as Parameters<typeof decide>[0]);
       case 'publication.download': {
         const producer = input.producer as NonNullable<ExecutionInput['producer']>;
         const query = new URLSearchParams({ step: input.step_id as string, name: input.name as string, attempt: String(producer.attempt) });

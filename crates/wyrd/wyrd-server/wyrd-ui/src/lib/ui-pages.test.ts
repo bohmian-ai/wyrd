@@ -726,6 +726,72 @@ test('an exact execution page keeps its selection in the URL and cancels once th
   expect(requests).toHaveLength(1);
 });
 
+
+test('TASK-006: an execution page decides one exact approval occurrence once and reads it back', async () => {
+  // Setup: the page shows `exec_approval` on its `release` step, whose occurrence `apo_release_0` is pending.
+  host.executor = fixtureExecutor;
+  const url = new URL('http://ui.test/t/acme/verify/executions/exec_approval?node=step%3Arelease');
+  const loaded = { ...(await loadExecutionPage({ locals: { browserSession: { client: () => ({}), api: vi.fn() } }, params: { tenantKey: 'acme', executionId: 'exec_approval' }, url, request: new Request(url) } as never)), tenant: { key: 'acme', name: 'Acme' } };
+  const page = render(ExecutionPage, { data: loaded } as never);
+  const here = '/t/acme/verify/executions/exec_approval';
+  const occurrence = () => page.container.querySelector('[data-approval="apo_release_0"]') as HTMLElement;
+  const approve = () => within(occurrence()).getByRole('button', { name: /Approve/ });
+  const answers: ((response: Response | Error) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve, reject) => answers.push((answer) => (answer instanceof Error ? reject(answer) : resolve(answer)))));
+  vi.mocked(invalidateAll).mockClear();
+
+  // Approve with a reason is one host request for that exact occurrence; a second click while it is pending sends nothing.
+  await fireEvent.input(within(occurrence()).getByRole('textbox', { name: /Reason/ }), { target: { value: 'metrics hold' } });
+  await fireEvent.click(approve());
+  await waitFor(() => expect(approve()).toBeDisabled());
+  await fireEvent.click(approve());
+  const sent = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'approved', reason: 'metrics hold' }) };
+  expect(fetched.mock.calls).toEqual([[`${here}/approvals/apo_release_0`, sent]]);
+  expect(occurrence()).toHaveTextContent('Submitting for apo_release_0…');
+
+  // The durable receipt is reported for that occurrence, and the status is read again; it claims no finished continuation.
+  answers[0](Response.json({ approval_id: 'apo_release_0', status: 'approved', actor_id: 'pr_me', decided_at: '2026-10-20T11:50:00Z', reason: 'metrics hold' }));
+  await waitFor(() => expect(occurrence()).toHaveTextContent('Recorded approved by pr_me at 2026-10-20T11:50:00Z. The same execution continues from this decision; its status is read again.'));
+  expect(invalidateAll).toHaveBeenCalledTimes(1);
+
+  // A refusal is the server's stable problem, and the readable occurrence stays.
+  await fireEvent.click(approve());
+  answers[1](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(occurrence()).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(occurrence().querySelector('[data-approval-status]')).toHaveTextContent('pending');
+  // Another decision already accepted is explained by the server and the status read back.
+  await fireEvent.click(approve());
+  answers[2](Response.json({ code: 'WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING', title: 'The approval is no longer pending', status: 409 }, { status: 409 }));
+  await waitFor(() => expect(occurrence()).toHaveTextContent('WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING'));
+  expect(invalidateAll).toHaveBeenCalledTimes(3);
+
+  // A lost answer is resolved by reading that occurrence back: still pending, it asks for an explicit retry and sends nothing itself.
+  await fireEvent.click(approve());
+  answers[3](new TypeError('network'));
+  await waitFor(() => expect(occurrence()).toHaveTextContent('No decision is recorded for apo_release_0; submit it again to retry.'));
+  expect(fetched).toHaveBeenCalledTimes(4);
+  // When the status cannot be read again, the outcome is unknown rather than pending, and the control is not left waiting.
+  vi.mocked(invalidateAll).mockRejectedValueOnce(new Error('offline'));
+  await fireEvent.click(approve());
+  answers[4](new TypeError('network'));
+  await waitFor(() => expect(occurrence()).toHaveTextContent('Whether apo_release_0 was decided is unknown: its status could not be read. Refresh before deciding again.'));
+  expect(approve()).toBeEnabled();
+  expect(fetched).toHaveBeenCalledTimes(5);
+  // The retry is the same decision and reason, sent only when asked; this time the server recorded it before its answer was lost.
+  const decided = structuredClone(loaded);
+  const status = ((decided as unknown as { execution: unknown }).execution as { result: { data: { status: { approvals: { approval_id: string; status: string; actor_id: string | null; decided_at: string | null }[] } } } }).result.data.status;
+  Object.assign(status.approvals.find((each) => each.approval_id === 'apo_release_0')!, { status: 'approved', actor_id: 'pr_me', decided_at: '2026-10-20T11:52:00Z' });
+  vi.mocked(invalidateAll).mockImplementationOnce(async () => void (await page.rerender({ data: decided } as never)));
+  await fireEvent.click(approve());
+  expect(fetched.mock.calls[5]).toEqual([`${here}/approvals/apo_release_0`, sent]);
+  answers[5](Response.json({ code: 'WYRD_SERVICE_503_UNAVAILABLE', title: 'Unavailable', status: 503 }, { status: 503 }));
+  await waitFor(() => expect(occurrence()).toHaveTextContent('The answer was lost; the server records approved by pr_me at 2026-10-20T11:52:00Z.'));
+  expect(occurrence().querySelector('[data-approval-status]')).toHaveTextContent('approved');
+  expect(within(occurrence()).queryByRole('button', { name: /Approve/ })).toBeNull();
+  expect(fetched).toHaveBeenCalledTimes(6);
+  fetched.mockRestore();
+  page.unmount();
+});
 test('executions list, facets and charts read one population in bounded shared queries', async () => {
   const where = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: null }];
   const context = () => {

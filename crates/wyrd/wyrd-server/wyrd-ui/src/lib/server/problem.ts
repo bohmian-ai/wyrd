@@ -1,4 +1,4 @@
-import { isHttpError } from '@sveltejs/kit';
+import { isHttpError, json } from '@sveltejs/kit';
 import examples from '../../../../../../wyrd-spec/schemas/ui_problem_examples.json';
 
 /** Safe BFF problem projection. Error authority remains in wyrd-spec. */
@@ -53,6 +53,20 @@ const kindByStatus: Record<number, ProblemKind> = {
   404: 'notFound',
   409: 'conflict'
 };
+
+/**
+ * Relay a Wyrd `/v1` operation's answer to the browser: its JSON body on
+ * success, else the server's stable code, title and detail with its status,
+ * as `fallback` when the body is not a problem.
+ */
+export async function relayAnswer(response: Response, fallback: string): Promise<Response> {
+  const body = (await response.json().catch(() => null)) as { code?: unknown; title?: unknown; detail?: unknown } | null;
+  if (response.ok) return json(body);
+  return json(
+    { code: typeof body?.code === 'string' ? body.code : 'WYRD_SPEC_500_INTERNAL', title: typeof body?.title === 'string' ? body.title : fallback, status: response.status, ...(typeof body?.detail === 'string' ? { detail: body.detail } : {}) },
+    { status: response.status, headers: { 'content-type': 'application/problem+json' } }
+  );
+}
 
 /** Map a Wyrd problem response to its safe problem: by code, then by status. */
 export async function upstreamProblem(response: Response): Promise<WyrdProblem> {

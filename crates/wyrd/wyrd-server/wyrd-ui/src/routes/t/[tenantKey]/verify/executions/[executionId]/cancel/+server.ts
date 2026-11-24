@@ -1,5 +1,5 @@
-import { json } from '@sveltejs/kit';
 import { reject } from '$lib/server/auth/session';
+import { relayAnswer } from '$lib/server/problem';
 import type { RequestHandler } from './$types';
 
 /**
@@ -9,11 +9,5 @@ import type { RequestHandler } from './$types';
  */
 export const POST: RequestHandler = async ({ locals, params }) => {
   const session = locals.browserSession ?? reject('unauthenticated');
-  const response = await session.api('POST', `/verification/executions/${encodeURIComponent(params.executionId)}/cancel`);
-  const body = (await response.json().catch(() => null)) as { code?: unknown; title?: unknown; detail?: unknown; status?: unknown } | null;
-  if (response.ok) return json(body);
-  return json(
-    { code: typeof body?.code === 'string' ? body.code : 'WYRD_SPEC_500_INTERNAL', title: typeof body?.title === 'string' ? body.title : 'Cancel failed', status: response.status, ...(typeof body?.detail === 'string' ? { detail: body.detail } : {}) },
-    { status: response.status, headers: { 'content-type': 'application/problem+json' } }
-  );
+  return relayAnswer(await session.api('POST', `/verification/executions/${encodeURIComponent(params.executionId)}/cancel`), 'Cancel failed');
 };

@@ -2,8 +2,8 @@
 
 ``verify`` waits for memory and then passes, is refused as retryable ``503``
 when memory cannot even hold the waiting request, and ends in ``504`` at the
-one deadline from its arrival without a replay; ``submit`` defers a queued
-execution until memory frees.
+one deadline from its arrival without a replay; ``submit`` is accepted while
+memory is held and its queued execution is judged once memory frees.
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ pytestmark = pytest.mark.integration
 VERIFY_TIMEOUT_SECONDS = 2.0
 """The direct deadline every journey here runs under."""
 
-SHORT_OF_A_SESSION = 64 << 20
-"""Bytes left free while an operation should wait: short of one session envelope."""
+CONTENDED = 64 << 20
+"""Bytes left free while an operation should wait: the held memory puts Verification over its contended share."""
 
 REQUEST_BYTES = 256 << 10
 """Bytes of the answer the full-memory refusal sends."""
@@ -67,16 +67,16 @@ def await_waiters(server: WyrdTestServer, count: int) -> None:
 
 def test_verify_waits_for_hosted_memory_then_passes(tmp_path: Path) -> None:
     with capacity_desk(tmp_path) as (server, state), ThreadPoolExecutor(max_workers=1) as pool:
-        with server.occupy_hosted_memory(SHORT_OF_A_SESSION):
+        with server.occupy_hosted_memory(CONTENDED):
             waiting = pool.submit(lambda: state.run("agent").observe.verify("adds-one", 2))
             await_waiters(server, 1)
             assert not waiting.done(), "the verify waits for memory"
         assert waiting.result(WAIT_SECONDS).verdict == "passed"
 
 
-def test_submit_defers_under_hosted_memory_then_passes(tmp_path: Path) -> None:
+def test_submit_under_hosted_memory_is_accepted_then_passes(tmp_path: Path) -> None:
     with capacity_desk(tmp_path) as (server, state):
-        with server.occupy_hosted_memory(SHORT_OF_A_SESSION):
+        with server.occupy_hosted_memory(CONTENDED):
             submitted = state.run("agent").observe.submit("adds-one", 2)
             assert isinstance(submitted, verify.Execution)
             accepted: verify.Execution = submitted
@@ -97,7 +97,7 @@ def test_verify_refusals_follow_the_arrival_deadline(tmp_path: Path) -> None:
             "process memory cannot hold the Python operation now"
         )
 
-        with server.occupy_hosted_memory(SHORT_OF_A_SESSION):
+        with server.occupy_hosted_memory(CONTENDED):
             started = time.monotonic()
             with pytest.raises(WyrdError) as timed_out:
                 state.run("agent").observe.verify("adds-one", 2)

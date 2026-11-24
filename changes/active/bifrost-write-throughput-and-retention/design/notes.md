@@ -1,7 +1,46 @@
 # Bifrost write throughput and bounded retry history
 
-Status: finalized — throughput, retention, cleanup-health admission, retry defaults
-and two-task/six-scenario delivery approved and locked
+Status: finalized — maintainer agreed to bounded write pipelining and requested
+aligned specification and one-task planning; implementation is not started
+
+## Current agreed handoff
+
+[Spec revision 4](../spec.md) and the single [pipeline task](../tasks/TASK-003-bounded-write-pipeline.md)
+record the current agreement. The implementation proposal is the selected pipeline
+design. Earlier serial-only selection, numerical targets and six-scenario delivery
+text below are historical context, superseded for this pipeline work. Retention
+and existing acceptance/custody behavior remain protected. The final required
+execution step is the maintainer's independent Bifrost writes benchmark.
+
+## Historical design evolution
+
+The implementation proposal now supplies a decision-complete recommendation:
+two slots, bounded collection, independent completion, lifecycle barriers and
+explicit fail-closed handling of partial operational failures. Its Recommended
+decisions section supersedes earlier exploratory alternatives. Primary-source
+grounding and closeout criteria are included. Status remains exploring pending
+maintainer agreement; no implementation approval is inferred.
+
+Maintainer clarification: pipelining addresses observed waiting from serial write
+execution. The goal is interleaved progress: continue later WAL work while earlier
+groups await acceptance, repeatedly reusing freed slots. Deterministic tests prove
+that removed scheduling dependency; the deferred benchmark measures its benefit.
+
+The follow-up [implementation proposal](pipeline-implementation-proposal.md)
+defines stage ownership, failure handling, ordered test-first scenarios and
+deterministic overlap proof. The maintainer requires the Bifrost writes benchmark
+at closeout and permits deferring it until other worktrees finish. For this
+proposed pipeline work, intermediate progress uses behavioral tests; earlier
+per-scenario benchmark checkpoints below are superseded by that direction.
+Measured improvement remains unverified until the deferred benchmark. The
+pipeline mechanism and proposed failure policy remain under discussion.
+
+The maintainer resumed review on 2026-11-23. Only
+[l1-baseline-74034459d.md](l1-baseline-74034459d.md) supplies benchmark evidence;
+older performance readings and forecasts below are historical and excluded from
+this review. [Pipeline review](pipeline-review.md) records source findings and
+necessary failure/rotation refinements. Overlap remains unapproved. The earlier
+handoff below describes the previously selected design.
 
 ## Two explicit objectives
 

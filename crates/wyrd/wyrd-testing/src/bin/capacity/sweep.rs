@@ -6,8 +6,9 @@
 //! temporary root for server storage and WAL, so no server, database,
 //! storage, client, SDK or provider state outlives it. The case process runs
 //! the engine plan of exactly that case through the shared runner on the
-//! case clock ([`Level::case_timing`]) and keeps its engine record. The
-//! supervisor owns the case deadline, confirms every owned process,
+//! case clock ([`Level::case_timing`]), announces its teardown before it
+//! stops any process, and keeps its engine record. The supervisor owns the
+//! case deadline and the one teardown deadline, confirms every owned process,
 //! container, volume and storage root is gone, keeps the [`CaseRecord`],
 //! and records the outcome in the [`SweepRecord`]. A case whose cleanup
 //! cannot be confirmed within its teardown allowance stops the sweep: every
@@ -22,7 +23,8 @@ use chrono::Utc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_testing::experiment::{
-    Allowances, Declaration, Level, Mode, Options, Owned, Profiling, Record, StepKind, Verdict, run,
+    Allowances, Declaration, HISTORY_DIRECTORY, Level, Lifecycle, Mode, Options, Owned, Profiling,
+    Record, StepKind, Verdict, run,
 };
 use wyrd_testing::profile::{ProfileMode, SAMPLY, SYMBOLS};
 use wyrd_testing::release_server::HostLoad;
@@ -40,6 +42,10 @@ const SWEEPS: &str = "target/benchmarks/l1";
 
 /// Where harness smoke sweeps keep their records.
 const SMOKE_SWEEPS: &str = "target/benchmarks/smoke/l1";
+
+/// The largest file history accepts: the pre-commit `check:file-size`
+/// limit, 1 MiB.
+const HISTORY_FILE_LIMIT: u64 = 1 << 20;
 
 /// The wrapper that owns each case's PostgreSQL.
 const POSTGRES: &str = "scripts/postgres/with-test-postgres.sh";
@@ -75,6 +81,9 @@ pub struct Sweep {
     pub stamp: String,
     /// The `capacity` program each case process runs: this binary.
     pub program: PathBuf,
+    /// The Docker client that lists and removes each case's Compose
+    /// resources.
+    pub docker: PathBuf,
 }
 
 impl Sweep {
@@ -101,6 +110,7 @@ impl Sweep {
             root: root.to_path_buf(),
             stamp,
             program: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("capacity")),
+            docker: PathBuf::from("docker"),
         }
     }
 
@@ -155,6 +165,7 @@ impl Sweep {
                     status: CaseStatus::NotRun,
                     record: None,
                     reasons: vec![reason.clone()],
+                    persist_seconds: None,
                 });
                 continue;
             }
@@ -227,11 +238,130 @@ impl Sweep {
         Ok(path)
     }
 
+    /// The commit of a sweep that may enter history, or why it may not:
+    /// a standard routine sweep (no `--cases`, `--profile` or `--pace`)
+    /// whose every case is VALID and was measured from the same clean
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the sweep stays under `target/` only.
+    pub fn historical(&self, record: &SweepRecord) -> Result<String, String> {
+        if self.mode != SweepMode::Standard || self.explicit {
+            return Err(format!(
+                "a {} sweep{} is not routine",
+                self.mode.label(),
+                if self.explicit {
+                    " chosen by --cases"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if self.forwarded.iter().any(|flag| flag == "--pace") {
+            return Err("a --pace sweep is diagnostic".to_owned());
+        }
+        if record.exit_code() != 0 {
+            return Err("not every case is VALID".to_owned());
+        }
+        let mut commits = std::collections::BTreeSet::new();
+        for entry in &record.cases {
+            let name = entry
+                .record
+                .as_deref()
+                .ok_or_else(|| format!("{} kept no case record", entry.selector))?;
+            let bytes = std::fs::read(self.directory.join(name))
+                .map_err(|error| format!("{name}: {error}"))?;
+            let case: CaseRecord =
+                serde_json::from_slice(&bytes).map_err(|error| format!("{name}: {error}"))?;
+            let engine = case
+                .record
+                .ok_or_else(|| format!("{name} holds no engine record"))?;
+            if engine.dirty {
+                return Err(format!("{name} was measured from a dirty tree"));
+            }
+            commits.insert(engine.commit);
+        }
+        match commits.into_iter().collect::<Vec<_>>().as_slice() {
+            [commit] => Ok(commit.chars().take(9).collect()),
+            [] => Err("the sweep has no cases".to_owned()),
+            several => Err(format!(
+                "its cases were measured from several commits: {several:?}"
+            )),
+        }
+    }
+
+    /// Copies the sweep record and its case records, never their artifact
+    /// directories, to `l1/<category>/<stamp>-<sha9>/` under
+    /// [`HISTORY_DIRECTORY`], returning that directory. Every file is
+    /// checked against [`HISTORY_FILE_LIMIT`] before anything is copied.
+    /// The destination is claimed by creating it, which fails atomically
+    /// when it already exists, so an existing directory is never replaced;
+    /// the case records are copied first and `sweep.json` last, so a
+    /// directory without it is incomplete, and a failed copy removes the
+    /// claim. Committing it stays manual.
+    ///
+    /// # Errors
+    ///
+    /// Returns an oversized file, an existing destination, or the
+    /// directory or copy failure; history is then left unchanged.
+    pub fn publish(&self, record: &SweepRecord, short: &str) -> Result<PathBuf, String> {
+        let names: Vec<&str> = record
+            .cases
+            .iter()
+            .filter_map(|entry| entry.record.as_deref())
+            .chain(std::iter::once(SWEEP_FILE))
+            .collect();
+        for name in &names {
+            let path = self.directory.join(name);
+            let size = std::fs::metadata(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?
+                .len();
+            if size > HISTORY_FILE_LIMIT {
+                return Err(format!(
+                    "{name} is {size} bytes, over history's {HISTORY_FILE_LIMIT}-byte file limit"
+                ));
+            }
+        }
+        let parent = self
+            .root
+            .join(HISTORY_DIRECTORY)
+            .join("l1")
+            .join(self.category.name());
+        let destination = parent.join(format!("{}-{short}", self.stamp));
+        std::fs::create_dir_all(&parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+        std::fs::create_dir(&destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{} already exists", destination.display())
+            } else {
+                format!("{}: {error}", destination.display())
+            }
+        })?;
+        let copied = names.iter().try_for_each(|name| {
+            std::fs::copy(self.directory.join(name), destination.join(name))
+                .map(drop)
+                .map_err(|error| format!("{name}: {error}"))
+        });
+        if let Err(error) = copied {
+            // The directory is this sweep's own claim, so removing it on
+            // failure never touches another publisher's records.
+            let _ = std::fs::remove_dir_all(&destination);
+            return Err(error);
+        }
+        Ok(destination)
+    }
+
     /// Runs case `case`, the `n`th, as its own process under the PostgreSQL
     /// wrapper and returns its case record: started only when its Compose
-    /// project does not yet exist, stopped at the case deadline, then
-    /// confirmed gone (processes, containers, volumes and storage root)
-    /// within the teardown allowance.
+    /// project does not yet exist, stopped when it has not begun teardown
+    /// by the 510 s cutoff, then confirmed gone (processes, containers,
+    /// volumes and storage root). Teardown has one deadline, the 60 s
+    /// allowance from when it began (announced by the case before it stops
+    /// a process, else the cutoff, an interrupt or the process ending)
+    /// within the 570 s envelope. Process stop, wrapper disposal, any
+    /// forced stop and confirmation all consume it; cleanup finished after
+    /// it is recorded but never confirmed.
     pub async fn attempt(&self, case: Case, n: usize, interrupt: &CancellationToken) -> CaseRecord {
         let allowances = Allowances::L1;
         let name = Self::name(n, &case);
@@ -247,7 +377,8 @@ impl Sweep {
             storage_root: storage.display().to_string(),
             ..Cleanup::default()
         };
-        match compose_resources(&project).await {
+        let checked = clock + Duration::from_secs(allowances.setup_seconds);
+        match compose_resources(&self.docker, &project, checked).await {
             Ok(found) => cleanup.preexisting = found,
             Err(error) => reasons.push(format!(
                 "PostgreSQL ownership could not be checked: {error}"
@@ -294,32 +425,71 @@ impl Sweep {
         if self.mode == SweepMode::Smoke {
             command.arg("--smoke");
         }
-        let deadline = clock
+        let cutoff = clock
             + Duration::from_secs(
                 allowances.total() - allowances.persist_seconds - allowances.teardown_seconds,
             );
-        let teardown = Duration::from_secs(allowances.teardown_seconds);
+        let envelope = clock + Duration::from_secs(allowances.total() - allowances.persist_seconds);
+        let allowance = Duration::from_secs(allowances.teardown_seconds);
+        let ends = |began: Instant| (began + allowance).min(envelope);
+        let second = |at: Instant| at.saturating_duration_since(clock).as_secs_f64();
+        let announced =
+            |now: Instant| Lifecycle::teardown_began(&artifacts).map(|at| (clock + at).min(now));
+        // Bounds cleanup work: the teardown deadline while it lasts, then the
+        // envelope, for physical cleanup that can no longer confirm anything.
+        let within = |deadline: Instant| {
+            let now = Instant::now();
+            if now < deadline {
+                deadline
+            } else {
+                envelope.max(now)
+            }
+        };
+        // When teardown began: set once, by the case's announcement, the
+        // cutoff, an interrupt or the case process ending, whichever is first.
+        let mut began: Option<Instant> = None;
         match command.spawn() {
             Err(error) => reasons.push(format!("the case process could not start: {error}")),
             Ok(mut child) => {
                 let group = child.id();
-                let status = tokio::select! {
-                    status = child.wait() => Some(status),
-                    () = tokio::time::sleep_until(deadline) => {
-                        reasons.push(format!(
-                            "the case did not finish within its {}s deadline; it was stopped",
-                            deadline.duration_since(clock).as_secs()
-                        ));
-                        None
-                    }
-                    () = interrupt.cancelled() => {
-                        reasons.push("the sweep was interrupted; the case was stopped".to_owned());
-                        None
+                let status = loop {
+                    let wake = began.map_or_else(|| cutoff.min(Instant::now() + POLL), ends);
+                    tokio::select! {
+                        status = child.wait() => break Some(status),
+                        () = tokio::time::sleep_until(wake) => {
+                            if let Some(began) = began {
+                                reasons.push(format!(
+                                    "the case's teardown did not finish within its {}s allowance, from {:.1}s to {:.1}s; it was stopped",
+                                    allowances.teardown_seconds,
+                                    second(began),
+                                    second(ends(began))
+                                ));
+                                break None;
+                            }
+                            let now = Instant::now();
+                            began = announced(now);
+                            if began.is_none() && now >= cutoff {
+                                reasons.push(format!(
+                                    "the case did not begin teardown within its {}s deadline; it was stopped",
+                                    second(cutoff).round()
+                                ));
+                                began = Some(now);
+                                break None;
+                            }
+                        }
+                        () = interrupt.cancelled() => {
+                            reasons.push("the sweep was interrupted; the case was stopped".to_owned());
+                            let now = Instant::now();
+                            began = began.or_else(|| announced(now)).or(Some(now));
+                            break None;
+                        }
                     }
                 };
-                let status = match status {
-                    Some(status) => status.ok(),
-                    None => stop(group, &mut child, teardown).await,
+                let status = if let Some(status) = status {
+                    status.ok()
+                } else {
+                    let deadline = ends(began.unwrap_or_else(Instant::now));
+                    stop(group, &mut child, within(deadline)).await
                 };
                 match status {
                     Some(status) if status.success() || status.code() == Some(2) => {}
@@ -328,13 +498,11 @@ impl Sweep {
                 }
             }
         }
-        let exited = Utc::now();
-        let record = std::fs::read(&record_path)
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| {
-                Record::parse(&String::from_utf8_lossy(&bytes)).map_err(|error| error.to_string())
-            });
-        let mut record = match record {
+        let began = began
+            .or_else(|| announced(Instant::now()))
+            .unwrap_or_else(Instant::now);
+        let deadline = ends(began);
+        let mut record = match Record::read(&record_path) {
             Ok(record) => Some(record),
             Err(error) => {
                 reasons.push(format!("the case process kept no engine record: {error}"));
@@ -346,23 +514,13 @@ impl Sweep {
             .and_then(|record| record.lifecycle.as_ref())
             .map(|lifecycle| lifecycle.owned.clone())
             .unwrap_or_default();
-        let confirming = Instant::now();
-        let child_teardown = record.as_ref().map_or(0.0, |record| {
-            (exited - record.finished_at).num_milliseconds().max(0) as f64 / 1e3
-        });
-        let left = record
-            .as_ref()
-            .and_then(|record| record.lifecycle.as_ref())
-            .map_or(teardown, |lifecycle| {
-                let used = lifecycle.teardown_seconds + child_teardown;
-                Duration::from_secs_f64((allowances.teardown_seconds as f64 - used).max(0.0))
-            });
-        let surviving = confirm(&project, &owned, &storage, left).await;
-        cleanup.seconds = child_teardown + confirming.elapsed().as_secs_f64();
-        cleanup.confirmed = surviving.is_empty();
+        let surviving = confirm(&self.docker, &project, &owned, &storage, within(deadline)).await;
+        let done = Instant::now();
+        cleanup.seconds = done.saturating_duration_since(began).as_secs_f64();
+        cleanup.confirmed = surviving.is_empty() && done < deadline;
         cleanup.surviving = surviving;
         if let Some(lifecycle) = record.as_mut().and_then(|record| record.lifecycle.as_mut()) {
-            lifecycle.teardown_seconds += cleanup.seconds;
+            lifecycle.teardown_seconds = cleanup.seconds;
             for overrun in lifecycle.overruns() {
                 if !record_has(&reasons, &overrun.message) {
                     reasons.push(overrun.message);
@@ -372,10 +530,15 @@ impl Sweep {
             reasons.push("the engine record has no case lifecycle".to_owned());
         }
         if !cleanup.confirmed {
-            reasons.push(format!(
-                "cleanup was not confirmed within the {}s teardown allowance: {}",
-                allowances.teardown_seconds,
+            let left = if cleanup.surviving.is_empty() {
+                format!("it finished at {:.1}s", second(done))
+            } else {
                 cleanup.surviving.join("; ")
+            };
+            reasons.push(format!(
+                "cleanup was not confirmed within the {}s teardown allowance ending at {:.1}s: {left}",
+                allowances.teardown_seconds,
+                second(deadline)
             ));
         }
         self.finished(case, started_at, record, cleanup, reasons)
@@ -415,6 +578,7 @@ impl Sweep {
             mode: self.mode,
             profile: self.profile,
             started_at,
+            timings: std::collections::BTreeMap::new(),
             record,
             verdict: if unique.is_empty() {
                 Verdict::Valid
@@ -447,13 +611,14 @@ fn keep(directory: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile, Strin
     Ok(file)
 }
 
-/// Stops the case process group `group` of `child`: TERM, so the wrapper
-/// tears its PostgreSQL down, then KILL once `grace` passes. Returns its
-/// exit status, or `None` when it could not be reaped.
+/// Stops the case process group `group` of `child` by `deadline`: TERM,
+/// so the wrapper tears its PostgreSQL down, then KILL once half the time
+/// left passes. Returns its exit status, or `None` when it could not be reaped
+/// by `deadline`.
 async fn stop(
     group: Option<u32>,
     child: &mut tokio::process::Child,
-    grace: Duration,
+    deadline: Instant,
 ) -> Option<std::process::ExitStatus> {
     let signal = |name: &str| {
         if let Some(group) = group {
@@ -463,23 +628,29 @@ async fn stop(
         }
     };
     signal("TERM");
-    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+    let term = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
+    if let Ok(status) = tokio::time::timeout_at(term, child.wait()).await {
         return status.ok();
     }
     signal("KILL");
-    tokio::time::timeout(grace, child.wait())
+    tokio::time::timeout_at(deadline, child.wait())
         .await
         .ok()
         .and_then(Result::ok)
 }
 
 /// The containers, volumes and networks Compose project `project` still
-/// has.
+/// has, asked of `docker` by `deadline`.
 ///
 /// # Errors
 ///
-/// Returns why Docker could not be asked.
-async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
+/// Returns why Docker could not be asked, or that it did not answer by
+/// `deadline`; a timeout never reads as an empty project.
+async fn compose_resources(
+    docker: &Path,
+    project: &str,
+    deadline: Instant,
+) -> Result<Vec<String>, String> {
     let label = format!("label=com.docker.compose.project={project}");
     let mut found = Vec::new();
     for (what, args) in [
@@ -496,11 +667,21 @@ async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
             vec!["network", "ls", "--quiet", "--filter", label.as_str()],
         ),
     ] {
-        let output = tokio::process::Command::new("docker")
-            .args(&args)
-            .output()
-            .await
-            .map_err(|error| format!("docker could not run: {error}"))?;
+        let output = tokio::time::timeout_at(
+            deadline,
+            tokio::process::Command::new(docker)
+                .args(&args)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "docker {} did not answer within its allowance",
+                args.join(" ")
+            )
+        })?
+        .map_err(|error| format!("docker could not run: {error}"))?;
         if !output.status.success() {
             return Err(format!(
                 "docker {} failed: {}",
@@ -518,12 +699,20 @@ async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
-/// What still exists of a finished case within `left`: owned processes
-/// still running with their recorded start, Compose containers and volumes
-/// of `project` (removed once if the wrapper left them), and the storage
-/// root, which is removed. Empty when cleanup is confirmed.
-async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration) -> Vec<String> {
-    let deadline = Instant::now() + left;
+/// What still exists of a finished case, polled until nothing does or
+/// `deadline` passes: owned processes still running with their recorded
+/// start, Compose containers and volumes of `project` (removed once if the
+/// wrapper left them), and the storage root, which is removed. Every Docker
+/// call is bounded by `deadline`, and an answer it did not give in time
+/// survives. Whether an empty answer came within the teardown allowance is
+/// the caller's judgment.
+async fn confirm(
+    docker: &Path,
+    project: &str,
+    owned: &[Owned],
+    storage: &Path,
+    deadline: Instant,
+) -> Vec<String> {
     let mut removed = false;
     loop {
         let mut surviving: Vec<String> = owned
@@ -531,20 +720,24 @@ async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration)
             .filter(|process| process.alive())
             .map(|process| format!("{} process {} still runs", process.role.name(), process.pid))
             .collect();
-        match compose_resources(project).await {
+        match compose_resources(docker, project, deadline).await {
             Ok(found) if !found.is_empty() && !removed => {
                 removed = true;
-                let _ = tokio::process::Command::new("docker")
-                    .args([
-                        "compose",
-                        "--project-name",
-                        project,
-                        "down",
-                        "--volumes",
-                        "--remove-orphans",
-                    ])
-                    .output()
-                    .await;
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    tokio::process::Command::new(docker)
+                        .args([
+                            "compose",
+                            "--project-name",
+                            project,
+                            "down",
+                            "--volumes",
+                            "--remove-orphans",
+                        ])
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await;
                 surviving.extend(found);
             }
             Ok(found) => surviving.extend(found),
@@ -562,10 +755,11 @@ async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration)
                 surviving.push(format!("storage root {} still exists", storage.display()));
             }
         }
-        if surviving.is_empty() || Instant::now() >= deadline {
+        let now = Instant::now();
+        if surviving.is_empty() || now >= deadline {
             return surviving;
         }
-        tokio::time::sleep(POLL).await;
+        tokio::time::sleep(POLL.min(deadline - now)).await;
     }
 }
 
@@ -753,7 +947,29 @@ pub async fn command(category: Category, arguments: &[String], root: &Path) -> u
             async move { sweep.attempt(case, n, interrupt).await }
         })
         .await;
-    print_summary(&sweep, &record)
+    let code = print_summary(&sweep, &record);
+    match sweep.historical(&record) {
+        Err(reason) => {
+            println!("history: not published: {reason}");
+            code
+        }
+        Ok(short) => match sweep.publish(&record, &short) {
+            Ok(directory) => {
+                println!(
+                    "history: {} (commit it on benchmark-records)",
+                    directory.display()
+                );
+                code
+            }
+            Err(error) => {
+                eprintln!(
+                    "INVALID: the sweep could not enter history: {error}; its records stay under {}",
+                    sweep.directory.display()
+                );
+                2
+            }
+        },
+    }
 }
 
 /// Prints the sweep's summary table, rendered from the saved files as
@@ -777,10 +993,11 @@ pub fn print_summary(sweep: &Sweep, record: &SweepRecord) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use chrono::Utc;
     use tokio_util::sync::CancellationToken;
-    use wyrd_testing::experiment::Verdict;
+    use wyrd_testing::experiment::{Lifecycle, Record, Verdict};
 
     use super::Sweep;
     use crate::cases::{Case, Category, Request, resolve};
@@ -812,6 +1029,7 @@ mod tests {
             profile: None,
             started_at: Utc::now(),
             record: None,
+            timings: std::collections::BTreeMap::new(),
             cleanup: Cleanup {
                 project: "p".to_owned(),
                 confirmed,
@@ -829,7 +1047,7 @@ mod tests {
     async fn unconfirmed_cleanup_stops_later_launches() {
         let root = tempfile::tempdir().expect("root");
         let sweep = sweep(
-            Category::Bifrost,
+            Category::BifrostWrites,
             &[
                 "--cases",
                 "otlp-logs-c1,otlp-logs-c64,native-write-c1,native-write-c64",
@@ -887,6 +1105,732 @@ mod tests {
         assert!(table.contains("| otlp-logs-c1 | INVALID: setup failed | — | — | — | — | — | 01-writes-parquet-otlp-logs-c1.json |"), "{table}");
     }
 
+    /// The engine record a Bifrost write case process keeps: 240 s of
+    /// setup, 30 s of warmup, 90 s measured, `drain` seconds of drain and
+    /// capture, `teardown` seconds stopping its processes, and no owned
+    /// process still running.
+    fn engine_record(drain: f64, teardown: f64) -> Record {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let case = runtime.block_on(crate::tests::case_record(
+            Category::BifrostWrites,
+            "native-write-c1",
+            None,
+            crate::tests::case_script("rows", 30_000.0, 0.0, 300_000),
+        ));
+        assert_eq!(case.verdict, Verdict::Valid, "{:?}", case.reasons);
+        let mut record = case.record.expect("an engine record");
+        let lifecycle = record.lifecycle.as_mut().expect("a lifecycle");
+        lifecycle.setup_seconds = 240.0;
+        lifecycle.warmup_seconds = 30.0;
+        lifecycle.measurement_seconds = 90.0;
+        lifecycle.drain_seconds = drain;
+        lifecycle.teardown_seconds = teardown;
+        lifecycle.owned.clear();
+        record
+    }
+
+    /// Writes an executable `sh` script of `body` at `path`.
+    fn script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    }
+
+    /// A smoke sweep of `cases` under `root` whose PostgreSQL wrapper runs
+    /// `wrapper` with `$record` and `$artifacts` naming the case's engine
+    /// record and artifacts, and whose Docker client runs `docker`. Both
+    /// may `gate NAME` to wait until a [`stepped`] test opens that gate,
+    /// `passed NAME` to tell it they passed, and the wrapper may
+    /// `announce SECOND` to announce the case's teardown as its runner does.
+    fn faked(root: &std::path::Path, cases: &str, wrapper: &str, docker: &str) -> Sweep {
+        let gates = root.join("gates");
+        std::fs::create_dir_all(&gates).expect("gates");
+        let helpers = format!(
+            "gates='{}'\n\
+             gate() {{ until [ -e \"$gates/$1\" ]; do sleep 0.01; done; }}\n\
+             passed() {{ touch \"$gates/$1.passed\"; }}\n\
+             announce() {{ echo \"$1\" > \"$artifacts/{teardown}.partial\" && mv \"$artifacts/{teardown}.partial\" \"$artifacts/{teardown}\"; }}\n",
+            gates.display(),
+            teardown = Lifecycle::TEARDOWN_FILE,
+        );
+        script(
+            &root.join(super::POSTGRES),
+            &format!(
+                "{helpers}while [ $# -gt 0 ]; do case \"$1\" in --record) record=$2;; --artifacts) artifacts=$2;; esac; shift; done\n{wrapper}"
+            ),
+        );
+        let docker_path = root.join("docker");
+        script(&docker_path, &format!("{helpers}{docker}"));
+        let mut sweep = sweep(Category::BifrostWrites, &["--cases", cases], root);
+        sweep.docker = docker_path;
+        sweep
+    }
+
+    /// Runs `sweep` through its real case attempts, returning the sweep
+    /// record and how many cases were launched.
+    async fn attempted_sweep(sweep: &Sweep) -> (summary::SweepRecord, usize) {
+        let interrupt = CancellationToken::new();
+        let launched = Arc::new(Mutex::new(0));
+        let record = sweep
+            .supervise(&interrupt, |case, n| {
+                *launched.lock().expect("launched") += 1;
+                let interrupt = &interrupt;
+                async move { sweep.attempt(case, n, interrupt).await }
+            })
+            .await;
+        let launched = *launched.lock().expect("launched");
+        (record, launched)
+    }
+
+    /// Runs `sweep`'s real case attempts under `root` on the paused clock,
+    /// held still while its processes and Docker calls run, so only
+    /// `steps` move it: each moves the clock to its case second in poll
+    /// advances, then, unless its gate is empty, opens that gate and waits
+    /// until the fake wrapper or Docker client passed it. Returns the sweep
+    /// record, how many cases launched and the case second the sweep
+    /// returned at.
+    async fn stepped(
+        sweep: &Sweep,
+        root: &std::path::Path,
+        steps: &[(f64, &str)],
+    ) -> (summary::SweepRecord, usize, f64) {
+        let started = tokio::time::Instant::now();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        // While a blocking task runs, the paused clock never advances itself.
+        let hold = tokio::task::spawn_blocking(move || held.recv_timeout(Duration::from_secs(60)));
+        let gates = root.join("gates");
+        let drive = async {
+            for &(second, gate) in steps {
+                let at = started + Duration::from_secs_f64(second);
+                while tokio::time::Instant::now() < at {
+                    tokio::time::advance(super::POLL.min(at - tokio::time::Instant::now())).await;
+                }
+                if gate.is_empty() {
+                    continue;
+                }
+                std::fs::write(gates.join(gate), "").expect("gate");
+                let passed = gates.join(format!("{gate}.passed"));
+                tokio::task::spawn_blocking(move || {
+                    let waiting = std::time::Instant::now();
+                    while !passed.exists() {
+                        assert!(
+                            waiting.elapsed() < Duration::from_secs(10),
+                            "nothing passed {}",
+                            passed.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+                .await
+                .expect("the gate wait");
+            }
+        };
+        let ((record, launched, returned), ()) = tokio::join!(
+            async {
+                let (record, launched) = attempted_sweep(sweep).await;
+                let returned = started.elapsed().as_secs_f64();
+                drop(release);
+                (record, launched, returned)
+            },
+            drive
+        );
+        let _ = hold.await;
+        (record, launched, returned)
+    }
+
+    /// Runs `future` to completion on a fresh paused-clock runtime.
+    fn paused<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    /// The saved case record of the first case of a native-write sweep.
+    fn first_case(sweep: &Sweep) -> CaseRecord {
+        summary::read_case(
+            &sweep
+                .directory
+                .join("01-writes-parquet-native-write-c1.json"),
+        )
+        .expect("case record")
+    }
+
+    /// A case that announces teardown at 500 s, after 240 s of setup, 30 s
+    /// of warmup, 90 s measured and 140 s of drain, is in allowed teardown
+    /// past the 510 s cutoff although it has no record yet: its process stop
+    /// keeps the record only at 520 s and its PostgreSQL wrapper is gone at
+    /// 530 s, inside the 560 s deadline set at 500 s. The case completes at
+    /// 530 s VALID, with cleanup confirmed and 30 s of teardown charged.
+    #[test]
+    fn an_announced_teardown_runs_past_the_cutoff_before_its_record() {
+        let root = tempfile::tempdir().expect("root");
+        let fixture = root.path().join("fixture.json");
+        let record = engine_record(140.0, 20.0);
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1",
+            &format!(
+                "gate teardown; announce 500; passed teardown\n\
+                 gate record; cp '{}' \"$record\"; passed record\n\
+                 gate exit; passed exit",
+                fixture.display()
+            ),
+            "exit 0",
+        );
+        let (record, launched, returned) = paused(stepped(
+            &sweep,
+            root.path(),
+            &[(500.0, "teardown"), (520.0, "record"), (530.0, "exit")],
+        ));
+        assert_eq!(launched, 1);
+        assert_eq!(
+            record.cases[0].status,
+            CaseStatus::Valid,
+            "{:?}",
+            record.cases[0].reasons
+        );
+        assert!((returned - 530.0).abs() < 0.01, "{returned}");
+        let case = first_case(&sweep);
+        assert!(case.cleanup.confirmed);
+        assert!(
+            (case.cleanup.seconds - 30.0).abs() < 0.01,
+            "{}",
+            case.cleanup.seconds
+        );
+        let teardown = case
+            .record
+            .as_ref()
+            .and_then(|record| record.lifecycle.as_ref())
+            .expect("lifecycle")
+            .teardown_seconds;
+        assert!((teardown - 30.0).abs() < 0.01, "{teardown}");
+    }
+
+    /// A process stop that outlives its teardown is an overrun, never a
+    /// reason to extend it: teardown announced at 500 s ends at 560 s, so
+    /// the case still stopping then is stopped at 560 s, INVALID naming the
+    /// deadline, its cleanup unconfirmed, and the next case is NOT RUN.
+    #[test]
+    fn a_stop_past_its_teardown_deadline_is_stopped_at_it() {
+        let root = tempfile::tempdir().expect("root");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            "trap 'exit 0' TERM\n\
+             gate teardown; announce 500; passed teardown\n\
+             gate never",
+            "exit 0",
+        );
+        let (record, launched, returned) = paused(stepped(
+            &sweep,
+            root.path(),
+            &[(500.0, "teardown"), (560.0, "")],
+        ));
+        assert_eq!(launched, 1);
+        assert!((returned - 560.0).abs() < 0.01, "{returned}");
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::NotRun]
+        );
+        let case = first_case(&sweep);
+        assert!(!case.cleanup.confirmed);
+        assert!(
+            (case.cleanup.seconds - 60.0).abs() < 0.01,
+            "{}",
+            case.cleanup.seconds
+        );
+        for expected in [
+            "teardown did not finish within its 60s allowance, from 500.0s to 560.0s",
+            "kept no engine record",
+            "cleanup was not confirmed within the 60s teardown allowance ending at 560.0s",
+        ] {
+            assert!(
+                case.reasons.iter().any(|reason| reason.contains(expected)),
+                "{expected}: {:?}",
+                case.reasons
+            );
+        }
+    }
+
+    /// Teardown that expires cannot be confirmed later: announced at 490 s
+    /// with the record kept at 500 s, the PostgreSQL wrapper still runs at
+    /// the 550 s deadline, is stopped then and is gone at 555 s with nothing
+    /// left. That later absence is kept as evidence but confirms nothing:
+    /// the case is INVALID with cleanup unconfirmed at 550 s, and the next
+    /// case is NOT RUN without being launched.
+    #[test]
+    fn an_expired_teardown_cannot_confirm_later_cleanup() {
+        let root = tempfile::tempdir().expect("root");
+        let fixture = root.path().join("fixture.json");
+        let record = engine_record(130.0, 10.0);
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            &format!(
+                "trap 'gate exit; passed exit; exit 0' TERM\n\
+                 gate teardown; announce 490; passed teardown\n\
+                 gate record; cp '{}' \"$record\"; passed record\n\
+                 gate never",
+                fixture.display()
+            ),
+            "exit 0",
+        );
+        let (record, launched, returned) = paused(stepped(
+            &sweep,
+            root.path(),
+            &[(490.0, "teardown"), (500.0, "record"), (555.0, "exit")],
+        ));
+        assert_eq!(launched, 1);
+        assert!((returned - 555.0).abs() < 0.01, "{returned}");
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::NotRun]
+        );
+        assert!(
+            record.cases[1].reasons[0].contains("could not be confirmed"),
+            "{:?}",
+            record.cases[1].reasons
+        );
+        let case = first_case(&sweep);
+        assert!(!case.cleanup.confirmed);
+        assert!(
+            case.cleanup.surviving.is_empty(),
+            "{:?}",
+            case.cleanup.surviving
+        );
+        assert!(
+            (case.cleanup.seconds - 65.0).abs() < 0.01,
+            "{}",
+            case.cleanup.seconds
+        );
+        for expected in [
+            "teardown did not finish within its 60s allowance, from 490.0s to 550.0s",
+            "cleanup was not confirmed within the 60s teardown allowance ending at 550.0s: it finished at 555.0s",
+            "teardown took 65.0s, over its 60s allowance",
+        ] {
+            assert!(
+                case.reasons.iter().any(|reason| reason.contains(expected)),
+                "{expected}: {:?}",
+                case.reasons
+            );
+        }
+    }
+
+    /// A case INVALID for a drain overrun whose cleanup is confirmed inside
+    /// its teardown allowance still lets the next case start: both cases
+    /// launch, both are INVALID, and both cleanups are confirmed.
+    #[test]
+    fn timely_cleanup_after_an_invalid_case_starts_the_next() {
+        let root = tempfile::tempdir().expect("root");
+        let fixture = root.path().join("fixture.json");
+        let record = engine_record(160.0, 10.0);
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            &format!("announce 0; cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let (record, launched, _) = paused(stepped(&sweep, root.path(), &[]));
+        assert_eq!(launched, 2);
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::Invalid]
+        );
+        let case = first_case(&sweep);
+        assert!(case.cleanup.confirmed, "{:?}", case.reasons);
+        assert!(
+            case.reasons
+                .iter()
+                .any(|reason| reason.contains("drain and capture took 160.0s")),
+            "{:?}",
+            case.reasons
+        );
+    }
+
+    /// A case's kept window snapshots (timing, scan, counter and gauge) go
+    /// from its process's artifacts into the saved case record, so after the
+    /// temporary artifacts are removed `capacity report` still lists every
+    /// window series with its original labels and the measured persistence
+    /// time, and regenerates the same sweep table.
+    #[test]
+    fn saved_cases_keep_window_snapshots_and_persistence_time() {
+        use wyrd_testing::experiment::{Role, TimingEvidence};
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        wyrd_benchmark::record_timing(
+            &tracing::Span::none(),
+            "bifrost.ingest",
+            "success",
+            Duration::from_micros(700),
+            None,
+        );
+        wyrd_benchmark::record_scan(&tracing::Span::none(), "success", Some(42), Some(4_096));
+        metrics::counter!("l1_saved_counter_total", "lane" => "kept").increment(3);
+        metrics::gauge!("l1_saved_gauge", "lane" => "kept").set(7.0);
+        let after = wyrd_benchmark::snapshot();
+        let evidence = vec![TimingEvidence {
+            window: "measured".to_owned(),
+            role: Role::Server,
+            before,
+            after,
+            reconciliation: Vec::new(),
+        }];
+        let root = tempfile::tempdir().expect("root");
+        let artifacts = root.path().join("artifacts");
+        let mut record = engine_record(130.0, 10.0);
+        record.artifacts.directory = Some(artifacts.display().to_string());
+        let step = record.steps[0].id.clone();
+        let kept = artifacts
+            .join("timings")
+            .join(&step)
+            .join("repetition-1.json");
+        std::fs::create_dir_all(kept.parent().expect("parent")).expect("timings");
+        std::fs::write(&kept, serde_json::to_vec(&evidence).expect("json")).expect("kept");
+        let fixture = root.path().join("fixture.json");
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1",
+            &format!("cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (swept, _) = runtime.block_on(attempted_sweep(&sweep));
+        assert_eq!(
+            swept.cases[0].status,
+            CaseStatus::Valid,
+            "{:?}",
+            swept.cases[0].reasons
+        );
+        let persisted = swept.cases[0]
+            .persist_seconds
+            .expect("measured persistence");
+        let sweep_file = sweep.directory.join(summary::SWEEP_FILE);
+        let table = summary::report(&sweep_file)
+            .expect("reads")
+            .expect("a sweep");
+        let case_file = sweep
+            .directory
+            .join("01-writes-parquet-native-write-c1.json");
+        let local = summary::report(&case_file).expect("reads").expect("a case");
+        assert!(
+            local.contains("    - timing bifrost.ingest success case"),
+            "the local report loads the diagnostics beside it: {local}"
+        );
+        std::fs::remove_dir_all(&artifacts).expect("artifacts removed");
+        assert_eq!(
+            summary::report(&sweep_file)
+                .expect("reads")
+                .expect("a sweep"),
+            table,
+            "the same sweep table"
+        );
+        let full = summary::report(&case_file).expect("reads").expect("a case");
+        assert!(
+            full.contains(&format!("| persist and report | {persisted:.1} | 20 |")),
+            "{full}"
+        );
+        assert!(
+            !full.contains("timing bifrost.ingest"),
+            "no diagnostics left: {full}"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&case_file).expect("case file")).expect("json");
+        assert!(
+            saved.get("timings").is_none(),
+            "the case record carries no snapshots"
+        );
+
+        // An older case record embedding its snapshots still renders them.
+        let mut older = saved;
+        older["timings"] = serde_json::json!({ step.clone(): [evidence.clone()] });
+        std::fs::write(&case_file, serde_json::to_vec(&older).expect("json")).expect("older");
+        let full = summary::report(&case_file).expect("reads").expect("a case");
+        for line in [
+            "  - repetition 1 server measured window (nearest-rank bucket bounds):",
+            "    - timing bifrost.ingest success case",
+            "    - scan success case",
+            "l1_saved_counter_total{lane=kept}",
+            "l1_saved_gauge{lane=kept}",
+        ] {
+            assert!(full.contains(line), "{line} in {full}");
+        }
+        let read = summary::read_case(&case_file).expect("case record");
+        assert_eq!(
+            read.record.as_ref().expect("record").steps[0].repetitions[0].timings,
+            evidence
+        );
+    }
+
+    /// A clean, standard, routine, all-VALID sweep publishes its sweep and
+    /// case records, without artifact directories or diagnostics, under
+    /// `benchmarks/history/l1/<category>/<stamp>-<sha9>/`, once; a sweep
+    /// chosen by `--cases`, profiled, paced, with an INVALID case or
+    /// measured dirty never does; and a file over the 1 MiB limit leaves
+    /// history unchanged.
+    #[test]
+    fn eligible_sweeps_publish_compact_records_to_history() {
+        let root = tempfile::tempdir().expect("root");
+        let mut record = engine_record(130.0, 10.0);
+        record.dirty = false;
+        record.commit = "0123456789abcdef".to_owned();
+        let fixture = root.path().join("fixture.json");
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let mut sweep = faked(
+            root.path(),
+            "native-write-c1",
+            &format!("cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (swept, _) = runtime.block_on(attempted_sweep(&sweep));
+        assert_eq!(
+            swept.cases[0].status,
+            CaseStatus::Valid,
+            "{:?}",
+            swept.cases[0].reasons
+        );
+        assert!(
+            sweep.historical(&swept).is_err(),
+            "a smoke sweep chosen by --cases stays local"
+        );
+
+        sweep.mode = summary::SweepMode::Standard;
+        assert!(
+            sweep
+                .historical(&swept)
+                .expect_err("explicit")
+                .contains("--cases")
+        );
+        sweep.explicit = false;
+        let short = sweep.historical(&swept).expect("eligible");
+        assert_eq!(short, "012345678");
+        let mut profiled = sweep.clone();
+        profiled.mode = summary::SweepMode::Diagnostic;
+        assert!(profiled.historical(&swept).is_err(), "profiled");
+        let mut paced = sweep.clone();
+        paced.forwarded.push("--pace".to_owned());
+        assert!(paced.historical(&swept).is_err(), "paced");
+        let mut invalid = swept.clone();
+        invalid.cases[0].status = CaseStatus::Invalid;
+        assert!(sweep.historical(&invalid).is_err(), "INVALID");
+
+        let case_file = sweep
+            .directory
+            .join("01-writes-parquet-native-write-c1.json");
+        let saved = std::fs::read(&case_file).expect("case file");
+        let mut dirty: serde_json::Value = serde_json::from_slice(&saved).expect("json");
+        dirty["record"]["dirty"] = serde_json::Value::Bool(true);
+        std::fs::write(&case_file, serde_json::to_vec(&dirty).expect("json")).expect("dirty");
+        assert!(
+            sweep
+                .historical(&swept)
+                .expect_err("dirty")
+                .contains("dirty")
+        );
+        std::fs::write(&case_file, &saved).expect("clean again");
+
+        let history = root.path().join("benchmarks/history/l1/bifrost-writes");
+        std::fs::File::create(&case_file)
+            .and_then(|file| file.set_len(super::HISTORY_FILE_LIMIT + 1))
+            .expect("oversized");
+        assert!(
+            sweep
+                .publish(&swept, &short)
+                .expect_err("oversized")
+                .contains("file limit")
+        );
+        assert!(!history.exists(), "nothing published");
+        std::fs::write(&case_file, &saved).expect("restored");
+
+        let claimed = history.join(format!("{}-012345678", sweep.stamp));
+        std::fs::create_dir_all(&claimed).expect("another publisher's empty directory");
+        assert!(
+            sweep
+                .publish(&swept, &short)
+                .expect_err("claimed")
+                .contains("already exists")
+        );
+        assert_eq!(
+            std::fs::read_dir(&claimed).expect("kept").count(),
+            0,
+            "never replaced"
+        );
+        std::fs::remove_dir(&claimed).expect("released");
+        let published = sweep.publish(&swept, &short).expect("published");
+        assert_eq!(
+            published,
+            history.join(format!("{}-012345678", sweep.stamp))
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&published)
+            .expect("published directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "01-writes-parquet-native-write-c1.json",
+                summary::SWEEP_FILE
+            ]
+        );
+        assert_eq!(
+            summary::report(&published.join(summary::SWEEP_FILE))
+                .expect("reads")
+                .expect("a sweep")
+                .replace(&published.display().to_string(), ""),
+            summary::report(&sweep.directory.join(summary::SWEEP_FILE))
+                .expect("reads")
+                .expect("a sweep")
+                .replace(&sweep.directory.display().to_string(), ""),
+            "history renders the same table"
+        );
+        assert!(
+            sweep
+                .publish(&swept, &short)
+                .expect_err("once")
+                .contains("already exists")
+        );
+    }
+
+    /// A case process that never keeps a record and ignores TERM is
+    /// stopped at the 510 s cutoff, which leaves teardown and persistence
+    /// their allowances, and its stop, Docker removal and confirmation share
+    /// one 60 s teardown allowance however long Docker hangs: the case is INVALID with its
+    /// cleanup unconfirmed, the sweep is kept, and the next case is NOT RUN
+    /// without being launched.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_case_is_stopped_at_its_cutoff_within_one_cleanup_allowance() {
+        let root = tempfile::tempdir().expect("root");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            "trap '' TERM\nexec sleep 600",
+            "exec sleep 600",
+        );
+        let started = tokio::time::Instant::now();
+        let (record, launched) =
+            tokio::time::timeout(Duration::from_secs(3_600), attempted_sweep(&sweep))
+                .await
+                .expect("the supervisor returns");
+        let elapsed = started.elapsed().as_secs_f64();
+        assert_eq!(launched, 1);
+        assert!((510.0..=571.0).contains(&elapsed), "{elapsed}");
+        let case = summary::read_case(
+            &sweep
+                .directory
+                .join("01-writes-parquet-native-write-c1.json"),
+        )
+        .expect("case record");
+        assert_eq!(case.verdict, Verdict::Invalid);
+        assert!(!case.cleanup.confirmed);
+        assert!(case.cleanup.seconds <= 60.5, "{}", case.cleanup.seconds);
+        for expected in [
+            "did not begin teardown within its 510s deadline",
+            "kept no engine record",
+            "cleanup was not confirmed",
+        ] {
+            assert!(
+                case.reasons.iter().any(|reason| reason.contains(expected)),
+                "{expected}: {:?}",
+                case.reasons
+            );
+        }
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::NotRun]
+        );
+        assert!(sweep.directory.join(summary::SWEEP_FILE).exists());
+    }
+
+    /// Cleanup confirmation is bounded by what remains of the teardown
+    /// allowance: with the wrapper gone at 559.5 s of a teardown that ends
+    /// at 560 s, a Docker check that answers only after 2 s, or never
+    /// answers, leaves cleanup unconfirmed, so the next case is NOT RUN and
+    /// never launched.
+    #[test]
+    fn late_or_missing_cleanup_answers_stop_the_sweep() {
+        for delay in ["2", "600"] {
+            let root = tempfile::tempdir().expect("root");
+            let fixture = root.path().join("fixture.json");
+            let record = engine_record(140.0, 5.0);
+            std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+            let sweep = faked(
+                root.path(),
+                "native-write-c1,native-write-c64",
+                &format!(
+                    "gate teardown; announce 500; cp '{}' \"$record\"; passed teardown\n\
+                     gate exit; passed exit",
+                    fixture.display()
+                ),
+                &format!("[ -e \"$gates/exit.passed\" ] && passed asked && sleep {delay}\nexit 0"),
+            );
+            let (record, launched, _) = paused(stepped(
+                &sweep,
+                root.path(),
+                &[
+                    (500.0, "teardown"),
+                    (559.5, "exit"),
+                    (559.5, "asked"),
+                    (561.5, ""),
+                ],
+            ));
+            assert_eq!(launched, 1, "delay {delay}");
+            assert_eq!(
+                record
+                    .cases
+                    .iter()
+                    .map(|entry| entry.status)
+                    .collect::<Vec<_>>(),
+                [CaseStatus::Invalid, CaseStatus::NotRun],
+                "delay {delay}"
+            );
+            let case = first_case(&sweep);
+            assert!(!case.cleanup.confirmed, "delay {delay}");
+            assert!(
+                case.cleanup
+                    .surviving
+                    .iter()
+                    .any(|item| item.contains("did not answer within its allowance")),
+                "delay {delay}: {:?}",
+                case.cleanup.surviving
+            );
+        }
+    }
+
     /// An interrupt before a case starts records it and every later case
     /// NOT RUN.
     #[tokio::test]
@@ -918,6 +1862,7 @@ mod tests {
         let unsaved = summary::entry(&case, &valid, Err("disk full".to_owned()), 20);
         assert_eq!(unsaved.status, CaseStatus::Invalid);
         assert_eq!(unsaved.record, None);
+        assert_eq!(unsaved.persist_seconds, None);
         assert_eq!(
             unsaved.reasons,
             ["the case record could not be kept: disk full"]
@@ -930,6 +1875,7 @@ mod tests {
         );
         assert_eq!(late.status, CaseStatus::Invalid);
         assert_eq!(late.record.as_deref(), Some("01-overhead-x.json"));
+        assert_eq!(late.persist_seconds, Some(25.5));
         assert_eq!(
             late.reasons,
             ["persisting the case record took 25.5s, over its 20s allowance"]

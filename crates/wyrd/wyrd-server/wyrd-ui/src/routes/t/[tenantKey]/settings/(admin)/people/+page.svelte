@@ -10,7 +10,7 @@
   import { OPERATIONS, operationName, scopeLabel } from '$lib/access';
   import { guidance } from '$lib/Entry.svelte';
   import AccessRequest from '$lib/AccessRequest.svelte';
-  import GrantFields from './GrantFields.svelte';
+  import GrantFields from '../GrantFields.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
 

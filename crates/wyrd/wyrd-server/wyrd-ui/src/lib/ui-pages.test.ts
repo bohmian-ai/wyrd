@@ -935,8 +935,8 @@ import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[na
 import RepositoryPage from '../routes/t/[tenantKey]/repositories/[name]/+page.svelte';
 import { load as loadUndeclared } from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.server';
 import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.svelte';
-import { load as loadGithub } from '../routes/t/[tenantKey]/settings/integrations/github/+page.server';
-import GithubPage from '../routes/t/[tenantKey]/settings/integrations/github/+page.svelte';
+import { load as loadGithub } from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.server';
+import GithubPage from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.svelte';
 import { connectionExecutor } from '$lib/ui-fixtures';
 import { EventEmitter } from 'node:events';
 import { GET as getObserveSupport } from '../routes/t/[tenantKey]/observe/support/+server';

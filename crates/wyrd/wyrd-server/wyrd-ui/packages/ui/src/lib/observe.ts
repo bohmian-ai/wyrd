@@ -1209,6 +1209,8 @@ export const EXECUTION_MARKS: Readonly<Record<string, ExecutionMark>> = {
   running: ['●', 'running', 'run'],
   retrying: ['↻', 'retrying', 'run'],
   waiting: ['◷', 'waiting', 'warn'],
+  awaiting_input: ['◷', 'waiting for input', 'warn'],
+  awaiting_approval: ['◷', 'waiting for approval', 'warn'],
   completed: ['■', 'completed', 'ok'],
   errored: ['✕', 'errored', 'danger'],
   timed_out: ['⧗', 'timed out', 'warn'],

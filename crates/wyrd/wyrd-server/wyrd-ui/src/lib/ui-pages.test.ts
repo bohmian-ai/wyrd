@@ -758,44 +758,60 @@ test('TASK-006: an execution page decides one exact approval occurrence once and
   expect(fetched.mock.calls).toEqual([[`${here}/approvals/apo_release_0`, sent]]);
   expect(occurrence()).toHaveTextContent('Submitting for apo_release_0…');
 
-  // The durable receipt is reported for that occurrence, and the status is read again; it claims no finished continuation.
+  // The durable receipt is the mock's page notice for that occurrence, and the status is read again; it claims no finished continuation.
+  const notice = () => page.container.querySelector('[data-decision-notice]');
   answers[0](Response.json({ approval_id: 'apo_release_0', status: 'approved', actor_id: 'pr_me', decided_at: '2026-10-20T11:50:00Z', reason: 'metrics hold' }));
-  await waitFor(() => expect(occurrence()).toHaveTextContent('Recorded approved by pr_me at 2026-10-20T11:50:00Z. The same execution continues from this decision; its status is read again.'));
+  await waitFor(() => expect(notice()).toHaveTextContent('Accepted by the server: approved apo_release_0 (decided by pr_me at 2026-10-20T11:50:00Z). The same execution continues; no new work was started.'));
   expect(invalidateAll).toHaveBeenCalledTimes(1);
 
-  // A refusal is the server's stable problem, and the readable occurrence stays.
+  // A conflict the reread cannot explain is the server's stable problem, and the readable occurrence stays.
   await fireEvent.click(approve());
-  answers[1](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
-  await waitFor(() => expect(occurrence()).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  answers[1](Response.json({ code: 'WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING', title: 'The approval is no longer pending', status: 409 }, { status: 409 }));
+  await waitFor(() => expect(notice()).toHaveTextContent('WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING'));
   expect(occurrence().querySelector('[data-approval-status]')).toHaveTextContent('pending');
-  // Another decision already accepted is explained by the server and the status read back.
-  await fireEvent.click(approve());
-  answers[2](Response.json({ code: 'WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING', title: 'The approval is no longer pending', status: 409 }, { status: 409 }));
-  await waitFor(() => expect(occurrence()).toHaveTextContent('WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING'));
-  expect(invalidateAll).toHaveBeenCalledTimes(3);
+  expect(invalidateAll).toHaveBeenCalledTimes(2);
 
   // A lost answer is resolved by reading that occurrence back: still pending, it asks for an explicit retry and sends nothing itself.
   await fireEvent.click(approve());
-  answers[3](new TypeError('network'));
-  await waitFor(() => expect(occurrence()).toHaveTextContent('No decision is recorded for apo_release_0; submit it again to retry.'));
-  expect(fetched).toHaveBeenCalledTimes(4);
+  answers[2](new TypeError('network'));
+  await waitFor(() => expect(notice()).toHaveTextContent('No decision is recorded for apo_release_0; submit it again to retry.'));
+  expect(fetched).toHaveBeenCalledTimes(3);
   // When the status cannot be read again, the outcome is unknown rather than pending, and the control is not left waiting.
   vi.mocked(invalidateAll).mockRejectedValueOnce(new Error('offline'));
   await fireEvent.click(approve());
-  answers[4](new TypeError('network'));
-  await waitFor(() => expect(occurrence()).toHaveTextContent('Whether apo_release_0 was decided is unknown: its status could not be read. Refresh before deciding again.'));
+  answers[3](new TypeError('network'));
+  await waitFor(() => expect(notice()).toHaveTextContent('Whether apo_release_0 was decided is unknown: its status could not be read. Refresh before deciding again.'));
   expect(approve()).toBeEnabled();
-  expect(fetched).toHaveBeenCalledTimes(5);
+  expect(fetched).toHaveBeenCalledTimes(4);
   // The retry is the same decision and reason, sent only when asked; this time the server recorded it before its answer was lost.
   const decided = withRecordedDecision(loaded, 'apo_release_0', { status: 'approved', actor_id: 'pr_me', decided_at: '2026-10-20T11:52:00Z' });
   vi.mocked(invalidateAll).mockImplementationOnce(async () => void (await page.rerender({ data: decided } as never)));
   await fireEvent.click(approve());
-  expect(fetched.mock.calls[5]).toEqual([`${here}/approvals/apo_release_0`, sent]);
-  answers[5](Response.json({ code: 'WYRD_SERVICE_503_UNAVAILABLE', title: 'Unavailable', status: 503 }, { status: 503 }));
-  await waitFor(() => expect(occurrence()).toHaveTextContent('The answer was lost; the server records approved by pr_me at 2026-10-20T11:52:00Z.'));
+  expect(fetched.mock.calls[4]).toEqual([`${here}/approvals/apo_release_0`, sent]);
+  answers[4](Response.json({ code: 'WYRD_SERVICE_503_UNAVAILABLE', title: 'Unavailable', status: 503 }, { status: 503 }));
+  await waitFor(() => expect(notice()).toHaveTextContent('Refreshed: the answer was lost; the server records approved apo_release_0 by pr_me at 2026-10-20T11:52:00Z.'));
   expect(occurrence().querySelector('[data-approval-status]')).toHaveTextContent('approved');
   expect(within(occurrence()).queryByRole('button', { name: /Approve/ })).toBeNull();
-  expect(fetched).toHaveBeenCalledTimes(6);
+  expect(fetched).toHaveBeenCalledTimes(5);
+
+  // Someone else decided first: the reread explains the conflict as the mock's notice does, and nothing is applied.
+  await page.rerender({ data: loaded } as never);
+  const otherFirst = withRecordedDecision(loaded, 'apo_release_0', { status: 'rejected', actor_id: 'pr_bo', decided_at: '2026-10-20T11:49:00Z' });
+  vi.mocked(invalidateAll).mockImplementationOnce(async () => void (await page.rerender({ data: otherFirst } as never)));
+  await fireEvent.click(approve());
+  answers[5](Response.json({ code: 'WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING', title: 'The approval is no longer pending', status: 409 }, { status: 409 }));
+  await waitFor(() => expect(notice()).toHaveTextContent('Refreshed: pr_bo already rejected apo_release_0. Your approval was not applied.'));
+  expect(occurrence().querySelector('[data-approval-status]')).toHaveTextContent('rejected');
+
+  // A refusal is the server's stable problem; the occurrence stays readable and offers no decision, as the mock's viewer sees it.
+  await page.rerender({ data: loaded } as never);
+  await fireEvent.click(approve());
+  answers[6](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(notice()).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(occurrence().querySelector('[data-approval-status]')).toHaveTextContent('pending');
+  expect(occurrence().querySelector('[data-viewer-note]')).toHaveTextContent('needs approve on this Verifier and read on its Repository');
+  expect(within(occurrence()).queryByRole('button', { name: /Approve/ })).toBeNull();
+  expect(fetched).toHaveBeenCalledTimes(7);
   fetched.mockRestore();
   page.unmount();
 });

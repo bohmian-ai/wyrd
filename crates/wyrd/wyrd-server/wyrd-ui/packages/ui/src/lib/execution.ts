@@ -261,6 +261,8 @@ export interface NodeState {
   readonly value: string;
   readonly word?: string;
   readonly dim?: boolean;
+  /** The node waits on something outside the execution: an input not provided yet or a pending approval. */
+  readonly wait?: boolean;
 }
 
 type Invocation = CardTypes.ExecutionInvocation;
@@ -285,9 +287,12 @@ function together(values: readonly string[]): Pick<NodeState, 'value' | 'word'> 
 }
 
 /**
- * The recorded state of every step and requirement node, by node key. A step
- * of an unfinished execution with a pending approval occurrence is waiting;
- * otherwise a step reads the last attempt of each of its items and iterations; a requirement
+ * The recorded state of every input, step and requirement node, by node key.
+ * In an unfinished execution, an input the status lists as waiting is not
+ * provided yet, and a step with a pending approval occurrence waits for
+ * approval. A step with no recorded invocation reads its latest decided
+ * occurrence, else waits for input when it reads a waiting input. Otherwise a
+ * step reads the last attempt of each of its items and iterations; a requirement
  * reads the compact result, else its recorded requirement attempts. Nothing
  * here positions or sizes a node.
  */
@@ -295,13 +300,18 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
   const done = settled(status.status);
   const idle: NodeState = { value: done ? 'not run' : 'not started', dim: done };
   const states: Record<string, NodeState> = {};
+  const missing = new Set(done ? [] : (status.waiting ?? []).map((slot) => `input:${slot}`));
+  for (const key of missing) states[key] = { value: 'not provided', wait: true };
   for (const step of graph.steps) {
     const latest = new Map<string, Invocation>();
     for (const item of attemptsOf(items, step.id)) if ((latest.get(slotKey(item.producer))?.producer.attempt ?? 0) <= item.producer.attempt) latest.set(slotKey(item.producer), item);
     const last = [...latest.values()];
     const speculation = last.find((item) => item.speculation !== 'none')?.speculation;
     const dim = speculation === 'discarded' || speculation === 'blocked';
-    if (!done && status.approvals?.some((each) => each.step_id === step.id && each.status === 'pending')) states[step.key] = { value: 'waiting' };
+    const occurrences = status.approvals?.filter((each) => each.step_id === step.id) ?? [];
+    if (!done && occurrences.some((each) => each.status === 'pending')) states[step.key] = { value: 'awaiting_approval', wait: true };
+    else if (last.length === 0 && occurrences.length) states[step.key] = { value: occurrences.at(-1)!.status };
+    else if (last.length === 0 && graph.edges.some((edge) => edge.target === step.key && missing.has(edge.source))) states[step.key] = { value: 'awaiting_input', wait: true };
     else if (last.length === 0) states[step.key] = idle;
     else if (last.some((item) => item.state === 'started')) states[step.key] = done ? { value: 'not finished', dim: true } : { value: 'running', dim };
     else {

@@ -44,19 +44,21 @@
 {:else}
   {@const node = data.node}
   {@const on = graph.selected === node.key}
-  <div class="gn" class:sel={on} class:dim={graph.states?.[node.key]?.dim}>
+  <div class="gn" class:sel={on} class:dim={graph.states?.[node.key]?.dim} class:wait={graph.states?.[node.key]?.wait}>
     {#if data.type !== 'input'}<Handle type="target" position={Position.Left} isConnectable={false} />{/if}
     <button type="button" class="main" data-node={node.key} aria-pressed={on} title={'statement' in node ? node.statement : node.detail} onclick={() => graph.select(node.key)}>
       <span class="row">
         {#if data.type === 'req'}<span class="glyph" aria-hidden="true">◇</span>{/if}
-        <span class="id">{node.id}</span>{@render recorded(graph.states?.[node.key])}<span class="kind">{node.kind}</span>
+        <span class="id">{node.id}</span>{#if data.type === 'req'}{@render recorded(graph.states?.[node.key])}{/if}<span class="kind">{node.kind}</span>
       </span>
       {#if data.type === 'step'}
-        <span class="sub mono needs" title={data.needs}>{data.needs}</span>
+        {#if graph.states?.[node.key]}<span class="row">{@render recorded(graph.states[node.key])}</span>{:else}<span class="sub mono needs" title={data.needs}>{data.needs}</span>{/if}
         <span class="sub mono">{data.node.detail}</span>
         {#if data.node.chips.length}
           <span class="row">{#each data.node.chips as chip (chip)}<span class="chip">{chip}</span>{/each}</span>
         {/if}
+      {:else if data.type === 'input' && graph.states?.[node.key]?.wait}
+        <span class="sub warn">not provided yet</span>
       {:else}
         <span class="sub">{data.type === 'req' ? data.node.statement : data.node.detail}</span>
       {/if}
@@ -138,12 +140,23 @@
   .gn.dim {
     border-style: dashed;
   }
+  .gn.wait {
+    border-color: var(--warn);
+    border-style: dashed;
+  }
+  .sub.warn {
+    color: var(--warn);
+  }
   .gn.dim .main {
     color: var(--muted);
   }
   .state {
     flex: none;
     margin-left: auto;
+  }
+  .row > .state:only-child {
+    margin-left: 0;
+    font: 11px var(--font-mono);
   }
   .state + .kind {
     margin-left: 0;

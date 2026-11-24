@@ -74,16 +74,20 @@
     const body = (await response?.json().catch(() => null)) as { status?: unknown; actor_id?: unknown; decided_at?: unknown; code?: unknown } | null;
     // A failed reread leaves the last status shown; the occurrence below then reads as unknown, never as pending.
     const reread = await invalidateAll().then(() => true, () => false);
+    const shown = reread && data.execution?.result.state === 'populated' ? data.execution.result.data.status.approvals?.find((each) => each.approval_id === input.approval_id) : undefined;
     if (response?.ok && typeof body?.status === 'string')
-      actions[name] = { state: 'success', message: `Recorded ${body.status} by ${body.actor_id} at ${body.decided_at}. The same execution continues from this decision; its status is read again.` };
+      actions[name] = { state: 'success', message: `Accepted by the server: ${body.status} ${input.approval_id} (decided by ${body.actor_id} at ${body.decided_at}). The same execution continues; no new work was started.` };
+    else if (response?.status === 409 && shown?.status === 'expired')
+      actions[name] = { state: 'error', problem: { code: body?.code as string, title: `Refreshed: ${input.approval_id} has expired. Nothing was applied.` } };
+    else if (response?.status === 409 && shown?.actor_id)
+      actions[name] = { state: 'error', problem: { code: body?.code as string, title: `Refreshed: ${shown.actor_id} already ${shown.status} ${input.approval_id}. Your ${input.decision === 'approved' ? 'approval' : 'rejection'} was not applied.` } };
     else if (response && response.status < 500 && body && typeof body.code === 'string')
       actions[name] = { state: response.status === 401 || response.status === 403 ? 'denied' : 'error', problem: body as unknown as Problem };
     else {
-      const shown = reread && data.execution?.result.state === 'populated' ? data.execution.result.data.status.approvals?.find((each) => each.approval_id === input.approval_id) : undefined;
       const code = typeof body?.code === 'string' ? body.code : 'WYRD_SPEC_500_INTERNAL';
       if (!shown) actions[name] = { state: 'error', problem: { code, title: `Whether ${input.approval_id} was decided is unknown: its status could not be read. Refresh before deciding again.` } };
       else if (shown.status === 'pending') actions[name] = { state: 'error', problem: { code, title: `No decision is recorded for ${input.approval_id}; submit it again to retry.` } };
-      else actions[name] = { state: 'success', message: `The answer was lost; the server records ${shown.status}${shown.actor_id ? ` by ${shown.actor_id} at ${shown.decided_at}` : ''}.` };
+      else actions[name] = { state: 'success', message: `Refreshed: the answer was lost; the server records ${shown.status} ${input.approval_id}${shown.actor_id ? ` by ${shown.actor_id} at ${shown.decided_at}` : ''}.` };
     }
   }
 

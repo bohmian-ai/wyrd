@@ -75,6 +75,10 @@
   const reached = $derived([...new Set([...ran, ...approvals.map((each) => each.step_id)])]);
   /** Whether `step` of this unfinished execution waits for a decision. */
   const awaiting = (step: string) => !!data && !settled(data.status.status) && approvals.some((each) => each.step_id === step && each.status === 'pending');
+  /** Inputs this unfinished execution started without and still waits for. */
+  const missing = $derived(data && !settled(data.status.status) ? (data.status.waiting ?? []) : []);
+  /** The waiting inputs the selected step reads, by its declared edges. */
+  const awaitedBy = (key: string) => missing.filter((slot) => definition?.graph.edges.some((edge) => edge.source === `input:${slot}` && edge.target === key));
   /** Requirements judged in the result or by a settled invocation, each once, in recorded order; the only requirements known when the definition is unavailable. */
   const judgedIds = $derived([...new Set([...(data?.status.result?.outcome.requirements.map((each) => each.id) ?? []), ...items.flatMap((each) => (each.state === 'requirement' ? [each.producer.step_id] : []))])]);
   const attempts = $derived(type === 'step' ? attemptsOf(items, id) : []);
@@ -108,6 +112,8 @@
   }
 
   const act = (name: string) => actions[name];
+  /** The host's answer to the last decision, shown once for the page. */
+  const decided = $derived(actions['approval.decide']);
   const off = (name: string) => !onaction || act(name)?.state === 'pending' || act(name)?.state === 'unavailable';
 
   /** The reason typed for each pending occurrence, by approval id. */
@@ -255,31 +261,31 @@
   <div class="approval" data-approval={each.approval_id}>
     <div class="approval-head">
       <span class="label">Human approval</span>
-      <span data-approval-status><StatusMark value={each.status === 'pending' ? 'waiting' : each.status} label={each.status === 'pending' ? 'pending' : undefined} /></span>
+      <span data-approval-status><StatusMark value={each.status === 'pending' ? 'waiting' : each.status} label={each.status === 'pending' ? 'pending' : undefined} badge /></span>
     </div>
-    <p class="description">{each.message}</p>
-    <dl>
-      {@render fact('Occurrence', each.approval_id)}
-      {@render fact('For', [input.executionId, `step ${each.step_id}`, each.item == null ? '' : `item ${each.item}`, each.iteration == null ? '' : `iteration ${each.iteration}`].filter(Boolean).join(' · '))}
-      {@render fact('Decided', each.actor_id ? `${each.status} by ${each.actor_id} at ${each.decided_at}${each.reason ? ` · “${each.reason}”` : ''}` : undefined)}
+    <p class="prose">{each.message}</p>
+    <dl class="dkv">
+      <dt>Occurrence</dt><dd>{each.approval_id}</dd>
+      <dt>For</dt><dd>{[input.executionId, `step ${each.step_id}`, each.item == null ? '' : `item ${each.item}`, each.iteration == null ? '' : `iteration ${each.iteration}`].filter(Boolean).join(' · ')}</dd>
+      {#if each.status === 'pending'}<dt>Expires</dt><dd>with this execution · at its deadline, on cancellation, or when newer work supersedes it</dd>{/if}
+      {#if each.actor_id}<dt>Decided</dt><dd>{each.status} by {each.actor_id} at {each.decided_at}{each.reason ? ` · “${each.reason}”` : ''}</dd>{/if}
     </dl>
-    {#if each.status === 'expired'}
-      <p class="hint">The execution ended before anyone decided.</p>
-    {:else if each.status === 'pending'}
-      <p class="hint">It expires with this execution: when the execution's own deadline passes, it is cancelled or newer work supersedes it.</p>
-    {/if}
     {#if each.status === 'pending' && data && !settled(data.status.status)}
-      <label class="reason">
-        <span class="label">Reason (optional)</span>
-        <textarea rows="2" maxlength="4096" bind:value={reasons[each.approval_id]} disabled={off('approval.decide')}></textarea>
-      </label>
-      <div class="decide">
-        <ActionButton variant="primary" label="Approve" disabled={off('approval.decide')} onclick={() => decide(each, 'approved')} />
-        <ActionButton label="Reject" disabled={off('approval.decide')} onclick={() => decide(each, 'rejected')} />
-        {#if mine && act('approval.decide')?.state === 'pending'}<span class="hint" role="status">Submitting for {each.approval_id}…</span>{/if}
-      </div>
+      {#if onaction && act('approval.decide')?.state !== 'unavailable' && act('approval.decide')?.state !== 'denied'}
+        <label class="field">Reason (optional)
+          <textarea rows="2" maxlength="4096" bind:value={reasons[each.approval_id]} disabled={off('approval.decide')}></textarea>
+        </label>
+        <div class="decide">
+          <ActionButton variant="primary" label="Approve" disabled={off('approval.decide')} onclick={() => decide(each, 'approved')} />
+          <ActionButton label="Reject" disabled={off('approval.decide')} onclick={() => decide(each, 'rejected')} />
+          {#if mine && act('approval.decide')?.state === 'pending'}<span class="small muted" role="status">Submitting for {each.approval_id}…</span>{/if}
+        </div>
+      {:else if act('approval.decide')?.state === 'denied'}
+        <p class="note" data-viewer-note>You can read this approval. Approving or rejecting needs approve on this Verifier and read on its Repository.</p>
+      {:else}
+        <p class="note" data-viewer-note>You can read this approval. This view cannot submit a decision; open the execution in Wyrd to approve or reject.</p>
+      {/if}
     {/if}
-    {#if mine}<ActionNote state={act('approval.decide')} />{/if}
   </div>
 {/snippet}
 
@@ -297,11 +303,15 @@
         {/if}
       {/snippet}
       <dl class="summary">
-        <div class="fact"><dt>Status</dt><dd data-execution-status={status.status}><StatusMark value={status.status} /></dd></div>
+        <div class="fact"><dt>Status</dt><dd data-execution-status={status.status}>
+            <StatusMark value={status.status} badge />
+            {#if missing.length}<span class="tag" data-blocked="awaiting_input">waiting for input <b>{missing.join(', ')}</b></span>{/if}
+            {#if !settled(status.status) && approvals.some((each) => each.status === 'pending')}<span class="tag" data-blocked="awaiting_approval">waiting for approval</span>{/if}
+          </dd></div>
         <div class="fact">
           <dt>Verdict</dt>
           <dd data-verdict={status.result?.outcome.verdict ?? ''}>
-            {#if status.result}<StatusMark value={status.result.outcome.verdict} badge />{:else}<span class="muted">no verdict recorded</span>{/if}
+            {#if status.result}<StatusMark value={status.result.outcome.verdict} badge />{:else}<span class="muted">{settled(status.status) ? 'no recorded verdict' : 'none while running'}</span>{/if}
           </dd>
         </div>
         {#if definition}<div class="fact"><dt>Judged</dt><dd>{judged} of {declared} requirements</dd></div>{/if}
@@ -333,7 +343,6 @@
         {@render fact('Run', status.result?.run_id)}
         {@render fact('Session', status.group_id)}
         {@render fact('Owner Card', status.owner_card_uid)}
-        {#if status.waiting?.length}{@render fact('Waiting for input', status.waiting.join(', '))}{/if}
       </dl>
       {#if status.error}
         <p class="failure" role="note"><span aria-hidden="true">✕</span> {status.error.code}: {status.error.message}</p>
@@ -341,6 +350,11 @@
       {#if definition?.spec.description}<p class="description">{definition.spec.description}</p>{/if}
       <ActionNote state={act('card.open')} />
     </Panel>
+    {#if decided?.state === 'success'}
+      <p class="banner ok" role="status" data-decision-notice>{decided.message}</p>
+    {:else if decided?.state === 'error' || decided?.state === 'denied'}
+      <p class="banner warn" role="status" data-decision-notice>{decided.problem.title} <span class="mono small muted">{decided.problem.code}</span></p>
+    {/if}
 
     {#if definition && states}
       {#key fmtCardRef(definition.ref)}
@@ -360,7 +374,7 @@
               {@const last = attemptsOf(items, step).at(-1)}
               <button type="button" class="tool" aria-pressed={selection.node === `step:${step}`} onclick={() => select({ node: `step:${step}` })}
                 ><span class="label">Step</span> {step}
-                {#if awaiting(step)}<StatusMark value="waiting" />{:else if last}<span class="muted">{recorded(last)}</span>{/if}</button
+                {#if awaiting(step)}<StatusMark value="awaiting_approval" />{:else if last}<span class="muted">{recorded(last)}</span>{/if}</button
               >
             {/each}
           </div>
@@ -416,10 +430,17 @@
       </Panel>
     {:else if type && id}
       <Panel title="{WORDS[type]} {id}" note={type === 'req' ? 'Recorded judgment' : type === 'step' ? 'Recorded invocations' : 'Recorded input'}>
+        {#if type === 'input' && missing.includes(id)}
+          {@const readers = (definition?.graph.edges ?? []).filter((edge) => edge.source === `input:${id}`).map((edge) => (edge.target.startsWith('req:') ? `${edge.target.slice(4)} is judged` : `${edge.target.slice(5)} starts`))}
+          <p class="note box waitnote" data-waiting-input>Not provided yet. The execution started without it{#if readers.length}; {readers.join(' and ')} when it arrives{/if}.</p>
+        {/if}
         {#if type === 'step'}
           {#each approvals.filter((each) => each.step_id === id) as each (each.approval_id)}
             {@render approval(each)}
           {/each}
+          {#if !attempts.length && awaitedBy(`step:${id}`).length}
+            <p class="note box waitnote" data-waiting-input>Waiting for input <b class="mono">{awaitedBy(`step:${id}`).join(', ')}</b>. The execution started without it; this step starts when the evidence is provided. Nothing here is judged until then.</p>
+          {/if}
           {#if attempts.length > 1}
             <div class="attempts" role="radiogroup" aria-label="Invocations of {id}">
               {#each attempts as each (where(each.producer))}
@@ -584,21 +605,110 @@
     border-left-width: 2px;
     border-radius: var(--r);
     padding: 12px 14px;
+    background: var(--bg);
   }
-  .approval-head,
+  .approval-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .decide {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
   .approval-head [data-approval-status] {
     margin-left: auto;
   }
-  .reason {
+  .prose {
+    margin: 0;
+    font-size: 13px;
+  }
+  .dkv {
+    display: grid;
+    grid-template-columns: 120px minmax(0, 1fr);
+    gap: 8px 14px;
+    margin: 0;
+    font: 12px/1.5 var(--font-mono);
+  }
+  .dkv dt,
+  .dkv dd {
+    font: 12px/1.5 var(--font-mono);
+    letter-spacing: normal;
+    text-transform: none;
+  }
+  .dkv dt {
+    color: var(--muted);
+  }
+  .dkv dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .approval .field {
     display: flex;
     flex-direction: column;
     gap: 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .note {
+    max-width: 80ch;
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .note.box {
+    border: 1px dashed var(--border);
+    border-radius: var(--r);
+    padding: 8px 10px;
+  }
+  .waitnote {
+    border-color: var(--warn);
+    color: var(--text);
+  }
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 4px;
+    border: 1px dashed var(--border);
+    border-radius: var(--r);
+    padding: 0 6px;
+    color: var(--muted);
+    font: 11px/17px var(--font-mono);
+    white-space: nowrap;
+  }
+  .tag b {
+    color: var(--text);
+    font-weight: 400;
+  }
+  .banner {
+    margin: 0;
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--declare);
+    border-radius: var(--r);
+    padding: 8px 12px;
+    background: var(--surface);
+    font-size: 13px;
+  }
+  .banner.ok {
+    border-left-color: var(--ok);
+  }
+  .banner.warn {
+    border-left-color: var(--warn);
+  }
+  .small {
+    font-size: 12px;
+  }
+  @media (max-width: 900px) {
+    .dkv {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 2px;
+    }
+    .dkv dd {
+      margin-bottom: 8px;
+    }
   }
   textarea {
     min-height: 52px;

@@ -3143,7 +3143,7 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   const running = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.running, node: 'req:has-answer', details: true })), onaction, actions });
   await waitFor(() => expect(running.container.querySelector('[data-node="step:classify"]')).toBeInTheDocument());
   expect(running.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
-  expect(running.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  expect(running.container.querySelector('[data-verdict]')).toHaveTextContent('none while running');
   expect(running.container).toHaveTextContent('0 of 3 requirements');
   expect(running.container.querySelector('[data-node="step:classify"] [data-status]')).toHaveTextContent('●running');
   expect(within(running.container).getByRole('region', { name: 'Requirement has-answer' })).toHaveTextContent('Not judged yet.');
@@ -3219,21 +3219,22 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
   const load = (node?: string) => loadExecution({ executionId: EXECUTIONS.approval, ...(node ? { node } : {}) }, { executor: blind });
   const view = render(VerificationExecution, { ...(await load()), onaction, actions });
 
-  // Waiting is a status without a verdict; the missing input is named apart from the approvals.
+  // Waiting is a status without a verdict; as in the mock, tags beside it name the missing input apart from the pending approvals.
   const head = within(view.container).getByRole('region', { name: 'Execution' });
   expect(head.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'waiting');
-  expect(head.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
-  expect(within(head).getByText('Waiting for input').nextElementSibling).toHaveTextContent('eval_report');
+  expect(head.querySelector('[data-verdict]')).toHaveTextContent('none while running');
+  expect(head.querySelector('[data-blocked="awaiting_input"]')).toHaveTextContent('waiting for input eval_report');
+  expect(head.querySelector('[data-blocked="awaiting_approval"]')).toHaveTextContent('waiting for approval');
   expect(within(head).getByRole('button', { name: /Cancel execution/ })).toBeEnabled();
 
-  // Without the definition, each approval step is selectable though it recorded no invocation; a pending occurrence reads as waiting.
+  // Without the definition, each approval step is selectable though it recorded no invocation; a pending occurrence reads as waiting for approval.
   const recorded = within(view.container).getByRole('group', { name: 'Recorded without the definition' });
-  expect(within(recorded).getAllByRole('button').map((each) => each.textContent?.replace(/\s+/g, ' ').trim())).toEqual(['Step gather succeeded', 'Step audit started', 'Step release ◷waiting', 'Step review ◷waiting']);
+  expect(within(recorded).getAllByRole('button').map((each) => each.textContent?.replace(/\s+/g, ' ').trim())).toEqual(['Step gather succeeded', 'Step audit started', 'Step release ◷waiting for approval', 'Step review ◷waiting for approval']);
   await fireEvent.click(within(recorded).getByRole('button', { name: /Step release/ }));
   expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:release' } });
   await view.rerender({ ...(await load('step:release')), onaction, actions });
 
-  // Each occurrence: its message, exact identity and recorded state; expiry is the execution's lifecycle, never a timestamp.
+  // Each occurrence, laid out as the mock's approval box: boxed state, message, then Occurrence, For, Expires and Decided rows. Expiry is the execution's lifecycle; the server records no per-occurrence time.
   const step = (id: string) => within(view.container).getByRole('region', { name: `Step ${id}` });
   const occurrence = (id: string) => view.container.querySelector(`[data-approval="${id}"]`) as HTMLElement;
   expect([...step('release').querySelectorAll('[data-approval]')].map((each) => [each.getAttribute('data-approval'), each.querySelector('[data-approval-status]')?.textContent])).toEqual([
@@ -3242,8 +3243,9 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
   ]);
   expect(occurrence('apo_release_0')).toHaveTextContent('Promote item 0 of refund-classifier?');
   expect(occurrence('apo_release_0')).toHaveTextContent('exec_approval · step release · item 0');
-  expect(occurrence('apo_release_0')).toHaveTextContent("It expires with this execution: when the execution's own deadline passes, it is cancelled or newer work supersedes it.");
-  expect(occurrence('apo_release_0').textContent).not.toMatch(/Requested|Expires at|UTC/);
+  expect([...occurrence('apo_release_0').querySelectorAll('dl.dkv dt')].map((each) => each.textContent)).toEqual(['Occurrence', 'For', 'Expires']);
+  expect(occurrence('apo_release_0')).toHaveTextContent('Expireswith this execution · at its deadline, on cancellation, or when newer work supersedes it');
+  expect(occurrence('apo_release_0').querySelector('[data-approval-status] .badge')).not.toBeNull();
   expect(occurrence('apo_release_1')).toHaveTextContent('approved by pr_ana at 2026-10-20T11:40:00Z · “reviewed the diff”');
   expect(within(occurrence('apo_release_1')).queryByRole('button', { name: 'Approve' })).toBeNull();
 
@@ -3265,23 +3267,27 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
   await fireEvent.click(within(pending).getByRole('button', { name: /Reject/ }));
   expect(onaction.mock.calls).toHaveLength(sends);
 
-  // Another step selected meanwhile shows none of that answer, and its own pending occurrence waits too.
+  // Another step selected meanwhile waits too; its decided occurrence keeps its record.
   await view.rerender({ ...(await load('step:review')), onaction, actions });
   expect(within(occurrence('apo_review_1')).getByRole('button', { name: /Approve/ })).toBeDisabled();
-  actions['approval.decide'] = { state: 'denied', problem: denied };
-  await tick();
-  expect(step('review')).not.toHaveTextContent(denied.code);
   expect(occurrence('apo_review_0')).toHaveTextContent('rejected by pr_bo at 2026-10-20T11:41:00Z');
   expect(occurrence('apo_review_0')).toHaveTextContent('Occurrenceapo_review_0');
   expect(occurrence('apo_review_0')).toHaveTextContent('exec_approval · step review · iteration 0');
-  // The answer stays with the occurrence it was sent for.
-  await view.rerender({ ...(await load('step:release')), onaction, actions });
-  expect(occurrence('apo_release_0')).toHaveTextContent(denied.code);
 
   // Reject with no reason sends no reason.
-  await view.rerender({ ...(await load('step:review')), onaction, actions });
+  actions['approval.decide'] = { state: 'success', message: 'Accepted by the server: approved apo_release_0 (decided by pr_me at 2026-10-20T11:50:00Z). The same execution continues; no new work was started.' };
+  await tick();
   await fireEvent.click(within(occurrence('apo_review_1')).getByRole('button', { name: 'Reject' }));
   expect(sent()).toEqual({ name: 'approval.decide', input: { execution_id: 'exec_approval', approval_id: 'apo_review_1', decision: 'rejected' } });
+  // The host's answer is the page notice the mock shows under the header, naming its occurrence.
+  expect(view.container.querySelector('[data-decision-notice]')).toHaveTextContent('Accepted by the server: approved apo_release_0');
+
+  // A refusal is a notice with its stable code, and the occurrence reads as readable but not decidable, as the mock's viewer does.
+  actions['approval.decide'] = { state: 'denied', problem: denied };
+  await tick();
+  expect(view.container.querySelector('[data-decision-notice]')).toHaveTextContent(denied.code);
+  expect(occurrence('apo_review_1').querySelector('[data-viewer-note]')).toHaveTextContent('You can read this approval. Approving or rejecting needs approve on this Verifier and read on its Repository.');
+  expect(within(occurrence('apo_review_1')).queryByRole('button', { name: 'Approve' })).toBeNull();
   view.unmount();
 
   // Ended before anyone decided: the occurrence is recorded as expired, with nothing to submit.
@@ -3289,14 +3295,37 @@ test('TASK-006: a waiting execution shows each reached approval occurrence and d
   const ended = await loadExecution({ executionId: EXECUTIONS.approval, node: 'step:release' }, { executor: fixtureRecording((request) => (request.op === 'verification.get_execution' ? { ok: true, value: expired as never } : undefined)).executor });
   const late = render(VerificationExecution, { ...ended, onaction });
   expect(late.container.querySelector('[data-approval="apo_release_0"] [data-approval-status]')).toHaveTextContent('⧗expired');
-  expect(late.container.querySelector('[data-approval="apo_release_0"]')).toHaveTextContent('The execution ended before anyone decided.');
   expect(within(late.container).queryByRole('button', { name: 'Approve' })).toBeNull();
   late.unmount();
 
-  // A host without actions draws the occurrence and sends nothing.
+  // A host without actions draws the occurrence with the mock's read-only note and nothing to send.
   const readOnly = render(VerificationExecution, await load('step:release'));
-  expect(within(readOnly.container.querySelector('[data-approval="apo_release_0"]') as HTMLElement).getByRole('button', { name: 'Approve' })).toBeDisabled();
+  const shown = readOnly.container.querySelector('[data-approval="apo_release_0"]') as HTMLElement;
+  expect(within(shown).queryByRole('button', { name: 'Approve' })).toBeNull();
+  expect(shown.querySelector('[data-viewer-note]')).toHaveTextContent('You can read this approval. This view cannot submit a decision; open the execution in Wyrd to approve or reject.');
   readOnly.unmount();
+
+  // With the definition, each graph node says what it waits for, as the mock's nodes do: an input not provided yet,
+  // a step waiting for that input, a step waiting for approval, and a decided step the server has not yet recorded as an invocation.
+  const read = { kind: 'assert', path: 'inputs.eval_report.f1', operator: 'is_truthy' };
+  const parked = definitionGraph({
+    inputs: { eval_report: { type: 'json', deferred: true } },
+    steps: [
+      { id: 'release', action: { kind: 'approval', message: 'Promote?' } },
+      { id: 'review', action: { kind: 'approval', message: 'Reviewed?' } },
+      { id: 'compare', action: { kind: 'code', entrypoint: 'f', source: { inline: '' } }, requirements: [{ id: 'beats', statement: 's', check: read }] }
+    ]
+  } as never);
+  const states = executionStates(parked, executionStatus.exec_approval, []);
+  expect([states['input:eval_report'], states['step:release'], states['step:review'], states['step:compare']]).toEqual([
+    { value: 'not provided', wait: true },
+    { value: 'awaiting_approval', wait: true },
+    { value: 'awaiting_approval', wait: true },
+    { value: 'awaiting_input', wait: true }
+  ]);
+  // Once review's only occurrence is decided, the step reads that decision until its invocation is recorded.
+  const decidedOnly = { ...executionStatus.exec_approval, approvals: executionStatus.exec_approval.approvals?.filter((each) => each.approval_id === 'apo_review_0') };
+  expect(executionStates(parked, decidedOnly, [])['step:review']).toEqual({ value: 'rejected' });
 });
 test('a retained text file previews as inert text within the bound, and says when it cannot', async () => {
   const file = (output: string) => ({ executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output });
@@ -4194,5 +4223,5 @@ test('a requirement settled while other work runs stays readable from its record
   expect(judgment).toHaveTextContent('iteration 2 · attempt 1');
   expect(view.container).not.toHaveTextContent('Not judged yet.');
   expect(view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
-  expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('none while running');
 });

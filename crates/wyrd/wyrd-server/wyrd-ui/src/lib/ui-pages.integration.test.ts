@@ -1646,7 +1646,7 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   await page.goto(`${at(tenant)}?node=outputs`);
   await expect.poll(status).toBe('cancelled');
   expect(await outputs.locator('tbody tr').count()).toBe(4);
-  expect(await page.locator('[data-verdict]').textContent()).toContain('no verdict recorded');
+  expect(await page.locator('[data-verdict]').textContent()).toContain('no recorded verdict');
   expect(await page.getByRole('button', { name: 'Cancel execution' }).count()).toBe(0);
   await capture('settled');
   await page.setViewportSize({ width: 1280, height: 720 });
@@ -2665,18 +2665,21 @@ reviewing('TASK-006: an approver reads each waiting approval in the execution pa
     await vi.waitFor(async () => expect((await occurrences()).map((each) => each.status)).toEqual(['pending', 'pending']), { timeout: 30_000, interval: 200 });
     const [review, release] = await occurrences();
 
-    // The page says it waits for input, with no verdict, and marks both approval steps waiting.
+    // As in the mock: the status is tagged waiting for input and for approval with no verdict, the input node is not provided yet, and both approval steps wait for approval.
     await page.goto(`${base}/verify/executions/${executionId}?node=step%3Areview`);
     const reviewBox = page.locator(`[data-approval="${review.approval_id}"]`);
     await expect.poll(() => reviewBox.textContent()).toContain('Reviewed?');
-    expect(await page.locator('[data-verdict]').textContent()).toBe('no verdict recorded');
-    await expect.poll(() => page.getByText('Waiting for input').count()).toBe(1);
+    expect(await page.locator('[data-verdict]').textContent()).toBe('none while running');
+    expect(await page.locator('[data-blocked="awaiting_input"]').textContent()).toBe('waiting for input ci');
+    expect(await page.locator('[data-blocked="awaiting_approval"]').textContent()).toBe('waiting for approval');
+    expect(await page.locator('[data-node="input:ci"]').textContent()).toContain('not provided yet');
+    for (const step of ['review', 'release']) expect(await page.locator(`[data-node="step:${step}"]`).textContent()).toContain('waiting for approval');
     await captureRepositories(page, 'execution-approval-pending');
 
     // Approve the review with a reason through its button: the receipt is reported and the reread shows it approved.
     await reviewBox.getByLabel('Reason (optional)').fill('reviewed the diff');
     await reviewBox.getByRole('button', { name: 'Approve' }).click();
-    await expect.poll(() => reviewBox.textContent(), { timeout: 30_000 }).toMatch(/Recorded approved by \S+ at \S+\. The same execution continues/);
+    await expect.poll(() => page.locator('[data-decision-notice]').textContent(), { timeout: 30_000 }).toMatch(new RegExp(`^Accepted by the server: approved ${review.approval_id} \\(decided by \\S+ at \\S+\\)\\. The same execution continues; no new work was started\\.$`));
     await expect.poll(() => reviewBox.locator('[data-approval-status]').textContent()).toContain('approved');
     expect(await reviewBox.getByRole('button', { name: 'Approve' }).count()).toBe(0);
 

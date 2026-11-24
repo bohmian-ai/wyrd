@@ -2478,7 +2478,7 @@ deferred('TASK-005: a requirement judged while its execution waits stays readabl
   expect(judgment).toHaveTextContent('attempt 1');
   expect(view.container).not.toHaveTextContent('Not judged yet.');
   expect(view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'waiting');
-  expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('none while running');
   view.unmount();
 });
 

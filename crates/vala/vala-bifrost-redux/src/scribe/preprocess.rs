@@ -1,11 +1,11 @@
 //! Blocking preprocessing for admitted appends.
 
+use crate::scribe::wal::{ContentDigest, ContentHasher};
 use arrow::array::{Array, ArrayData};
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use iceberg::spec::Schema;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -182,7 +182,7 @@ impl PreparedAppend {
     /// an honest retry reproduces the digest its first attempt fenced.
     /// Returns `None` when the set is not exactly the ordinals `0..count` or a
     /// count does not fit its field.
-    pub(crate) fn logical_identity(&self) -> Option<([u8; 32], u32, u64)> {
+    pub(crate) fn logical_identity(&self) -> Option<(ContentDigest, u32, u64)> {
         let PreparedSliceSet::Materialized(slices) = &self.slices;
         let mut ordered: Vec<&PreparedSlice> = slices.iter().collect();
         ordered.sort_unstable_by_key(|slice| slice.id.slice_index);
@@ -330,7 +330,10 @@ impl NativeSliceProducer {
     /// or day materialization fails, or Arrow IPC encoding fails, and
     /// [`ScribeError::DecodedPayloadTooLarge`] when actual output exceeds the
     /// expanded ceiling.
-    pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
+    pub(crate) fn next_slice(
+        &mut self,
+        encoders: &EncoderContexts,
+    ) -> Result<Option<PreparedSlice>, ScribeError> {
         loop {
             if let Some(current) = self.current.as_mut() {
                 if current.next_partition < current.partitions.len() {
@@ -340,6 +343,7 @@ impl NativeSliceProducer {
                     current.next_partition += 1;
                     let mut slice = prepare_slice(
                         SliceContext {
+                            encoders,
                             batch_id: self.source.batch_id,
                             request_id: self.request_id,
                             tenant: self.tenant,
@@ -454,7 +458,7 @@ pub(crate) struct PreparedSlice {
 /// overflows its `usize` accumulator.
 fn digest_array_data(
     data: &ArrayData,
-    digest: &mut Sha256,
+    digest: &mut ContentHasher,
     bytes: &mut usize,
 ) -> Result<(), ScribeError> {
     digest.update(data.len().to_le_bytes());
@@ -494,6 +498,17 @@ fn is_volatile_column(name: &str) -> bool {
         && !crate::tables::managed_columns::is_correlation_column(name)
 }
 
+/// Reports whether `batch_id` was derived from its rows' content.
+///
+/// Gate derives each OTLP batch id from the XXH3-128 logical identity of the
+/// accepted rows and marks it UUID version 8; client ids must be version 7.
+/// Such an id is the content, so its slices carry an empty logical identity
+/// (zero digest and length) on the live path and in replay alike, and a retry
+/// is recognised by id alone.
+pub(crate) fn is_content_derived(batch_id: Uuid) -> bool {
+    batch_id.get_version() == Some(uuid::Version::Custom)
+}
+
 /// Computes the stable logical Arrow identity used only for retained retries.
 ///
 /// Server-generated request and time columns change across a legitimate client
@@ -507,8 +522,10 @@ fn is_volatile_column(name: &str) -> bool {
 ///
 /// Returns an internal error when the stable buffer length exceeds its WAL-v8
 /// metadata representation.
-pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
-    let mut digest = Sha256::new();
+pub(crate) fn logical_data_identity(
+    rows: &RecordBatch,
+) -> Result<(ContentDigest, u32), ScribeError> {
+    let mut digest = ContentHasher::new();
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
         // The request and time columns describe *which* attempt carried the
@@ -524,12 +541,12 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
         let before = bytes;
         digest_array_data(&column.to_data(), &mut digest, &mut bytes)?;
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let mut column_digest = Sha256::new();
+            let mut column_digest = ContentHasher::new();
             let mut column_bytes = 0_usize;
             digest_array_data(&column.to_data(), &mut column_digest, &mut column_bytes)?;
             tracing::debug!(
                 column = field.name().as_str(),
-                digest = %hex_digest(&column_digest.finalize().into()),
+                digest = %hex_digest(&column_digest.finish()),
                 bytes = bytes.saturating_sub(before),
                 "logical batch identity column contribution"
             );
@@ -538,7 +555,7 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
     let bytes = u32::try_from(bytes).map_err(|_| ScribeError::Internal {
         detail: "logical Arrow identity exceeds its u32 bound".to_owned(),
     })?;
-    Ok((digest.finalize().into(), bytes))
+    Ok((digest.finish(), bytes))
 }
 
 /// Idempotency identity for one logical slice within a routed batch.
@@ -580,6 +597,7 @@ struct PreparedRowsContext {
 fn prepare_rows(
     rows: AdmittedRows,
     context: PreparedRowsContext,
+    encoders: &EncoderContexts,
 ) -> Result<(PreparedSliceSet, usize), ScribeError> {
     let PreparedRowsContext {
         batch_id,
@@ -595,6 +613,7 @@ fn prepare_rows(
             append_prepared_slices(
                 &mut slices,
                 SliceContext {
+                    encoders,
                     batch_id,
                     request_id,
                     tenant,
@@ -624,7 +643,7 @@ fn prepare_rows(
             let mut producer =
                 NativeSliceProducer::new(*native, request_id, tenant, table, partition_scheme);
             let mut slices = Vec::new();
-            while let Some(slice) = producer.next_slice()? {
+            while let Some(slice) = producer.next_slice(encoders)? {
                 slices.push(slice);
             }
             if slices.is_empty() {
@@ -665,7 +684,10 @@ fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError
 ///
 /// Returns the preparation or category-transition error after notifying the
 /// durable waiter.
-pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
+pub(crate) fn prepare_append(
+    admitted: AdmittedAppend,
+    encoders: &EncoderContexts,
+) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         batch_id,
         request_id,
@@ -695,6 +717,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             partition_scheme,
             memory_bytes: memory.bytes(),
         },
+        encoders,
     );
     let (slices, prepared_bytes) = match slices_result {
         Ok(result) => result,
@@ -768,6 +791,8 @@ fn append_prepared_slices(
 /// Borrowed immutable context shared by each current slice preparation.
 #[derive(Clone, Copy)]
 struct SliceContext<'a> {
+    /// The lane's reusable IPC encoder contexts.
+    encoders: &'a EncoderContexts,
     /// Stable logical batch identity.
     batch_id: Uuid,
     /// Request correlation stamped on the produced slice.
@@ -794,14 +819,17 @@ fn prepare_slice(
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition)
         .with_table_version(context.table_version);
     let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
-    let data_payload = encode_ipc(&rows, memtable_bytes)?;
+    let data_payload = context.encoders.encode(&rows)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
         batch_id = %context.batch_id,
         table = %context.table.fqn(),
     );
-    let (logical_data_digest, logical_data_len) =
-        identity_span.in_scope(|| logical_data_identity(&rows))?;
+    let (logical_data_digest, logical_data_len) = if is_content_derived(context.batch_id) {
+        (ContentDigest::default(), 0)
+    } else {
+        identity_span.in_scope(|| logical_data_identity(&rows))?
+    };
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -825,49 +853,199 @@ fn prepare_slice(
         memtable_bytes,
     })
 }
+thread_local! {
+    /// This thread's index among the ingress lane's workers; `None` on every
+    /// other thread, including other Rayon pools' workers.
+    static INGRESS_WORKER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 
-/// Encodes one current day as a ZSTD level-1 Arrow IPC stream, in one pass.
+/// Marks the current thread as ingress lane worker `index`, the only threads
+/// whose [`EncoderContexts`] slot is used; the ingress pool's start handler.
+pub(crate) fn mark_ingress_worker(index: usize) {
+    INGRESS_WORKER.set(Some(index));
+}
+
+/// One ingress worker's IPC write context, kept between streams, and the
+/// `Metadata` lease charging the bytes it retains; it outlives every request,
+/// so no request's `Prepared` charge carries it.
+#[derive(Debug)]
+struct RetainedEncoder {
+    /// Compressor and scratch the next stream on this worker reuses.
+    context: arrow::ipc::writer::IpcWriteContext,
+    /// Charges exactly [`arrow::ipc::writer::IpcWriteContext::retained_bytes`].
+    lease: ScribeMemoryLease,
+}
+
+/// The ingress lane's reusable slice encoder contexts: one slot per worker
+/// thread, each charged to Scribe memory while it holds a context.
 ///
-/// The payload is written into one allocation of `capacity` bytes, the
-/// rows' retained Arrow bytes, which compression keeps it under in the common
-/// case, then shrunk to its compressed length so the WAL does not retain the
-/// spare capacity. The stream stays within
-/// [`crate::scribe::material_plan::wal_payload_bound`], which canonical
-/// admission reserved, so it is not counted again here. Every WAL reader
-/// decodes it with Arrow's standard `StreamReader`.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when either Arrow step fails.
-fn encode_ipc(rows: &RecordBatch, capacity: usize) -> Result<Bytes, ScribeError> {
-    let options = arrow::ipc::writer::IpcWriteOptions::default()
-        .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
-        .and_then(|options| {
-            options.try_with_compression_level(Some(
-                crate::scribe::material_plan::WAL_IPC_COMPRESSION_LEVEL,
-            ))
-        })
+/// A context carries only compressor and scratch allocations; every stream
+/// starts its own schema, dictionary and end-of-stream state, so its bytes
+/// equal a freshly encoded stream's. A worker takes its slot's context out
+/// for one encode and restores it only after the stream finishes, re-charged
+/// at its measured size: a failed or panicking encode drops the context and
+/// its lease with the encoder, a context larger than the cap or one the
+/// memory root refuses is dropped, and [`Self::clear`] releases every slot
+/// at shutdown. A caller outside the lane's workers, or the empty default,
+/// encodes with a fresh context and keeps nothing.
+#[derive(Debug, Default)]
+pub(crate) struct EncoderContexts {
+    /// One slot per lane worker, indexed by its [`mark_ingress_worker`]
+    /// index; only that worker locks it, so the lock is never contended.
+    slots: Box<[std::sync::Mutex<Option<RetainedEncoder>>]>,
+    /// The memory root retained contexts are charged to.
+    resources: Option<crate::resources::ScribeResources>,
+    /// Largest retained context kept for reuse.
+    cap: usize,
+    /// Set by [`Self::clear`]; a closed set keeps nothing.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl EncoderContexts {
+    /// Creates `workers` empty slots charged to `resources`, each keeping a
+    /// context of at most `cap` retained bytes.
+    pub(crate) fn new(
+        workers: usize,
+        resources: crate::resources::ScribeResources,
+        cap: usize,
+    ) -> Self {
+        Self {
+            slots: (0..workers).map(|_| std::sync::Mutex::new(None)).collect(),
+            resources: Some(resources),
+            cap,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Encodes one slice as a standalone compressed Arrow IPC stream,
+    /// joined into one exact-length payload the WAL writes in a single
+    /// vectored write.
+    ///
+    /// The payload is byte for byte the stream Arrow's `StreamWriter` writes
+    /// with the same options, whether or not the worker's context was reused,
+    /// so every WAL reader still decodes it with Arrow's standard
+    /// `StreamReader`. The stream stays within
+    /// [`crate::scribe::material_plan::wal_payload_bound`], which canonical
+    /// admission reserved; its length is charged with the slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when compression is unavailable,
+    /// either Arrow step fails, or memory accounting is poisoned while the
+    /// context is re-charged. A busy memory root only drops the context.
+    pub(crate) fn encode(&self, rows: &RecordBatch) -> Result<Bytes, ScribeError> {
+        let slot = INGRESS_WORKER.get().and_then(|index| self.slots.get(index));
+        let retained = slot.and_then(|slot| slot.lock().ok()?.take());
+        let (context, lease) = retained.map_or_else(
+            || (arrow::ipc::writer::IpcWriteContext::default(), None),
+            |retained| (retained.context, Some(retained.lease)),
+        );
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
+            .and_then(|options| {
+                options.try_with_compression_level(Some(
+                    crate::scribe::material_plan::WAL_IPC_COMPRESSION_LEVEL,
+                ))
+            })
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("Arrow IPC compression unavailable: {error}"),
+            })?;
+        let mut encoder = arrow::ipc::writer::StreamEncoder::try_new_with_context(
+            &rows.schema(),
+            options,
+            context,
+        )
         .map_err(|error| ScribeError::Internal {
-            detail: format!("Arrow IPC compression unavailable: {error}"),
+            detail: format!("Arrow IPC encode init failed: {error}"),
         })?;
-    let mut payload = Vec::with_capacity(capacity);
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
-        &mut payload,
-        &rows.schema(),
-        options,
-    )
-    .map_err(|error| ScribeError::Internal {
-        detail: format!("Arrow IPC encode init failed: {error}"),
-    })?;
-    writer.write(rows).map_err(|error| ScribeError::Internal {
-        detail: format!("Arrow IPC encode failed: {error}"),
-    })?;
-    writer.finish().map_err(|error| ScribeError::Internal {
-        detail: format!("Arrow IPC encode finish failed: {error}"),
-    })?;
-    drop(writer);
-    payload.shrink_to_fit();
-    Ok(Bytes::from(payload))
+        let mut chunks = encoder
+            .encode(rows)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("Arrow IPC encode failed: {error}"),
+            })?;
+        let (tail, context) =
+            encoder
+                .finish_with_context()
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("Arrow IPC encode finish failed: {error}"),
+                })?;
+        chunks.extend(tail);
+        if let Some(slot) = slot {
+            self.restore(slot, context, lease)?;
+        }
+        let mut payload = Vec::with_capacity(chunks.iter().map(arrow::buffer::Buffer::len).sum());
+        for chunk in &chunks {
+            payload.extend_from_slice(chunk.as_slice());
+        }
+        Ok(Bytes::from(payload))
+    }
+
+    /// Keeps `context` in `slot`, charged at its measured size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when memory accounting is poisoned.
+    fn restore(
+        &self,
+        slot: &std::sync::Mutex<Option<RetainedEncoder>>,
+        mut context: arrow::ipc::writer::IpcWriteContext,
+        lease: Option<ScribeMemoryLease>,
+    ) -> Result<(), ScribeError> {
+        let bytes = context.retained_bytes();
+        let Some(resources) = &self.resources else {
+            return Ok(());
+        };
+        if bytes == 0 || bytes > self.cap || self.is_closed() {
+            return Ok(());
+        }
+        let lease = match lease {
+            Some(mut lease) => lease.resize_ingress(bytes).map(|()| lease),
+            None => resources.try_reserve_ingress(MemoryCategory::Metadata, bytes),
+        };
+        let lease = match lease {
+            Ok(lease) => lease,
+            Err(ScribeError::IngestBusy { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if let Ok(mut slot) = slot.lock() {
+            *slot = Some(RetainedEncoder { context, lease });
+            // A clear that raced this restore must not leave it charged.
+            if self.is_closed() {
+                slot.take();
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::clear`] has closed this set.
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Releases every retained context and keeps none from now on.
+    pub(crate) fn clear(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        for slot in &self.slots {
+            if let Ok(mut slot) = slot.lock() {
+                slot.take();
+            }
+        }
+    }
+
+    /// Returns the bytes every slot's lease charges: worker-owned memory no
+    /// request or shard holds, reported by Scribe inspection.
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                slot.lock()
+                    .ok()?
+                    .as_ref()
+                    .map(|retained| retained.lease.bytes())
+            })
+            .sum()
+    }
 }
 
 fn notify_completion(
@@ -883,7 +1061,7 @@ fn notify_completion(
 ///
 /// Only diagnostics use this: the durable identity always compares raw bytes.
 #[must_use]
-fn hex_digest(digest: &[u8; 32]) -> String {
+pub(crate) fn hex_digest(digest: &ContentDigest) -> String {
     use std::fmt::Write as _;
     digest
         .iter()
@@ -914,8 +1092,8 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// carries the result; replay reads that durable field rather than recomputing
 /// it, so the two paths cannot drift.
 pub(crate) struct LogicalBatchDigest {
-    /// Running SHA-256 over every slice pushed so far, in ordinal order.
-    inner: Sha256,
+    /// Running XXH3-128 over every slice pushed so far, in ordinal order.
+    inner: ContentHasher,
 }
 
 impl LogicalBatchDigest {
@@ -923,7 +1101,7 @@ impl LogicalBatchDigest {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            inner: Sha256::new(),
+            inner: ContentHasher::new(),
         }
     }
 
@@ -935,7 +1113,7 @@ impl LogicalBatchDigest {
         &mut self,
         slice_index: u32,
         schema_fingerprint: &[u8; 32],
-        data_digest: &[u8; 32],
+        data_digest: &ContentDigest,
         data_len: u32,
     ) {
         self.inner.update(slice_index.to_le_bytes());
@@ -946,8 +1124,8 @@ impl LogicalBatchDigest {
 
     /// Returns the canonical digest over every pushed slice.
     #[must_use]
-    pub(crate) fn finish(self) -> [u8; 32] {
-        self.inner.finalize().into()
+    pub(crate) fn finish(self) -> ContentDigest {
+        self.inner.finish()
     }
 }
 
@@ -968,7 +1146,7 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{WORKLOAD_CARD_UID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
-    use super::{NativeAdmittedRows, NativeSliceProducer, encode_ipc, logical_data_identity};
+    use super::{EncoderContexts, NativeAdmittedRows, NativeSliceProducer, logical_data_identity};
     use crate::catalog::TableRef;
     use crate::catalog::{TimeAxis, TimeGranularity};
     use crate::contracts::ScribeError;
@@ -1183,7 +1361,8 @@ mod tests {
             DataType::Decimal128(10, 2),
             true,
         )]));
-        let refusal = producer(Bytes::from(bytes), registered).next_slice();
+        let refusal =
+            producer(Bytes::from(bytes), registered).next_slice(&EncoderContexts::default());
         assert!(
             matches!(refusal, Err(ScribeError::FingerprintMismatch { .. })),
             "{refusal:?}"
@@ -1201,7 +1380,7 @@ mod tests {
         let mut producer = producer(bytes, fingerprint);
         producer.source.expanded_limit_bytes = 1;
         assert!(matches!(
-            producer.next_slice(),
+            producer.next_slice(&EncoderContexts::default()),
             Err(ScribeError::DecodedPayloadTooLarge { limit: 1, .. })
         ));
     }
@@ -1283,7 +1462,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(map) as _]).expect("map batch");
 
-        let payload = encode_ipc(&batch, 0).expect("encodes");
+        let payload = joined(EncoderContexts::default().encode(&batch).expect("encodes"));
 
         assert!(
             payload.len()
@@ -1294,6 +1473,267 @@ mod tests {
                 .expect("valid stream");
         assert_eq!(reader.next().expect("one batch").expect("decodes"), batch);
         assert!(reader.next().is_none());
+    }
+
+    /// Copies an encoded payload into the bytes a reader decodes.
+    fn joined(payload: Bytes) -> Vec<u8> {
+        payload.to_vec()
+    }
+
+    /// Encodes `rows` through Arrow's `StreamWriter`, the exact byte
+    /// reference for a slice's WAL payload.
+    fn reference_ipc(rows: &RecordBatch) -> Vec<u8> {
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
+            .and_then(|options| {
+                options.try_with_compression_level(Some(
+                    crate::scribe::material_plan::WAL_IPC_COMPRESSION_LEVEL,
+                ))
+            })
+            .expect("WAL compression");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new_with_options(&mut bytes, &rows.schema(), options)
+            .expect("reference writer");
+        writer.write(rows).expect("reference batch");
+        writer.finish().expect("reference finish");
+        drop(writer);
+        bytes
+    }
+
+    /// A prepared slice's WAL payload is byte for byte the stream Arrow's
+    /// `StreamWriter` produces, for nested, null, dictionary and offset-sliced
+    /// columns and for each tenant's independent slice.
+    #[test]
+    fn prepared_slices_carry_reference_ipc_bytes() {
+        use arrow::array::{DictionaryArray, ListArray, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let list = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(
+            (0..64_i64)
+                .map(|row| (row % 5 != 0).then(|| (0..row % 4).map(Some).collect::<Vec<_>>())),
+        );
+        let dictionary: DictionaryArray<Int32Type> = (0..64)
+            .map(|row| (row % 3 != 0).then_some(["x", "y", "z"][row % 3]))
+            .collect();
+        let text =
+            StringArray::from_iter((0..64).map(|row| (row % 7 != 0).then(|| format!("v{row}"))));
+        let rows = RecordBatch::try_from_iter(vec![
+            ("list", Arc::new(list) as ArrayRef),
+            ("dictionary", Arc::new(dictionary) as ArrayRef),
+            ("text", Arc::new(text) as ArrayRef),
+        ])
+        .expect("mixed batch")
+        .slice(3, 50);
+        let table = TableRef::new(BifrostNamespace::Bifrost, "mixed");
+        for tenant in [DataTenantId::new_v7(), DataTenantId::new_v7()] {
+            let slice = super::prepare_slice(
+                super::SliceContext {
+                    encoders: &EncoderContexts::default(),
+                    batch_id: uuid::Uuid::new_v4(),
+                    request_id: uuid::Uuid::new_v4(),
+                    tenant,
+                    table: &table,
+                    table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
+                },
+                crate::catalog::PhysicalPartition::time_only(crate::test_support::day_partition(
+                    2026, 1, 1,
+                )),
+                rows.clone(),
+            )
+            .expect("prepares slice");
+            assert_eq!(slice.wal_append.data.as_ref(), reference_ipc(&rows));
+        }
+    }
+
+    /// A lane worker reuses one charged encoder context across independent
+    /// streams of alternating tenants, schemas and dictionaries, while every
+    /// earlier stream's output stays live: each stream is byte for byte the
+    /// fresh-writer reference, the slot's lease charges exactly the retained
+    /// bytes, a context over the cap or refused by the memory root is
+    /// dropped without failing the encode, and clearing releases everything.
+    #[test]
+    fn lane_workers_reuse_charged_encoder_contexts() {
+        use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
+        use arrow::array::{DictionaryArray, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let roles =
+            BifrostRuntimeResources::composed_for_test(1 << 30, 1 << 30, [BifrostRole::Scribe]);
+        let scribe = roles.scribe().expect("Scribe role").clone();
+        let charged = || {
+            scribe
+                .snapshot()
+                .expect("snapshot")
+                .scribe_memory_used_bytes
+        };
+        let worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .start_handler(super::mark_ingress_worker)
+            .build()
+            .expect("one worker");
+        let dictionary: DictionaryArray<Int32Type> =
+            (0..512).map(|row| ["x", "y", "z"][row % 3]).collect();
+        let streams = [
+            RecordBatch::try_from_iter(vec![("dictionary", Arc::new(dictionary) as ArrayRef)])
+                .expect("dictionary rows"),
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from_iter_values(0..2048)) as ArrayRef,
+            )])
+            .expect("integer rows"),
+            RecordBatch::try_from_iter(vec![(
+                "text",
+                Arc::new(StringArray::from_iter_values(
+                    (0..512).map(|row| format!("t{row}")),
+                )) as ArrayRef,
+            )])
+            .expect("text rows"),
+        ];
+
+        let encoders = EncoderContexts::new(1, scribe.clone(), usize::MAX);
+        let mut outputs = Vec::new();
+        for rows in streams.iter().cycle().take(6) {
+            let chunks = worker.install(|| encoders.encode(rows)).expect("encodes");
+            assert_eq!(joined(chunks.clone()), reference_ipc(rows));
+            outputs.push(chunks);
+            assert!(encoders.charged_bytes() > 0, "the worker kept no context");
+            assert_eq!(charged(), encoders.charged_bytes());
+            assert_eq!(
+                scribe.memory_snapshot().categories[ScribeMemoryCategory::Metadata as usize],
+                encoders.charged_bytes(),
+                "a retained context is worker metadata, not a request's prepared slice"
+            );
+        }
+        let nested = DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Utf8),
+            )),
+        );
+        let unencodable =
+            RecordBatch::try_from_iter(vec![("nested", arrow::array::new_null_array(&nested, 1))])
+                .expect("dictionary-of-dictionary rows");
+        assert!(worker.install(|| encoders.encode(&unencodable)).is_err());
+        assert_eq!(
+            (encoders.charged_bytes(), charged()),
+            (0, 0),
+            "a failed encode drops its context and lease"
+        );
+        worker
+            .install(|| encoders.encode(&streams[0]))
+            .expect("encodes after a failure");
+        assert!(encoders.charged_bytes() > 0);
+
+        encoders.clear();
+        assert_eq!(charged(), 0);
+        let after_clear = worker
+            .install(|| encoders.encode(&streams[0]))
+            .expect("encodes");
+        assert_eq!(joined(after_clear), reference_ipc(&streams[0]));
+        assert_eq!(charged(), 0, "a cleared set keeps nothing");
+
+        let oversized = EncoderContexts::new(1, scribe.clone(), 1);
+        worker
+            .install(|| oversized.encode(&streams[1]))
+            .expect("encodes");
+        assert_eq!((oversized.charged_bytes(), charged()), (0, 0));
+
+        let hog = scribe
+            .try_reserve_ingress(ScribeMemoryCategory::Raw, scribe.ingress_limit_bytes())
+            .expect("whole ingress budget");
+        let refused = EncoderContexts::new(1, scribe.clone(), usize::MAX);
+        let chunks = worker
+            .install(|| refused.encode(&streams[2]))
+            .expect("a refused charge still encodes");
+        assert_eq!(joined(chunks), reference_ipc(&streams[2]));
+        assert_eq!(refused.charged_bytes(), 0);
+        drop(hog);
+        assert_eq!(charged(), 0);
+
+        let outside = EncoderContexts::new(1, scribe, usize::MAX);
+        outside.encode(&streams[0]).expect("encodes off the lane");
+        let unrelated = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("another pool");
+        unrelated
+            .install(|| outside.encode(&streams[0]))
+            .expect("encodes on another pool");
+        assert_eq!(
+            outside.charged_bytes(),
+            0,
+            "a caller off the lane keeps nothing"
+        );
+    }
+
+    /// A closure that runs while an encode holds its worker's context keeps
+    /// that context charged until the encode settles, then never restores it.
+    ///
+    /// The in-flight state is the one [`EncoderContexts::encode`] creates: the
+    /// slot's context and lease taken out for the stream. Completion restores
+    /// through [`EncoderContexts::restore`]; failure drops both.
+    ///
+    /// # Panics
+    /// Panics when encoding fails, the in-flight lease is released before it
+    /// settles, or a settled encode refills or stays charged in a closed set.
+    #[test]
+    fn closure_during_encode_keeps_its_lease_until_settlement() {
+        use crate::resources::{BifrostRole, BifrostRuntimeResources};
+
+        let roles =
+            BifrostRuntimeResources::composed_for_test(1 << 30, 1 << 30, [BifrostRole::Scribe]);
+        let scribe = roles.scribe().expect("Scribe role").clone();
+        let charged = || {
+            scribe
+                .snapshot()
+                .expect("snapshot")
+                .scribe_memory_used_bytes
+        };
+        let worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .start_handler(super::mark_ingress_worker)
+            .build()
+            .expect("one worker");
+        let rows = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..2048)) as ArrayRef,
+        )])
+        .expect("integer rows");
+
+        for completes in [true, false] {
+            let encoders = EncoderContexts::new(1, scribe.clone(), usize::MAX);
+            let chunks = worker.install(|| encoders.encode(&rows)).expect("encodes");
+            assert_eq!(joined(chunks), reference_ipc(&rows));
+            let warmed = encoders.charged_bytes();
+            assert!(warmed > 0, "the worker kept no context");
+
+            let in_flight = encoders.slots[0]
+                .lock()
+                .expect("slot")
+                .take()
+                .expect("retained context");
+            encoders.clear();
+            assert_eq!(
+                charged(),
+                warmed,
+                "closure released a lease an encode still holds"
+            );
+
+            if completes {
+                encoders
+                    .restore(&encoders.slots[0], in_flight.context, Some(in_flight.lease))
+                    .expect("restore settles");
+            } else {
+                drop(in_flight);
+            }
+            assert_eq!(
+                (encoders.charged_bytes(), charged()),
+                (0, 0),
+                "a settled encode refilled or stayed charged in a closed set"
+            );
+            assert!(encoders.slots[0].lock().expect("slot").is_none());
+        }
     }
 
     /// Incompressible buffers stay within the reserved bound; compressible
@@ -1332,7 +1772,7 @@ mod tests {
         ])
         .expect("incompressible batch");
 
-        let payload = encode_ipc(&batch, 0).expect("encodes");
+        let payload = joined(EncoderContexts::default().encode(&batch).expect("encodes"));
         assert!(
             payload.len()
                 <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
@@ -1353,6 +1793,14 @@ mod tests {
         writer.write(&constant).expect("writes");
         writer.finish().expect("finishes");
         drop(writer);
-        assert!(encode_ipc(&constant, 0).expect("encodes").len() < uncompressed.len());
+        assert!(
+            joined(
+                EncoderContexts::default()
+                    .encode(&constant)
+                    .expect("encodes")
+            )
+            .len()
+                < uncompressed.len()
+        );
     }
 }

@@ -1590,7 +1590,7 @@ async fn prove_learned_variant_memory(spec: BifrostClusterSpec) -> Result<(), Jo
         return Err("a refused caller ran a Scribe fragment".into());
     }
 
-    // The producer pauses before a second batch, so the read needs two.
+    // The producer pauses after its first batch, holding the read open.
     write(variant_documents(80)).await?;
     cluster.refresh_oracle_snapshots().await?;
     let case = "cancelled learned read";

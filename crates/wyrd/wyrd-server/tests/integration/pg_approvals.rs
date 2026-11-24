@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
+use wyrd_server::scribe_outbox::{ScribeTable, fenced_batch_id};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_spec::auth::TokenAudience;
@@ -17,7 +18,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::pg_deferred_evidence::limits;
-use super::pg_github_pull_requests::{Deployment, REPOSITORY};
+use super::pg_github_pull_requests::{Deployment, REPOSITORY, expire_receipts, invisible_receipt};
 
 /// The first head a signoff pull request opens at.
 const H1: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
@@ -636,6 +637,127 @@ async fn an_unacknowledged_decision_is_unavailable_and_its_retry_replays() {
     assert_eq!(replay["reason"], "ship it", "{replay}");
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+}
+
+/// A decision outlives its retry receipt: its Bifrost record stays the
+/// authority once cleanup removes the receipt.
+///
+/// An editor approves a pull request's execution, which passes. Once every
+/// accepted row is published, the approval and execution revision receipts
+/// are removed. Inspection still serves the completed execution with the
+/// same decision, actor and time; the same decision replays the original
+/// receipt, and a contradictory one is still refused as not pending. A
+/// second execution's occurrence whose decision Scribe holds but no query
+/// sees reads as pending, and a new decision for it is refused, so the held
+/// decision is never overwritten.
+///
+/// # Panics
+/// Panics when the decision, its replay or its conflict changes after the
+/// receipts are removed, inspection depends on the receipts, or a held
+/// decision is overwritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_outlives_its_retry_receipt() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.signoff().await;
+    let (status, receipt) = deployment.publish_ci(H1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let execution = deployment.open(1, H1).await;
+    let served = deployment.awaiting_approval(execution).await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    let (approver, approver_jwt) = deployment.user("approval-editor", &["editor"]).await;
+    let approve = json!({"decision": "approved", "reason": "reviewed the diff"});
+    let (status, receipt) = deployment
+        .decide(&approver_jwt, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let completed = deployment.until(execution, "completed").await;
+    assert_eq!(completed["result"]["outcome"]["verdict"], "passed");
+
+    expire_receipts(
+        &deployment.server,
+        &[
+            "bifrost.verification.approvals",
+            "bifrost.verification.execution_events",
+        ],
+    )
+    .await;
+    let served = deployment.status(execution).await;
+    assert_eq!(served["status"], "completed", "{served}");
+    assert_eq!(served["result"], completed["result"], "{served}");
+    let decided = occurrence(&served);
+    assert_eq!(decided["status"], "approved", "{served}");
+    assert_eq!(decided["actor_id"], approver.to_string());
+    assert_eq!(decided["decided_at"], receipt["decided_at"]);
+    let (status, replayed) = deployment
+        .decide(&approver_jwt, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed, receipt, "a retry still replays the decision");
+    let (status, refused) = deployment
+        .decide(
+            &approver_jwt,
+            execution,
+            &approval,
+            &json!({"decision": "rejected", "reason": "reviewed the diff"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["code"],
+        "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"
+    );
+    assert_eq!(refused["details"]["status"], "approved");
+
+    let waiting = deployment.open(2, H2).await;
+    deployment.until(waiting, "waiting").await;
+    let (status, receipt) = deployment.publish_ci(H2, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let served = deployment.awaiting_approval(waiting).await;
+    let pending = Uuid::parse_str(
+        occurrence(&served)["approval_id"]
+            .as_str()
+            .expect("approval id"),
+    )
+    .expect("approval id is a UUID");
+    invisible_receipt(
+        &deployment.server,
+        "bifrost.verification.approvals",
+        fenced_batch_id(
+            deployment.server.data_tenant_id(),
+            ScribeTable::Approvals,
+            pending,
+        ),
+    )
+    .await;
+    let response = deployment
+        .server
+        .oneshot_authenticated(
+            &deployment.jwt,
+            axum::http::Request::builder()
+                .uri(format!("/v1/verification/executions/{waiting}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("status responds");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "inspection reads no receipt"
+    );
+    let served = deployment.status(waiting).await;
+    assert_eq!(occurrence(&served)["status"], "pending", "{served}");
+    let (status, refused) = deployment
+        .decide(&approver_jwt, waiting, &pending.to_string(), &approve)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a decision Scribe already holds is never overwritten: {refused}"
+    );
 }
 
 /// A decision is refused once the Verifier's own shorter timeout passes,

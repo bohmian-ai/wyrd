@@ -266,33 +266,36 @@ impl<'q> InputResolver<'q> {
         Ok(rows.into_values().next())
     }
 
-    /// The value of `execution`'s state at exactly `revision`, `None` while
-    /// that revision is not visible.
+    /// The newest revision of `execution`'s state a query can see and its
+    /// value; `None` while none is visible.
     ///
-    /// Only the exact revision is read: an earlier one is never returned in
-    /// its place, so a revision still held by an unreachable writer reads as
-    /// not visible rather than as older state.
+    /// A revision Scribe accepted but no query sees yet, such as one a Scribe
+    /// unavailable to the read still holds, is not returned: the older
+    /// revision is. A writer resuming from it cannot overwrite the held one,
+    /// because the held revision's batch id refuses its different rows.
     ///
     /// # Errors
     /// Returns the query refusal or failure, and an internal error when the
     /// stored row is malformed.
-    pub async fn state(
+    pub async fn latest_state(
         &self,
         execution: ExecutionId,
-        revision: i64,
-    ) -> Result<Option<Value>, WyrdError> {
+    ) -> Result<Option<(i64, Value)>, WyrdError> {
         let batches = self
             .rows(&format!(
-                "SELECT value FROM bifrost.verification.execution_events \
-                 WHERE execution_id = {} AND sequence = {revision} AND event = 'checkpoint'",
+                "SELECT sequence, value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND event = 'checkpoint' \
+                 ORDER BY sequence DESC LIMIT 1",
                 quote(&execution.to_string())
             ))
             .await?;
-        batches
-            .iter()
-            .find(|batch| batch.num_rows() > 0)
-            .map(|batch| variant(batch, "value", 0))
-            .transpose()
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        let revision = text(batch, "sequence", 0)?
+            .parse()
+            .map_err(|error: std::num::ParseIntError| invalid(error.to_string()))?;
+        Ok(Some((revision, variant(batch, "value", 0)?)))
     }
 
     /// The GitHub delivery outcome `event` recorded for `execution`'s state

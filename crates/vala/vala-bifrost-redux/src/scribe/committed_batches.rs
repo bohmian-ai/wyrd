@@ -1,8 +1,10 @@
 //! Recently fenced batch identities, so an honest retry of a batch that is
 //! already durable and visible is answered without re-entering a shard.
 //!
-//! A shard records each batch once its group has synced the WAL, committed
-//! the batch fence, and inserted (or deliberately suppressed) its rows. The
+//! A shard records each batch its own group accepted, once that group has
+//! synced the WAL, committed the batch fence, and inserted its rows. A retry
+//! the fence finds already held is never recorded: the receipt it matched may
+//! belong to another pod, whose cleaner forgets only its own index. The
 //! ingress consults the index after preprocessing: a resend whose tenant,
 //! table, batch id, and logical identity all match a recorded batch is
 //! acknowledged at once with no first commit, instead of waiting behind every
@@ -31,7 +33,7 @@ pub(crate) struct CommittedBatch {
     /// any other version is not this batch.
     pub(crate) table_version: wyrd_spec::vala::ids::TableVersion,
     /// Ordered logical slice-set digest the fence stores.
-    pub(crate) logical_digest: [u8; 32],
+    pub(crate) logical_digest: crate::scribe::wal::ContentDigest,
     /// Closed slice-set cardinality the fence stores.
     pub(crate) slice_count: u32,
 }
@@ -53,7 +55,7 @@ struct Inner {
 }
 
 impl CommittedBatches {
-    /// Records a batch whose fence is committed and whose rows are visible,
+    /// Records a batch this pod committed and made visible,
     /// evicting the oldest identity once the bound is reached.
     ///
     /// A batch already recorded keeps its first identity and position.
@@ -105,6 +107,23 @@ impl CommittedBatches {
         self.lock().batches.contains_key(&(tenant, batch_id))
     }
 
+    /// Forgets `tenant`'s `batch_ids` once their receipts are deleted, so a
+    /// later batch with one of those ids is decided by the durable fence,
+    /// never by the former acceptance.
+    ///
+    /// One pass over the recording order covers the whole set.
+    pub(crate) fn forget(&self, tenant: DataTenantId, batch_ids: &[Uuid]) {
+        let mut inner = self.lock();
+        let before = inner.batches.len();
+        for batch_id in batch_ids {
+            inner.batches.remove(&(tenant, *batch_id));
+        }
+        if inner.batches.len() != before {
+            let Inner { batches, order } = &mut *inner;
+            order.retain(|key| batches.contains_key(key));
+        }
+    }
+
     /// Takes the lock, recovering the map if a holder panicked; every update
     /// leaves it consistent, and a stale entry only routes a resend to the
     /// shard path.
@@ -124,7 +143,7 @@ mod tests {
         CommittedBatch {
             table_fqn: table.to_owned(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            logical_digest: [digest; 32],
+            logical_digest: [digest; 16],
             slice_count: 1,
         }
     }

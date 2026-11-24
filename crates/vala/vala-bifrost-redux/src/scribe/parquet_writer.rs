@@ -2548,9 +2548,9 @@ mod tests {
         let meta = crate::scribe::wal::ScribeAppendMeta {
             batch_id: [0u8; 16],
             schema_fingerprint: [0; 32],
-            data_digest: [0; 32],
+            data_digest: [0; 16],
             data_len: 0,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_index: 0,
             slice_count: 1,

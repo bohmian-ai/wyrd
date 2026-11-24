@@ -1852,7 +1852,7 @@ pub(crate) fn revision_batch_id(tenant: DataTenantId, key: Uuid) -> Uuid {
 /// The Scribe batch id, and so the batch fence, under which `tenant`'s
 /// [`ScribeWrite::Fenced`] acceptance of `table` staged with batch identity
 /// `key` is written: an acceptance is its own one-row frame and chunk.
-pub(crate) fn fenced_batch_id(tenant: DataTenantId, table: ScribeTable, key: Uuid) -> Uuid {
+pub fn fenced_batch_id(tenant: DataTenantId, table: ScribeTable, key: Uuid) -> Uuid {
     batch_id(tenant, table, (key, 0, 0), 0)
 }
 

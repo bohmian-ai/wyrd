@@ -177,12 +177,34 @@ pub struct ScribeIngressCpuPool {
     capacity: usize,
     /// Conform plans shared by every decode this lane runs.
     conform: Arc<ConformPlans>,
+    /// IPC encoder contexts this lane's workers reuse, once Scribe build
+    /// charges them; empty until then.
+    encoders: Arc<crate::scribe::preprocess::EncoderContexts>,
     /// The process workload manager whose CPU lanes every job runs on, once
     /// the pool joins them at Scribe build.
     workloads: Option<WorkloadManager>,
 }
 
 impl ScribeIngressCpuPool {
+    /// Lets each of this lane's workers keep one IPC encoder context of at
+    /// most `cap` retained bytes, charged to `resources`.
+    pub(crate) fn retain_encoders(
+        &mut self,
+        resources: crate::resources::ScribeResources,
+        cap: usize,
+    ) {
+        self.encoders = Arc::new(crate::scribe::preprocess::EncoderContexts::new(
+            self.pool.current_num_threads(),
+            resources,
+            cap,
+        ));
+    }
+
+    /// The IPC encoder contexts this lane's workers reuse.
+    pub(crate) const fn encoders(&self) -> &Arc<crate::scribe::preprocess::EncoderContexts> {
+        &self.encoders
+    }
+
     /// Runs every later job on the process CPU lanes as Bifrost work.
     pub(crate) fn join_lanes(&mut self, workloads: &WorkloadManager) {
         self.workloads = Some(workloads.clone());
@@ -222,6 +244,7 @@ impl ScribeIngressCpuPool {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-ingress-cpu-{index}"))
+            .start_handler(crate::scribe::preprocess::mark_ingress_worker)
             .build()?;
         register_lane_gauges("ingress");
         Ok(Self {
@@ -236,6 +259,7 @@ impl ScribeIngressCpuPool {
             drained: Arc::new(Notify::new()),
             capacity,
             conform: Arc::default(),
+            encoders: Arc::default(),
             workloads: None,
         })
     }
@@ -2187,6 +2211,12 @@ pub(crate) enum ScribeWalIoOp {
         wal: WalHandle,
         segments: Vec<WalSegmentRef>,
     },
+    /// Trims, fsyncs and detaches one shard's non-empty active WAL generation,
+    /// so the shard owner's rotation never fsyncs on an async worker.
+    CloseActiveGeneration {
+        /// Fixed shard WAL handle whose active generation closes.
+        wal: WalHandle,
+    },
 }
 
 /// Results produced by [`ScribeWalIoPool`].
@@ -2206,6 +2236,9 @@ pub(crate) enum ScribeWalIoResult {
     },
     WalSynced,
     Completed,
+    /// The closed generation's segment, or `None` when the stream held no
+    /// accepted record and nothing closed.
+    GenerationClosed(Option<WalSegmentRef>),
     /// Reports a fully settled in-worker replay after each manifest was durably
     /// advanced before generation retirement and all safe reader pins closed.
     ReplayStreamCompleted {
@@ -2244,12 +2277,29 @@ pub struct ScribeWalIoPool {
     /// Retire operations submitted through the production lane in unit tests.
     #[cfg(test)]
     retire_submissions: Arc<AtomicU64>,
+    /// Generation closes submitted through the production lane in unit tests.
+    #[cfg(test)]
+    close_submissions: Arc<AtomicU64>,
     /// Sync operations submitted through the production lane in unit tests.
     #[cfg(test)]
     sync_submissions: Arc<AtomicU64>,
     /// Record write operations submitted through the production lane in unit tests.
     #[cfg(test)]
     write_submissions: Arc<AtomicU64>,
+    /// One armed hold on the next sync: the worker reports the completed sync
+    /// and keeps its result until the holder releases it.
+    #[cfg(test)]
+    sync_hold: Arc<std::sync::Mutex<Option<WalSyncHold>>>,
+}
+
+/// A test hold placed on one WAL sync after it is durable.
+#[cfg(test)]
+#[derive(Debug)]
+struct WalSyncHold {
+    /// Fired by the worker once the held sync has completed.
+    reached: oneshot::Sender<()>,
+    /// Ends the hold; a dropped sender also releases it.
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl ScribeWalIoPool {
@@ -2309,9 +2359,13 @@ impl ScribeWalIoPool {
             #[cfg(test)]
             retire_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            close_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
             sync_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             write_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            sync_hold: Arc::default(),
         })
     }
 
@@ -2326,6 +2380,10 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
             self.sync_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(&operation, ScribeWalIoOp::CloseActiveGeneration { .. }) {
+            self.close_submissions.fetch_add(1, Ordering::AcqRel);
         }
         #[cfg(test)]
         if matches!(
@@ -2359,6 +2417,15 @@ impl ScribeWalIoPool {
         let failed = Arc::clone(&self.failed);
         let delay = self.sync_delay;
         let (sender, receiver) = oneshot::channel();
+        #[cfg(test)]
+        let hold = matches!(&operation, ScribeWalIoOp::SyncWal { .. })
+            .then(|| {
+                self.sync_hold
+                    .lock()
+                    .expect("WAL sync hold lock must not be poisoned")
+                    .take()
+            })
+            .flatten();
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("wal_io");
         let active = Arc::clone(&self.active);
@@ -2369,6 +2436,11 @@ impl ScribeWalIoPool {
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("wal_io");
             let result = catch_unwind(AssertUnwindSafe(|| execute_wal_io(operation, delay)));
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold.reached.send(());
+                let _ = hold.release.recv();
+            }
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
             record_lane_finished("wal_io");
@@ -2431,6 +2503,12 @@ impl ScribeWalIoPool {
         self.retire_submissions.load(Ordering::Acquire)
     }
 
+    /// Returns generation closes observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn close_submissions_for_test(&self) -> u64 {
+        self.close_submissions.load(Ordering::Acquire)
+    }
+
     /// Returns sync submissions observed at the production WAL lane boundary.
     #[cfg(test)]
     pub(crate) fn sync_submissions_for_test(&self) -> u64 {
@@ -2441,6 +2519,30 @@ impl ScribeWalIoPool {
     #[cfg(test)]
     pub(crate) fn write_submissions_for_test(&self) -> u64 {
         self.write_submissions.load(Ordering::Acquire)
+    }
+
+    /// Holds the next submitted sync after it is durable.
+    ///
+    /// The returned receiver fires once that sync has completed on its worker;
+    /// the worker keeps the result from its submitter until the returned
+    /// sender sends or is dropped, so a test can observe a durable group while
+    /// its IO completion is still outstanding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hold lock is poisoned.
+    #[cfg(test)]
+    pub(crate) fn hold_next_sync_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = oneshot::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self
+            .sync_hold
+            .lock()
+            .expect("WAL sync hold lock must not be poisoned") =
+            Some(WalSyncHold { reached, release });
+        (reached_rx, release_tx)
     }
 }
 
@@ -2501,6 +2603,9 @@ fn execute_wal_io(
             wal.retire_segments(&segments)?;
             Ok(ScribeWalIoResult::Completed)
         }
+        ScribeWalIoOp::CloseActiveGeneration { wal } => wal
+            .close_active_generation()
+            .map(ScribeWalIoResult::GenerationClosed),
     }
 }
 
@@ -4120,8 +4225,12 @@ mod tests {
         let seal_key = idle_seal_key();
         let mut settlement = ReplayRetirementSettlement::new(root.path());
         for index in 1_u64..=2 {
-            let path = shard_dir.join(format!("retirement-{index}.wal"));
-            std::fs::write(&path, index.to_le_bytes()).expect("retirement fixture");
+            let path = shard_dir.join(format!("{}.wal", index - 1));
+            crate::scribe::wal::WalSegment::create(
+                &path,
+                crate::scribe::wal::SegmentHeader::new(*node.as_bytes(), 1, index - 1, 0),
+            )
+            .expect("retirement fixture");
             let segment = crate::scribe::wal::WalSegmentRef { path };
             wal.retain_segments(std::slice::from_ref(&segment))
                 .expect("generation reference");

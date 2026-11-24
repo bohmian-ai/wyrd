@@ -11,6 +11,10 @@
 //! - a fence offered for another tenant is refused
 //! - a durable-fence lookup names exactly the offered batch ids that hold a
 //!   fence on their table
+//! - receipt deletion removes only receipts of the named stream shard at or
+//!   below its safe segment and outside the age/count retry history
+//! - a sweep's cutoff bounds deletion to receipts accepted before it
+//! - a node's receipt streams are discovered across tenants and epochs
 
 mod pg_tests {
     use std::sync::{Mutex, OnceLock};
@@ -22,8 +26,9 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_sql::TenantConn;
     use vala_sql::queries::scribe_batch_commits::{
-        ScribeBatchCommit, ScribeBatchCommitResolution, accepted_version, committed_batches,
-        record, resolve,
+        HandedOffShard, ReceiptStream, RetryHistory, ScribeBatchCommit,
+        ScribeBatchCommitResolution, accepted_version, committed_batches, delete_handed_off,
+        receipt_streams, record, resolve,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -117,7 +122,7 @@ mod pg_tests {
             logical_table_fqn: table.to_owned(),
             batch_id,
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            slice_set_digest: [u8::try_from(lsn % 251).expect("digest byte"); 32],
+            slice_set_digest: [u8::try_from(lsn % 251).expect("digest byte"); 16],
             slice_count: 1,
             wal_node_id: Uuid::now_v7(),
             wal_writer_epoch: 1,
@@ -262,7 +267,7 @@ mod pg_tests {
 
         let fresh = fence(tenant, "bifrost.a", Uuid::now_v7(), 20);
         let conflicting = ScribeBatchCommit {
-            slice_set_digest: [0xEE; 32],
+            slice_set_digest: [0xEE; 16],
             ..accepted
         };
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
@@ -332,7 +337,7 @@ mod pg_tests {
         let next = wyrd_spec::vala::ids::TableVersion::new(2).expect("positive version");
         let changed = ScribeBatchCommit {
             table_version: next,
-            slice_set_digest: [0xEE; 32],
+            slice_set_digest: [0xEE; 16],
             wal_lsn_min: 90,
             wal_lsn_max: 91,
             request_id: Uuid::now_v7(),
@@ -440,5 +445,337 @@ mod pg_tests {
         .await
         .expect("the lookup runs");
         assert_eq!(found, [fenced.batch_id]);
+    }
+
+    /// Deletes only receipts the named shard handed off that left recent
+    /// retry history, by age or by count, and leaves every other receipt.
+    ///
+    /// One shard stream holds an old receipt at the safe segment, an old one
+    /// above it, and a recent one below it; another stream holds an old and
+    /// the newest. Only the first goes. Shrinking the count history to one
+    /// identity then removes the recent one too, since another stream's
+    /// receipt is newer, while every uncovered or foreign receipt stays. A
+    /// deleted identity accepted again above the frontier is not removed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, or the
+    /// remaining receipts diverge from the eligibility rule.
+    #[tokio::test]
+    async fn only_handed_off_receipts_outside_retry_history_are_deleted() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let old = Utc::now() - chrono::Duration::hours(2);
+        let at = |lsn, segment| ScribeBatchCommit {
+            wal_segment_sequence: segment,
+            ..fence(tenant, "bifrost.a", Uuid::now_v7(), lsn)
+        };
+        let handed_off = at(10, 3);
+        let shard = HandedOffShard {
+            node_id: handed_off.wal_node_id,
+            writer_epoch: 1,
+            shard_id: 0,
+            safe_segment: 3,
+        };
+        let same_stream = |commit: ScribeBatchCommit| ScribeBatchCommit {
+            wal_node_id: shard.node_id,
+            ..commit
+        };
+        let uncovered = same_stream(at(20, 4));
+        let recent = same_stream(at(30, 2));
+        let other_stream = at(40, 1);
+        let newest = at(50, 1);
+        commit_group(
+            &fixture,
+            &[
+                (handed_off.clone(), old),
+                (uncovered.clone(), old),
+                (other_stream.clone(), old),
+                (recent.clone(), Utc::now()),
+                (newest.clone(), Utc::now() + chrono::Duration::minutes(1)),
+            ],
+        )
+        .await;
+        let remaining = async |history: RetryHistory| {
+            let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .expect("tenant connection");
+            let deleted = delete_handed_off(&mut conn, &shard, &history, Utc::now(), 100)
+                .await
+                .expect("the delete runs")
+                .len();
+            let mut left = committed_batches(
+                &mut conn,
+                "bifrost.a",
+                &[
+                    handed_off.batch_id,
+                    uncovered.batch_id,
+                    recent.batch_id,
+                    other_stream.batch_id,
+                    newest.batch_id,
+                ],
+            )
+            .await
+            .expect("the lookup runs");
+            conn.commit().await.expect("commit");
+            left.sort();
+            (deleted, left)
+        };
+        let sorted = |mut ids: Vec<Uuid>| {
+            ids.sort();
+            ids
+        };
+
+        let (deleted, left) = remaining(RetryHistory::default()).await;
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            left,
+            sorted(vec![
+                uncovered.batch_id,
+                recent.batch_id,
+                other_stream.batch_id,
+                newest.batch_id
+            ])
+        );
+
+        let (deleted, left) = remaining(RetryHistory {
+            newest: 1,
+            ..RetryHistory::default()
+        })
+        .await;
+        assert_eq!(deleted, 1, "the recent receipt is outside the newest one");
+        assert_eq!(
+            left,
+            sorted(vec![
+                uncovered.batch_id,
+                other_stream.batch_id,
+                newest.batch_id
+            ])
+        );
+
+        // A deleted identity accepted again above the frontier is a fresh
+        // receipt; the same handed-off shard cannot remove it.
+        let replacement = ScribeBatchCommit {
+            batch_id: handed_off.batch_id,
+            ..same_stream(at(60, 4))
+        };
+        commit_group(&fixture, &[(replacement, old)]).await;
+        let (deleted, left) = remaining(RetryHistory::default()).await;
+        assert_eq!(deleted, 0, "the replacement acceptance stays");
+        assert!(left.contains(&handed_off.batch_id));
+    }
+
+    /// A sweep deletes only receipts accepted at or before its cutoff, so
+    /// receipts arriving during the sweep cannot keep it running.
+    ///
+    /// Two covered receipts leave a one-identity count history: one accepted
+    /// before the cutoff, one after. Only the first goes, and its batch id is
+    /// returned so the caller can forget it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, or the
+    /// deletion crosses the cutoff.
+    #[tokio::test]
+    async fn a_sweep_cutoff_bounds_deletion_to_receipts_accepted_before_it() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let cutoff = Utc::now();
+        let before = fence(tenant, "bifrost.a", Uuid::now_v7(), 10);
+        let shard = HandedOffShard {
+            node_id: before.wal_node_id,
+            writer_epoch: 1,
+            shard_id: 0,
+            safe_segment: 1,
+        };
+        let after = ScribeBatchCommit {
+            wal_node_id: shard.node_id,
+            ..fence(tenant, "bifrost.a", Uuid::now_v7(), 20)
+        };
+        let newest = fence(tenant, "bifrost.a", Uuid::now_v7(), 30);
+        commit_group(
+            &fixture,
+            &[
+                (before.clone(), cutoff - chrono::Duration::minutes(1)),
+                (after.clone(), cutoff + chrono::Duration::minutes(1)),
+                (newest, cutoff + chrono::Duration::minutes(2)),
+            ],
+        )
+        .await;
+
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let deleted = delete_handed_off(
+            &mut conn,
+            &shard,
+            &RetryHistory {
+                newest: 1,
+                ..RetryHistory::default()
+            },
+            cutoff,
+            100,
+        )
+        .await
+        .expect("the delete runs");
+        conn.commit().await.expect("commit");
+
+        assert_eq!(
+            deleted,
+            [before.batch_id],
+            "only the receipt before the cutoff goes"
+        );
+    }
+
+    /// A sweep DELETE grows linearly with the receipts it reads, never
+    /// quadratically, when the table grew faster than its planner statistics.
+    ///
+    /// A write load inserts receipts faster than autovacuum analyzes them, so
+    /// the planner believes the shard holds about one row. One shard's fresh
+    /// receipts over four tables, none yet due, are recorded with autovacuum
+    /// off so they are never analyzed, and the DELETE is timed at 10,000, 20,000 and 40,000 of them
+    /// (the median of three runs each, since none deletes anything). Linear
+    /// cost grows about 4x from the smallest to the largest size and quadratic
+    /// cost about 16x, so growth must stay under 8x; the largest size must
+    /// also finish within 3 s. A plan that re-ranks the table once per shard
+    /// row took 103 s at 30,000.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, a receipt is
+    /// deleted, the cost grows 8x or more from 10,000 to 40,000 receipts, or
+    /// the largest DELETE takes 3 s or longer.
+    #[tokio::test]
+    async fn a_sweep_delete_grows_linearly_over_unanalyzed_receipts() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let node_id = Uuid::now_v7();
+        let accepted = Utc::now();
+        // Autovacuum would analyze the table during a slow DELETE and hand the
+        // larger sizes a plan the write load never gets.
+        sqlx::query("ALTER TABLE vala.scribe_batch_commits SET (autovacuum_enabled = false)")
+            .execute(&fixture.superuser_pool().expect("superuser pool"))
+            .await
+            .expect("statistics stay as the write load leaves them");
+        let shard = HandedOffShard {
+            node_id,
+            writer_epoch: 1,
+            shard_id: 0,
+            safe_segment: 1,
+        };
+        let median_delete = async || {
+            let mut runs = Vec::new();
+            for _ in 0..3 {
+                let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+                    .await
+                    .expect("tenant connection");
+                let started = std::time::Instant::now();
+                let deleted = delete_handed_off(
+                    &mut conn,
+                    &shard,
+                    &RetryHistory::default(),
+                    accepted + chrono::Duration::seconds(1),
+                    1_000,
+                )
+                .await
+                .expect("the delete runs");
+                runs.push(started.elapsed());
+                conn.commit().await.expect("commit");
+                assert!(deleted.is_empty(), "no receipt is due yet");
+            }
+            runs.sort();
+            runs[1]
+        };
+
+        let mut held = 0_i64;
+        let mut timings = Vec::new();
+        for size in [10_000_i64, 20_000, 40_000] {
+            let receipts: Vec<_> = (held..size)
+                .map(|lsn| {
+                    let table = format!("bifrost.t{}", lsn % 4);
+                    let receipt = ScribeBatchCommit {
+                        wal_node_id: node_id,
+                        ..fence(tenant, &table, Uuid::now_v7(), lsn * 2)
+                    };
+                    (receipt, accepted)
+                })
+                .collect();
+            for group in receipts.chunks(5_000) {
+                commit_group(&fixture, group).await;
+            }
+            held = size;
+            timings.push((size, median_delete().await));
+        }
+
+        let (_, smallest) = timings[0];
+        let (_, largest) = timings[2];
+        assert!(
+            largest < smallest * 8,
+            "4x the receipts cost {:.1}x the time: {timings:?}",
+            largest.as_secs_f64() / smallest.as_secs_f64()
+        );
+        assert!(
+            largest < std::time::Duration::from_secs(3),
+            "one sweep DELETE took {largest:?} over 40,000 unanalyzed receipts"
+        );
+    }
+
+    /// A node's receipt streams are listed across every tenant and writer
+    /// epoch, and another node's are not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, or the
+    /// discovered streams differ from the recorded ones.
+    #[tokio::test]
+    async fn receipt_streams_of_a_node_span_tenants_and_epochs() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let other_tenant = fixture
+            .seed_additional_tenant("receipt-streams-other")
+            .await
+            .expect("second tenant");
+        let node = Uuid::now_v7();
+        let on = |tenant, epoch, shard, lsn| ScribeBatchCommit {
+            wal_node_id: node,
+            wal_writer_epoch: epoch,
+            wal_shard_id: shard,
+            ..fence(tenant, "bifrost.a", Uuid::now_v7(), lsn)
+        };
+        commit_group(
+            &fixture,
+            &[
+                (on(tenant, 1, 0, 10), Utc::now()),
+                (on(tenant, 1, 0, 12), Utc::now()),
+                (on(tenant, 2, 3, 20), Utc::now()),
+                (fence(tenant, "bifrost.a", Uuid::now_v7(), 30), Utc::now()),
+            ],
+        )
+        .await;
+        commit_group(&fixture, &[(on(other_tenant, 2, 3, 40), Utc::now())]).await;
+
+        let mut streams = receipt_streams(fixture.operator_pool(), node)
+            .await
+            .expect("the discovery runs");
+        streams.sort_by_key(|stream| (stream.writer_epoch, stream.shard_id, stream.tenant));
+        let mut expected = vec![
+            ReceiptStream {
+                tenant,
+                writer_epoch: 1,
+                shard_id: 0,
+            },
+            ReceiptStream {
+                tenant,
+                writer_epoch: 2,
+                shard_id: 3,
+            },
+            ReceiptStream {
+                tenant: other_tenant,
+                writer_epoch: 2,
+                shard_id: 3,
+            },
+        ];
+        expected.sort_by_key(|stream| (stream.writer_epoch, stream.shard_id, stream.tenant));
+        assert_eq!(streams, expected);
     }
 }

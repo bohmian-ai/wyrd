@@ -22,14 +22,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
@@ -163,6 +162,47 @@ const RECORD_HEADER_SIZE: usize = 72;
 const RECORD_HEADER_SIZE_U16: u16 = 72;
 /// Exact v8 record magic.
 const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL8";
+/// Byte width of every Scribe content digest.
+pub(crate) const DIGEST_BYTES: usize = 16;
+
+/// An XXH3-128 content digest: a logical batch or slice identity, or a WAL
+/// payload digest.
+///
+/// These digests detect accidental mismatch inside one tenant's own table,
+/// never adversarial collision; CRC32C still frames every WAL record.
+pub(crate) type ContentDigest = [u8; DIGEST_BYTES];
+
+/// Streaming XXH3-128 over the parts of one digested value, in order.
+///
+/// It is the one place Scribe fixes its digest algorithm and byte order, so
+/// the live path, the COMMIT binding, and replay cannot disagree.
+pub(crate) struct ContentHasher(twox_hash::XxHash3_128);
+
+impl ContentHasher {
+    /// Starts an empty digest.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self(twox_hash::XxHash3_128::new())
+    }
+
+    /// Folds `bytes` in after everything already written.
+    pub(crate) fn update(&mut self, bytes: impl AsRef<[u8]>) {
+        self.0.write(bytes.as_ref());
+    }
+
+    /// Returns the digest of everything written, little-endian.
+    #[must_use]
+    pub(crate) fn finish(&self) -> ContentDigest {
+        self.0.finish_128().to_le_bytes()
+    }
+
+    /// Digests one contiguous value.
+    #[must_use]
+    pub(crate) fn digest(bytes: impl AsRef<[u8]>) -> ContentDigest {
+        twox_hash::XxHash3_128::oneshot(bytes.as_ref()).to_le_bytes()
+    }
+}
+
 /// Exact magic prefixing every v8 COMMIT payload.
 const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
 /// Exact encoded width of a v8 COMMIT payload.
@@ -171,7 +211,7 @@ const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
 /// identity. A COMMIT record whose declared payload is any other length is
 /// refused rather than interpreted, so a record written by a different format
 /// can never be read as a truncated or extended identity.
-const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
+const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 2 * DIGEST_BYTES + 16;
 
 /// Complete batch identity carried by one terminal v8 COMMIT record.
 ///
@@ -195,10 +235,10 @@ const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
 /// verbatim without consulting any other durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCommitIdentity {
-    /// SHA-256 over this attempt's ordered slice frames.
-    pub wal_digest: [u8; 32],
-    /// SHA-256 over the batch's attempt-independent logical row identity.
-    pub logical_digest: [u8; 32],
+    /// XXH3-128 over this attempt's ordered slice frames.
+    pub wal_digest: ContentDigest,
+    /// XXH3-128 over the batch's attempt-independent logical row identity.
+    pub logical_digest: ContentDigest,
     /// Request correlation recorded by the durable batch-commit fence.
     pub request_id: [u8; 16],
 }
@@ -209,9 +249,11 @@ impl WalCommitIdentity {
     pub fn encode(&self) -> [u8; COMMIT_PAYLOAD_BYTES] {
         let mut encoded = [0_u8; COMMIT_PAYLOAD_BYTES];
         encoded[0..4].copy_from_slice(&COMMIT_PAYLOAD_MAGIC);
-        encoded[4..36].copy_from_slice(&self.wal_digest);
-        encoded[36..68].copy_from_slice(&self.logical_digest);
-        encoded[68..84].copy_from_slice(&self.request_id);
+        let logical = 4 + DIGEST_BYTES;
+        let request = logical + DIGEST_BYTES;
+        encoded[4..logical].copy_from_slice(&self.wal_digest);
+        encoded[logical..request].copy_from_slice(&self.logical_digest);
+        encoded[request..].copy_from_slice(&self.request_id);
         encoded
     }
 
@@ -235,12 +277,14 @@ impl WalCommitIdentity {
                 detail: "WAL v8 COMMIT payload magic mismatch".to_owned(),
             });
         }
-        let mut wal_digest = [0_u8; 32];
-        wal_digest.copy_from_slice(&payload[4..36]);
-        let mut logical_digest = [0_u8; 32];
-        logical_digest.copy_from_slice(&payload[36..68]);
+        let logical = 4 + DIGEST_BYTES;
+        let request = logical + DIGEST_BYTES;
+        let mut wal_digest = [0_u8; DIGEST_BYTES];
+        wal_digest.copy_from_slice(&payload[4..logical]);
+        let mut logical_digest = [0_u8; DIGEST_BYTES];
+        logical_digest.copy_from_slice(&payload[logical..request]);
         let mut request_id = [0_u8; 16];
-        request_id.copy_from_slice(&payload[68..84]);
+        request_id.copy_from_slice(&payload[request..]);
         Ok(Self {
             wal_digest,
             logical_digest,
@@ -478,7 +522,7 @@ pub(crate) struct PreparedWalAppend {
     pub(crate) seal_key: Option<SealKey>,
     pub(crate) schema_fingerprint: [u8; 32],
     /// Stable logical Arrow digest excluding volatile managed correlation columns.
-    pub(crate) logical_data_digest: [u8; 32],
+    pub(crate) logical_data_digest: ContentDigest,
     /// Stable logical Arrow buffer length covered by `logical_data_digest`.
     pub(crate) logical_data_len: u32,
     pub(crate) shard_id: Option<u8>,
@@ -500,12 +544,14 @@ pub(crate) struct WalAppendResult {
     pub(crate) encoded_bytes: u64,
     pub(crate) touched_segments: Vec<Arc<WalSegment>>,
     /// Digest of the exact payload protected by this record's CRC.
-    pub(crate) payload_digest: [u8; 32],
+    pub(crate) payload_digest: ContentDigest,
     /// Exact payload length represented by the digest.
     pub(crate) payload_len: u32,
 }
 
 impl PreparedWalAppend {
+    /// Prepares one slice record whose payload is `data`, one contiguous
+    /// Arrow IPC stream the WAL writes in a single vectored write.
     pub(crate) fn new(lsn: WalLsn, batch_id: [u8; 16], data: Bytes) -> Self {
         Self {
             lsn,
@@ -513,7 +559,7 @@ impl PreparedWalAppend {
             data,
             seal_key: None,
             schema_fingerprint: [0; 32],
-            logical_data_digest: [0; 32],
+            logical_data_digest: [0; DIGEST_BYTES],
             logical_data_len: 0,
             shard_id: None,
             slice_index: 0,
@@ -540,7 +586,7 @@ impl PreparedWalAppend {
             data: Bytes::new(),
             seal_key: None,
             schema_fingerprint: [0; 32],
-            logical_data_digest: [0; 32],
+            logical_data_digest: [0; DIGEST_BYTES],
             logical_data_len: 0,
             shard_id: None,
             slice_index: slice_count,
@@ -557,7 +603,7 @@ impl PreparedWalAppend {
     }
 
     /// Attaches the stable logical Arrow identity computed before WAL append.
-    pub(crate) fn with_logical_data_identity(mut self, digest: [u8; 32], len: u32) -> Self {
+    pub(crate) fn with_logical_data_identity(mut self, digest: ContentDigest, len: u32) -> Self {
         self.logical_data_digest = digest;
         self.logical_data_len = len;
         self
@@ -705,6 +751,35 @@ impl PreparedWalAppend {
     }
 }
 
+/// Most pieces one WAL record writes: its header, at most 12 SLICE payload
+/// parts, and its CRC.
+const MAX_RECORD_PIECES: usize = 14;
+
+/// Writes every byte of `slices` to `writer` in as few vectored writes as it
+/// accepts, so one WAL record normally costs one write call.
+///
+/// Empty slices are skipped, `Interrupted` is retried, and each call's
+/// progress advances exactly the bytes it reports, including a write that
+/// ends inside a slice.
+///
+/// # Errors
+///
+/// Returns `WriteZero` when the writer accepts nothing while bytes remain,
+/// and any other write error unchanged; bytes already written stay written,
+/// so the caller owns rollback.
+fn write_all_vectored(writer: &mut impl Write, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+    IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match writer.write_vectored(slices) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Streams one prepared record from borrowed payload owners into its segment.
 ///
 /// # Errors
@@ -716,7 +791,7 @@ fn append_prepared_borrowed(
     prepared: &PreparedWalAppend,
     encoded_len: usize,
     offset: u64,
-) -> Result<([u8; 32], u32), ScribeError> {
+) -> Result<(ContentDigest, u32), ScribeError> {
     let payload_len =
         u32::try_from(prepared.payload_len()?).map_err(|_| ScribeError::Internal {
             detail: "WAL v8 payload exceeds its u32 record bound".to_owned(),
@@ -749,15 +824,15 @@ fn append_prepared_borrowed(
         payload_len,
     );
     header[68..72].copy_from_slice(&segment.header.record_tag().to_le_bytes());
-    let write_parts = |parts: &[&[u8]]| -> Result<[u8; 32], ScribeError> {
-        let mut digest = Sha256::new();
+    let write_parts = |parts: &[&[u8]]| -> Result<ContentDigest, ScribeError> {
+        let mut digest = ContentHasher::new();
         let mut crc = crc32c::crc32c(&header);
         for part in parts {
             digest.update(part);
             crc = crc32c::crc32c_append(crc, part);
         }
         segment.append_borrowed(&header, parts, crc.to_le_bytes(), encoded_len, offset)?;
-        Ok(digest.finalize().into())
+        Ok(digest.finish())
     };
     let payload_digest = if let Some(identity) = prepared.commit_identity.as_ref() {
         write_parts(&[identity.encode().as_slice()])?
@@ -1734,14 +1809,21 @@ impl WalSegment {
         }
         let started = Instant::now();
         let result = (|| -> Result<(), ScribeError> {
-            file.write_all(header)
-                .map_err(|error| wal_io_error("WAL record header write failed", &error))?;
-            for part in payload_parts {
-                file.write_all(part)
-                    .map_err(|error| wal_io_error("WAL record payload write failed", &error))?;
+            let pieces = payload_parts.len() + 2;
+            if pieces > MAX_RECORD_PIECES {
+                return Err(ScribeError::Internal {
+                    detail: "WAL record has more payload parts than one vectored write holds"
+                        .to_owned(),
+                });
             }
-            file.write_all(&crc)
-                .map_err(|error| wal_io_error("WAL record CRC write failed", &error))
+            let mut slices = [IoSlice::new(&[]); MAX_RECORD_PIECES];
+            slices[0] = IoSlice::new(header);
+            for (slot, part) in slices[1..].iter_mut().zip(payload_parts) {
+                *slot = IoSlice::new(part);
+            }
+            slices[pieces - 1] = IoSlice::new(&crc);
+            write_all_vectored(&mut *file, &mut slices[..pieces])
+                .map_err(|error| wal_io_error("WAL record write failed", &error))
         })();
         self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded_len, started);
@@ -1967,6 +2049,12 @@ pub struct WalWriter {
     /// failed; every later deletion pass retries it, so releasing the last
     /// reference never loses the only record that the file must be removed.
     deferred_deletes: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Released-segment prefixes by shard directory, loaded from each shard
+    /// manifest on first release.
+    frontiers: Arc<Mutex<HashMap<PathBuf, ShardFrontier>>>,
+    /// Signalled after a persisted frontier advances, so receipt cleanup can
+    /// delete the receipts it now covers without waiting for its cadence.
+    frontier_advanced: Arc<tokio::sync::Notify>,
     /// Retired segment files of this stream kept for reuse, by shard directory.
     ///
     /// They exist only while this writer lives: construction deletes every
@@ -1975,6 +2063,19 @@ pub struct WalWriter {
     /// Scribe-local fault raised when the WAL no longer matches what the
     /// writer reported; shared by every handle and never reset in process.
     fault: tokio_util::sync::CancellationToken,
+}
+
+/// One shard directory's contiguous prefix of released closed segments.
+///
+/// A segment joins `released` once its last owner let it go while it was no
+/// longer current; `safe` then advances only through consecutive sequences,
+/// so an earlier segment still held blocks every later one.
+#[derive(Debug, Default)]
+struct ShardFrontier {
+    /// Highest persisted sequence of the prefix, `None` before the first.
+    safe: Option<u64>,
+    /// Released sequences above `safe`, waiting for the gap below them.
+    released: BTreeSet<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -2145,7 +2246,7 @@ impl WalHandle {
         active_paths: &HashSet<PathBuf>,
     ) -> Result<(), ScribeError> {
         self.writer
-            .close_segments_if_unowned(segments, active_paths)
+            .close_segments_if_unowned(self.shard_id, segments, active_paths)
     }
 }
 
@@ -2253,6 +2354,8 @@ impl WalWriter {
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
+            frontiers: Arc::new(Mutex::new(HashMap::new())),
+            frontier_advanced: Arc::new(tokio::sync::Notify::new()),
             free_segments: Arc::new(Mutex::new(HashMap::new())),
             fault: tokio_util::sync::CancellationToken::new(),
         };
@@ -2313,6 +2416,14 @@ impl WalWriter {
         }
         self.next_lsn.store(next_lsn, Ordering::Release);
         Ok(())
+    }
+
+    /// Signal raised after any shard's persisted safe frontier advances.
+    ///
+    /// Wakes are coalesced: several advances before the waiter runs wake it
+    /// once.
+    pub(crate) fn frontier_advanced(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.frontier_advanced)
     }
 
     /// Return the pod-local WAL root used for replay and diagnostics.
@@ -2384,6 +2495,8 @@ impl WalWriter {
             faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
+            frontiers: Arc::clone(&self.frontiers),
+            frontier_advanced: Arc::clone(&self.frontier_advanced),
             free_segments: Arc::clone(&self.free_segments),
             fault: self.fault.clone(),
         }
@@ -2432,7 +2545,7 @@ impl WalWriter {
                 detail: "test WAL payload exceeds its u32 logical length bound".to_owned(),
             })?;
         prepared = prepared
-            .with_logical_data_identity(Sha256::digest(data_payload).into(), logical_data_len);
+            .with_logical_data_identity(ContentHasher::digest(data_payload), logical_data_len);
         prepared.shard_id = Some(
             u8::try_from(crate::scribe::routing::shard_for(
                 seal_key.tenant,
@@ -2452,7 +2565,7 @@ impl WalWriter {
         );
         let logical_digest = logical.finish();
         let slice = self.append_prepared(prepared)?;
-        let mut digest = Sha256::new();
+        let mut digest = ContentHasher::new();
         digest.update(0_u32.to_le_bytes());
         digest.update(slice.payload_len.to_le_bytes());
         digest.update(slice.payload_digest);
@@ -2461,7 +2574,7 @@ impl WalWriter {
             *seal_key.tenant.as_uuid().as_bytes(),
             1,
             WalCommitIdentity {
-                wal_digest: digest.finalize().into(),
+                wal_digest: digest.finish(),
                 logical_digest,
                 request_id: *uuid::Uuid::now_v7().as_bytes(),
             },
@@ -2862,12 +2975,18 @@ impl WalWriter {
     /// retaining a low-volume current file forever when no later append causes
     /// a size rollover.
     ///
+    /// Only `shard_id`'s state is locked: a segment belongs to the one shard
+    /// that wrote it, and locking every shard would wait behind other shards'
+    /// appends and fsyncs.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a shard state lock is poisoned or
-    /// returns the segment synchronization error before ownership is cleared.
+    /// Returns [`ScribeError::Internal`] when `shard_id` has no WAL state or its
+    /// lock is poisoned, or returns the segment synchronization error before
+    /// ownership is cleared.
     pub(crate) fn close_segments_if_unowned(
         &self,
+        shard_id: u8,
         segments: &[WalSegmentRef],
         active_paths: &HashSet<PathBuf>,
     ) -> Result<(), ScribeError> {
@@ -2879,20 +2998,25 @@ impl WalWriter {
         if candidates.is_empty() {
             return Ok(());
         }
-        for state in self.states.iter() {
-            let mut state = state.lock().map_err(|_| ScribeError::Internal {
+        let mut state = self
+            .states
+            .get(usize::from(shard_id))
+            .ok_or_else(|| ScribeError::Internal {
+                detail: format!("WAL has no shard {shard_id} (close segment)"),
+            })?
+            .lock()
+            .map_err(|_| ScribeError::Internal {
                 detail: "WAL state lock poisoned (close segment)".to_owned(),
             })?;
-            let Some(segment) = state.current_segment.as_ref() else {
-                continue;
-            };
-            if candidates.contains(segment.path()) {
-                segment.trim(state.current_segment_size)?;
-                segment.sync_data()?;
-                state.current_segment = None;
-                state.current_segment_size = 0;
-                state.current_segment_records = 0;
-            }
+        let Some(segment) = state.current_segment.as_ref() else {
+            return Ok(());
+        };
+        if candidates.contains(segment.path()) {
+            segment.trim(state.current_segment_size)?;
+            segment.sync_data()?;
+            state.current_segment = None;
+            state.current_segment_size = 0;
+            state.current_segment_records = 0;
         }
         Ok(())
     }
@@ -2941,11 +3065,12 @@ impl WalWriter {
                 active.push(segment.path().to_path_buf());
             }
         }
+        let closed = pending
+            .into_iter()
+            .filter(|path| !active.contains(path))
+            .collect::<Vec<_>>();
         let mut first_error = None;
-        for path in pending {
-            if active.iter().any(|active_path| active_path == &path) {
-                continue;
-            }
+        for path in self.cover_released(&closed)? {
             match self.retire_segment_file(&path) {
                 Ok(()) => {
                     self.deferred_deletes
@@ -2962,6 +3087,102 @@ impl WalWriter {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Records released closed segments in their shard frontiers and returns
+    /// the ones the persisted frontier now covers.
+    ///
+    /// Each touched frontier advances through consecutive released sequences
+    /// and is written to its shard manifest before any covered path is
+    /// returned, so a deleted segment is always inside a durable prefix. A
+    /// path already gone was covered by an earlier pass and is returned for
+    /// its deferral to clear. Uncovered paths stay deferred by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the frontier lock is poisoned, a
+    /// segment header or manifest cannot be read, or a manifest cannot be
+    /// written; a frontier that failed to persist is left unchanged.
+    fn cover_released(&self, paths: &[PathBuf]) -> Result<Vec<PathBuf>, ScribeError> {
+        let mut frontiers = self.frontiers.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL frontier lock poisoned".to_owned(),
+        })?;
+        let mut covered = Vec::new();
+        let mut held = Vec::new();
+        let mut touched = HashMap::new();
+        for path in paths {
+            let header = match File::open(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    covered.push(path.clone());
+                    continue;
+                }
+                opened => {
+                    let mut buf = [0_u8; SEGMENT_HEADER_SIZE];
+                    opened
+                        .and_then(|mut file| file.read_exact(&mut buf))
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!(
+                                "WAL segment retirement failed: unreadable header: {error}"
+                            ),
+                        })?;
+                    SegmentHeader::decode(&buf)?
+                }
+            };
+            let Some(directory) = path.parent() else {
+                continue;
+            };
+            let frontier = match frontiers.entry(directory.to_path_buf()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let safe = crate::scribe::manifest::read_manifest(directory.join("manifest"))?
+                        .and_then(|manifest| manifest.safe_segment);
+                    entry.insert(ShardFrontier {
+                        safe,
+                        released: BTreeSet::new(),
+                    })
+                }
+            };
+            if frontier.safe.is_none_or(|safe| header.seg_seq > safe) {
+                frontier.released.insert(header.seg_seq);
+            }
+            let stream = StreamIdentity::new(
+                crate::scribe::stream_identity::NodeId::new(Uuid::from_bytes(header.node_id)),
+                crate::scribe::stream_identity::WriterEpoch::new(header.writer_epoch),
+            );
+            touched.insert(directory.to_path_buf(), stream);
+            held.push((directory.to_path_buf(), header.seg_seq, path.clone()));
+        }
+        for (directory, stream) in touched {
+            let Some(frontier) = frontiers.get_mut(&directory) else {
+                continue;
+            };
+            let mut advanced = frontier.safe;
+            while let Some(next) = advanced
+                .map_or(Some(0), |safe| safe.checked_add(1))
+                .filter(|next| frontier.released.contains(next))
+            {
+                advanced = Some(next);
+            }
+            let Some(safe) = advanced.filter(|_| advanced != frontier.safe) else {
+                continue;
+            };
+            crate::scribe::manifest::advance_safe_segment(
+                &directory.join("manifest"),
+                stream,
+                safe,
+            )?;
+            frontier.released.retain(|sequence| *sequence > safe);
+            frontier.safe = Some(safe);
+            self.frontier_advanced.notify_one();
+        }
+        covered.extend(held.into_iter().filter_map(|(directory, sequence, path)| {
+            frontiers
+                .get(&directory)
+                .and_then(|frontier| frontier.safe)
+                .is_some_and(|safe| sequence <= safe)
+                .then_some(path)
+        }));
+        Ok(covered)
     }
 
     /// Keeps one closed segment of this stream for reuse, or deletes it.
@@ -3565,10 +3786,16 @@ impl WalReader {
 
     /// Opens, sorts, and validates already-discovered WAL paths.
     ///
+    /// A segment at or below its shard manifest's safe frontier holds nothing
+    /// replay may restore, and a crash can leave it behind with an earlier
+    /// part of one of its batches already deleted, so it is removed instead of
+    /// read.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a segment cannot be opened, belongs to a
-    /// different node, or duplicates an existing stream/shard/sequence key.
+    /// different node, or duplicates an existing stream/shard/sequence key, a
+    /// shard manifest cannot be read, or a covered segment cannot be removed.
     fn open_paths(paths: Vec<PathBuf>, node_filter: Option<[u8; 16]>) -> Result<Self, ScribeError> {
         let mut segments = Vec::new();
         for path in paths {
@@ -3612,7 +3839,34 @@ impl WalReader {
             }
         }
 
-        Ok(Self { segments })
+        let mut frontiers = HashMap::<PathBuf, Option<u64>>::new();
+        let mut uncovered = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let directory = segment.path().parent().map(Path::to_path_buf);
+            let safe = match directory {
+                None => None,
+                Some(directory) => match frontiers.entry(directory) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let safe =
+                            crate::scribe::manifest::read_manifest(entry.key().join("manifest"))?
+                                .and_then(|manifest| manifest.safe_segment);
+                        *entry.insert(safe)
+                    }
+                },
+            };
+            if safe.is_some_and(|safe| segment.header().seg_seq <= safe) {
+                let path = segment.path().to_path_buf();
+                drop(segment);
+                WalWriter::delete_segment_file(&path)?;
+            } else {
+                uncovered.push(segment);
+            }
+        }
+
+        Ok(Self {
+            segments: uncovered,
+        })
     }
 
     /// Read all records from all segments.
@@ -3852,12 +4106,12 @@ pub struct ScribeAppendMeta {
     pub batch_id: [u8; 16],
     /// Stable Arrow schema identity for logical retry comparison.
     pub schema_fingerprint: [u8; 32],
-    /// SHA-256 digest of canonical Arrow data, excluding managed correlation columns.
-    pub data_digest: [u8; 32],
+    /// XXH3-128 digest of canonical Arrow data, excluding managed correlation columns.
+    pub data_digest: ContentDigest,
     /// Canonical Arrow data length, excluding managed correlation columns.
     pub data_len: u32,
-    /// SHA-256 digest of the exact WAL-v8 slice payload.
-    pub payload_digest: [u8; 32],
+    /// XXH3-128 digest of the exact WAL-v8 slice payload.
+    pub payload_digest: ContentDigest,
     /// Exact WAL-v8 slice payload length.
     pub payload_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
@@ -3881,8 +4135,8 @@ pub(crate) struct ScribeAppendPayloadIdentity {
     pub(crate) batch_id: [u8; 16],
     /// Stable Arrow schema identity.
     pub(crate) schema_fingerprint: [u8; 32],
-    /// SHA-256 digest of canonical Arrow data.
-    pub(crate) data_digest: [u8; 32],
+    /// XXH3-128 digest of canonical Arrow data.
+    pub(crate) data_digest: ContentDigest,
     /// Canonical Arrow data length.
     pub(crate) data_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
@@ -3939,6 +4193,191 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::namespaces::BifrostNamespace;
+
+    /// Returns the shard that wrote `segment`, read from its `shard-NN` directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the segment does not sit in a `shard-NN` directory.
+    fn shard_of(segment: &WalSegmentRef) -> u8 {
+        segment
+            .path
+            .parent()
+            .and_then(|directory| directory.file_name())
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("shard-"))
+            .and_then(|shard| shard.parse().ok())
+            .expect("a segment sits in its shard-NN directory")
+    }
+
+    /// A writer that accepts at most `limit` bytes per call and first plays
+    /// back `script`, recording what it received and how many calls it took.
+    struct ScriptedWriter {
+        limit: usize,
+        script: Vec<io::Result<()>>,
+        written: Vec<u8>,
+        calls: usize,
+    }
+
+    impl ScriptedWriter {
+        fn new(limit: usize, script: Vec<io::Result<()>>) -> Self {
+            Self {
+                limit,
+                script,
+                written: Vec::new(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.calls += 1;
+            if !self.script.is_empty() {
+                self.script.remove(0)?;
+                return Ok(0);
+            }
+            let mut taken = 0;
+            for buf in bufs {
+                let take = buf.len().min(self.limit - taken);
+                self.written.extend_from_slice(&buf[..take]);
+                taken += take;
+                if taken == self.limit {
+                    break;
+                }
+            }
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pieces() -> [&'static [u8]; 4] {
+        [b"head", b"", b"payload", b"crc!"]
+    }
+
+    /// A writer that takes everything receives the whole record in one call,
+    /// in order.
+    #[test]
+    fn a_record_is_one_vectored_write() {
+        let mut writer = ScriptedWriter::new(usize::MAX, Vec::new());
+        let mut slices = pieces().map(IoSlice::new);
+        write_all_vectored(&mut writer, &mut slices).expect("write");
+        assert_eq!(writer.written, b"headpayloadcrc!");
+        assert_eq!(writer.calls, 1);
+    }
+
+    /// Short writes that end inside and between pieces still produce the
+    /// exact record bytes.
+    #[test]
+    fn short_writes_resume_exactly_where_they_stopped() {
+        for limit in [1, 3, 4, 6, 11] {
+            let mut writer = ScriptedWriter::new(limit, Vec::new());
+            let mut slices = pieces().map(IoSlice::new);
+            write_all_vectored(&mut writer, &mut slices).expect("write");
+            assert_eq!(writer.written, b"headpayloadcrc!", "limit {limit}");
+        }
+    }
+
+    /// Only empty pieces never reach the writer.
+    #[test]
+    fn empty_pieces_write_nothing() {
+        let mut writer = ScriptedWriter::new(usize::MAX, Vec::new());
+        let mut slices = [IoSlice::new(&[]), IoSlice::new(&[])];
+        write_all_vectored(&mut writer, &mut slices).expect("write");
+        assert_eq!(writer.calls, 0);
+    }
+
+    /// An interrupted write is retried and completes the record.
+    #[test]
+    fn an_interrupted_write_is_retried() {
+        let mut writer =
+            ScriptedWriter::new(usize::MAX, vec![Err(io::ErrorKind::Interrupted.into())]);
+        let mut slices = pieces().map(IoSlice::new);
+        write_all_vectored(&mut writer, &mut slices).expect("write");
+        assert_eq!(writer.written, b"headpayloadcrc!");
+        assert_eq!(writer.calls, 2);
+    }
+
+    /// A writer that accepts nothing while bytes remain is `WriteZero`,
+    /// never a silent success.
+    #[test]
+    fn zero_progress_is_write_zero() {
+        let mut writer = ScriptedWriter::new(usize::MAX, vec![Ok(())]);
+        let mut slices = pieces().map(IoSlice::new);
+        let error = write_all_vectored(&mut writer, &mut slices).expect_err("zero progress");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    /// Any other error is returned at once, without a retry.
+    #[test]
+    fn a_write_error_is_returned_unchanged() {
+        let mut writer =
+            ScriptedWriter::new(usize::MAX, vec![Err(io::Error::other("disk gone")), Ok(())]);
+        let mut slices = pieces().map(IoSlice::new);
+        let error = write_all_vectored(&mut writer, &mut slices).expect_err("failure");
+        assert_eq!(error.to_string(), "disk gone");
+        assert_eq!(writer.calls, 1);
+    }
+
+    /// A CRC-valid slice whose payload was substituted fails its COMMIT binding.
+    ///
+    /// The slice frame is rewritten with different bytes of the same length
+    /// and a recomputed CRC32C, so only the COMMIT's XXH3-128 payload binding
+    /// can tell it from the slice the commit closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be written or replay accepts the slice.
+    #[test]
+    fn a_crc_valid_substituted_slice_fails_its_commit_binding() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let wal =
+            WalWriter::new(temp_dir.path(), [7; 16], 1, WalConfig::default()).expect("writer");
+        let seal_key = test_seal_key(DataTenantId::new_v7());
+        wal.append_and_commit_for_replay_test(&seal_key, [42; 16], b"original")
+            .expect("append");
+        wal.sync_data_for_test(&seal_key).expect("sync");
+        drop(wal);
+
+        let mut segments = Vec::new();
+        collect_segment_paths(temp_dir.path(), &mut segments).expect("segments");
+        let [segment] = segments.as_slice() else {
+            panic!("one segment, found {segments:?}");
+        };
+        let mut bytes = std::fs::read(segment).expect("segment bytes");
+        let header = 64;
+        let payload_len = usize::try_from(u32::from_le_bytes(
+            bytes[header + 64..header + 68]
+                .try_into()
+                .expect("length field"),
+        ))
+        .expect("length");
+        let payload = header + 72..header + 72 + payload_len;
+        let original_end = payload.end - b"original".len();
+        bytes[original_end..payload.end].copy_from_slice(b"replaced");
+        let crc = crc32c::crc32c_append(
+            crc32c::crc32c(&bytes[header..header + 72]),
+            &bytes[payload.clone()],
+        );
+        bytes[payload.end..payload.end + 4].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(segment, bytes).expect("rewrite segment");
+
+        let error = crate::scribe::replay::replay_wal_directory(temp_dir.path())
+            .expect_err("substituted slice");
+        assert!(
+            error
+                .to_string()
+                .contains("COMMIT digest does not match its slice set"),
+            "{error}"
+        );
+    }
 
     fn test_seal_key(tenant: DataTenantId) -> SealKey {
         SealKey::new(
@@ -4247,8 +4686,8 @@ mod tests {
     #[test]
     fn wal_commit_record_uses_the_terminal_slice_identity() {
         let identity = WalCommitIdentity {
-            wal_digest: [9; 32],
-            logical_digest: [11; 32],
+            wal_digest: [9; 16],
+            logical_digest: [11; 16],
             request_id: [13; 16],
         };
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
@@ -4278,8 +4717,8 @@ mod tests {
     #[test]
     fn wal_commit_identity_rejects_a_foreign_payload() {
         let identity = WalCommitIdentity {
-            wal_digest: [1; 32],
-            logical_digest: [2; 32],
+            wal_digest: [1; 16],
+            logical_digest: [2; 16],
             request_id: [3; 16],
         };
         let encoded = identity.encode();
@@ -4641,6 +5080,99 @@ mod tests {
         assert!(current.path.exists());
     }
 
+    /// A released segment becomes deletable only once every earlier segment of
+    /// its shard is released too, and the shard manifest records that prefix
+    /// before any file in it goes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer cannot append, a segment is deleted ahead of the
+    /// persisted prefix, or the manifest frontier diverges from the released
+    /// contiguous prefix.
+    #[test]
+    fn released_segments_advance_a_persisted_contiguous_frontier() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            [11_u8; 16],
+            1,
+            WalConfig {
+                segment_bytes: 1200,
+            },
+        )
+        .expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        // Two records fill a segment, so eight records close segments 0, 1, 2.
+        for fill in 0..8 {
+            writer
+                .append_and_fsync_for_test(&key, [1_u8; 16], &[fill; 300])
+                .expect("append");
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        let [zero, one, two] = [0, 1, 2].map(|index| reader.segments[index].reference());
+        writer
+            .retain_segments(&[zero.clone(), one.clone(), two.clone()])
+            .expect("retain");
+        let manifest = zero.path.with_file_name("manifest");
+        let frontier = || {
+            crate::scribe::manifest::read_manifest(&manifest)
+                .expect("read manifest")
+                .and_then(|manifest| manifest.safe_segment)
+        };
+
+        writer
+            .retire_segments(std::slice::from_ref(&one))
+            .expect("release 1");
+        assert!(one.path.exists(), "segment 1 waits for segment 0");
+        assert_eq!(frontier(), None);
+
+        writer
+            .retire_segments(std::slice::from_ref(&zero))
+            .expect("release 0");
+        assert_eq!(frontier(), Some(1));
+        assert!(!zero.path.exists() && !one.path.exists());
+        assert!(two.path.exists());
+
+        writer
+            .retire_segments(std::slice::from_ref(&two))
+            .expect("release 2");
+        assert_eq!(frontier(), Some(2));
+        assert!(!two.path.exists());
+    }
+
+    /// A frontier that cannot be persisted keeps every segment it would cover.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer cannot append, the release succeeds, or the
+    /// segment is deleted without a persisted frontier.
+    #[test]
+    fn an_unpersisted_frontier_keeps_its_segments() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            [12_u8; 16],
+            1,
+            WalConfig {
+                segment_bytes: 1200,
+            },
+        )
+        .expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        for fill in 0..4 {
+            writer
+                .append_and_fsync_for_test(&key, [1_u8; 16], &[fill; 300])
+                .expect("append");
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        let zero = reader.segments[0].reference();
+        // A directory where the manifest's temporary file goes fails the write.
+        std::fs::create_dir(zero.path.with_file_name("manifest.tmp")).expect("block manifest");
+
+        assert!(writer.retire_segments(std::slice::from_ref(&zero)).is_err());
+        assert!(zero.path.exists(), "no persisted frontier, no deletion");
+    }
+
     /// A retired segment is recycled into the next one; its stale records end
     /// replay only when no acknowledged batch lies beyond them, and rolling
     /// out of the recycled segment trims them away.
@@ -4732,6 +5264,7 @@ mod tests {
             .reference();
         writer
             .close_segments_if_unowned(
+                shard_of(&current),
                 std::slice::from_ref(&current),
                 &std::collections::HashSet::new(),
             )
@@ -4849,6 +5382,7 @@ mod tests {
         let segment = reader.segments[0].reference();
         writer
             .close_segments_if_unowned(
+                shard_of(&segment),
                 std::slice::from_ref(&segment),
                 &std::collections::HashSet::new(),
             )
@@ -4967,6 +5501,7 @@ mod tests {
             .expect("terminal commit LSN");
         writer
             .close_segments_if_unowned(
+                shard_of(&segment),
                 std::slice::from_ref(&segment),
                 &std::collections::HashSet::new(),
             )
@@ -5163,6 +5698,51 @@ mod tests {
         }
     }
 
+    /// Closing one shard's unowned segment touches only that shard's state.
+    ///
+    /// Every other shard's state lock is poisoned, standing in for a shard
+    /// busy in its own append or fsync; the close must neither wait on nor
+    /// fail over any of them, and must detach the segment from its own shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if setup fails, the close fails, or the segment stays current.
+    #[test]
+    fn closing_an_unowned_segment_locks_only_its_own_shard() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let key = test_seal_key(crate::test_support::tenant());
+        let writer =
+            WalWriter::new(temp_dir.path(), [24; 16], 1, WalConfig::default()).expect("writer");
+        writer
+            .append_and_fsync_for_test(&key, [4; 16], b"data")
+            .expect("append");
+        let segment = WalReader::open_directory_unfiltered(temp_dir.path())
+            .expect("reader")
+            .segments
+            .first()
+            .expect("segment")
+            .reference();
+        let own = shard_of(&segment);
+        for (shard, state) in writer.states.iter().enumerate() {
+            if shard != usize::from(own) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _held = state.lock().expect("unpoisoned state");
+                    panic!("poison another shard's WAL state");
+                }));
+            }
+        }
+
+        writer
+            .close_segments_if_unowned(own, std::slice::from_ref(&segment), &HashSet::new())
+            .expect("the close ignores every other shard's state");
+
+        let state = writer.states[usize::from(own)].lock().expect("own state");
+        assert!(
+            state.current_segment.is_none(),
+            "the segment is detached from its shard"
+        );
+    }
+
     /// A released segment survives a skipped or failed deletion and is
     /// removed by the next retirement pass.
     ///
@@ -5194,7 +5774,11 @@ mod tests {
             "the current segment is never deleted"
         );
         writer
-            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
+            .close_segments_if_unowned(
+                shard_of(&segment),
+                std::slice::from_ref(&segment),
+                &HashSet::new(),
+            )
             .expect("close");
         let shard_dir = segment.path.parent().expect("shard directory");
         std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o500))

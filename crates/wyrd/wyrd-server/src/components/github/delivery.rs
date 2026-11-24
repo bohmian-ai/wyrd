@@ -42,7 +42,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_bifrost_redux::contracts::committed_batches;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::ExecutionEventsTable;
@@ -66,7 +65,7 @@ use super::extraction::output::PullRequestExtraction;
 use super::presentation::{CheckRun, Completed, Presentation, Review, Settled, review_marker};
 use super::service::GithubConnections;
 use crate::components::verification::service::{Presented, VerificationControl};
-use crate::scribe_outbox::{ScribeTable, ScribeWrite, fenced_batch_id};
+use crate::scribe_outbox::{ScribeTable, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::inputs::InputResolver;
 use crate::verification::state::STATE_TABLE;
@@ -345,11 +344,15 @@ impl<'a> GithubDeliveries<'a> {
     /// read through `records`: a cancelled execution's own outcome, else its
     /// revision's; `None` while none is recorded.
     ///
+    /// Reads come only from Bifrost. An outcome Scribe accepted but no query
+    /// sees yet is `None` here: delivery runs again, its lookup-before-create
+    /// updates the same Check and review, and recording the outcome again is
+    /// absorbed, or refused when different, under the outcome's batch id, so
+    /// the first recorded outcome stays final.
+    ///
     /// # Errors
-    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the fence
-    /// cannot be read or a recorded outcome is not visible yet, so an
-    /// outcome is never mistaken for absence; the query error or an internal
-    /// error when its row cannot be read or is malformed.
+    /// Returns the query error, or an internal error when the row is
+    /// malformed.
     pub(crate) async fn recorded(
         &self,
         records: &InputResolver<'_>,
@@ -357,31 +360,9 @@ impl<'a> GithubDeliveries<'a> {
         revision: i64,
         status: VerificationExecutionStatus,
     ) -> Result<Option<GithubDelivery>, WyrdError> {
-        let event = event(status);
-        let fence = fenced_batch_id(
-            self.tenant,
-            ScribeTable::ExecutionEvents,
-            key(event, execution_id, revision),
-        );
-        let mut conn = self
-            .app
-            .postgres
-            .vala()
-            .tenant_conn(self.tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let fenced = committed_batches(&mut conn, STATE_TABLE, &[fence])
-            .await
-            .map_err(|error| unavailable(&error))?;
-        drop(conn);
-        if !fenced.contains(&fence) {
-            return Ok(None);
-        }
         records
-            .delivery(execution_id, revision, event)
-            .await?
-            .ok_or_else(|| unavailable(&"a recorded outcome is not visible yet"))
-            .map(Some)
+            .delivery(execution_id, revision, event(status))
+            .await
     }
 
     /// What `presented` shows on GitHub: a completed execution's report is
@@ -691,13 +672,6 @@ fn row(
         .collect();
     StagedRow::new(Arc::clone(&SCHEMA), cells)
         .map_err(|error| WyrdError::internal(format!("delivery row: {error}")))
-}
-
-/// An unreadable fence or invisible recorded outcome as a retryable
-/// unavailability. The cause is traced here and never reaches the caller.
-fn unavailable(error: &dyn std::fmt::Display) -> WyrdError {
-    tracing::warn!(cause = %error, "GitHub delivery outcomes cannot be read");
-    WyrdError::from(BifrostError::QueryVisibilityUnavailable)
 }
 
 /// Unit proofs of outcome identity.

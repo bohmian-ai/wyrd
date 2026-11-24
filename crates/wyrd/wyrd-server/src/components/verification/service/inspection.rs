@@ -56,7 +56,7 @@ use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
 use crate::verification::inputs::{DirectResult, InputOrigin, InputResolver};
-use crate::verification::state::RunState;
+use crate::verification::state::{RunState, StateError};
 
 /// Audit operation of an invocation page read.
 const LIST_INVOCATIONS: &str = "verification.execution.invocations";
@@ -222,6 +222,43 @@ fn invocation(state: &ExecutionState, entry: InvocationRecord) -> ExecutionInvoc
     }
 }
 
+/// One execution's inspected status from its accepted `state`, its queue
+/// row's status while one exists, whether it is published direct work, and
+/// whether an approval it reached is still undecided; see
+/// [`Retained::status`].
+///
+/// A selected outcome reads as completed only once its queue row commits
+/// completion, in the transaction that also records its Operator
+/// dispatches, so a caller never sees `completed` with dispatches still to
+/// come; with no queue row the selection alone completes it.
+fn execution_status(
+    state: &ExecutionState,
+    queued: Option<VerificationExecutionStatus>,
+    direct: bool,
+    undecided: bool,
+) -> VerificationExecutionStatus {
+    if direct {
+        return VerificationExecutionStatus::Completed;
+    }
+    if state.terminal.is_some() {
+        return queued.unwrap_or(VerificationExecutionStatus::Completed);
+    }
+    if let Some(failure) = &state.failure {
+        return failure.status;
+    }
+    queued.map_or(
+        VerificationExecutionStatus::Running,
+        |status| match status {
+            VerificationExecutionStatus::Pending | VerificationExecutionStatus::Retrying
+                if !state.waiting.is_empty() || undecided =>
+            {
+                VerificationExecutionStatus::Waiting
+            }
+            status => status,
+        },
+    )
+}
+
 /// One execution as an authorized inspection read it.
 pub(super) struct Retained {
     /// Its queue row, while one exists.
@@ -241,32 +278,19 @@ pub(super) struct Retained {
 }
 
 impl Retained {
-    /// The execution's status: the outcome or failure its state retained,
-    /// else `waiting` for a queued execution parked on deferred inputs or an
+    /// The execution's status: the outcome its state selected, read as
+    /// completed once its queue row, if any, commits completion; else the
+    /// failure its state retained; else `waiting` for a queued execution parked on deferred inputs or an
     /// undecided approval, else its queue status, else `running`, since a
     /// state with neither and no queue row belongs to direct work still in
     /// flight.
     pub(super) fn status(&self) -> VerificationExecutionStatus {
-        if self.state.terminal.is_some() || self.direct.is_some() {
-            return VerificationExecutionStatus::Completed;
-        }
-        if let Some(failure) = &self.state.failure {
-            return failure.status;
-        }
-        self.queued
-            .as_ref()
-            .map_or(
-                VerificationExecutionStatus::Running,
-                |queued| match queued.state.status {
-                    VerificationExecutionStatus::Pending
-                    | VerificationExecutionStatus::Retrying
-                        if !self.state.waiting.is_empty() || self.undecided() =>
-                    {
-                        VerificationExecutionStatus::Waiting
-                    }
-                    status => status,
-                },
-            )
+        execution_status(
+            &self.state,
+            self.queued.as_ref().map(|queued| queued.state.status),
+            self.direct.is_some(),
+            self.undecided(),
+        )
     }
 
     /// The deferred inputs a `waiting` execution is parked for; empty in
@@ -492,10 +516,9 @@ impl<'a> VerificationControl<'a> {
             .records(&mut conn, caller.data_tenant_id, Some(caller))
             .await?;
         conn.commit().await.map_err(registry_db_error)?;
-        let (revision, state) = RunState::accepted(
-            self.state,
-            caller.data_tenant_id,
+        let (revision, state) = accepted(
             execution_id,
+            queued.as_ref(),
             &InputResolver::new(&query, None),
         )
         .await?;
@@ -601,8 +624,7 @@ impl<'a> VerificationControl<'a> {
         let query = self.records(&mut conn, tenant, None).await?;
         conn.commit().await.map_err(registry_db_error)?;
         let records = InputResolver::new(&query, None);
-        let (revision, state) =
-            RunState::accepted(self.state, tenant, execution_id, &records).await?;
+        let (revision, state) = accepted(execution_id, queued.as_ref(), &records).await?;
         let approvals: Vec<ApprovalId> = state
             .approvals
             .iter()
@@ -1073,4 +1095,62 @@ fn content_url(
         name.as_str(),
         query.finish()
     )
+}
+
+/// The accepted revision and state of `execution_id`, fresh at revision 0
+/// with no read when its queue row `queued` proves no claim ever leased it,
+/// since only a lease holder writes execution state. Without a queue row
+/// the state is recovered: retained history may outlive the row.
+///
+/// # Errors
+/// As [`RunState::accepted`].
+async fn accepted(
+    execution_id: ExecutionId,
+    queued: Option<&ExecutionStatus>,
+    records: &InputResolver<'_>,
+) -> Result<(i64, ExecutionState), StateError> {
+    if queued.is_some_and(|queued| !queued.claimed) {
+        return Ok((0, ExecutionState::fresh()));
+    }
+    RunState::accepted(execution_id, records).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wyrd_spec::ids::VerificationResultId;
+    use wyrd_spec::verification::VerificationVerdict;
+    use wyrd_spec::verification::execution::ExecutedOutcome;
+    use wyrd_spec::verification::state::TerminalSelection;
+
+    /// An execution whose outcome is selected reads as completed only once
+    /// its queue row commits completion, the transaction that also records
+    /// its dispatches; with no queue row, the selection alone completes it.
+    #[test]
+    fn a_selected_outcome_completes_only_with_its_queue_row() {
+        let state = ExecutionState {
+            terminal: Some(TerminalSelection {
+                result_id: VerificationResultId::new_v7(),
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
+                outcome: ExecutedOutcome {
+                    verdict: VerificationVerdict::Passed,
+                    requirements: Vec::new(),
+                    steps: Vec::new(),
+                    evidence: BTreeMap::new(),
+                },
+            }),
+            ..ExecutionState::default()
+        };
+        let status = |queued| execution_status(&state, queued, false, false);
+        assert_eq!(
+            status(Some(VerificationExecutionStatus::Running)),
+            VerificationExecutionStatus::Running
+        );
+        assert_eq!(
+            status(Some(VerificationExecutionStatus::Completed)),
+            VerificationExecutionStatus::Completed
+        );
+        assert_eq!(status(None), VerificationExecutionStatus::Completed);
+    }
 }

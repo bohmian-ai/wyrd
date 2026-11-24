@@ -25,6 +25,7 @@ pub mod persistence;
 pub mod preprocess;
 pub(crate) mod profile;
 pub mod promotion;
+pub(crate) mod receipt_cleaner;
 pub mod registry;
 pub mod replay;
 pub mod routing;
@@ -326,6 +327,9 @@ pub struct ScribeImpl {
     /// Vala SQL pool holding the batch-control fence, read by ingress only to
     /// recover an accepted retry the committed index no longer holds.
     control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    /// Background deleter of this node's retry receipts, present when
+    /// receipts are written.
+    receipt_cleaner: Option<Arc<receipt_cleaner::ReceiptCleaner>>,
     /// The `bifrost.metrics.series` rows this process has made durable, so a
     /// points batch admits only the series rows it adds.
     series_seen: series_index::SeriesSeen,
@@ -1151,8 +1155,13 @@ impl ScribeImpl {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
+        let cleanup = config
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.operator_pool.is_some())
+            .then(|| Arc::new(receipt_cleaner::CleanupHealth::default()));
         let admission =
-            AdmissionController::with_config_and_memory(config.admission, memory.clone());
+            AdmissionController::with_cleanup(config.admission, memory.clone(), cleanup.clone());
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1173,6 +1182,7 @@ impl ScribeImpl {
             wal_io,
         } = execution_pools;
         ingress_cpu.join_lanes(memory.workloads());
+        ingress_cpu.retain_encoders(memory.clone(), ingest_limits.max_frame_bytes);
         persistence_cpu.join_lanes(memory.workloads());
         let control_postgres = persistence_config
             .as_ref()
@@ -1215,6 +1225,21 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
+        let receipt_cleaner = cleanup.and_then(|health| {
+            let operator = fence_operator.clone()?;
+            let postgres = control_postgres.clone()?;
+            let cleaner = Arc::new(receipt_cleaner::ReceiptCleaner::new(
+                operator,
+                postgres,
+                wal.base_dir().to_path_buf(),
+                stream.node_id,
+                shards.committed(),
+                health,
+                wal.frontier_advanced(),
+            ));
+            cleaner.start(&coordination_runtime);
+            Some(cleaner)
+        });
         Self::install_boot_metrics();
         Self {
             catalog,
@@ -1245,6 +1270,7 @@ impl ScribeImpl {
             admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
             control_postgres,
             fence_operator,
+            receipt_cleaner,
             series_seen: series_index::SeriesSeen::default(),
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
@@ -1263,7 +1289,15 @@ impl ScribeImpl {
     /// bytes are the volume governor's `bifrost_resource_current_bytes` series.
     fn install_boot_metrics() {
         metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
-        for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
+        for reason in [
+            "in_flight",
+            "memory",
+            "wal",
+            "queue",
+            "closed",
+            "invalid",
+            "cleanup",
+        ] {
             metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
         }
     }
@@ -1473,8 +1507,15 @@ impl ScribeImpl {
         self.finalize_shutdown_owners();
     }
 
-    /// Abort retained async owners and publish the terminal stopped state.
+    /// Abort retained async owners, release idle encoder contexts, and publish
+    /// the terminal stopped state.
+    ///
+    /// Every terminal path ends here, so a stopped Scribe whose handle is
+    /// still held keeps no encoder memory. An encode already running keeps its
+    /// context's lease until it settles and cannot restore it into the closed
+    /// set.
     fn finalize_shutdown_owners(&self) {
+        self.ingress_cpu.encoders().clear();
         let aborted_shards = self.shards.abort_retained();
         self.shards.clear_retained_join_handles();
         let aborted_persistence = self
@@ -1527,6 +1568,9 @@ impl ScribeImpl {
         self.closed.store(true, Ordering::Release);
         self.recovery_cancelled.store(true, Ordering::Release);
         self.shards.close();
+        if let Some(cleaner) = &self.receipt_cleaner {
+            cleaner.stop();
+        }
     }
 
     /// Closes internal execution lanes after graceful flush has completed or timed out.
@@ -2416,6 +2460,7 @@ impl ScribeImpl {
             let before = self.memory.memory_snapshot();
             let owner_snapshots = self.shards.memtable_snapshots()?;
             let transient_by_shard = self.memory.shard_snapshot(self.shards.shard_count());
+            let encoder_memory = self.ingress_cpu.encoders().charged_bytes();
             let memory = self.memory.memory_snapshot().with_ingress_watermarks(
                 self.pressure_config.ingress_high_water_percent,
                 self.pressure_config.ingress_low_water_percent,
@@ -2426,16 +2471,24 @@ impl ScribeImpl {
                 .map(|bucket| bucket.writable_bytes.saturating_add(bucket.immutable_bytes))
                 .sum::<usize>();
             let transient_total = transient_by_shard.iter().sum::<usize>();
-            latest = Some((memory, owner_snapshots.clone(), transient_by_shard.clone()));
+            latest = Some((
+                memory,
+                owner_snapshots.clone(),
+                transient_by_shard.clone(),
+                encoder_memory,
+            ));
             if before.total_bytes() == memory.total_bytes()
-                && bucket_total.saturating_add(transient_total) == memory.total_bytes()
+                && bucket_total
+                    .saturating_add(transient_total)
+                    .saturating_add(encoder_memory)
+                    == memory.total_bytes()
             {
-                coherent = Some((memory, owner_snapshots, transient_by_shard));
+                coherent = Some((memory, owner_snapshots, transient_by_shard, encoder_memory));
                 break;
             }
             std::hint::spin_loop();
         }
-        let (memory, owner_snapshots, transient_by_shard) =
+        let (memory, owner_snapshots, transient_by_shard, encoder_memory) =
             coherent.or(latest).ok_or_else(|| ScribeError::Internal {
                 detail: "inspection could not read bucket and shard ownership".to_owned(),
             })?;
@@ -2465,6 +2518,7 @@ impl ScribeImpl {
             memory_by_category: memory.categories,
             memory_by_shard,
             transient_memory_by_shard: transient_by_shard,
+            encoder_memory,
             memory_by_bucket,
             total_accounted_memory: memory.total_bytes(),
             parent_used_memory: memory.bifrost_total_bytes,
@@ -2586,7 +2640,10 @@ impl ScribeImpl {
     /// Replays eligible WAL sequentially through the bounded filesystem lane.
     ///
     /// Readiness remains false until every restored shard result, manifest
-    /// advance, and WAL retirement settles. Shutdown requests cancellation
+    /// advance, and WAL retirement settles. Receipt cleanup does not gate it:
+    /// the background cleaner's first completed sweep admits fresh writes, so
+    /// a blocked sweep leaves writes busy while recovered rows are served.
+    /// Shutdown requests cancellation
     /// between records; an already-started shard settlement completes first.
     ///
     /// # Errors

@@ -1,4 +1,5 @@
-//! The Bifrost engine's experiments, run through `mise run bench:l1:bifrost`
+//! The Bifrost engine's experiments, run through `mise run benchmark:l1:bifrost-writes`,
+//! `mise run benchmark:l1:bifrost-reads`
 //! and `mise run bench:l2:bifrost`.
 //!
 //! Both read as the production journey they measure. One release
@@ -37,9 +38,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, Platform, WyrdClient};
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
     Criterion, Declaration, Derive, Direction, Engine, HISTORY_DIRECTORY, Level, Metric, Mode, Op,
-    Reason, Record, Status, Step, Verdict, WINDOW_SECONDS,
+    Reason, Record, Role, Status, Step, Verdict, WINDOW_SECONDS,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -109,7 +111,7 @@ pub const POINT_P99_MS: f64 = 5.0;
 /// Native write peak sanity floor, rows per second.
 pub const NATIVE_PEAK_FLOOR: f64 = 200_000.0;
 
-/// OTLP write peak sanity floor, encoded wire MiB per server CPU-second.
+/// OTLP write peak sanity floor, uncompressed OTLP input MiB per server CPU-second.
 pub const OTLP_PEAK_FLOOR: f64 = 30.0;
 
 /// The `writes-parquet` budget, seconds: its measured windows, the
@@ -176,11 +178,12 @@ pub enum Experiment {
 }
 
 impl Experiment {
-    /// Every experiment, in the order `l1 bifrost` runs them.
+    /// The experiments the routine Bifrost sweep's cases belong to, in the
+    /// order it runs them.
     pub const ALL: [Self; 4] = [Self::WritesParquet, Self::Hot, Self::Parquet, Self::UiSql];
 
-    /// The extended experiments, run only when selected by name: never part
-    /// of `l1 bifrost` or `l1`.
+    /// The extended experiments, whose cases are all targeted: never part of
+    /// the routine Bifrost sweep.
     pub const EXTENDED: [Self; 2] = [Self::UiSql10x, Self::UiSqlLearned];
 
     /// The experiment id: its command word and record directory.
@@ -817,6 +820,20 @@ fn isolated_metrics() -> Vec<Metric> {
             cpu_per(work("queries", 1e3)),
         ),
         derived(
+            "input_mib_per_s_per_vcpu",
+            "MiB/s/vCPU",
+            "(W/T)/P: the headline ingest rate: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per wall second per provisioned vCPU; OTLP steps only",
+            Direction::Higher,
+            per_vcpu(work("wire_bytes", 1.0 / 1_048_576.0)),
+        ),
+        derived(
+            "input_mib_per_cpu_s",
+            "MiB/cpu-s",
+            "W/C: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per server CPU-second used; OTLP steps only",
+            Direction::Higher,
+            per_cpu(work("wire_bytes", 1.0 / 1_048_576.0)),
+        ),
+        derived(
             "rows_per_s",
             "rows/s",
             "durably acknowledged rows per wall second",
@@ -854,32 +871,18 @@ fn isolated_metrics() -> Vec<Metric> {
             },
         ),
         derived(
-            "mib_per_s_per_vcpu",
+            "stored_mib_per_s_per_vcpu",
             "MiB/s/vCPU",
-            "(W/T)/P: uncompressed retained Arrow MiB per wall second per provisioned vCPU",
+            "(W/T)/P: uncompressed Arrow MiB the server stored per wall second per provisioned vCPU; it falls when the schema stores less per row, so it is not an ingest rate",
             Direction::Higher,
             per_vcpu(work("retained_mib", 1.0)),
         ),
         derived(
-            "mib_per_cpu_s",
+            "stored_mib_per_cpu_s",
             "MiB/cpu-s",
-            "W/C: uncompressed retained Arrow MiB per server CPU-second used",
+            "W/C: uncompressed Arrow MiB the server stored per server CPU-second used; not an ingest rate",
             Direction::Higher,
             per_cpu(work("retained_mib", 1.0)),
-        ),
-        derived(
-            "wire_mib_per_s_per_vcpu",
-            "MiB/s/vCPU",
-            "(W/T)/P: encoded OTLP wire MiB per wall second per provisioned vCPU",
-            Direction::Higher,
-            per_vcpu(work("wire_bytes", 1.0 / 1_048_576.0)),
-        ),
-        derived(
-            "wire_mib_per_cpu_s",
-            "MiB/cpu-s",
-            "W/C: encoded OTLP wire MiB per server CPU-second used",
-            Direction::Higher,
-            per_cpu(work("wire_bytes", 1.0 / 1_048_576.0)),
         ),
     ];
     let phases = WRITE_PHASES
@@ -900,6 +903,10 @@ fn isolated_metrics() -> Vec<Metric> {
             ));
         }
     }
+    metrics.extend(Population::root_metrics(
+        Role::Driver,
+        &[run::OTLP_DRIVER_ROOT],
+    ));
     metrics
 }
 
@@ -915,8 +922,10 @@ const SERVER_FAILURES: &str = "server timings at the step's boundary whose outco
 
 /// The settled-state facts the `parquet` experiment reads once after its
 /// settlement, outside every window, and reports on the step each
-/// describes: `(step, metric, unit, description)`.
-pub const SETTLED: [(&str, &str, &str, &str); 5] = [
+/// describes: `(step, metric, unit, description)`. Each OTLP path's
+/// `compression` is the headline storage figure; `storage_ratio` stays as
+/// the Arrow-relative diagnostic every path, native included, reports.
+pub const SETTLED: [(&str, &str, &str, &str); 7] = [
     (
         "span-shredded-c1",
         "span_shredding_faults",
@@ -947,7 +956,22 @@ pub const SETTLED: [(&str, &str, &str, &str); 5] = [
         "ratio",
         STORAGE_RATIO,
     ),
+    (
+        "full-scan-c1",
+        "compression.otlp-spans",
+        "ratio",
+        COMPRESSION,
+    ),
+    (
+        "full-scan-c1",
+        "compression.otlp-logs",
+        "ratio",
+        COMPRESSION,
+    ),
 ];
+
+/// What each `compression.<path>` reading is.
+const COMPRESSION: &str = "uncompressed OTLP protobuf bytes the clients sent and the server acknowledged while the path's sample loaded alone, per byte of its table's growth in published Parquet: input over stored, higher is smaller; WAL, staging, and catalog bytes are excluded";
 
 /// What each `storage_ratio.<path>` reading is.
 const STORAGE_RATIO: &str = "the path's table growth in published Parquet bytes per retained Arrow byte inserted while its sample loaded alone: 200,000 rows for native and logs, the 1M-row span fixture for spans, all settled together; the inserted bytes include server-internal rows written meanwhile, and WAL, staging, and catalog bytes are excluded";
@@ -1060,13 +1084,13 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
             ),
             (
                 "otlp-spans-peak-floor",
-                "wire_mib_per_cpu_s",
+                "input_mib_per_cpu_s",
                 "otlp-spans-peak",
                 OTLP_PEAK_FLOOR,
             ),
             (
                 "otlp-logs-peak-floor",
-                "wire_mib_per_cpu_s",
+                "input_mib_per_cpu_s",
                 "otlp-logs-peak",
                 OTLP_PEAK_FLOOR,
             ),
@@ -1214,6 +1238,7 @@ pub fn calibrate(
                     == Some(&limits(&PARQUET_ENV, shard_override().as_deref()))
                 && record.validity.reasons.is_empty()
                 && record.mode == Mode::Full
+                && record.lifecycle.is_none()
         })
         .collect();
     compatible.sort_by_key(|record| std::cmp::Reverse(record.started_at));
@@ -1248,7 +1273,7 @@ pub fn calibrate(
         })
         .ok_or_else(|| {
             format!(
-                "no compatible valid L1 `writes-parquet` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost:writes:parquet` (or `bench:l1:bifrost:writes`) on this host and build first",
+                "no compatible valid historical schema-3 L1 `writes-parquet` record measures every write path: {} records read, {} compatible; L1 case-protocol records never calibrate L2",
                 records.len(),
                 compatible.len()
             )
@@ -1476,10 +1501,10 @@ fn competing_declaration(
         Metric::derived("table_aggregates_per_cpu_s", "queries/cpu-s", "whole-table aggregates per server CPU-second; the denominator also pays for everything else", Direction::Higher, Derive::PerCpu { work: "table_aggregates".to_owned(), scale: 1.0 }),
         Metric::derived("ingest_rows_per_cpu_s", "rows/cpu-s", "ingest rows per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
         Metric::derived("queries_per_s_per_vcpu", "queries/s/vCPU", "mixed queries per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "queries".to_owned(), scale: 1.0 }),
-        Metric::derived("mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: retained Arrow MiB per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "retained_mib".to_owned(), scale: 1.0 }),
-        Metric::derived("mib_per_cpu_s", "MiB/cpu-s", "W/C: retained Arrow MiB per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "retained_mib".to_owned(), scale: 1.0 }),
-        Metric::derived("wire_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: encoded OTLP wire MiB per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
-        Metric::derived("wire_mib_per_cpu_s", "MiB/cpu-s", "W/C: encoded OTLP wire MiB per server CPU-second; the denominator also pays for native ingest and queries", Direction::Higher, Derive::PerCpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("stored_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: retained Arrow MiB the server stored per wall second per provisioned logical CPU; not an ingest rate", Direction::Higher, Derive::PerVcpu { work: "retained_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("stored_mib_per_cpu_s", "MiB/cpu-s", "W/C: retained Arrow MiB the server stored per server CPU-second; not an ingest rate; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "retained_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("input_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: the headline ingest rate: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("input_mib_per_cpu_s", "MiB/cpu-s", "W/C: uncompressed OTLP protobuf MiB the clients sent and the server acknowledged, per server CPU-second; the denominator also pays for native ingest and queries", Direction::Higher, Derive::PerCpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
         Metric::derived("cpu_ms_per_query", "cpu-ms/query", "server CPU per mixed query, C/W; the numerator also pays for ingest", Direction::Lower, Derive::CpuPer { work: "queries".to_owned(), scale: 1e3 }),
         Metric::derived("ingest_rows_per_s_per_vcpu", "rows/s/vCPU", "ingest rows per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
         Metric::derived("cpu_us_per_ingest_row", "cpu-µs/row", "server CPU per ingest row, C/W; the numerator also pays for queries", Direction::Lower, Derive::CpuPer { work: "ingest_rows".to_owned(), scale: 1e6 }),

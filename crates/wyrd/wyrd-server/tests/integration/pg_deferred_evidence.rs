@@ -25,7 +25,7 @@ use wyrd_spec::ids::SlotName;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::github::PullRequest;
 
-use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY};
+use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY, expire_receipts};
 use super::pg_hosted_artifacts::client;
 
 /// The connected repository's slug.
@@ -857,6 +857,65 @@ async fn unacknowledged_publication_is_unavailable_and_its_retry_resumes() {
     );
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+}
+
+/// Accepted evidence outlives its retry receipt: its Bifrost record stays
+/// the authority once cleanup removes the receipt.
+///
+/// Evidence is accepted before any pull request and published, then its
+/// receipt is removed. Publishing it again still replays the original
+/// evidence and time, different content is still a conflict, and a pull
+/// request opened later consumes it and passes. Reading acceptances never
+/// touches receipts: while they cannot be read at all, a republication,
+/// which only reads, still replays.
+///
+/// # Panics
+/// Panics when the replay, conflict or consumption changes after the
+/// receipt is removed, or publication depends on the receipts.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_evidence_outlives_its_retry_receipt() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let (status, receipt) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["status"], "accepted");
+
+    expire_receipts(&deployment.server, &["bifrost.verification.evidence"]).await;
+    let (status, replay) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["status"], "replayed", "{replay}");
+    assert_eq!(replay["evidence_id"], receipt["evidence_id"]);
+    assert_eq!(replay["recorded_at"], receipt["recorded_at"]);
+    let (status, conflict) = deployment.publish_ci(C0, json!({"status": "red"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], "WYRD_VERIFICATION_409_EVIDENCE_CONFLICT");
+    let consumer = deployment.open(1, C0).await;
+    let served = deployment.until(consumer, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let grant = |statement: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("the receipt grant changes");
+        }
+    };
+    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    let (status, replay) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the replay reads no receipt: {replay}"
+    );
+    assert_eq!(replay["status"], "replayed", "{replay}");
 }
 
 /// A registered Artifact is admitted against the subscriber's slot before

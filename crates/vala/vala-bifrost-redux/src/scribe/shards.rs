@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::scribe::wal::ContentHasher;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -425,6 +425,10 @@ pub const SHARD_COMMAND_CAPACITY: usize = 256;
 /// Maximum requests in one tenant scheduling group.
 pub const MAX_GROUP_ITEMS: usize = 64;
 
+/// Mailbox commands a shard routes before it again services ready group
+/// completions, so a mailbox backlog cannot delay a ready ACK.
+const MAILBOX_SERVICE_CHUNK: usize = MAX_GROUP_ITEMS;
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PressureSignal {
     pub(crate) keys: Vec<crate::scribe::seal_key::SealKey>,
@@ -533,6 +537,10 @@ impl<T> ScribeShardSet<T> {
     }
 }
 
+/// A tenant, table, and client batch id: the identity one batch holds while
+/// a dispatched group owns it.
+pub type BatchIdentity = (DataTenantId, TableRef, [u8; 16]);
+
 /// Hierarchical tenant-then-table-fair pending scheduler owned by one shard.
 ///
 /// Scheduling walks three levels, outermost first: tenants in round-robin
@@ -547,6 +555,8 @@ pub struct TenantTableRoundRobin<T> {
     pending_by_tenant: HashMap<DataTenantId, TenantTableQueues<T>>,
     /// Tenants with at least one pending request, in service order.
     active_tenants: VecDeque<DataTenantId>,
+    /// Queued requests across every level.
+    len: usize,
 }
 
 /// One tenant's table queues and its table-level rotation.
@@ -563,13 +573,16 @@ struct TenantTableQueues<T> {
 }
 
 impl<T> TenantTableQueues<T> {
-    /// Returns the request the tenant's next turn would take, without taking it.
+    /// Returns the request the table at `position` in the rotation would
+    /// give, without taking it.
     ///
-    /// Reads the front of the next table's queue, which is the item
-    /// [`TenantTableRoundRobin::pop_next_table_item`] pops while the rotation
-    /// and queues stay in step.
-    fn peek_next_table_item(&self) -> Option<&T> {
-        self.by_table.get(self.active_tables.front()?)?.front()
+    /// Reads the front of that table's queue, which is the item
+    /// [`TenantTableRoundRobin::pop_table_item`] pops while the rotation and
+    /// queues stay in step.
+    fn peek_table_item(&self, position: usize) -> Option<&T> {
+        self.by_table
+            .get(self.active_tables.get(position)?)?
+            .front()
     }
 }
 
@@ -587,6 +600,7 @@ impl<T> Default for TenantTableRoundRobin<T> {
         Self {
             pending_by_tenant: HashMap::new(),
             active_tenants: VecDeque::new(),
+            len: 0,
         }
     }
 }
@@ -605,6 +619,7 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
         let queue = queues.by_table.entry(table.clone()).or_default();
         let table_was_idle = queue.is_empty();
         queue.push_back(item);
+        self.len += 1;
         if table_was_idle {
             queues.active_tables.push_back(table);
         }
@@ -615,19 +630,26 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
 
     /// Drains one bounded group in tenant-then-table round-robin order.
     ///
-    /// Each iteration serves one request from the next tenant's next table and
-    /// requeues both levels behind their peers when either still has work.
-    /// Tenants and tables whose queues emptied are dropped from the rotation
-    /// entirely rather than left as empty entries a later turn would waste.
+    /// Each iteration serves one request from the next tenant's next eligible
+    /// table and requeues both levels behind their peers when either still
+    /// has work. Tenants and tables whose queues emptied are dropped from the
+    /// rotation entirely rather than left as empty entries a later turn would
+    /// waste.
+    ///
+    /// A table whose next request carries an identity in `held`, one a
+    /// dispatched group still owns, is skipped without losing its turn, so
+    /// its later requests stay behind that request while other tables
+    /// proceed. A tenant with every table skipped likewise keeps its place.
     ///
     /// The group never holds two copies of one tenant/table/batch identity:
     /// the owner's duplicate checks see a batch only after its group commits,
     /// so a second in-group copy would write its WAL slices twice. When the
     /// next request is such a copy, its tenant goes back to the front of the
     /// rotation, keeping its turn for the next group, and this group ends.
-    pub fn pop_group(&mut self) -> Vec<T> {
+    pub fn pop_group(&mut self, held: &HashSet<BatchIdentity>) -> Vec<T> {
         let mut result = Vec::new();
         let mut batches = HashSet::new();
+        let mut skipped = Vec::new();
         while result.len() < MAX_GROUP_ITEMS {
             let Some(tenant) = self.active_tenants.pop_front() else {
                 break;
@@ -635,19 +657,30 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
             let Some(queues) = self.pending_by_tenant.get_mut(&tenant) else {
                 continue;
             };
+            let Some(position) = queues.active_tables.iter().position(|table| {
+                queues
+                    .by_table
+                    .get(table)
+                    .and_then(VecDeque::front)
+                    .is_none_or(|item| !held.contains(&(tenant, table.clone(), item.batch_id())))
+            }) else {
+                skipped.push(tenant);
+                continue;
+            };
             // ponytail: a resent copy closes the group; the next group's
             // existing memtable and durable fence checks absorb it.
-            if let Some(next) = queues.peek_next_table_item()
+            if let Some(next) = queues.peek_table_item(position)
                 && batches.contains(&(tenant, next.table().clone(), next.batch_id()))
             {
                 self.active_tenants.push_front(tenant);
                 break;
             }
-            let Some(item) = Self::pop_next_table_item(queues) else {
+            let Some(item) = Self::pop_table_item(queues, position) else {
                 self.pending_by_tenant.remove(&tenant);
                 continue;
             };
             batches.insert((tenant, item.table().clone(), item.batch_id()));
+            self.len -= 1;
             result.push(item);
             if queues.active_tables.is_empty() {
                 self.pending_by_tenant.remove(&tenant);
@@ -655,15 +688,20 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
                 self.active_tenants.push_back(tenant);
             }
         }
+        for tenant in skipped.into_iter().rev() {
+            self.active_tenants.push_front(tenant);
+        }
         result
     }
 
-    /// Takes one request from the tenant's next table, rotating that table.
+    /// Takes one request from the tenant's table at `position` in its
+    /// rotation, moving that table behind its peers.
     ///
-    /// Returns `None` only when the tenant has no table with pending work, in
+    /// Tables ahead of `position` keep their turn. Returns `None` only when
+    /// the tenant has no table with pending work from `position` on, in
     /// which case the caller drops the tenant from the rotation.
-    fn pop_next_table_item(queues: &mut TenantTableQueues<T>) -> Option<T> {
-        while let Some(table) = queues.active_tables.pop_front() {
+    fn pop_table_item(queues: &mut TenantTableQueues<T>, position: usize) -> Option<T> {
+        while let Some(table) = queues.active_tables.remove(position) {
             let Some(queue) = queues.by_table.get_mut(&table) else {
                 continue;
             };
@@ -679,6 +717,41 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
             return Some(item);
         }
         None
+    }
+
+    /// Counts the queued requests at every level.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Counts, up to `limit`, the requests [`Self::pop_group`] may take
+    /// now: each table's requests ahead of its first one whose identity is
+    /// in `held` or repeats an earlier request of that table.
+    ///
+    /// Collection timing counts only these, so requests a dispatched group
+    /// holds back never end the free slot's wait for arrivals.
+    #[must_use]
+    pub fn eligible(&self, held: &HashSet<BatchIdentity>, limit: usize) -> usize {
+        let mut eligible = 0;
+        let mut batches = Vec::new();
+        for (tenant, queues) in &self.pending_by_tenant {
+            for (table, queue) in &queues.by_table {
+                batches.clear();
+                for item in queue {
+                    if eligible == limit {
+                        return eligible;
+                    }
+                    let batch = item.batch_id();
+                    if batches.contains(&batch) || held.contains(&(*tenant, table.clone(), batch)) {
+                        break;
+                    }
+                    batches.push(batch);
+                    eligible += 1;
+                }
+            }
+        }
+        eligible
     }
 
     /// Reports whether the shard has no queued requests at any level.
@@ -703,8 +776,9 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
     /// waits behind it; see [`GROUP_CLOSE_TOTAL`] and [`record_group_size`].
     ///
     /// The reason follows from [`Self::pop_group`]: a full group hit the
-    /// limit, a short one with work left stopped before a duplicate, and a
-    /// short one with none left exhausted the queues.
+    /// limit, a short one with work left stopped before a duplicate or an
+    /// identity a dispatched group holds, and a short one with none left
+    /// exhausted the queues.
     fn record_closed(&self, group: &[T]) {
         if group.is_empty() || !wyrd_benchmark::enabled() {
             return;
@@ -844,13 +918,17 @@ struct ShardOwner {
     seal_retry: HashSet<crate::scribe::seal_key::SealKey>,
     /// Published generations retained until grace-ordered WAL retirement.
     retained_generations: HashMap<u64, RetainedGeneration>,
-    /// The sole in-flight group retained after unresolved SQL COMMIT ambiguity.
+    /// The oldest group, retained after unresolved SQL COMMIT ambiguity.
     ///
-    /// A shard processes one group at a time. Once this slot is populated the
-    /// shared governor is poisoned and the owner stops advancing its scheduler,
-    /// so the current group plus already-admitted scheduler entries remain the
-    /// complete bounded ambiguity set until process restart.
+    /// Only the oldest dispatched group fences or inserts, so at most one
+    /// group holds this slot. Once it is populated the shared governor is
+    /// poisoned and the owner stops dispatching and fencing, so this group,
+    /// any younger group retained in the pipeline, and already-admitted
+    /// scheduler entries remain the complete bounded ambiguity set until
+    /// process restart.
     retained_commit_ambiguity: Option<GroupWalState>,
+    /// The bounded two-group write pipeline.
+    pipeline: GroupPipeline,
     /// This shard's memtable. Only this task writes it; live reads share it
     /// through [`ScribeShardRuntime::snapshot`] under the memtable's own locks.
     memtable: Arc<Memtable>,
@@ -880,11 +958,19 @@ struct ShardOwner {
     pending: Arc<AtomicUsize>,
     /// Notification used by runtime drains to await accepted work.
     drained: Arc<Notify>,
-    /// Pod-wide index of fenced, visible batches this owner records into.
+    /// Pod-wide index this owner records its own committed, visible batches into.
     committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// One-shot retirement release fault used only by deterministic owner tests.
     #[cfg(test)]
     fail_next_retirement_release: bool,
+    /// Pauses each group preparation until a test releases it: the sender
+    /// reports that preparation was reached, then preparation takes one
+    /// permit. Deterministic coordinator-ordering tests only.
+    #[cfg(test)]
+    preparation_hold: Option<(
+        tokio::sync::mpsc::UnboundedSender<()>,
+        Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 /// Last owner-published state used by synchronous inspection surfaces.
@@ -922,7 +1008,7 @@ pub(crate) struct ScribeShardRuntime {
     drained: Arc<Notify>,
     /// Whether external shard admission has closed.
     closed: AtomicBool,
-    /// Batches every owner fenced and made visible, consulted by the ingress
+    /// Batches this pod's owners committed and made visible, consulted by the ingress
     /// to answer an honest retry without re-entering a shard.
     committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// Owner acknowledgements received through the graceful flush path.
@@ -1122,6 +1208,7 @@ impl ScribeShardRuntime {
                 seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
+                pipeline: GroupPipeline::default(),
                 memtable: Arc::clone(&memtable),
                 persistence_cpu: persistence_cpu.clone(),
                 ingress_cpu: ingress_cpu.clone(),
@@ -1139,6 +1226,8 @@ impl ScribeShardRuntime {
                 committed: Arc::clone(&committed),
                 #[cfg(test)]
                 fail_next_retirement_release: false,
+                #[cfg(test)]
+                preparation_hold: None,
             };
             let task = runtime.spawn(owner.run());
             abort_handles
@@ -1189,6 +1278,11 @@ impl ScribeShardRuntime {
     #[must_use]
     pub(crate) fn shard_count(&self) -> usize {
         self.senders.len()
+    }
+
+    /// This pod's committed-batch mirror, shared with receipt cleanup.
+    pub(crate) fn committed(&self) -> Arc<crate::scribe::committed_batches::CommittedBatches> {
+        Arc::clone(&self.committed)
     }
 
     /// Rows of `append` when it is an honest retry of a batch some owner
@@ -1432,9 +1526,14 @@ impl ShardOwner {
 
     /// Runs the shard mailbox until accepted work drains and shutdown completes.
     ///
-    /// Commands are consumed FIFO at the shard boundary. Group processing keeps
-    /// WAL append, sync, memtable insertion, and ACK ordering intact; shutdown
-    /// waits for the scheduler and accepted-item counter before the owner exits.
+    /// Commands are consumed FIFO at the shard boundary. Up to two groups are
+    /// dispatched at once: the younger writes and syncs its WAL while the
+    /// older fences, and groups fence, insert, and ACK in dispatch order.
+    /// A control command waits for the dispatched groups to settle, as does
+    /// a pressure signal or a group that needs a generation rotation, and no
+    /// group dispatches while one waits. Shutdown waits for the scheduler,
+    /// the dispatched groups, and the accepted-item counter before the owner
+    /// exits.
     ///
     /// # Cancellation
     ///
@@ -1443,8 +1542,20 @@ impl ShardOwner {
     /// progress.
     async fn run(mut self) {
         self.publish_snapshot();
+        let mut detached = false;
         loop {
             if self.memory_ownership.is_poisoned() {
+                if self.pipeline.is_running() {
+                    self.settle_next().await;
+                    continue;
+                }
+                if let Some(command) = self.pipeline.deferred.pop_front() {
+                    self.apply_command(command).await;
+                    continue;
+                }
+                if detached {
+                    break;
+                }
                 match self.receiver.recv().await {
                     Some(ShardCommand::Shutdown) | None => break,
                     Some(command) => {
@@ -1456,59 +1567,124 @@ impl ShardOwner {
                 }
                 continue;
             }
-            if self.pressure_receiver.has_changed().unwrap_or(false) {
-                let signal = self.pressure_receiver.borrow_and_update().clone();
-                if let Some(signal) = signal {
-                    self.handle_pressure_signal(signal);
-                    self.publish_snapshot();
+            if let Some((slot, meta, done)) = self.pipeline.ready_stage().await {
+                if let Some(Err(error)) = self.finish_stage(slot, meta, done) {
+                    self.log_group_failure(&error);
                 }
+                continue;
             }
-            while let Ok(command) = self.receiver.try_recv() {
-                if self.handle_command(command).await {
-                    self.shutting_down = true;
+            if self.pipeline.is_idle() {
+                if detached {
+                    break;
                 }
-                self.publish_snapshot();
-            }
-            let group = self.scheduler.pop_group();
-            self.scheduler.record_closed(&group);
-            if !group.is_empty() {
-                let group_len = group.len();
-                if let Err(error) = self.process_group(group).await {
-                    if is_expected_wal_capacity(&error) {
-                        tracing::warn!(error = %error, shard = self.id, "Scribe shard reached its WAL capacity");
-                    } else {
-                        tracing::error!(error = %error, shard = self.id, "Scribe shard group failed");
+                while let Some(command) = self.pipeline.deferred.pop_front() {
+                    self.apply_command(command).await;
+                }
+                if self.pressure_receiver.has_changed().unwrap_or(false) {
+                    let signal = self.pressure_receiver.borrow_and_update().clone();
+                    if let Some(signal) = signal {
+                        self.handle_pressure_signal(signal);
+                        self.publish_snapshot();
                     }
-                    self.publish_snapshot();
                 }
-                self.pending.fetch_sub(group_len, Ordering::AcqRel);
-                self.drained.notify_waiters();
+            }
+            if !detached {
+                self.drain_mailbox().await;
+            }
+            if self.dispatch_next().await {
                 continue;
             }
             if self.shutting_down
                 && self.scheduler.is_empty()
                 && self.pending.load(Ordering::Acquire) == 0
+                && self.pipeline.is_idle()
+                && self.pipeline.rotating.is_none()
+                && self.pipeline.deferred.is_empty()
             {
                 break;
             }
-            tokio::select! {
-                command = self.receiver.recv() => {
-                    match command {
-                        Some(command) => {
-                            if self.handle_command(command).await {
-                                self.shutting_down = true;
-                            }
-                            self.publish_snapshot();
-                        }
-                        None => break,
+            let idle = self.pipeline.is_idle();
+            let pressure_waits = self.pressure_receiver.has_changed().unwrap_or(false) && !idle;
+            let collected = self.pipeline.collection.deadline();
+            let wake = tokio::select! {
+                biased;
+                (meta, done) = GroupPipeline::stage_done(&mut self.pipeline.older) => {
+                    ShardWake::Stage(GroupSlot::Older, meta, done)
+                }
+                (meta, done) = GroupPipeline::stage_done(&mut self.pipeline.newer) => {
+                    ShardWake::Stage(GroupSlot::Newer, meta, done)
+                }
+                command = self.receiver.recv(), if !detached => ShardWake::Command(command),
+                changed = self.pressure_receiver.changed(), if !detached && !pressure_waits => {
+                    ShardWake::Pressure(changed.is_ok())
+                }
+                () = tokio::time::sleep_until(collected.unwrap_or_else(tokio::time::Instant::now)),
+                    if collected.is_some() => ShardWake::Collected,
+            };
+            match wake {
+                ShardWake::Stage(slot, meta, done) => {
+                    if let Some(Err(error)) = self.finish_stage(slot, meta, done) {
+                        self.log_group_failure(&error);
                     }
                 }
-                changed = self.pressure_receiver.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
+                ShardWake::Command(Some(command)) => self.route_command(command).await,
+                ShardWake::Command(None) | ShardWake::Pressure(false) => detached = true,
+                // `changed()` marked the signal seen; keep it for the idle
+                // seal and the dispatch barrier.
+                ShardWake::Pressure(true) => self.pressure_receiver.mark_changed(),
+                ShardWake::Collected => {}
             }
+        }
+    }
+
+    /// Waits for the next dispatched stage and applies it, logging a failed
+    /// group.
+    async fn settle_next(&mut self) {
+        if let Some(Err(error)) = self.advance_pipeline().await {
+            self.log_group_failure(&error);
+        }
+    }
+
+    /// Routes up to [`MAILBOX_SERVICE_CHUNK`] commands already queued in the
+    /// mailbox; see [`Self::route_command`]. The run loop services ready
+    /// group completions between chunks.
+    async fn drain_mailbox(&mut self) {
+        for _ in 0..MAILBOX_SERVICE_CHUNK {
+            let Ok(command) = self.receiver.try_recv() else {
+                break;
+            };
+            self.route_command(command).await;
+        }
+    }
+
+    /// Queues an append, or applies a control command once no group is
+    /// dispatched.
+    ///
+    /// Queuing an append changes no memtable state, so it publishes nothing;
+    /// its rows reach inspection in the group's publication before its ACK.
+    /// A control command that arrives while groups are dispatched, or behind
+    /// another waiting command, waits in FIFO order until they settle, so it
+    /// observes the same generation the serial owner would have. Shutdown
+    /// only marks the owner for exit and applies at once.
+    async fn route_command(&mut self, command: ShardCommand) {
+        let waits = !matches!(command, ShardCommand::Append(_) | ShardCommand::Shutdown)
+            && (!self.pipeline.is_idle() || !self.pipeline.deferred.is_empty());
+        if waits {
+            self.pipeline.deferred.push_back(command);
+        } else {
+            self.apply_command(command).await;
+        }
+    }
+
+    /// Applies one mailbox command, publishing inspection after a control
+    /// command; see [`Self::drain_mailbox`].
+    async fn apply_command(&mut self, command: ShardCommand) {
+        let control = !matches!(command, ShardCommand::Append(_));
+        if self.handle_command(command).await {
+            self.shutting_down = true;
+        }
+        if control {
+            self.publish_snapshot();
         }
     }
 
@@ -1920,47 +2096,20 @@ impl ShardOwner {
             });
         }
         let commits = replayed.commits.clone();
-        let fenced_only = crate::tables::builtin_table(
-            replayed
-                .seal_key
-                .table
-                .namespace
-                .as_str()
-                .strip_prefix("bifrost.")
-                .unwrap_or_default(),
-            &replayed.seal_key.table.name,
-        )
-        .is_some_and(|definition| definition.fenced_only);
         let mut suppressed = Vec::new();
         for commit in &commits {
             match self.resolve_replayed_commit(replayed, commit).await? {
-                // A fenced-only table's batch is accepted only with its
-                // fence, so an unfenced one was never accepted or ACKed.
+                // Only an accepted batch was ever acknowledged, so an
+                // unfenced attempt restores nothing, and neither does a
+                // later attempt of an accepted batch.
                 vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                    if fenced_only =>
-                {
+                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
                     suppressed.push((
                         commit.batch_id,
                         commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
                     ));
                 }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
-                    suppressed.push((
-                        commit.batch_id,
-                        commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
-                    ));
-                }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                    if commit.contested =>
-                {
-                    return Err(ScribeError::Internal {
-                        detail: "WAL replay holds differing attempts at an unfenced batch id"
-                            .to_owned(),
-                    });
-                }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {
-                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {}
             }
         }
         suppressed.extend(
@@ -3177,13 +3326,13 @@ struct DurableSlice {
     /// Stable Arrow schema identity for logical retry comparison.
     schema_fingerprint: [u8; 32],
     /// Stable Arrow data digest for logical retry comparison.
-    data_digest: [u8; 32],
+    data_digest: crate::scribe::wal::ContentDigest,
     /// Stable Arrow data length for logical retry comparison.
     data_len: u32,
     /// WAL sequence number assigned to the durable append.
     lsn: crate::scribe::wal::WalLsn,
-    /// SHA-256 digest of this exact WAL slice payload.
-    payload_digest: [u8; 32],
+    /// XXH3-128 digest of this exact WAL slice payload.
+    payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact WAL slice payload length.
     payload_len: u32,
     /// Zero-based ordinal in the closed batch slice set.
@@ -3201,8 +3350,8 @@ struct DurableSlice {
 struct WalSliceState {
     /// WAL sequence number that can be reused without another append.
     lsn: crate::scribe::wal::WalLsn,
-    /// SHA-256 digest of the exact durable slice payload.
-    payload_digest: [u8; 32],
+    /// XXH3-128 digest of the exact durable slice payload.
+    payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact durable slice payload length.
     payload_len: u32,
     /// Stable ordinal in the committed batch slice set.
@@ -3226,13 +3375,13 @@ struct BatchCommitIdentity {
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
     /// terminal record.
-    wal_digest: [u8; 32],
+    wal_digest: crate::scribe::wal::ContentDigest,
     /// Digest over stable logical row identity, stored in the durable SQL fence.
     ///
     /// This is a client-visible idempotency fact: it must be reproducible by an
     /// honest retry of the same batch, so it binds only the rows and their
     /// schema and never the per-attempt managed columns or WAL coordinates.
-    logical_digest: [u8; 32],
+    logical_digest: crate::scribe::wal::ContentDigest,
 }
 
 /// Most Variant conversions of one group that run on the ingress lane at once.
@@ -3559,7 +3708,359 @@ struct GroupWalState {
     /// `prepared`; recorded into the pod-wide index once the group's rows are
     /// visible. The version is captured at fence time because insertion
     /// moves the slices that carry it.
-    fenced: Vec<(usize, [u8; 32], u32, wyrd_spec::vala::ids::TableVersion)>,
+    fenced: Vec<(
+        usize,
+        crate::scribe::wal::ContentDigest,
+        u32,
+        wyrd_spec::vala::ids::TableVersion,
+    )>,
+}
+
+/// Layout choices pinned per seal key by the groups dispatched since the
+/// shard was last idle.
+type LayoutChoices = HashMap<
+    crate::scribe::seal_key::SealKey,
+    Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+>;
+
+/// One committed batch's prepared index, identity, COMMIT segment header, and
+/// COMMIT LSN, as its fence needs them.
+type GroupCommit = (
+    usize,
+    BatchCommitIdentity,
+    crate::scribe::wal::SegmentHeader,
+    crate::scribe::wal::WalLsn,
+);
+
+/// An owned stage of one dispatched group, polled by the shard coordinator.
+///
+/// The owner is polled only through `&mut`, so the mutex is never locked:
+/// it only lets the owner stay `Sync` while it holds a `Send` future.
+type StageFuture<T> =
+    std::sync::Mutex<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>;
+
+/// One slice bound to its layout and any earlier synced attempt, in
+/// submission order.
+struct BoundSlice {
+    /// Index of the owning append in the group.
+    append: usize,
+    /// The slice to stage.
+    slice: PreparedSlice,
+    /// Layout the slice converts into, when its key has one.
+    layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    /// WAL record of an earlier attempt that synced this slice but did not
+    /// insert it.
+    synced: Option<WalSliceState>,
+}
+
+/// One group's WAL write as planned on the coordinator: owned input for its
+/// WAL stage.
+struct PlannedGroupWrite {
+    /// When planning started, for the prepare stage metric.
+    started: Instant,
+    /// The group's appends in submission order.
+    prepared: Vec<PreparedAppend>,
+    /// Exact slice metadata capacity of the group.
+    durable_capacity: usize,
+    /// Rows of batches already retained, by batch id.
+    rows_by_append: HashMap<[u8; 16], u64>,
+    /// Slices to stage, in submission order.
+    bound: Vec<BoundSlice>,
+    /// Conversions to run before staging.
+    planned: Vec<PlannedConversion>,
+    /// Index in `bound` of each planned conversion's slice.
+    planned_slices: Vec<usize>,
+}
+
+/// The shared lanes one group's WAL stage owns clones of.
+struct GroupWalLane {
+    /// Ordered WAL IO lane.
+    wal_io: ScribeWalIoPool,
+    /// The shard's WAL.
+    wal: WalHandle,
+    /// Bounded CPU lane for Variant conversion.
+    ingress_cpu: ScribeIngressCpuPool,
+    /// Memory governor charged for the group's active rows.
+    ownership: ScribeOwnership,
+}
+
+/// What a finished WAL stage hands back to the coordinator.
+struct WrittenGroup {
+    /// Every segment the group wrote, under each seal key that must retain it.
+    segments: Vec<(
+        crate::scribe::seal_key::SealKey,
+        Arc<crate::scribe::wal::WalSegment>,
+    )>,
+    /// The stage's outcome.
+    result: WalStageResult,
+    /// The group's stage timers.
+    stages: GroupStages,
+}
+
+/// Outcome of one WAL stage.
+enum WalStageResult {
+    /// The group failed before any WAL record: its waiters already have the
+    /// error and its reservations are released.
+    Refused(ScribeError),
+    /// The SLICE records were written; `synced` says whether the COMMIT
+    /// records were written and every touched segment synced.
+    Written {
+        /// The written group.
+        state: Box<GroupWalState>,
+        /// The group's batch commits, for its fence.
+        commits: Vec<GroupCommit>,
+        /// The COMMIT write and sync outcome.
+        synced: Result<(), ScribeError>,
+    },
+}
+
+/// What a finished fence stage hands back to the coordinator.
+struct FencedGroup {
+    /// The fenced group.
+    state: Box<GroupWalState>,
+    /// The group's stage timers.
+    stages: GroupStages,
+    /// The fence outcome.
+    result: Result<(), ScribeError>,
+}
+
+/// The stage one dispatched group is in.
+enum GroupStage {
+    /// Its WAL write and sync are running.
+    Writing(StageFuture<WrittenGroup>),
+    /// Durable and waiting for the older group to settle before fencing.
+    Synced {
+        /// The durable group.
+        state: Box<GroupWalState>,
+        /// The group's batch commits.
+        commits: Vec<GroupCommit>,
+        /// The group's stage timers.
+        stages: GroupStages,
+    },
+    /// Its tenant fences are running.
+    Fencing(StageFuture<FencedGroup>),
+    /// Held for restart recovery after the shard failed closed.
+    Retained {
+        /// The group, kept with its charges and waiters until restart.
+        _charged: Box<GroupWalState>,
+    },
+}
+
+/// Coordinator bookkeeping for one dispatched group.
+struct GroupMeta {
+    /// Batch identities the group owns until it settles.
+    identities: Vec<BatchIdentity>,
+    /// Admitted requests the group still counts in the drain count.
+    requests: usize,
+    /// JSON-equivalent and Arrow bytes the group adds when it inserts.
+    pending_bytes: (usize, usize),
+    /// When the group was dispatched.
+    cycle: Instant,
+}
+
+/// One group occupying a pipeline slot.
+struct DispatchedGroup {
+    /// Coordinator bookkeeping.
+    meta: GroupMeta,
+    /// Current stage.
+    stage: GroupStage,
+}
+
+/// The two pipeline slots.
+#[derive(Clone, Copy)]
+enum GroupSlot {
+    /// The oldest dispatched group, the only one that fences or publishes.
+    Older,
+    /// The group dispatched after it.
+    Newer,
+}
+
+/// A completed stage, taken from its slot.
+enum StageDone {
+    /// A WAL stage finished.
+    Written(WrittenGroup),
+    /// A fence stage finished.
+    Fenced(FencedGroup),
+}
+
+/// What woke the shard coordinator.
+enum ShardWake {
+    /// A dispatched group's stage completed.
+    Stage(GroupSlot, GroupMeta, StageDone),
+    /// A mailbox command arrived, or the mailbox closed.
+    Command(Option<ShardCommand>),
+    /// The pressure signal changed (`true`) or its sender closed (`false`).
+    Pressure(bool),
+    /// The collecting group's deadline passed.
+    Collected,
+}
+
+/// Requests at which a group collected beside a dispatched group stops
+/// waiting for arrivals.
+const COLLECTION_TARGET: usize = 32;
+
+/// Longest a group collected beside a dispatched group waits for arrivals,
+/// measured from its first collected request.
+const COLLECTION_WAIT: Duration = Duration::from_millis(1);
+
+/// Times the group the free slot collects while another group is dispatched.
+///
+/// An idle shard dispatches at once. Beside a dispatched group, a group
+/// below [`COLLECTION_TARGET`] eligible requests waits for arrivals until
+/// [`COLLECTION_WAIT`] after its first eligible request; later arrivals never
+/// move that deadline. Requests a dispatched group's identity holds back are
+/// not eligible. The target only ends waiting: the dispatched group still
+/// drains every ready eligible request up to [`MAX_GROUP_ITEMS`]. The
+/// deadline clears only when the group dispatches.
+#[derive(Debug, Default)]
+struct GroupCollection {
+    /// When the collecting group dispatches regardless of its size.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl GroupCollection {
+    /// Reports whether the collected group of `eligible` requests dispatches
+    /// now, starting its deadline at its first eligible request.
+    fn due(&mut self, eligible: usize, overlapping: bool, now: tokio::time::Instant) -> bool {
+        if eligible == 0 {
+            return false;
+        }
+        let deadline = *self.deadline.get_or_insert(now + COLLECTION_WAIT);
+        let due = !overlapping || eligible >= COLLECTION_TARGET || now >= deadline;
+        if due {
+            self.deadline = None;
+        }
+        due
+    }
+
+    /// The collecting group's deadline, when it has one.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+}
+
+/// The shard's bounded two-group write pipeline.
+///
+/// At most two groups are dispatched. One WAL stage runs at a time, and only
+/// the older group fences or publishes, so groups settle in dispatch order.
+/// Control commands that mutate the generation wait in `deferred` until no
+/// group is dispatched.
+#[derive(Default)]
+struct GroupPipeline {
+    /// The oldest dispatched group.
+    older: Option<DispatchedGroup>,
+    /// The group dispatched after `older`.
+    newer: Option<DispatchedGroup>,
+    /// A collected group that needs a generation rotation, waiting for the
+    /// dispatched groups to settle.
+    rotating: Option<Vec<PreparedAppend>>,
+    /// Control commands waiting for the dispatched groups to settle.
+    deferred: VecDeque<ShardCommand>,
+    /// Layouts the dispatched groups chose.
+    layouts: LayoutChoices,
+    /// Timing of the group the free slot collects.
+    collection: GroupCollection,
+}
+
+impl GroupPipeline {
+    /// Whether no group is dispatched.
+    fn is_idle(&self) -> bool {
+        self.older.is_none() && self.newer.is_none()
+    }
+
+    /// Whether any dispatched group has a stage running.
+    fn is_running(&self) -> bool {
+        [&self.older, &self.newer]
+            .into_iter()
+            .flatten()
+            .any(|group| matches!(group.stage, GroupStage::Writing(_) | GroupStage::Fencing(_)))
+    }
+
+    /// Whether a dispatched group's WAL stage is running.
+    fn is_writing(&self) -> bool {
+        [&self.older, &self.newer]
+            .into_iter()
+            .flatten()
+            .any(|group| matches!(group.stage, GroupStage::Writing(_)))
+    }
+
+    /// JSON-equivalent and Arrow bytes the dispatched groups have written but
+    /// not inserted.
+    fn pending_bytes(&self) -> (usize, usize) {
+        [&self.older, &self.newer]
+            .into_iter()
+            .flatten()
+            .fold((0, 0), |(json, arrow), group| {
+                (
+                    json.saturating_add(group.meta.pending_bytes.0),
+                    arrow.saturating_add(group.meta.pending_bytes.1),
+                )
+            })
+    }
+
+    /// Batch identities the dispatched groups own, which the other slot must
+    /// not collect.
+    fn held_identities(&self) -> HashSet<BatchIdentity> {
+        [&self.older, &self.newer]
+            .into_iter()
+            .flatten()
+            .flat_map(|group| group.meta.identities.iter().cloned())
+            .collect()
+    }
+
+    /// Takes a dispatched group whose running stage has already completed,
+    /// oldest first, without waiting for a stage that has not.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancel-safe: an unfinished stage stays in its slot.
+    async fn ready_stage(&mut self) -> Option<(GroupSlot, GroupMeta, StageDone)> {
+        tokio::select! {
+            biased;
+            (meta, done) = Self::stage_done(&mut self.older) => Some((GroupSlot::Older, meta, done)),
+            (meta, done) = Self::stage_done(&mut self.newer) => Some((GroupSlot::Newer, meta, done)),
+            () = std::future::ready(()) => None,
+        }
+    }
+
+    /// Puts a group back into the slot it was taken from.
+    fn place(&mut self, slot: GroupSlot, group: DispatchedGroup) {
+        match slot {
+            GroupSlot::Older => self.older = Some(group),
+            GroupSlot::Newer => self.newer = Some(group),
+        }
+    }
+
+    /// Waits for the running stage in `slot` and takes the group from the
+    /// slot once it completes. Pending forever when the slot runs nothing.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancel-safe: the stage stays in its slot until it completes.
+    async fn stage_done(slot: &mut Option<DispatchedGroup>) -> (GroupMeta, StageDone) {
+        std::future::poll_fn(|context| {
+            let done = match slot.as_mut().map(|group| &mut group.stage) {
+                Some(GroupStage::Writing(stage)) => stage
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .poll(context)
+                    .map(StageDone::Written),
+                Some(GroupStage::Fencing(stage)) => stage
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .poll(context)
+                    .map(StageDone::Fenced),
+                _ => std::task::Poll::Pending,
+            };
+            done.map(|done| {
+                let group = slot.take().expect("a polled stage occupies its slot");
+                (group.meta, done)
+            })
+        })
+        .await
+    }
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3585,50 +4086,407 @@ impl PostCommitInsertOwner {
 }
 
 impl ShardOwner {
-    /// Writes, syncs, inserts, rotates, and ACKs one bounded tenant-fair group.
+    /// Writes, syncs, fences, inserts, and ACKs one group on an idle owner.
     ///
-    /// The owner's inspection snapshot is published before the ACK, so a
-    /// writer that observes its ACK reads memtable stats that include its rows.
-    ///
-    /// Each append's write profile is charged its shard wait when the group
-    /// starts; each serial stage is timed once into [`GroupStages`] and charged
-    /// to every append the group acknowledges.
+    /// Tests drive one group through the pipeline the run loop uses, with no
+    /// second group dispatched, until it settles: the one-group composition
+    /// of [`Self::dispatch_group`] and [`Self::advance_pipeline`]. The
+    /// group's requests count as accepted work exactly as runtime admission
+    /// would count them.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when WAL write/sync or memtable insertion fails;
-    /// prepared ACK waiters receive the same completion error and reservations
-    /// are released before the error returns.
+    /// Returns [`ScribeError`] when WAL write/sync, fencing, or memtable
+    /// insertion fails; prepared ACK waiters receive the same completion
+    /// error and reservations are released before the error returns, unless
+    /// the group is retained for retry or restart.
+    #[cfg(test)]
     async fn process_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
+        self.pending.fetch_add(group.len(), Ordering::AcqRel);
+        self.dispatch_group(group).await?;
+        let mut result = Ok(());
+        while self.pipeline.is_running() {
+            if let Some(settled) = self.advance_pipeline().await {
+                result = settled;
+            }
+        }
+        result
+    }
+
+    /// Prepares one collected group and starts its WAL stage in a free slot.
+    ///
+    /// With no group dispatched the owner first re-drives a retained
+    /// insertion and rotates the generation when the group would cross a
+    /// writer threshold; a dispatch beside an older group happens only when
+    /// its caller proved no rotation is due. Each append's write profile is
+    /// charged its shard wait here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retry, rotation, sizing, or preparation error; the group's
+    /// accepted requests are released before it returns.
+    async fn dispatch_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
+        let requests = group.len();
+        let dispatched = self.start_group(group).await;
+        if dispatched.is_err() {
+            self.release_requests(requests);
+        }
+        dispatched
+    }
+
+    /// Starts one group's WAL stage; see [`Self::dispatch_group`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the retry, rotation, sizing, or preparation error.
+    async fn start_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
         let cycle = Instant::now();
         for append in &group {
             append.profile.shard_wait.add_elapsed(append.prepared_at);
         }
         record_group_size("requests", group.len());
-        let rotating = Instant::now();
-        self.retry_retained_post_commit()?;
-        self.rotate_before_append_if_needed(&group)?;
-        record_group_stage("rotate", rotating.elapsed());
-        let stages = GroupStages::default();
-        let write = stages.write.timer();
-        let mut state = self.write_group(group).await?;
-        write.done();
-        if let Err(error) = self
-            .append_and_sync_batch_commits(&mut state, &stages)
-            .await
+        if self.pipeline.is_idle() {
+            let rotating = Instant::now();
+            self.retry_retained_post_commit()?;
+            self.rotate_before_append_if_needed(&group).await?;
+            record_group_stage("rotate", rotating.elapsed());
+            self.pipeline.layouts.clear();
+        }
+        let requests = group.len();
+        let identities = group
+            .iter()
+            .map(|append| (append.tenant(), append.table().clone(), append.batch_id()))
+            .collect();
+        let (_, pending_json, pending_arrow) = Self::incoming_generation_bytes(&group)?;
+        let mut layouts = std::mem::take(&mut self.pipeline.layouts);
+        let planned = self.plan_group_write(group, &mut layouts);
+        self.pipeline.layouts = layouts;
+        let lane = GroupWalLane {
+            wal_io: self.wal_io.clone(),
+            wal: self.wal_handle.clone(),
+            ingress_cpu: self.ingress_cpu.clone(),
+            ownership: self.memory_ownership.clone(),
+        };
+        let stage = GroupStage::Writing(std::sync::Mutex::new(Box::pin(Self::write_and_sync(
+            lane,
+            planned?,
+            GroupStages::default(),
+        ))));
+        let group = DispatchedGroup {
+            meta: GroupMeta {
+                identities,
+                requests,
+                pending_bytes: (pending_json, pending_arrow),
+                cycle,
+            },
+            stage,
+        };
+        if self.pipeline.older.is_none() {
+            self.pipeline.older = Some(group);
+        } else {
+            debug_assert!(
+                self.pipeline.newer.is_none(),
+                "a shard dispatches two groups at most"
+            );
+            self.pipeline.newer = Some(group);
+        }
+        Ok(())
+    }
+
+    /// Dispatches the next collected group when the pipeline allows one.
+    ///
+    /// A group dispatches only while no group writes the WAL, a slot is free,
+    /// and no lifecycle barrier waits for the dispatched groups to settle.
+    /// A group that needs a rotation beside an older group waits in the
+    /// second slot until the older group settles. Returns whether the owner
+    /// changed state.
+    async fn dispatch_next(&mut self) -> bool {
+        if !self.pipeline.deferred.is_empty()
+            || self.pressure_receiver.has_changed().unwrap_or(false)
+            || self.pipeline.is_writing()
+            || self.pipeline.newer.is_some()
         {
+            return false;
+        }
+        if let Some(group) = self.pipeline.rotating.take() {
+            if !self.pipeline.is_idle() {
+                self.pipeline.rotating = Some(group);
+                return false;
+            }
+            self.dispatch_logged(group).await;
+            return true;
+        }
+        let overlapping = !self.pipeline.is_idle();
+        let held = self.pipeline.held_identities();
+        if !self.pipeline.collection.due(
+            self.scheduler.eligible(&held, COLLECTION_TARGET),
+            overlapping,
+            tokio::time::Instant::now(),
+        ) {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.preparation_hold {
+            let _ = reached.send(());
+            release
+                .acquire()
+                .await
+                .expect("the preparation hold stays open")
+                .forget();
+        }
+        let mut group = self.scheduler.pop_group(&held);
+        self.scheduler.record_closed(&group);
+        if group.is_empty() {
+            return false;
+        }
+        if overlapping {
+            match self.rotation_trigger(&group, self.pipeline.pending_bytes()) {
+                Ok(None) => {}
+                Ok(Some(rotation_trigger)) => {
+                    tracing::debug!(
+                        shard_id = self.id,
+                        rotation_trigger,
+                        "Scribe shard group waits for dispatched groups before rotation"
+                    );
+                    self.pipeline.rotating = Some(group);
+                    return true;
+                }
+                Err(error) => {
+                    Self::notify_prepared_error(&mut group, &error);
+                    self.release_requests(group.len());
+                    self.log_group_failure(&error);
+                    return true;
+                }
+            }
+        }
+        self.dispatch_logged(group).await;
+        true
+    }
+
+    /// Dispatches one group and reports a refused dispatch.
+    async fn dispatch_logged(&mut self, group: Vec<PreparedAppend>) {
+        if let Err(error) = self.dispatch_group(group).await {
+            self.log_group_failure(&error);
+        }
+    }
+
+    /// Logs one failed group and republishes inspection.
+    fn log_group_failure(&self, error: &ScribeError) {
+        if is_expected_wal_capacity(error) {
+            tracing::warn!(error = %error, shard = self.id, "Scribe shard reached its WAL capacity");
+        } else {
+            tracing::error!(error = %error, shard = self.id, "Scribe shard group failed");
+        }
+        self.publish_snapshot();
+    }
+
+    /// Releases one settled or retained group's requests from the drain count.
+    fn release_requests(&self, requests: usize) {
+        self.pending.fetch_sub(requests, Ordering::AcqRel);
+        self.drained.notify_waiters();
+    }
+
+    /// Waits for the next running stage of a dispatched group and applies it.
+    ///
+    /// Returns the result of a group that settled or was retained.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancel-safe: an unfinished stage stays in its slot.
+    async fn advance_pipeline(&mut self) -> Option<Result<(), ScribeError>> {
+        let (slot, meta, done) = tokio::select! {
+            biased;
+            (meta, done) = GroupPipeline::stage_done(&mut self.pipeline.older) => (GroupSlot::Older, meta, done),
+            (meta, done) = GroupPipeline::stage_done(&mut self.pipeline.newer) => (GroupSlot::Newer, meta, done),
+        };
+        self.finish_stage(slot, meta, done)
+    }
+
+    /// Applies one completed stage on the coordinator.
+    ///
+    /// A finished WAL stage registers every segment it wrote, then either
+    /// waits durable in its slot or settles as refused. A finished fence
+    /// settles the oldest group. Either way the younger group moves into the
+    /// freed oldest slot and fences once durable. Returns the result of a
+    /// group that settled or was retained.
+    fn finish_stage(
+        &mut self,
+        slot: GroupSlot,
+        mut meta: GroupMeta,
+        done: StageDone,
+    ) -> Option<Result<(), ScribeError>> {
+        let result = match done {
+            StageDone::Written(WrittenGroup {
+                segments,
+                result,
+                stages,
+            }) => {
+                for (seal_key, segment) in segments {
+                    self.wal_segments
+                        .entry(seal_key)
+                        .or_default()
+                        .entry(segment.path().to_path_buf())
+                        .or_insert(segment);
+                }
+                match result {
+                    WalStageResult::Refused(error) => {
+                        self.release_requests(meta.requests);
+                        Some(Err(error))
+                    }
+                    WalStageResult::Written {
+                        mut state,
+                        synced: Err(error),
+                        ..
+                    } => {
+                        if self.memory_ownership.is_poisoned() {
+                            self.release_requests(std::mem::take(&mut meta.requests));
+                            self.pipeline.place(
+                                slot,
+                                DispatchedGroup {
+                                    meta,
+                                    stage: GroupStage::Retained { _charged: state },
+                                },
+                            );
+                        } else {
+                            self.refuse_group(&mut state, &error);
+                            self.release_requests(meta.requests);
+                        }
+                        Some(Err(error))
+                    }
+                    WalStageResult::Written {
+                        state,
+                        commits,
+                        synced: Ok(()),
+                    } => {
+                        self.pipeline.place(
+                            slot,
+                            DispatchedGroup {
+                                meta,
+                                stage: GroupStage::Synced {
+                                    state,
+                                    commits,
+                                    stages,
+                                },
+                            },
+                        );
+                        None
+                    }
+                }
+            }
+            StageDone::Fenced(fenced) => {
+                let result = self.complete_fenced_group(meta.cycle, fenced);
+                self.release_requests(meta.requests);
+                Some(result)
+            }
+        };
+        if self.pipeline.older.is_none() {
+            self.pipeline.older = self.pipeline.newer.take();
+        }
+        let retained = self.start_oldest_fence();
+        if self.pipeline.is_idle() {
+            self.pipeline.layouts.clear();
+        }
+        result.or(retained)
+    }
+
+    /// Starts the oldest group's fence once it is durable.
+    ///
+    /// A retained post-COMMIT insertion settles first. When the shard has
+    /// failed closed, the durable group stays unfenced and charged for
+    /// restart recovery instead; its requests leave the drain count and its
+    /// waiters are not answered. Returns that retention as an error.
+    fn start_oldest_fence(&mut self) -> Option<Result<(), ScribeError>> {
+        if !matches!(
+            self.pipeline.older,
+            Some(DispatchedGroup {
+                stage: GroupStage::Synced { .. },
+                ..
+            })
+        ) {
+            return None;
+        }
+        let allowed =
+            !self.memory_ownership.is_poisoned() && self.retry_retained_post_commit().is_ok();
+        let DispatchedGroup { mut meta, stage } = self.pipeline.older.take()?;
+        let GroupStage::Synced {
+            mut state,
+            commits,
+            stages,
+        } = stage
+        else {
+            self.pipeline.older = Some(DispatchedGroup { meta, stage });
+            return None;
+        };
+        if !allowed {
+            self.release_requests(std::mem::take(&mut meta.requests));
+            self.pipeline.older = Some(DispatchedGroup {
+                meta,
+                stage: GroupStage::Retained { _charged: state },
+            });
+            return Some(Err(ScribeError::Internal {
+                detail: "the shard failed closed before this durable group could fence".to_owned(),
+            }));
+        }
+        let postgres = self.control_postgres.clone();
+        let ownership = self.memory_ownership.clone();
+        let fencing = Box::pin(async move {
+            let fence = stages.fence.timer();
+            let result = Self::fence_group(postgres, &ownership, &mut state, commits).await;
+            fence.done();
+            FencedGroup {
+                state,
+                stages,
+                result,
+            }
+        });
+        self.pipeline.older = Some(DispatchedGroup {
+            meta,
+            stage: GroupStage::Fencing(std::sync::Mutex::new(fencing)),
+        });
+        None
+    }
+
+    /// Refuses one failed group: releases its active reservations and sends
+    /// every remaining waiter the failure.
+    fn refuse_group(&self, state: &mut GroupWalState, error: &ScribeError) {
+        if let Err(cleanup_error) =
+            Self::release_active_reservations(&self.memory_ownership, &state.durable)
+        {
+            tracing::error!(error = %cleanup_error, "active cleanup failed after batch commit error");
+        }
+        Self::notify_prepared_error(&mut state.prepared, error);
+    }
+
+    /// Settles the oldest group once its fences resolve.
+    ///
+    /// Success inserts the accepted rows, records them in the committed
+    /// mirror, and publishes inspection before any ACK. A failure after
+    /// readiness was poisoned retains the group for restart; any other
+    /// failure refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fence or insertion failure.
+    fn complete_fenced_group(
+        &mut self,
+        cycle: Instant,
+        fenced: FencedGroup,
+    ) -> Result<(), ScribeError> {
+        let FencedGroup {
+            mut state,
+            stages,
+            result,
+        } = fenced;
+        if let Err(error) = result {
             if self.memory_ownership.is_poisoned() {
                 debug_assert!(
                     self.retained_commit_ambiguity.is_none(),
-                    "one serial shard group may hold COMMIT ambiguity"
+                    "only the oldest shard group may hold COMMIT ambiguity"
                 );
-                self.retained_commit_ambiguity = Some(state);
+                self.retained_commit_ambiguity = Some(*state);
                 return Err(error);
             }
-            if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
-                tracing::error!(error = %cleanup_error, "active cleanup failed after batch commit error");
-            }
-            Self::notify_prepared_error(&mut state.prepared, &error);
+            self.refuse_group(&mut state, &error);
             return Err(error);
         }
         for slice in &state.durable {
@@ -3647,7 +4505,7 @@ impl ShardOwner {
                 },
             );
         }
-        let mut post_commit = PostCommitInsertOwner::new(state);
+        let mut post_commit = PostCommitInsertOwner::new(*state);
         #[cfg(any(test, feature = "test-support"))]
         if self.wal_handle.take_post_sync_failure_for_test() {
             tracing::warn!(
@@ -3719,19 +4577,23 @@ impl ShardOwner {
         record_group_size("wal_bytes", total(|slice| slice.payload_len as usize));
     }
 
-    /// Records every batch this group fenced into the pod-wide index, once its
-    /// rows are query-visible, so a later honest retry is answered at ingress.
+    /// Records every batch this group committed into the pod-wide index, once
+    /// its rows are query-visible, so a later honest retry is answered at
+    /// ingress.
+    ///
+    /// Only acceptances this group made are recorded. A spent batch, whose
+    /// fence another attempt already holds (already committed, accepted under
+    /// another version, or conflicted), is skipped: its receipt may belong to
+    /// another pod, whose cleaner forgets only its own index, so recording it
+    /// here could acknowledge the identity after that receipt is deleted. An
+    /// entry this pod recorded earlier is left as it is.
     ///
     /// Only the successful path records: a group that failed after its sync
     /// stays retained for serial retry and records nothing until it settles.
     fn record_committed(&self, state: &GroupWalState) {
         for &(index, logical_digest, slice_count, table_version) in &state.fenced {
             let append = &state.prepared[index];
-            if state
-                .accepted_under
-                .contains_key(append.batch_id.as_bytes())
-                || state.conflicted.contains(append.batch_id.as_bytes())
-            {
+            if state.spent_batch_ids.contains(append.batch_id.as_bytes()) {
                 continue;
             }
             self.committed.record(
@@ -3805,26 +4667,43 @@ impl ShardOwner {
     /// aggregate JSON-equivalent or Arrow ownership, or generation age reaches
     /// its configured target. The old WAL is closed and every active key is
     /// installed immutable before the incoming group can append to fresh state.
+    /// Only an owner with no dispatched group calls this, so no group is
+    /// writing to, or waiting to insert into, the generation it closes.
     ///
     /// # Errors
     ///
     /// Returns a sizing, WAL close/retention, memtable, binding, or accounting
     /// error before the incoming group mutates WAL.
-    fn rotate_before_append_if_needed(
+    async fn rotate_before_append_if_needed(
         &mut self,
         group: &[PreparedAppend],
     ) -> Result<(), ScribeError> {
-        let stats = self.memtable.stats()?;
-        // A selectively sealed key can leave this generation with no writable
-        // bucket while its WAL still contains accepted records.  Upstream's
-        // writer predicate evaluates a non-empty WAL independently from the
-        // complete memtable, so neither a fresh append nor an empty bucket set
-        // may reset this generation's age or skip its WAL threshold.
-        let active_wal_bytes = self.wal_handle.current_segment_bytes()?;
-        let wal_has_records = self.wal_handle.has_active_records()?;
-        if stats.writable_buckets == 0 && !wal_has_records {
+        let Some(rotation_trigger) = self.rotation_trigger(group, (0, 0))? else {
             return Ok(());
+        };
+        let rotation_result = self.rotate_active_generation().await;
+        if let Err(error) = &rotation_result {
+            tracing::warn!(
+                shard_id = self.id,
+                rotation_trigger,
+                error = %error,
+                "Scribe shard generation rotation failed"
+            );
         }
+        rotation_result
+    }
+
+    /// Sums one group's encoded WAL, uncompressed (JSON-equivalent), and
+    /// Arrow bytes, the amounts its WAL write and insertion add to the active
+    /// generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a slice's WAL length cannot be
+    /// read or a total overflows.
+    fn incoming_generation_bytes(
+        group: &[PreparedAppend],
+    ) -> Result<(usize, usize, usize), ScribeError> {
         let mut incoming_encoded = 0_usize;
         let mut incoming_uncompressed = 0_usize;
         let mut incoming_arrow = 0_usize;
@@ -3848,13 +4727,50 @@ impl ShardOwner {
                     })?;
             }
         }
+        Ok((incoming_encoded, incoming_uncompressed, incoming_arrow))
+    }
+
+    /// Names the first writer threshold `group` would cross, or `None` when
+    /// the active generation needs no rotation before it.
+    ///
+    /// `pending` holds the JSON-equivalent and Arrow bytes that dispatched
+    /// groups have written to the WAL but not yet inserted. Their encoded WAL
+    /// bytes already count in the active segment, so each byte is projected
+    /// exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a memtable, WAL sizing, or overflow error.
+    fn rotation_trigger(
+        &self,
+        group: &[PreparedAppend],
+        pending: (usize, usize),
+    ) -> Result<Option<&'static str>, ScribeError> {
+        let stats = self.memtable.stats()?;
+        // A selectively sealed key can leave this generation with no writable
+        // bucket while its WAL still contains accepted records.  Upstream's
+        // writer predicate evaluates a non-empty WAL independently from the
+        // complete memtable, so neither a fresh append nor an empty bucket set
+        // may reset this generation's age or skip its WAL threshold.
+        let active_wal_bytes = self.wal_handle.current_segment_bytes()?;
+        let wal_has_records = self.wal_handle.has_active_records()?;
+        if stats.writable_buckets == 0 && !wal_has_records {
+            return Ok(None);
+        }
+        let (incoming_encoded, incoming_uncompressed, incoming_arrow) =
+            Self::incoming_generation_bytes(group)?;
+        let (pending_json, pending_arrow) = pending;
+        let active_json = self.active_json_bytes.saturating_add(pending_json);
         let encoded =
             active_wal_bytes.saturating_add(u64::try_from(incoming_encoded).unwrap_or(u64::MAX));
-        let uncompressed = u64::try_from(self.active_json_bytes)
+        let uncompressed = u64::try_from(active_json)
             .unwrap_or(u64::MAX)
             .saturating_add(u64::try_from(incoming_uncompressed).unwrap_or(u64::MAX));
-        let projected_json = self.active_json_bytes.saturating_add(incoming_uncompressed);
-        let projected_arrow = stats.writable_bytes.saturating_add(incoming_arrow);
+        let projected_json = active_json.saturating_add(incoming_uncompressed);
+        let projected_arrow = stats
+            .writable_bytes
+            .saturating_add(pending_arrow)
+            .saturating_add(incoming_arrow);
         let age_expired =
             wal_has_records && self.generation_started_at.elapsed() >= self.generation_max_age;
         let projection = ShardRotationProjection {
@@ -3865,9 +4781,9 @@ impl ShardOwner {
             age_expired,
         };
         if !projection.should_rotate(self.wal_segment_bytes, self.generation_rotation_bytes) {
-            return Ok(());
+            return Ok(None);
         }
-        let rotation_trigger = if projection.age_expired {
+        Ok(Some(if projection.age_expired {
             "age"
         } else if projection.wal_encoded > self.wal_segment_bytes {
             "wal_encoded"
@@ -3877,17 +4793,7 @@ impl ShardOwner {
             "memtable_json"
         } else {
             "memtable_arrow"
-        };
-        let rotation_result = self.rotate_active_generation();
-        if let Err(error) = &rotation_result {
-            tracing::warn!(
-                shard_id = self.id,
-                rotation_trigger,
-                error = %error,
-                "Scribe shard generation rotation failed"
-            );
-        }
-        rotation_result
+        }))
     }
 
     /// Closes and queues one complete non-empty shard generation as a cohort.
@@ -3897,7 +4803,7 @@ impl ShardOwner {
     /// Returns when WAL retention, atomic all-key freeze, accounting transfer,
     /// binding resolution, or queue construction fails. The incoming append has
     /// not started when this method is called.
-    fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
+    async fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
         // Resolve every member and prove the complete accounting transfer
         // before closing the only active WAL. Nothing below this point may
         // discover an ordinary retryable preparation failure after durable
@@ -3919,7 +4825,7 @@ impl ShardOwner {
         self.memory_ownership
             .preflight_move_active_to_immutable(active_bytes)?;
 
-        let result = self.rotate_active_generation_after_preflight();
+        let result = self.rotate_active_generation_after_preflight().await;
         if result.is_err() {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
@@ -3932,18 +4838,34 @@ impl ShardOwner {
 
     /// Completes an automatic rotation after all retryable preparation passed.
     ///
+    /// The active WAL generation closes, and an unread closed cohort retires,
+    /// on the WAL IO lane: both fsync, and this owner runs on an async worker.
+    /// The owner awaits each before freezing, so no append reaches the closing
+    /// generation.
+    ///
     /// # Errors
     ///
     /// Returns a fail-stop error for WAL close/retention, all-key freeze,
     /// accounting transfer, or queue installation. The caller poisons
     /// readiness and leaves WAL/staged state intact for deterministic replay.
-    fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
+    async fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
         let mut segment_refs = self
             .wal_segments
             .values()
             .flat_map(|segments| segments.values().map(|segment| segment.reference()))
             .collect::<Vec<_>>();
-        if let Some(closed) = self.wal_handle.close_active_generation()?
+        let ScribeWalIoResult::GenerationClosed(closed) = self
+            .wal_io
+            .submit(ScribeWalIoOp::CloseActiveGeneration {
+                wal: self.wal_handle.clone(),
+            })
+            .await?
+        else {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong generation close result".to_owned(),
+            });
+        };
+        if let Some(closed) = closed
             && !segment_refs
                 .iter()
                 .any(|segment| segment.path == closed.path)
@@ -3998,7 +4920,12 @@ impl ShardOwner {
             // above forever: the closed bytes would never become deletable and
             // WAL disk pressure could never clear. Release the reference
             // instead, which is exactly what a terminal cohort would have done.
-            self.wal_handle.retire_segments(&segment_refs)?;
+            self.wal_io
+                .submit(ScribeWalIoOp::RetireWal {
+                    wal: self.wal_handle.clone(),
+                    segments: segment_refs.clone(),
+                })
+                .await?;
         } else {
             self.rotation_cohorts.push_back(ShardRotationCohort {
                 shard_id: self.id,
@@ -4111,7 +5038,7 @@ impl ShardOwner {
                 detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
             });
         }
-        let mut wal_digest = Sha256::new();
+        let mut wal_digest = ContentHasher::new();
         let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
         for slice_index in 0..slice_count {
             let slice = state
@@ -4139,39 +5066,38 @@ impl ShardOwner {
         Ok(Some(BatchCommitIdentity {
             first_index,
             slice_count,
-            wal_digest: wal_digest.finalize().into(),
+            wal_digest: wal_digest.finish(),
             logical_digest: logical.finish(),
         }))
     }
 
-    /// Appends one v8 COMMIT record per complete batch, syncs once, then fences.
+    /// Appends one v8 COMMIT record per complete batch, then syncs once.
     ///
     /// The group's SLICE records are written but not yet synced when this
-    /// method starts. Every complete batch's COMMIT is appended after them; one
-    /// sync then covers every segment the group's SLICE and COMMIT records
-    /// touched. Only after that sync does each batch commit its own `PostgreSQL`
-    /// identity fence, serially and in group order, so no ACK path can run
-    /// before its records are durable. A crash during the sync may persist any
-    /// subset of the group's blocks; replay ends the shard chain at the first
-    /// bad record, which the absent fences prove unacknowledged. A crash after
-    /// the sync but before a fence leaves an unfenced COMMIT that replay and a
-    /// same-ID retry settle exactly once. A batch a fence accepted under
-    /// another table version holds its tenant's fresh fences rolled back while
-    /// its waiter proves it identical under that version; only then are the
-    /// remaining fences offered again, in group order. The COMMIT appends accrue to
-    /// `stages.commit`, the sync to `stages.sync`, the fences to `stages.fence`.
+    /// starts. Every complete batch's COMMIT is appended after them; one sync
+    /// then covers every segment the group's SLICE and COMMIT records touched,
+    /// so no fence, and therefore no ACK, can precede durability. A crash
+    /// during the sync may persist any subset of the group's blocks; replay
+    /// ends the shard chain at the first bad record, which the absent fences
+    /// prove unacknowledged. Every segment the group wrote is pushed onto
+    /// `segments` under every seal key the group touched before the sync is
+    /// submitted. The COMMIT appends accrue to `stages.commit`, the sync to
+    /// `stages.sync`. Returns each committed batch's prepared index, identity,
+    /// segment header, and COMMIT LSN for [`Self::fence_group`].
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when a batch is incomplete, its digest cannot be
-    /// prepared, the WAL lane cannot append or fsync the COMMIT records, a
-    /// batch-control fence fails, or a batch accepted under another table
-    /// version is not proved identical.
-    async fn append_and_sync_batch_commits(
-        &mut self,
+    /// Returns [`ScribeError`] when a batch is incomplete, its digest cannot
+    /// be prepared, or the WAL lane cannot append or fsync the COMMIT records.
+    async fn write_and_sync_commits(
+        lane: &GroupWalLane,
         state: &mut GroupWalState,
         stages: &GroupStages,
-    ) -> Result<(), ScribeError> {
+        segments: &mut Vec<(
+            crate::scribe::seal_key::SealKey,
+            Arc<crate::scribe::wal::WalSegment>,
+        )>,
+    ) -> Result<Vec<GroupCommit>, ScribeError> {
         let commit = stages.commit.timer();
         let mut commits = Vec::with_capacity(state.prepared.len());
         let mut group_segments = std::mem::take(&mut state.touched);
@@ -4194,10 +5120,10 @@ impl ShardOwner {
             identities.push((index, identity));
         }
         if !records.is_empty() {
-            let ScribeWalIoResult::WalWritten { results } = self
+            let ScribeWalIoResult::WalWritten { results } = lane
                 .wal_io
                 .submit(ScribeWalIoOp::WritePrepared {
-                    wal: self.wal_handle.clone(),
+                    wal: lane.wal.clone(),
                     appends: records,
                 })
                 .await?
@@ -4228,11 +5154,48 @@ impl ShardOwner {
             }
         }
         commit.done();
+        // A batch's partitions seal and retire independently, so each keeps
+        // every segment the group wrote: otherwise retiring one partition
+        // could free a segment still holding another's slice or the COMMIT.
+        // ponytail: group-wide rather than per batch; narrow it if retained
+        // WAL grows.
+        for slice in &state.durable {
+            for segment in group_segments.values() {
+                segments.push((slice.seal_key.clone(), Arc::clone(segment)));
+            }
+        }
         let sync = stages.sync.timer();
-        self.sync_group(&group_segments).await?;
+        Self::sync_group(lane, &group_segments).await?;
         sync.done();
-        let _fence = stages.fence.timer();
-        let Some(postgres) = self.control_postgres.clone() else {
+        Ok(commits)
+    }
+
+    /// Commits each synced batch's `PostgreSQL` identity fence, one tenant
+    /// transaction at a time and in group order.
+    ///
+    /// Only the oldest dispatched group runs this, so fences commit in group
+    /// order across the shard. A batch a fence accepted under another table
+    /// version holds its tenant's fresh fences rolled back while its waiter
+    /// proves it identical under that version; only then are the remaining
+    /// fences offered again, in group order. A crash after the sync but
+    /// before a fence leaves an unfenced COMMIT that replay and a same-ID
+    /// retry settle exactly once. Without a control database the group is
+    /// accepted on its synced WAL alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a fence cannot be built, a
+    /// batch-control fence fails, or a batch accepted under another table
+    /// version is not proved identical. A tenant's failure after an earlier
+    /// tenant's fences were accepted poisons `ownership`, so the group is
+    /// retained for restart recovery rather than refused.
+    async fn fence_group(
+        postgres: Option<Arc<ValaPostgres>>,
+        ownership: &ScribeOwnership,
+        state: &mut GroupWalState,
+        commits: Vec<GroupCommit>,
+    ) -> Result<(), ScribeError> {
+        let Some(postgres) = postgres else {
             return Ok(());
         };
         let mut fences = Vec::<(
@@ -4266,91 +5229,129 @@ impl ShardOwner {
                 None => fences.push((append.tenant, vec![index], vec![fence])),
             }
         }
-        for (tenant, mut indices, mut offered) in fences {
-            use vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution;
-            let resolved = loop {
-                let resolved = self
-                    .commit_batch_control_fences(&postgres, tenant, &offered)
-                    .await?;
-                let refused: Vec<usize> = resolved
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, resolution)| {
-                        **resolution == ScribeBatchCommitResolution::Conflicted
-                    })
-                    .map(|(position, _)| position)
-                    .collect();
-                if !refused.is_empty() {
-                    for &position in &refused {
-                        let append = &mut state.prepared[indices[position]];
-                        Self::refuse_conflict(append);
-                        let batch_id = *append.batch_id.as_bytes();
-                        state.conflicted.insert(batch_id);
-                        state.spent_batch_ids.insert(batch_id);
+        let mut accepted_earlier = false;
+        for (tenant, indices, offered) in fences {
+            let fenced =
+                Self::fence_tenant(&postgres, ownership, state, tenant, indices, offered).await;
+            match fenced {
+                Ok(accepted) => accepted_earlier |= accepted,
+                Err(error) => {
+                    if accepted_earlier {
+                        tracing::error!(
+                            tenant = %tenant,
+                            error = %error,
+                            "Scribe tenant fence failed after an earlier tenant's fences were accepted"
+                        );
+                        ownership.poison();
                     }
-                    for &position in refused.iter().rev() {
-                        indices.remove(position);
-                        offered.remove(position);
-                    }
-                    if offered.is_empty() {
-                        break Vec::new();
-                    }
-                    continue;
+                    return Err(error);
                 }
-                let unproved: Vec<(usize, wyrd_spec::vala::ids::TableVersion)> = resolved
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, resolution)| match resolution {
-                        ScribeBatchCommitResolution::AcceptedUnder(version) => {
-                            Some((position, *version))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if unproved.is_empty() {
-                    break resolved;
-                }
-                for &(position, version) in &unproved {
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits one tenant's fences from a synced group, settling batches an
+    /// earlier attempt or another table version already holds. Returns
+    /// whether any of the tenant's batches is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the tenant's fences fail or a batch
+    /// accepted under another table version is not proved identical; none
+    /// of the tenant's fresh fences is then durable unless the failure is an
+    /// unresolved COMMIT, which poisons `ownership`.
+    async fn fence_tenant(
+        postgres: &ValaPostgres,
+        ownership: &ScribeOwnership,
+        state: &mut GroupWalState,
+        tenant: DataTenantId,
+        mut indices: Vec<usize>,
+        mut offered: Vec<(ScribeBatchCommit, DateTime<Utc>)>,
+    ) -> Result<bool, ScribeError> {
+        use vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution;
+        let offered_batches = indices.len();
+        let mut refused_batches = 0;
+        let resolved = loop {
+            let resolved =
+                Self::commit_batch_control_fences(ownership, postgres, tenant, &offered).await?;
+            let refused: Vec<usize> = resolved
+                .iter()
+                .enumerate()
+                .filter(|(_, resolution)| **resolution == ScribeBatchCommitResolution::Conflicted)
+                .map(|(position, _)| position)
+                .collect();
+            if !refused.is_empty() {
+                refused_batches += refused.len();
+                for &position in &refused {
                     let append = &mut state.prepared[indices[position]];
-                    Self::verify_accepted_retry(append, version).await?;
+                    Self::refuse_conflict(append);
                     let batch_id = *append.batch_id.as_bytes();
-                    state.accepted_under.insert(batch_id, version);
+                    state.conflicted.insert(batch_id);
                     state.spent_batch_ids.insert(batch_id);
                 }
-                for &(position, _) in unproved.iter().rev() {
+                for &position in refused.iter().rev() {
                     indices.remove(position);
                     offered.remove(position);
                 }
                 if offered.is_empty() {
                     break Vec::new();
                 }
-            };
-            for (index, resolution) in indices.into_iter().zip(resolved) {
-                let append = &state.prepared[index];
-                let batch_id = *append.batch_id.as_bytes();
-                match resolution {
-                    ScribeBatchCommitResolution::AlreadyCommitted => {}
-                    ScribeBatchCommitResolution::AcceptedUnder(_)
-                    | ScribeBatchCommitResolution::Conflicted => {
-                        return Err(ScribeError::Internal {
-                            detail: "a committed fence group held an unproved batch".to_owned(),
-                        });
+                continue;
+            }
+            let unproved: Vec<(usize, wyrd_spec::vala::ids::TableVersion)> = resolved
+                .iter()
+                .enumerate()
+                .filter_map(|(position, resolution)| match resolution {
+                    ScribeBatchCommitResolution::AcceptedUnder(version) => {
+                        Some((position, *version))
                     }
-                    ScribeBatchCommitResolution::Absent
-                    | ScribeBatchCommitResolution::Committed => continue,
-                }
-                tracing::debug!(
-                    tenant = %append.tenant,
-                    table = %append.table.fqn(),
-                    batch_id = %append.batch_id,
-                    "Scribe batch identity already committed; suppressing a second insertion"
-                );
+                    _ => None,
+                })
+                .collect();
+            if unproved.is_empty() {
+                break resolved;
+            }
+            for &(position, version) in &unproved {
+                let append = &mut state.prepared[indices[position]];
+                Self::verify_accepted_retry(append, version).await?;
+                let batch_id = *append.batch_id.as_bytes();
+                state.accepted_under.insert(batch_id, version);
                 state.spent_batch_ids.insert(batch_id);
             }
+            for &(position, _) in unproved.iter().rev() {
+                indices.remove(position);
+                offered.remove(position);
+            }
+            if offered.is_empty() {
+                break Vec::new();
+            }
+        };
+        for (index, resolution) in indices.into_iter().zip(resolved) {
+            let append = &state.prepared[index];
+            let batch_id = *append.batch_id.as_bytes();
+            match resolution {
+                ScribeBatchCommitResolution::AlreadyCommitted => {}
+                ScribeBatchCommitResolution::AcceptedUnder(_)
+                | ScribeBatchCommitResolution::Conflicted => {
+                    return Err(ScribeError::Internal {
+                        detail: "a committed fence group held an unproved batch".to_owned(),
+                    });
+                }
+                ScribeBatchCommitResolution::Absent | ScribeBatchCommitResolution::Committed => {
+                    continue;
+                }
+            }
+            tracing::debug!(
+                tenant = %append.tenant,
+                table = %append.table.fqn(),
+                batch_id = %append.batch_id,
+                "Scribe batch identity already committed; suppressing a second insertion"
+            );
+            state.spent_batch_ids.insert(batch_id);
         }
-        Ok(())
+        Ok(refused_batches < offered_batches)
     }
-
     /// Asks one append's waiter to prove it is the batch a durable fence
     /// accepted under `version`, while its tenant group's fresh fences stay
     /// rolled back.
@@ -4489,8 +5490,8 @@ impl ShardOwner {
     /// comparing its durable identity fields. When every fence resolves, the result is
     /// returned; when any is absent, the method retries the identical inserts,
     /// which reclassify the fences that did land. An unavailable or
-    /// contradictory lookup poisons the shared governor so
-    /// [`Self::process_group`] retains the complete admitted owner without ACK
+    /// contradictory lookup poisons the shared governor so the shard
+    /// retains the complete admitted owner without ACK
     /// or cleanup.
     ///
     /// # Errors
@@ -4500,7 +5501,7 @@ impl ShardOwner {
     /// unavailable or contradictory. The latter failures poison admission and
     /// retain the group until restart.
     async fn commit_batch_control_fences(
-        &self,
+        ownership: &ScribeOwnership,
         postgres: &ValaPostgres,
         tenant: DataTenantId,
         offered: &[(ScribeBatchCommit, DateTime<Utc>)],
@@ -4532,7 +5533,7 @@ impl ShardOwner {
             let mut reconciliation = match postgres.tenant_conn(tenant).await {
                 Ok(conn) => conn,
                 Err(error) => {
-                    self.memory_ownership.poison();
+                    ownership.poison();
                     return Err(error.into());
                 }
             };
@@ -4544,7 +5545,7 @@ impl ShardOwner {
             {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    self.memory_ownership.poison();
+                    ownership.poison();
                     return Err(error.into());
                 }
             };
@@ -4554,26 +5555,26 @@ impl ShardOwner {
         }
     }
 
-    /// Prepares one group for WAL synchronization without acknowledging it.
+    /// Plans one group's WAL write on the coordinator.
     ///
-    /// Three passes keep the group's order while its Variant conversions
-    /// overlap. The first, in submission order, refuses conflicting batches,
-    /// skips slices already retained, and pins each seal key's layout. The
-    /// second converts every slice with a layout through [`run_conversions`].
-    /// The third stages the slices for the WAL in submission order, and one
-    /// WAL IO operation writes them. Any failure before that operation fails
-    /// the whole group with nothing written.
+    /// In submission order this refuses conflicting batches, skips slices
+    /// already retained, pins each seal key's layout in `layouts`, and
+    /// records which slices an earlier attempt already synced. `layouts`
+    /// carries the choices of every dispatched group that has not settled,
+    /// so a group overlapping an older one converts its slices into the
+    /// layouts the older group's insertion will install. The returned plan
+    /// is owned work for [`Self::write_and_sync`].
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when duplicate detection, layout conversion,
-    /// WAL append, memory reservation, or retry bookkeeping fails.
-    async fn write_group(
+    /// Returns [`ScribeError`] when duplicate detection, layout selection,
+    /// or sizing fails; every waiter has then received the error.
+    fn plan_group_write(
         &mut self,
         mut prepared: Vec<PreparedAppend>,
-    ) -> Result<GroupWalState, ScribeError> {
+        layouts: &mut LayoutChoices,
+    ) -> Result<PlannedGroupWrite, ScribeError> {
         let started = Instant::now();
-        let mut writing = Duration::ZERO;
         let durable_capacity = prepared.iter().try_fold(0_usize, |total, append| {
             total
                 .checked_add(append.slices.exact_slice_capacity())
@@ -4581,15 +5582,7 @@ impl ShardOwner {
                     detail: "WAL durable slice metadata capacity overflow".to_owned(),
                 })
         })?;
-        let mut durable = Vec::with_capacity(durable_capacity);
-        let fixed_durable_capacity = durable.capacity();
-        let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
-        let mut staged = Vec::<usize>::new();
-        let mut records = Vec::new();
-        let mut owners = Vec::<usize>::new();
-        let mut leases = Vec::new();
-        let mut layouts = HashMap::new();
         let mut bound = Vec::new();
         let mut planned = Vec::new();
         let mut planned_slices = Vec::new();
@@ -4625,7 +5618,7 @@ impl ShardOwner {
                         return Err(error);
                     }
                 }
-                let layout = match self.slice_layout(&slice, &mut layouts) {
+                let layout = match self.slice_layout(&slice, layouts) {
                     Ok(layout) => layout,
                     Err(error) => {
                         Self::notify_prepared_error(&mut prepared, &error);
@@ -4647,16 +5640,115 @@ impl ShardOwner {
                     });
                     planned_slices.push(bound.len());
                 }
-                bound.push((append_index, slice, layout));
+                let synced = self.synced_not_inserted.get(&slice.id).copied();
+                bound.push(BoundSlice {
+                    append: append_index,
+                    slice,
+                    layout,
+                    synced,
+                });
             }
         }
+        Ok(PlannedGroupWrite {
+            started,
+            prepared,
+            durable_capacity,
+            rows_by_append,
+            bound,
+            planned,
+            planned_slices,
+        })
+    }
+
+    /// Runs one group's WAL stage as owned work: converts, writes the SLICE
+    /// records, appends one COMMIT per complete batch, and syncs every
+    /// segment the group touched.
+    ///
+    /// The coordinator keeps polling other work while this runs; the only
+    /// shared state it touches is the WAL lane and the memory governor, which
+    /// both serialize their own updates. Every segment the group wrote is
+    /// returned for the coordinator to register, whatever the outcome.
+    async fn write_and_sync(
+        lane: GroupWalLane,
+        plan: PlannedGroupWrite,
+        stages: GroupStages,
+    ) -> WrittenGroup {
+        let mut segments = Vec::new();
+        let write = stages.write.timer();
+        let written = Self::write_slices(&lane, plan, &mut segments).await;
+        write.done();
+        let result = match written {
+            Err(error) => WalStageResult::Refused(error),
+            Ok(mut state) => {
+                match Self::write_and_sync_commits(&lane, &mut state, &stages, &mut segments).await
+                {
+                    Ok(commits) => WalStageResult::Written {
+                        state: Box::new(state),
+                        commits,
+                        synced: Ok(()),
+                    },
+                    Err(error) => WalStageResult::Written {
+                        state: Box::new(state),
+                        commits: Vec::new(),
+                        synced: Err(error),
+                    },
+                }
+            }
+        };
+        WrittenGroup {
+            segments,
+            result,
+            stages,
+        }
+    }
+
+    /// Converts a planned group's slices and writes them in one WAL IO
+    /// operation.
+    ///
+    /// Conversions overlap on the ingress CPU lane; staging then reserves
+    /// each slice's active charge in submission order. Any failure before
+    /// the WAL operation fails the whole group with nothing written. Each
+    /// written slice's segments are pushed onto `segments` under its seal
+    /// key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when conversion, memory reservation, or the
+    /// WAL append fails; every waiter has then received the error and the
+    /// group's active reservations are released.
+    async fn write_slices(
+        lane: &GroupWalLane,
+        plan: PlannedGroupWrite,
+        segments: &mut Vec<(
+            crate::scribe::seal_key::SealKey,
+            Arc<crate::scribe::wal::WalSegment>,
+        )>,
+    ) -> Result<GroupWalState, ScribeError> {
+        let PlannedGroupWrite {
+            started,
+            mut prepared,
+            durable_capacity,
+            rows_by_append,
+            bound,
+            planned,
+            planned_slices,
+        } = plan;
+        let mut bound = bound;
+        let mut writing = Duration::ZERO;
+        let mut durable = Vec::with_capacity(durable_capacity);
+        let fixed_durable_capacity = durable.capacity();
+        let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
+        let mut staged = Vec::<usize>::new();
+        let mut records = Vec::new();
+        let mut owners = Vec::<usize>::new();
+        let mut leases = Vec::new();
         let conversion = Instant::now();
-        let converted = run_conversions(&self.ingress_cpu, &mut prepared, planned).await;
+        let converted = run_conversions(&lane.ingress_cpu, &mut prepared, planned).await;
         let converting = conversion.elapsed();
         match converted {
             Ok(converted) => {
                 for (index, (rows, retained)) in planned_slices.into_iter().zip(converted) {
-                    let (_, slice, _) = &mut bound[index];
+                    let slice = &mut bound[index].slice;
                     slice.rows = rows;
                     slice.memtable_bytes = retained;
                 }
@@ -4669,22 +5761,26 @@ impl ShardOwner {
         let mut bound = bound.into_iter().peekable();
         for (append_index, append) in prepared.iter_mut().enumerate() {
             let mut writes_records = false;
-            while let Some((_, slice, layout)) =
-                bound.next_if(|(owner, _, _)| *owner == append_index)
+            while let Some(BoundSlice {
+                slice,
+                layout,
+                synced,
+                ..
+            }) = bound.next_if(|bound| bound.append == append_index)
             {
-                let slice_id = slice.id.clone();
-                let staged_slice =
-                    if let Some(previous) = self.synced_not_inserted.get(&slice_id).copied() {
-                        self.reuse_synced_slice(append, slice, &previous)
-                            .map(|(slice, _)| (slice, None))
-                    } else {
-                        self.stage_ingress_slice(append, slice)
-                            .map(|(slice, record)| (slice, Some(record)))
-                    };
+                let staged_slice = if let Some(previous) = synced {
+                    Self::reuse_synced_slice(&lane.ownership, append, slice, &previous)
+                        .map(|(slice, _)| (slice, None))
+                } else {
+                    Self::stage_ingress_slice(&lane.ownership, append, slice)
+                        .map(|(slice, record)| (slice, Some(record)))
+                };
                 let (mut slice, record) = match staged_slice {
                     Ok(value) => value,
                     Err(error) => {
-                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                        if let Err(cleanup_error) =
+                            Self::release_active_reservations(&lane.ownership, &durable)
+                        {
                             tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
                         }
                         Self::notify_prepared_error(&mut prepared, &error);
@@ -4709,7 +5805,9 @@ impl ShardOwner {
                     let error = ScribeError::Internal {
                         detail: "ingress root owner missing before WAL dispatch".to_owned(),
                     };
-                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                    if let Err(cleanup_error) =
+                        Self::release_active_reservations(&lane.ownership, &durable)
+                    {
                         tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
                     }
                     Self::notify_prepared_error(&mut prepared, &error);
@@ -4721,10 +5819,10 @@ impl ShardOwner {
         }
         if !records.is_empty() {
             let submitted = Instant::now();
-            let written = self
+            let written = lane
                 .wal_io
                 .submit(ScribeWalIoOp::WriteIngressSlices {
-                    wal: self.wal_handle.clone(),
+                    wal: lane.wal.clone(),
                     appends: records,
                     memory: leases,
                 })
@@ -4747,7 +5845,9 @@ impl ShardOwner {
             let results = match written {
                 Ok(results) => results,
                 Err(error) => {
-                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                    if let Err(cleanup_error) =
+                        Self::release_active_reservations(&lane.ownership, &durable)
+                    {
                         tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
                     }
                     Self::notify_prepared_error(&mut prepared, &error);
@@ -4760,10 +5860,7 @@ impl ShardOwner {
                 slice.payload_digest = result.payload_digest;
                 slice.payload_len = result.payload_len;
                 for segment in result.touched_segments {
-                    self.wal_segments
-                        .entry(slice.seal_key.clone())
-                        .or_default()
-                        .insert(segment.path().to_path_buf(), Arc::clone(&segment));
+                    segments.push((slice.seal_key.clone(), Arc::clone(&segment)));
                     touched.insert(segment.path().to_path_buf(), segment);
                 }
             }
@@ -4884,7 +5981,7 @@ impl ShardOwner {
     /// Returns [`ScribeError`] when active memory accounting fails; the
     /// reservation helper releases what it acquired.
     fn stage_ingress_slice(
-        &mut self,
+        ownership: &ScribeOwnership,
         append: &mut PreparedAppend,
         slice: PreparedSlice,
     ) -> Result<(DurableSlice, crate::scribe::wal::PreparedWalAppend), ScribeError> {
@@ -4896,7 +5993,7 @@ impl ShardOwner {
             memtable_bytes,
             ..
         } = slice;
-        self.reserve_slice_active(append, memtable_bytes)?;
+        Self::reserve_slice_active(ownership, append, memtable_bytes)?;
         Ok((
             DurableSlice {
                 seal_key,
@@ -4910,7 +6007,7 @@ impl ShardOwner {
                 data_digest: wal_append.logical_data_digest,
                 data_len: wal_append.logical_data_len,
                 lsn: crate::scribe::wal::WalLsn::ZERO,
-                payload_digest: [0; 32],
+                payload_digest: [0; crate::scribe::wal::DIGEST_BYTES],
                 payload_len: 0,
                 slice_index: wal_append.slice_index,
                 slice_count: wal_append.slice_count,
@@ -4929,7 +6026,7 @@ impl ShardOwner {
     ///
     /// Returns [`ScribeError`] when memory accounting fails.
     fn reuse_synced_slice(
-        &mut self,
+        ownership: &ScribeOwnership,
         append: &mut PreparedAppend,
         slice: PreparedSlice,
         previous: &WalSliceState,
@@ -4944,7 +6041,7 @@ impl ShardOwner {
             ..
         } = slice;
         if retain_rows {
-            self.reserve_slice_active(append, memtable_bytes)?;
+            Self::reserve_slice_active(ownership, append, memtable_bytes)?;
         }
         Ok((
             DurableSlice {
@@ -4982,17 +6079,17 @@ impl ShardOwner {
     ///
     /// Returns [`ScribeError`] when the WAL lane fails or returns an unexpected result.
     async fn sync_group(
-        &self,
+        lane: &GroupWalLane,
         touched: &HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
     ) -> Result<(), ScribeError> {
         if touched.is_empty() {
             return Ok(());
         }
         let segments = touched.values().cloned().collect::<Vec<_>>();
-        match self
+        match lane
             .wal_io
             .submit(ScribeWalIoOp::SyncWal {
-                wal: self.wal_handle.clone(),
+                wal: lane.wal.clone(),
                 segments,
             })
             .await?
@@ -5055,7 +6152,7 @@ impl ShardOwner {
         let row_count = rows.num_rows();
         drop(rows);
         if slice.active_reserved {
-            self.release_active_ownership(slice.memtable_bytes, true)?;
+            Self::release_active_ownership(&self.memory_ownership, slice.memtable_bytes, true)?;
         }
         self.synced_not_inserted.remove(&AppendSliceId {
             batch_id: uuid::Uuid::from_bytes(slice.batch_id),
@@ -5115,7 +6212,12 @@ impl ShardOwner {
                 slice.layout.take(),
             )
             .map_err(|error| {
-                self.preserve_primary_after_active_cleanup(error, slice.memtable_bytes, true)
+                Self::preserve_primary_after_active_cleanup(
+                    &self.memory_ownership,
+                    error,
+                    slice.memtable_bytes,
+                    true,
+                )
             })?;
         metrics::counter!("bifrost_scribe_memtable_rows_inserted_total")
             .increment(u64::try_from(row_count).unwrap_or(u64::MAX));
@@ -5176,13 +6278,13 @@ impl ShardOwner {
 
     /// Releases active reservations after a failed group stage.
     fn release_active_ownership(
-        &self,
+        ownership: &ScribeOwnership,
         bytes: usize,
         already_absorbed: bool,
     ) -> Result<(), ScribeError> {
         if already_absorbed {
-            self.memory_ownership.preflight_release_active(bytes)?;
-            self.memory_ownership.release_active(bytes)?;
+            ownership.preflight_release_active(bytes)?;
+            ownership.release_active(bytes)?;
         }
         Ok(())
     }
@@ -5193,13 +6295,18 @@ impl ShardOwner {
     ///
     /// Returns the first memory-ledger release error after attempting to settle
     /// every active durable slice.
-    fn release_active_reservations(&self, durable: &[DurableSlice]) -> Result<(), ScribeError> {
+    fn release_active_reservations(
+        ownership: &ScribeOwnership,
+        durable: &[DurableSlice],
+    ) -> Result<(), ScribeError> {
         let mut first_error = None;
         for slice in durable {
             if !slice.active_reserved {
                 continue;
             }
-            if let Err(error) = self.release_active_ownership(slice.memtable_bytes, true) {
+            if let Err(error) =
+                Self::release_active_ownership(ownership, slice.memtable_bytes, true)
+            {
                 tracing::error!(error = %error, "active cleanup failed; accounting is poisoned");
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -5220,7 +6327,7 @@ impl ShardOwner {
     /// Returns [`ScribeError`] when the root cannot supply the slice's exact
     /// child or the ownership ledger refuses transfer.
     fn reserve_slice_active(
-        &mut self,
+        ownership: &ScribeOwnership,
         append: &mut PreparedAppend,
         memtable_bytes: usize,
     ) -> Result<(), ScribeError> {
@@ -5234,7 +6341,8 @@ impl ShardOwner {
         let mut active_memory = match active_memory {
             Ok(value) => value,
             Err(error) => {
-                return Err(self.preserve_primary_after_active_cleanup(
+                return Err(Self::preserve_primary_after_active_cleanup(
+                    ownership,
                     ScribeError::Internal {
                         detail: error.to_string(),
                     },
@@ -5244,10 +6352,20 @@ impl ShardOwner {
             }
         };
         if let Err(error) = active_memory.transfer_category(MemoryCategory::Active) {
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+            return Err(Self::preserve_primary_after_active_cleanup(
+                ownership,
+                error,
+                memtable_bytes,
+                false,
+            ));
         }
-        if let Err(error) = self.memory_ownership.absorb_active(active_memory) {
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+        if let Err(error) = ownership.absorb_active(active_memory) {
+            return Err(Self::preserve_primary_after_active_cleanup(
+                ownership,
+                error,
+                memtable_bytes,
+                false,
+            ));
         }
         Ok(())
     }
@@ -5259,12 +6377,12 @@ impl ShardOwner {
     /// returns the original operation error so callers retain the actionable
     /// WAL, split, or insertion diagnosis.
     fn preserve_primary_after_active_cleanup(
-        &self,
+        ownership: &ScribeOwnership,
         primary: ScribeError,
         bytes: usize,
         already_absorbed: bool,
     ) -> ScribeError {
-        if let Err(cleanup) = self.release_active_ownership(bytes, already_absorbed) {
+        if let Err(cleanup) = Self::release_active_ownership(ownership, bytes, already_absorbed) {
             tracing::error!(error = %cleanup, primary = %primary, "active cleanup failed after primary group error");
         }
         primary
@@ -5279,7 +6397,7 @@ impl ShardOwner {
     ) -> ScribeError {
         let mut first_cleanup = None;
         for owned in bytes {
-            if let Err(error) = self.release_active_ownership(owned, true)
+            if let Err(error) = Self::release_active_ownership(&self.memory_ownership, owned, true)
                 && first_cleanup.is_none()
             {
                 first_cleanup = Some(error);
@@ -5409,8 +6527,8 @@ mod tests {
     ///
     /// Panics if the isolated WAL, memtable, root ownership, or owner rotation
     /// cannot be constructed and settled for either threshold case.
-    #[test]
-    fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
+    #[tokio::test]
+    async fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
         for (wal_target, memtable_target) in [(1, usize::MAX), (u64::MAX, 1)] {
             let key = owner_key();
             let memtable = Memtable::new();
@@ -5446,6 +6564,7 @@ mod tests {
 
             owner
                 .rotate_before_append_if_needed(&[])
+                .await
                 .expect("threshold rotates owner");
 
             assert_eq!(owner.rotation_cohorts.len(), 1);
@@ -5597,8 +6716,8 @@ mod tests {
     ///
     /// Panics when isolated owners cannot be built or the all-key rotation does
     /// not preserve one complete cohort before admitting a fresh generation.
-    #[test]
-    fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
+    #[tokio::test]
+    async fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
         let first = owner_key();
         let second = SealKey::new(
             first.tenant,
@@ -5631,11 +6750,18 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
+        let closes_before = owner.wal_io.close_submissions_for_test();
 
         owner
             .rotate_active_generation()
+            .await
             .expect("automatic all-key rotation");
 
+        assert_eq!(
+            owner.wal_io.close_submissions_for_test(),
+            closes_before + 1,
+            "the WAL generation closes on the WAL IO lane, not the owner's async worker"
+        );
         let stats = owner.memtable.stats().expect("rotated statistics");
         assert_eq!(stats.writable_buckets, 0);
         assert_eq!(stats.immutable_generations, 2);
@@ -5684,8 +6810,8 @@ mod tests {
     ///
     /// Panics when the isolated owner cannot append its WAL records, transfer
     /// active ownership, rotate all keys, reset its clock, or admit fresh state.
-    #[test]
-    fn automatic_age_rotation_is_whole_shard_below_high_water() {
+    #[tokio::test]
+    async fn automatic_age_rotation_is_whole_shard_below_high_water() {
         let first = owner_key();
         let second = SealKey::new(
             first.tenant,
@@ -5730,6 +6856,7 @@ mod tests {
 
         owner
             .rotate_before_append_if_needed(&[])
+            .await
             .expect("automatic age owner rotation");
 
         assert_eq!(owner.rotation_cohorts.len(), 1);
@@ -7179,7 +8306,7 @@ mod tests {
         let retry = [2_u8; 16];
         let commit = |batch_id, lsn: u64| crate::scribe::replay::ReplayedCommitIdentity {
             batch_id,
-            slice_set_digest: [3; 32],
+            slice_set_digest: [3; 16],
             slice_count: 1,
             segment_sequence: 1,
             wal_lsn_min: WalLsn::new(lsn),
@@ -7189,7 +8316,7 @@ mod tests {
         };
         let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
@@ -7229,7 +8356,7 @@ mod tests {
         let key = owner_key();
         let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id: [marker; 16],
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
@@ -7342,7 +8469,7 @@ mod tests {
         let key = SealKey::new(tenant, table, a);
         let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id: [marker; 16],
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 2,
             wal_lsn: WalLsn::new(lsn),
@@ -7430,9 +8557,9 @@ mod tests {
         ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             schema_fingerprint: [0; 32],
-            data_digest: [0; 32],
+            data_digest: [0; 16],
             data_len: 0,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_index: 0,
             slice_count: 1,
@@ -7511,6 +8638,7 @@ mod tests {
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             retained_commit_ambiguity: None,
+            pipeline: GroupPipeline::default(),
             memtable: Arc::new(memtable),
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             ingress_cpu: ScribeIngressCpuPool::new(1),
@@ -7527,8 +8655,182 @@ mod tests {
             drained: Arc::new(Notify::new()),
             committed: Arc::default(),
             fail_next_retirement_release: false,
+            preparation_hold: None,
         };
         (owner, budget, command_tx, completion_tx, pressure_tx)
+    }
+
+    /// A mailbox drain of append-only commands leaves the published inspection
+    /// snapshot alone, because queuing an append changes no memtable state; a
+    /// control command in the same mailbox still publishes the current state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an append-only drain republishes the snapshot, the appends are
+    /// not queued, or a drained control command does not publish.
+    #[tokio::test]
+    async fn mailbox_drain_publishes_inspection_only_for_control_commands() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let (commands, receiver) = mpsc::channel(4);
+        owner.receiver = receiver;
+        let stale = || ShardMemtableSnapshot {
+            stats: MemtableStats {
+                writable_rows: usize::MAX,
+                ..MemtableStats::default()
+            },
+            ..ShardMemtableSnapshot::default()
+        };
+        let published_rows = |owner: &ShardOwner| {
+            owner
+                .snapshot
+                .lock()
+                .expect("snapshot lock")
+                .stats
+                .writable_rows
+        };
+        *owner.snapshot.lock().expect("snapshot lock") = stale();
+
+        for _ in 0..2 {
+            commands
+                .try_send(ShardCommand::Append(Box::new(
+                    prepared_append_for_group_test(&budget),
+                )))
+                .expect("queue append");
+        }
+        owner.drain_mailbox().await;
+
+        assert_eq!(
+            owner.scheduler.pop_group(&HashSet::new()).len(),
+            2,
+            "both appends are queued"
+        );
+        assert_eq!(
+            published_rows(&owner),
+            usize::MAX,
+            "appends do not republish"
+        );
+
+        let (response, flushed) = tokio::sync::oneshot::channel();
+        commands
+            .try_send(ShardCommand::FlushAll { response })
+            .expect("queue flush");
+        owner.drain_mailbox().await;
+
+        let _ = flushed.await.expect("flush response");
+        let current = owner
+            .memtable
+            .stats()
+            .expect("memtable stats")
+            .writable_rows;
+        assert_ne!(current, usize::MAX);
+        assert_eq!(
+            published_rows(&owner),
+            current,
+            "the flush publishes current state"
+        );
+    }
+
+    /// Proves the pod-wide index records only batches this group committed:
+    /// a retry the durable fence already held under another attempt, which
+    /// another pod may own and delete, never enters it, and a batch this pod
+    /// cached earlier stays matched when a later attempt of it is spent.
+    #[test]
+    fn record_committed_skips_spent_retries_and_keeps_cached_acceptances() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let key = owner_key();
+        let committed = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let retried = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let cached = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let fence = |index: usize, append: &PreparedAppend| {
+            let (digest, slices, _) = append.logical_identity().expect("logical identity");
+            (
+                index,
+                digest,
+                slices,
+                append.table_version().expect("table version"),
+            )
+        };
+        let identity = |append: &PreparedAppend| {
+            let (_, digest, slices, version) = fence(0, append);
+            crate::scribe::committed_batches::CommittedBatch {
+                table_fqn: append.table.fqn(),
+                table_version: version,
+                logical_digest: digest,
+                slice_count: slices,
+            }
+        };
+        owner
+            .committed
+            .record(cached.tenant, cached.batch_id, identity(&cached));
+        let state = GroupWalState {
+            fenced: vec![fence(0, &committed), fence(1, &retried), fence(2, &cached)],
+            spent_batch_ids: HashSet::from([
+                *retried.batch_id.as_bytes(),
+                *cached.batch_id.as_bytes(),
+            ]),
+            prepared: vec![committed, retried, cached],
+            durable: Vec::new(),
+            touched: HashMap::new(),
+            rows_by_append: HashMap::new(),
+            accepted_under: HashMap::new(),
+            conflicted: HashSet::new(),
+            inserted_batch_ids: HashSet::new(),
+        };
+
+        owner.record_committed(&state);
+
+        let [committed, retried, cached] = &state.prepared[..] else {
+            panic!("three prepared appends");
+        };
+        assert!(
+            owner
+                .committed
+                .contains(committed.tenant, committed.batch_id, &identity(committed)),
+            "a locally committed batch is matched exactly"
+        );
+        assert!(
+            !owner.committed.knows(retried.tenant, retried.batch_id),
+            "a spent retry never creates an index entry"
+        );
+        assert!(
+            owner
+                .committed
+                .contains(cached.tenant, cached.batch_id, &identity(cached)),
+            "an earlier local acceptance stays matched after a spent attempt"
+        );
     }
 
     /// Proves shard insertion seals a full bucket before a crossing append lands.
@@ -7573,10 +8875,10 @@ mod tests {
                     active_reserved: true,
                     batch_id: next_id,
                     schema_fingerprint: [0; 32],
-                    data_digest: [0; 32],
+                    data_digest: [0; 16],
                     data_len: 0,
                     lsn: WalLsn::new(2),
-                    payload_digest: [0; 32],
+                    payload_digest: [0; 16],
                     payload_len: 0,
                     slice_index: 0,
                     slice_count: 1,
@@ -7758,8 +9060,8 @@ mod tests {
         let memory = budget
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
             .expect("ingress memory");
-        let mut prepared =
-            crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
+        let mut prepared = crate::scribe::preprocess::prepare_append(
+            crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
@@ -7775,8 +9077,10 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
                 profile: Arc::default(),
-            })
-            .expect("prepared append");
+            },
+            &crate::scribe::preprocess::EncoderContexts::default(),
+        )
+        .expect("prepared append");
         let prepared_bytes = prepared.prepared_bytes;
         prepared
             .memory
@@ -8239,7 +9543,7 @@ mod tests {
             )
             .expect("capture reads");
         let mut values = Vec::new();
-        for readable in read.batches {
+        for readable in read.evaluated().expect("batches evaluate") {
             let attrs = readable.batch.column_by_name("attrs").expect("attrs");
             assert_eq!(
                 attrs.data_type(),
@@ -8937,7 +10241,7 @@ mod tests {
 
         let mut group_sizes = Vec::new();
         while !owner.scheduler.is_empty() {
-            let group = owner.scheduler.pop_group();
+            let group = owner.scheduler.pop_group(&HashSet::new());
             group_sizes.push(group.len());
             owner.process_group(group).await.expect("group commits");
         }
@@ -8968,21 +10272,24 @@ mod tests {
         );
     }
 
-    /// A crash after the group COMMIT sync but before the last fence replays once.
+    /// A crash after the group COMMIT sync but before the last fence restores
+    /// nothing, and the producer's retry writes every batch once.
     ///
     /// An uncommitted row holds the third batch's fence key, so the real owner
     /// syncs all three COMMIT records and blocks inside the group's one fence
     /// transaction. Dropping the owner there is the crash: no ACK was delivered
     /// and, because the group's fences commit together, none is durable. A
-    /// next-epoch owner replays the same WAL against `PostgreSQL`, and a retry
-    /// of the same IDs acknowledges every batch without a second row.
+    /// next-epoch owner replays the same WAL against `PostgreSQL` and restores
+    /// none of the never-accepted attempts; a retry of the same IDs
+    /// acknowledges every batch and holds each row once.
     ///
     /// # Panics
     ///
     /// Panics if the fixture cannot start, the group does not block on the last
-    /// fence, any ACK precedes the crash, replay fails, or row counts diverge.
+    /// fence, any ACK precedes the crash, replay fails, replay restores a row,
+    /// or the retry does not hold each row once.
     #[tokio::test]
-    async fn group_commit_crash_between_sync_and_fence_replays() {
+    async fn group_commit_crash_between_sync_and_fence_restores_nothing() {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
@@ -9029,7 +10336,7 @@ mod tests {
         .bind(key.tenant.as_uuid())
         .bind(key.table.fqn())
         .bind(batch_ids[2])
-        .bind([0_u8; 32].as_slice())
+        .bind([0_u8; 16].as_slice())
         .bind(node.as_uuid())
         .bind(uuid::Uuid::now_v7())
         .execute(&mut *blocker)
@@ -9037,11 +10344,13 @@ mod tests {
         .expect("hold the last fence key");
         let last_fence_blocked = async {
             loop {
-                let waiting: i64 =
-                    sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
-                        .fetch_one(&superuser)
-                        .await
-                        .expect("lock wait probe");
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+                     WHERE NOT l.granted AND a.datname = current_database()",
+                )
+                .fetch_one(&superuser)
+                .await
+                .expect("lock wait probe");
                 if waiting > 0 {
                     return;
                 }
@@ -9075,7 +10384,7 @@ mod tests {
             let stats = owner.memtable.stats().expect("memtable stats");
             stats.writable_rows + stats.immutable_rows
         };
-        assert_eq!(rows(&owner), batch_ids.len());
+        assert_eq!(rows(&owner), 0, "a never-accepted attempt restores no rows");
 
         let (retry, acks) = acked_group_for_key(&budget, &key, &batch_ids);
         owner.process_group(retry).await.expect("same-ID retry");
@@ -9156,7 +10465,7 @@ mod tests {
             .bind(key.table.fqn())
             .bind(spent)
             .bind(accepted_version.get())
-            .bind([0xEE_u8; 32].as_slice())
+            .bind([0xEE_u8; 16].as_slice())
             .bind(uuid::Uuid::now_v7())
             .bind(uuid::Uuid::now_v7())
             .execute(&superuser)
@@ -9601,7 +10910,7 @@ mod tests {
         }
         let mut drained = Vec::new();
         while !bounded.is_empty() {
-            let next = bounded.pop_group();
+            let next = bounded.pop_group(&HashSet::new());
             assert!(
                 next.len() <= MAX_GROUP_ITEMS,
                 "one drain must stay inside the bounded fsync group"
@@ -9640,7 +10949,7 @@ mod tests {
         let mut busy_order = Vec::new();
         let mut quiet_order = Vec::new();
         while !across_drains.is_empty() {
-            for item in across_drains.pop_group() {
+            for item in across_drains.pop_group(&HashSet::new()) {
                 if item.tenant() == busy {
                     busy_served += 1;
                     busy_order.push(item.sequence);
@@ -9664,6 +10973,393 @@ mod tests {
             quiet_order, expected_order,
             "cross-drain rotation must not reorder a tenant's own arrivals"
         );
+    }
+
+    /// An idle shard dispatches at once; beside a dispatched group, a short
+    /// group waits only until one fixed deadline after its first collected
+    /// request, and a group at the soft target dispatches without waiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an idle or full group waits, when a short overlapping
+    /// group dispatches before its deadline, or when an arrival or an empty
+    /// queue moves the deadline.
+    #[test]
+    fn group_collection_waits_once_from_its_first_request() {
+        let start = tokio::time::Instant::now();
+        let mut collection = GroupCollection::default();
+        assert!(
+            collection.due(1, false, start),
+            "an idle shard dispatches at once"
+        );
+        assert!(
+            !collection.due(0, true, start),
+            "nothing collected dispatches nothing"
+        );
+        assert_eq!(
+            collection.deadline(),
+            None,
+            "an empty queue starts no deadline"
+        );
+
+        let first = start + COLLECTION_WAIT;
+        assert!(
+            !collection.due(1, true, first),
+            "a short overlapping group waits"
+        );
+        assert_eq!(collection.deadline(), Some(first + COLLECTION_WAIT));
+        let arrival = first + COLLECTION_WAIT / 2;
+        assert!(!collection.due(5, true, arrival));
+        assert_eq!(
+            collection.deadline(),
+            Some(first + COLLECTION_WAIT),
+            "later arrivals never move the deadline"
+        );
+        assert!(
+            collection.due(5, true, first + COLLECTION_WAIT),
+            "the deadline dispatches a short group"
+        );
+        assert_eq!(collection.deadline(), None, "dispatch clears the deadline");
+
+        assert!(
+            collection.due(COLLECTION_TARGET, true, arrival),
+            "a group at the soft target dispatches without waiting"
+        );
+        assert_eq!(collection.deadline(), None);
+    }
+
+    /// An owner on a fresh WAL with no fence database, so a group's fence
+    /// resolves the first time the coordinator polls it. Returns the WAL
+    /// directory, the owner, its budget, a production-capacity mailbox
+    /// sender, and the pressure sender the owner needs kept open.
+    fn mailbox_owner() -> (
+        tempfile::TempDir,
+        ShardOwner,
+        crate::resources::ScribeResources,
+        mpsc::Sender<ShardCommand>,
+        watch::Sender<Option<PressureSignal>>,
+    ) {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget, _, _, pressure) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        let (command_tx, receiver) = mpsc::channel(SHARD_COMMAND_CAPACITY);
+        owner.receiver = receiver;
+        (wal_root, owner, budget, command_tx, pressure)
+    }
+
+    /// Dispatches `group` as the owner's head group and advances it, synced,
+    /// into its fence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the group does not dispatch, sync and start fencing.
+    async fn fencing_head(owner: &mut ShardOwner, group: Vec<PreparedAppend>) {
+        owner.pending.fetch_add(group.len(), Ordering::AcqRel);
+        owner
+            .dispatch_group(group)
+            .await
+            .expect("the head dispatches");
+        assert!(owner.advance_pipeline().await.is_none(), "the head syncs");
+        assert!(matches!(
+            owner.pipeline.older.as_ref().map(|group| &group.stage),
+            Some(GroupStage::Fencing(_))
+        ));
+    }
+
+    /// A second table in `key`'s tenant and partition.
+    fn other_table(key: &SealKey, name: &str) -> SealKey {
+        SealKey::new(
+            key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, name),
+            crate::test_support::day_partition(2026, 7, 24),
+        )
+    }
+
+    /// A head group whose fence is ready becomes visible and acknowledged
+    /// before the coordinator prepares the next group, and the mailbox is
+    /// served one bounded chunk at a time, so a backlog larger than a chunk
+    /// cannot delay that completion.
+    ///
+    /// The head's fence resolves on its first poll while a backlog of appends
+    /// for another table, far above the collection target, waits in the
+    /// mailbox. Preparation of the next group is held at its start; by then
+    /// the head must be visible and acknowledged, and only one service chunk
+    /// may have left the mailbox.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the next group prepares before the head's ACK or before its
+    /// rows are visible, more than one chunk leaves the mailbox before that
+    /// preparation, or a backlog append does not commit.
+    #[tokio::test]
+    async fn a_ready_head_completion_is_acknowledged_before_the_next_group_prepares() {
+        const BACKLOG: usize = MAILBOX_SERVICE_CHUNK * 2 + 1;
+        let (_wal_root, mut owner, budget, command_tx, _pressure) = mailbox_owner();
+        let head_key = owner_key();
+        let backlog_key = other_table(&head_key, "owner-test-backlog");
+        let (head, mut head_ack) = acked_group_for_key(&budget, &head_key, &[uuid::Uuid::now_v7()]);
+        fencing_head(&mut owner, head).await;
+        let backlog_ids: Vec<uuid::Uuid> = (0..BACKLOG).map(|_| uuid::Uuid::now_v7()).collect();
+        let (backlog, backlog_acks) = acked_group_for_key(&budget, &backlog_key, &backlog_ids);
+        owner.pending.fetch_add(BACKLOG, Ordering::AcqRel);
+        for append in backlog {
+            command_tx
+                .try_send(ShardCommand::Append(Box::new(append)))
+                .expect("the mailbox holds the backlog");
+        }
+        let (reached_tx, mut reached) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        owner.preparation_hold = Some((reached_tx, Arc::clone(&release)));
+        let live = Arc::clone(&owner.memtable);
+        let task = tokio::spawn(owner.run());
+
+        tokio::time::timeout(Duration::from_secs(10), reached.recv())
+            .await
+            .expect("the next group prepares")
+            .expect("preparation hold");
+        let head = head_ack[0]
+            .try_recv()
+            .expect("the ready head is acknowledged before the next group prepares")
+            .expect("the head commits");
+        assert!(head.first_commit);
+        let stats = live.stats().expect("memtable stats");
+        assert_eq!(
+            u64::try_from(stats.writable_rows + stats.immutable_rows).expect("rows fit u64"),
+            head.rows,
+            "the head's rows are visible before the next group prepares"
+        );
+        assert_eq!(
+            command_tx.max_capacity() - command_tx.capacity(),
+            BACKLOG - MAILBOX_SERVICE_CHUNK,
+            "one bounded chunk left the mailbox before the next group prepared"
+        );
+
+        release.add_permits(BACKLOG);
+        for (index, ack) in backlog_acks.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(10), ack)
+                .await
+                .unwrap_or_else(|_| panic!("backlog append {index} settles"))
+                .expect("ACK delivered")
+                .unwrap_or_else(|error| panic!("backlog append {index} commits: {error}"));
+        }
+        command_tx
+            .send(ShardCommand::Shutdown)
+            .await
+            .expect("shutdown mailbox");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the owner drains")
+            .expect("owner task");
+    }
+
+    /// Retries a dispatched group's identity holds back cannot end the
+    /// overlapping group's collection: only eligible requests count toward
+    /// the soft target, arrivals never move the first eligible request's
+    /// deadline, and once the target is met the group drains every ready
+    /// eligible request while the held table keeps its retries queued.
+    ///
+    /// # Panics
+    ///
+    /// Panics if held retries dispatch the eligible group, an arrival moves
+    /// the deadline, the group stops at the target instead of draining ready
+    /// requests, or a held retry joins the group.
+    #[tokio::test(start_paused = true)]
+    async fn held_retries_do_not_satisfy_the_collection_target() {
+        let (_wal_root, mut owner, budget, _command_tx, _pressure) = mailbox_owner();
+        let held_key = owner_key();
+        let other_key = other_table(&held_key, "owner-test-other");
+        let held_id = uuid::Uuid::now_v7();
+        let (head, _head_ack) = acked_group_for_key(&budget, &held_key, &[held_id]);
+        fencing_head(&mut owner, head).await;
+        for _ in 1..COLLECTION_TARGET {
+            owner
+                .scheduler
+                .push(prepared_append_for_key(&budget, held_key.clone(), held_id));
+        }
+        let queue_eligible = |owner: &mut ShardOwner, count: usize| {
+            for _ in 0..count {
+                owner.scheduler.push(prepared_append_for_key(
+                    &budget,
+                    other_key.clone(),
+                    uuid::Uuid::now_v7(),
+                ));
+            }
+        };
+
+        queue_eligible(&mut owner, 1);
+        assert!(
+            !owner.dispatch_next().await,
+            "held retries do not complete the eligible group"
+        );
+        let deadline = owner
+            .pipeline
+            .collection
+            .deadline()
+            .expect("the first eligible request starts the deadline");
+        tokio::time::advance(COLLECTION_WAIT / 2).await;
+        queue_eligible(&mut owner, 5);
+        assert!(!owner.dispatch_next().await, "a short group keeps waiting");
+        assert_eq!(
+            owner.pipeline.collection.deadline(),
+            Some(deadline),
+            "arrivals never move the deadline"
+        );
+
+        queue_eligible(&mut owner, COLLECTION_TARGET + 2);
+        assert!(
+            owner.dispatch_next().await,
+            "eligible requests at the target dispatch"
+        );
+        let group = &owner
+            .pipeline
+            .newer
+            .as_ref()
+            .expect("the eligible group takes the free slot")
+            .meta;
+        assert_eq!(
+            group.requests,
+            COLLECTION_TARGET + 8,
+            "ready eligible requests above the target drain into the group"
+        );
+        assert!(
+            group
+                .identities
+                .iter()
+                .all(|(_, table, _)| *table == other_key.table),
+            "no held retry joins the group"
+        );
+        assert_eq!(
+            owner.scheduler.len(),
+            COLLECTION_TARGET - 1,
+            "the held table keeps its retries queued"
+        );
+        assert_eq!(owner.pipeline.collection.deadline(), None);
+    }
+
+    /// A short eligible group waiting beside held retries dispatches as soon
+    /// as its predecessor settles, before its deadline, and the held table
+    /// resumes in arrival order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if held retries dispatch the eligible group, the predecessor
+    /// does not settle, or the short group waits after it settles.
+    #[tokio::test(start_paused = true)]
+    async fn a_predecessor_completion_dispatches_a_short_eligible_group() {
+        let (_wal_root, mut owner, budget, _command_tx, _pressure) = mailbox_owner();
+        let held_key = owner_key();
+        let other_key = other_table(&held_key, "owner-test-other");
+        let held_id = uuid::Uuid::now_v7();
+        let (head, mut head_ack) = acked_group_for_key(&budget, &held_key, &[held_id]);
+        fencing_head(&mut owner, head).await;
+        for _ in 1..COLLECTION_TARGET {
+            owner
+                .scheduler
+                .push(prepared_append_for_key(&budget, held_key.clone(), held_id));
+        }
+        let eligible = uuid::Uuid::now_v7();
+        owner.scheduler.push(prepared_append_for_key(
+            &budget,
+            other_key.clone(),
+            eligible,
+        ));
+        assert!(
+            !owner.dispatch_next().await,
+            "held retries do not complete the eligible group"
+        );
+
+        assert!(
+            matches!(owner.advance_pipeline().await, Some(Ok(()))),
+            "the predecessor settles"
+        );
+        head_ack[0]
+            .try_recv()
+            .expect("the predecessor is acknowledged")
+            .expect("the predecessor commits");
+        assert!(
+            owner.dispatch_next().await,
+            "the predecessor's completion dispatches the short group at once"
+        );
+        let group = &owner
+            .pipeline
+            .older
+            .as_ref()
+            .expect("the short group dispatches")
+            .meta;
+        assert_eq!(
+            group.identities,
+            vec![
+                (held_key.tenant, held_key.table.clone(), *held_id.as_bytes()),
+                (
+                    other_key.tenant,
+                    other_key.table.clone(),
+                    *eligible.as_bytes()
+                ),
+            ],
+            "the released table's first retry and the eligible request dispatch"
+        );
+        assert_eq!(owner.scheduler.len(), COLLECTION_TARGET - 2);
+    }
+
+    /// A table whose next request a dispatched group still owns is skipped
+    /// without losing its place: other tables and tenants are served, and the
+    /// held table's later requests stay behind the held one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a held request or anything behind it in its table is
+    /// served, when another table or tenant waits behind the held table, or
+    /// when the held table loses its turn once released.
+    #[test]
+    fn held_identities_skip_their_table_and_keep_its_turn() {
+        let busy = DataTenantId::new_v7();
+        let quiet = DataTenantId::new_v7();
+        let mut scheduler = TenantTableRoundRobin::default();
+        scheduler.push(scheduled_in(busy, BifrostNamespace::Datasets, "held", 1));
+        scheduler.push(scheduled_in(busy, BifrostNamespace::Datasets, "held", 2));
+        scheduler.push(scheduled_in(busy, BifrostNamespace::Datasets, "free", 3));
+        scheduler.push(scheduled_in(quiet, BifrostNamespace::Datasets, "held", 4));
+        let held_item = scheduled_in(busy, BifrostNamespace::Datasets, "held", 1);
+        let held = HashSet::from([(
+            held_item.tenant(),
+            held_item.table().clone(),
+            held_item.batch_id(),
+        )]);
+
+        let sequences = |group: Vec<Item>| {
+            group
+                .into_iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sequences(scheduler.pop_group(&held)),
+            vec![3, 4],
+            "the free table and the other tenant are served while the held table waits"
+        );
+        assert_eq!(
+            sequences(scheduler.pop_group(&held)),
+            Vec::<usize>::new(),
+            "nothing behind the held request is served"
+        );
+        assert_eq!(
+            sequences(scheduler.pop_group(&HashSet::new())),
+            vec![1, 2],
+            "the released table keeps its arrival order"
+        );
+        assert!(scheduler.is_empty());
     }
 
     /// AC22/AC25 unit owner: the shard scheduler is exactly hierarchical —
@@ -9715,7 +11411,7 @@ mod tests {
             21,
         ));
 
-        let group = scheduler.pop_group();
+        let group = scheduler.pop_group(&HashSet::new());
         assert_eq!(group.len(), 7, "one drain serves every pending request");
         let served: Vec<(DataTenantId, BifrostNamespace, usize)> = group
             .iter()
@@ -9785,7 +11481,7 @@ mod tests {
             scheduler.push(scheduled(narrow, "only", sequence));
         }
 
-        let group = scheduler.pop_group();
+        let group = scheduler.pop_group(&HashSet::new());
         assert_eq!(group.len(), 6);
         let wide_turns = group.iter().filter(|item| item.tenant() == wide).count();
         assert_eq!(
@@ -9804,7 +11500,7 @@ mod tests {
             scheduler.push(scheduled(light, "hot", 100 + sequence));
         }
         let sized: Vec<bool> = scheduler
-            .pop_group()
+            .pop_group(&HashSet::new())
             .iter()
             .map(|item| item.tenant() == heavy)
             .collect();
@@ -9833,8 +11529,8 @@ mod tests {
         }
 
         let sequences = |group: Vec<Item>| group.into_iter().map(|item| item.sequence).collect();
-        let first: Vec<usize> = sequences(scheduler.pop_group());
-        let second: Vec<usize> = sequences(scheduler.pop_group());
+        let first: Vec<usize> = sequences(scheduler.pop_group(&HashSet::new()));
+        let second: Vec<usize> = sequences(scheduler.pop_group(&HashSet::new()));
         assert_eq!(first, [1, 2]);
         assert_eq!(second, [1]);
         assert!(scheduler.is_empty());
@@ -10185,7 +11881,14 @@ mod tests {
             "a non-final holder keeps the charge"
         );
         assert_eq!(read.batches.len(), 1);
-        assert_eq!(read.batches[0].batch.num_rows(), 1);
+        assert_eq!(
+            read.batches[0]
+                .evaluate()
+                .expect("the batch evaluates")
+                .expect("its row is kept")
+                .num_rows(),
+            1
+        );
         drop(read);
         assert_eq!(
             budget.memory_snapshot().scribe_total_bytes,
@@ -10354,6 +12057,80 @@ mod tests {
         assert!(owner.memory_ownership.is_poisoned());
     }
 
+    /// Every partition of a batch keeps every WAL segment the batch wrote.
+    ///
+    /// One batch spans two day partitions, and its records are large enough
+    /// that the WAL rolls between them. Each partition's active bucket must
+    /// hold both segments, so sealing and retiring either partition alone
+    /// never frees a segment the other partition's slice or the COMMIT still
+    /// needs for recovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owner cannot append the batch, the batch does not span
+    /// two segments, or a partition holds fewer segments than the batch wrote.
+    #[tokio::test]
+    async fn every_partition_of_a_batch_keeps_all_its_segments() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::new(16 * 1024).expect("small WAL segments"),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget, _command_tx, _completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        let rows_per_day = 2_000_usize;
+        let day = |day: u32| {
+            NaiveDate::from_ymd_opt(2026, 7, day)
+                .and_then(|date| date.and_hms_opt(12, 0, 0))
+                .expect("valid event timestamp")
+                .and_utc()
+                .timestamp_micros()
+        };
+        let values = (0..2 * rows_per_day)
+            .map(|index| {
+                i64::try_from(index)
+                    .expect("row index fits i64")
+                    .wrapping_mul(0x1E37_79B9_7F4A_7C15)
+            })
+            .collect::<Vec<_>>();
+        let times = (0..2 * rows_per_day)
+            .map(|index| day(if index < rows_per_day { 24 } else { 25 }))
+            .collect::<Vec<_>>();
+        let rows = RecordBatch::try_new(
+            owner_prepared_batch().schema(),
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+            ],
+        )
+        .expect("two-day rows");
+        let append = prepared_append_with_rows(&budget, owner_key(), uuid::Uuid::now_v7(), rows);
+        owner.process_group(vec![append]).await.expect("append");
+
+        let segments = owner.wal_segments.values().collect::<Vec<_>>();
+        assert_eq!(segments.len(), 2, "the batch spans two partitions");
+        let written = segments
+            .iter()
+            .flat_map(|held| held.keys())
+            .collect::<HashSet<_>>();
+        assert!(written.len() > 1, "the WAL rolled inside the batch");
+        for held in segments {
+            assert_eq!(
+                held.keys().collect::<HashSet<_>>(),
+                written,
+                "a partition holds every segment of its batch"
+            );
+        }
+    }
+
     /// A segment shared by selective members retires with the last of them.
     ///
     /// Selective seals never form a rotation cohort, so once the final active
@@ -10506,5 +12283,1627 @@ mod tests {
         assert_eq!(memtable.immutable_rows, 0);
         assert!(owner.memory_ownership.active_bytes() > 0);
         assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_ok());
+    }
+
+    /// Real-`PostgreSQL` proofs of the shard's two-group pipeline.
+    mod pg_tests {
+        use super::*;
+
+        /// One real fence fixture: a migrated database, its superuser pool, a
+        /// shard owner fencing through it, and the WAL the owner writes.
+        struct PipelineFixture {
+            /// The test database.
+            database: wyrd_dev_fixtures::pg::PgFixture,
+            /// Superuser pool that holds fence keys and probes lock waits.
+            superuser: sqlx::PgPool,
+            /// The fenced seal key every group writes.
+            key: SealKey,
+            /// WAL node the fixture owner writes as.
+            node: crate::scribe::stream_identity::NodeId,
+            /// The WAL directory every opened owner writes.
+            wal_root: tempfile::TempDir,
+            /// Keeps each opened owner's pressure channel open, as the shard
+            /// runtime does.
+            pressure: Vec<watch::Sender<Option<PressureSignal>>>,
+            /// Each opened owner's WAL writer, for fault injection.
+            writers: Vec<Arc<WalWriter>>,
+        }
+
+        impl PipelineFixture {
+            /// Starts a migrated database and a fencing owner on a fresh WAL.
+            async fn start() -> (
+                Self,
+                ShardOwner,
+                crate::resources::ScribeResources,
+                mpsc::Sender<ShardCommand>,
+            ) {
+                let database = wyrd_dev_fixtures::pg::PgFixture::start()
+                    .await
+                    .expect("Postgres fixture");
+                let superuser = database.superuser_pool().expect("superuser pool");
+                let key = SealKey::new(
+                    database.data_tenant_id(),
+                    TableRef::new(BifrostNamespace::Bifrost, "owner-test"),
+                    crate::test_support::day_partition(2026, 7, 24),
+                );
+                let wal_root = tempfile::tempdir().expect("WAL directory");
+                let node = crate::scribe::stream_identity::NodeId::generate();
+                let mut fixture = Self {
+                    database,
+                    superuser,
+                    key,
+                    node,
+                    wal_root,
+                    pressure: Vec::new(),
+                    writers: Vec::new(),
+                };
+                let (owner, budget, command_tx, _, _) = fixture.open(1);
+                (fixture, owner, budget, command_tx)
+            }
+
+            /// Opens a fenced shard owner on the fixture's WAL and database as
+            /// writer `epoch`, keeping its pressure channel open.
+            fn open(
+                &mut self,
+                epoch: i64,
+            ) -> (
+                ShardOwner,
+                crate::resources::ScribeResources,
+                mpsc::Sender<ShardCommand>,
+                Arc<WalWriter>,
+                StreamIdentity,
+            ) {
+                let stream = StreamIdentity::new(
+                    self.node,
+                    crate::scribe::stream_identity::WriterEpoch::new(epoch),
+                );
+                let wal = Arc::new(
+                    WalWriter::new(
+                        self.wal_root.path(),
+                        *self.node.as_bytes(),
+                        epoch,
+                        crate::scribe::wal::WalConfig::default(),
+                    )
+                    .expect("WAL writer"),
+                );
+                let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+                let (mut owner, budget, command_tx, _completion_tx, pressure) =
+                    owner_for_completion_test_with_channels(
+                        Memtable::new(),
+                        &wal,
+                        wal_handle,
+                        stream,
+                    );
+                owner.control_postgres = Some(Arc::new(self.database.vala_postgres().clone()));
+                self.pressure.push(pressure);
+                self.writers.push(Arc::clone(&wal));
+                (owner, budget, command_tx, wal, stream)
+            }
+
+            /// Makes every later fence insert for `tenant` fail with a known
+            /// SQL error before COMMIT.
+            async fn refuse_fences_of(&self, tenant: DataTenantId) {
+                // A uuid renders as hex digits and hyphens only.
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "CREATE FUNCTION public.refuse_tenant_fence() RETURNS trigger \
+                     LANGUAGE plpgsql AS $$ BEGIN \
+                     IF NEW.data_tenant_id = '{}'::uuid THEN \
+                     RAISE EXCEPTION 'injected fence failure'; END IF; \
+                     RETURN NEW; END $$; \
+                     CREATE TRIGGER refuse_tenant_fence BEFORE INSERT \
+                     ON vala.scribe_batch_commits FOR EACH ROW \
+                     EXECUTE FUNCTION public.refuse_tenant_fence();",
+                    tenant.as_uuid()
+                )))
+                .execute(&self.superuser)
+                .await
+                .expect("install the fence failure");
+            }
+
+            /// Holds `batch_id`'s fence key in an uncommitted transaction, so the
+            /// fence that records it waits until the transaction ends.
+            async fn hold_fence(
+                &self,
+                batch_id: uuid::Uuid,
+            ) -> sqlx::Transaction<'static, sqlx::Postgres> {
+                let mut blocker = self.superuser.begin().await.expect("fence blocker");
+                sqlx::query(
+                    "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, \
+                     batch_id, slice_set_digest, slice_count, wal_node_id, wal_writer_epoch, \
+                     wal_shard_id, wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id, \
+                     ingested_at) \
+                     VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6, statement_timestamp())",
+                )
+                .bind(self.key.tenant.as_uuid())
+                .bind(self.key.table.fqn())
+                .bind(batch_id)
+                .bind([0_u8; 16].as_slice())
+                .bind(self.node.as_uuid())
+                .bind(uuid::Uuid::now_v7())
+                .execute(&mut *blocker)
+                .await
+                .expect("hold the fence key");
+                blocker
+            }
+
+            /// Returns once a fence is waiting on a held key.
+            ///
+            /// # Panics
+            ///
+            /// Panics when no fence waits within the deadlock bound.
+            async fn fence_blocked(&self) {
+                let probe = async {
+                    loop {
+                        let waiting: i64 =
+                            sqlx::query_scalar("SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+                     WHERE NOT l.granted AND a.datname = current_database()")
+                                .fetch_one(&self.superuser)
+                                .await
+                                .expect("lock wait probe");
+                        if waiting > 0 {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                };
+                tokio::time::timeout(DEADLOCK_BOUND, probe)
+                    .await
+                    .expect("a fence waits on its held key");
+            }
+
+            /// Counts the durable fences of `batch_ids`.
+            async fn fenced(&self, batch_ids: &[uuid::Uuid]) -> i64 {
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)",
+                )
+                .bind(batch_ids.to_vec())
+                .fetch_one(&self.superuser)
+                .await
+                .expect("fence count")
+            }
+        }
+
+        /// Bound that only diagnoses a deadlocked or serial pipeline; no
+        /// assertion depends on elapsed time.
+        const DEADLOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+        /// Reports whether a durable ACK is still outstanding.
+        fn ack_pending(
+            ack: &mut tokio::sync::oneshot::Receiver<
+                Result<crate::scribe::preprocess::DurableCompletion, ScribeError>,
+            >,
+        ) -> bool {
+            matches!(
+                ack.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
+        }
+
+        /// Sends one append to the owner's mailbox.
+        async fn submit(command_tx: &mpsc::Sender<ShardCommand>, append: Vec<PreparedAppend>) {
+            for append in append {
+                command_tx
+                    .send(ShardCommand::Append(Box::new(append)))
+                    .await
+                    .expect("append mailbox");
+            }
+        }
+
+        /// Waits for one durable ACK within the deadlock bound.
+        ///
+        /// # Panics
+        ///
+        /// Panics when no ACK arrives or the waiter is dropped.
+        async fn settled(
+            ack: &mut tokio::sync::oneshot::Receiver<
+                Result<crate::scribe::preprocess::DurableCompletion, ScribeError>,
+            >,
+            what: &str,
+        ) -> Result<crate::scribe::preprocess::DurableCompletion, ScribeError> {
+            tokio::time::timeout(DEADLOCK_BOUND, ack)
+                .await
+                .unwrap_or_else(|_| panic!("{what} settles"))
+                .unwrap_or_else(|_| panic!("{what} is answered"))
+        }
+
+        /// Scribe bytes still charged to request-transient categories: raw,
+        /// decoded, prepared and queued. Zero once every admitted request's
+        /// charge was released or transferred to the memtable.
+        fn transient_bytes(budget: &crate::resources::ScribeResources) -> usize {
+            let categories = budget.accounting_snapshot_for_test().category_bytes;
+            [
+                crate::scribe::memory::MemoryCategory::Raw,
+                crate::scribe::memory::MemoryCategory::Decode,
+                crate::scribe::memory::MemoryCategory::Prepared,
+                crate::scribe::memory::MemoryCategory::Queued,
+            ]
+            .into_iter()
+            .map(|category| categories[category as usize])
+            .sum()
+        }
+
+        /// Counts the owner's query-visible rows.
+        fn visible_rows(memtable: &Memtable) -> usize {
+            let stats = memtable.stats().expect("memtable stats");
+            stats.writable_rows + stats.immutable_rows
+        }
+
+        /// A stream of single-batch groups through the production run loop
+        /// keeps the WAL progressing while each earlier group fences, and
+        /// each group's ACK waits only on its own fence.
+        ///
+        /// Each batch's fence key is held before its group can fence. For each
+        /// group N in turn, with N blocked inside its real fence, N+1 is
+        /// submitted and its WAL sync completes; the sync's IO completion is
+        /// then held, N's fence is released, and N becomes visible and
+        /// acknowledged while N+1's IO is still held. Releasing N+1's IO
+        /// moves it into its own fence, which reuses N's slot for N+2. A
+        /// serial loop never syncs N+1 while N fences; a pipeline that joins
+        /// N's ACK to N+1's IO never acknowledges N under the hold.
+        ///
+        /// # Panics
+        ///
+        /// Panics if a later group does not sync during the earlier fence, an
+        /// ACK waits on a later group's IO, a group fences out of order, or
+        /// any group's rows do not become visible exactly once.
+        #[tokio::test]
+        async fn later_groups_sync_while_earlier_groups_fence_and_ack_independently() {
+            const GROUPS: usize = 4;
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let batch_ids: Vec<uuid::Uuid> = (0..GROUPS).map(|_| uuid::Uuid::now_v7()).collect();
+            let mut blocker = fixture.hold_fence(batch_ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &batch_ids);
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(GROUPS, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+            let mut appends = appends.into_iter();
+            let mut submit = || {
+                let append = appends.next().expect("one append per group");
+                let command_tx = command_tx.clone();
+                async move {
+                    command_tx
+                        .send(ShardCommand::Append(Box::new(append)))
+                        .await
+                        .expect("append mailbox");
+                }
+            };
+
+            submit().await;
+            fixture.fence_blocked().await;
+            let mut rows = 0;
+            for group in 0..GROUPS - 1 {
+                let (synced, release_io) = wal_io.hold_next_sync_for_test();
+                submit().await;
+                tokio::time::timeout(DEADLOCK_BOUND, synced)
+                    .await
+                    .expect("the next group syncs while this group fences")
+                    .expect("the held sync reports");
+                assert!(
+                    ack_pending(&mut acks[group]),
+                    "group {group} is still fencing"
+                );
+                assert_eq!(
+                    fixture.fenced(&batch_ids).await,
+                    i64::try_from(group).expect("group count fits i64"),
+                    "only earlier groups' fences are durable"
+                );
+
+                blocker
+                    .rollback()
+                    .await
+                    .expect("release this group's fence");
+                let completion = tokio::time::timeout(DEADLOCK_BOUND, &mut acks[group])
+                    .await
+                    .expect("this group's ACK does not wait on the next group's IO")
+                    .expect("ACK delivered")
+                    .expect("group commits");
+                assert!(completion.first_commit);
+                rows += usize::try_from(completion.rows).expect("row count fits usize");
+                assert_eq!(
+                    visible_rows(&live),
+                    rows,
+                    "rows are visible before their ACK"
+                );
+                assert!(
+                    ack_pending(&mut acks[group + 1]),
+                    "the next group's IO is held"
+                );
+                assert_eq!(
+                    fixture.fenced(&batch_ids).await,
+                    i64::try_from(group + 1).expect("group count fits i64"),
+                    "only the oldest group fences"
+                );
+
+                blocker = fixture.hold_fence(batch_ids[group + 1]).await;
+                drop(release_io);
+                fixture.fence_blocked().await;
+            }
+            blocker.rollback().await.expect("release the last fence");
+            let completion = tokio::time::timeout(DEADLOCK_BOUND, &mut acks[GROUPS - 1])
+                .await
+                .expect("the last group acknowledges")
+                .expect("ACK delivered")
+                .expect("group commits");
+            rows += usize::try_from(completion.rows).expect("row count fits usize");
+            assert_eq!(visible_rows(&live), rows);
+            assert_eq!(rows, GROUPS, "each group's one row is visible once");
+            assert_eq!(
+                fixture.fenced(&batch_ids).await,
+                i64::try_from(GROUPS).expect("group count fits i64")
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("owner shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("owner drains and stops")
+                .expect("owner task");
+        }
+
+        /// Competing tenants and tables share one shard's two-slot pipeline:
+        /// each wave of appends for two tenants and two tables per tenant
+        /// syncs while the previous wave fences, every wave is acknowledged
+        /// while the next wave's IO is held, and rows land under their own
+        /// tenant and table exactly once.
+        ///
+        /// Each wave is queued at once, so it dispatches as one group mixing
+        /// both tenants and all four tables. One batch of each wave has its
+        /// fence key held, so the wave blocks inside its real fence while the
+        /// next wave writes and syncs; the next wave's IO completion is then
+        /// held while the fence is released. The last wave also carries a
+        /// retry of the wave before it, queued behind that table's fresh
+        /// appends: it stays out of the group its first attempt's slot still
+        /// owns and later converges on the first attempt's rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics if a wave cannot sync during the earlier fence, a later
+        /// wave fences before an earlier one settles, an ACK waits on a later
+        /// wave's IO, a row lands under another tenant or table or twice, the
+        /// retry writes a second copy, or any request keeps its charge.
+        #[tokio::test]
+        async fn tenants_and_tables_interleave_through_both_slots_with_independent_acks() {
+            const WAVES: usize = 4;
+            const PER_KEY: usize = 2;
+            let (fixture, mut owner, budget, _) = PipelineFixture::start().await;
+            let (command_tx, receiver) = mpsc::channel(SHARD_COMMAND_CAPACITY);
+            owner.receiver = receiver;
+            let other_tenant = fixture
+                .database
+                .seed_additional_tenant("pipeline-tenants")
+                .await
+                .expect("second tenant");
+            let partition = || crate::test_support::day_partition(2026, 7, 24);
+            let other_table = TableRef::new(BifrostNamespace::Bifrost, "owner-test-other");
+            let keys = [
+                fixture.key.clone(),
+                SealKey::new(fixture.key.tenant, other_table.clone(), partition()),
+                SealKey::new(other_tenant, fixture.key.table.clone(), partition()),
+                SealKey::new(other_tenant, other_table, partition()),
+            ];
+            let ids: Vec<Vec<uuid::Uuid>> = (0..WAVES)
+                .map(|_| {
+                    (0..keys.len() * PER_KEY)
+                        .map(|_| uuid::Uuid::now_v7())
+                        .collect()
+                })
+                .collect();
+            let mut waves = Vec::new();
+            let mut acks = Vec::new();
+            for wave in &ids {
+                let mut appends = Vec::new();
+                let mut wave_acks = Vec::new();
+                for (index, batch_id) in wave.iter().enumerate() {
+                    let (append, ack) =
+                        acked_group_for_key(&budget, &keys[index % keys.len()], &[*batch_id]);
+                    appends.extend(append);
+                    wave_acks.extend(ack);
+                }
+                waves.push(appends);
+                acks.push(wave_acks);
+            }
+            // The first append of each wave is under the fixture key, whose
+            // fence key the fixture can hold.
+            let held = |wave: usize| ids[wave][0];
+            let retried = held(WAVES - 2);
+            let (retry, mut retry_ack) = acked_group_for_key(&budget, &fixture.key, &[retried]);
+            waves[WAVES - 1].extend(retry);
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            let pending = Arc::clone(&owner.pending);
+            owner
+                .pending
+                .fetch_add(WAVES * keys.len() * PER_KEY + 1, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+            let mut waves = waves.into_iter();
+            let mut submit_wave = || {
+                for append in waves.next().expect("one queued wave per group") {
+                    command_tx
+                        .try_send(ShardCommand::Append(Box::new(append)))
+                        .expect("the mailbox holds the whole wave");
+                }
+            };
+            let fenced_waves = |range: std::ops::Range<usize>| {
+                ids[range].iter().flatten().copied().collect::<Vec<_>>()
+            };
+
+            let wal_bytes = || crate::scribe::wal::wal_file_bytes_for_test(fixture.wal_root.path());
+
+            let mut blocker = fixture.hold_fence(held(0)).await;
+            submit_wave();
+            fixture.fence_blocked().await;
+            let mut synced_bytes = vec![wal_bytes()];
+            for wave in 0..WAVES - 1 {
+                let (synced, release_io) = wal_io.hold_next_sync_for_test();
+                submit_wave();
+                tokio::time::timeout(DEADLOCK_BOUND, synced)
+                    .await
+                    .expect("the next wave syncs while this wave fences")
+                    .expect("the held sync reports");
+                synced_bytes.push(wal_bytes());
+                assert!(
+                    acks[wave].iter_mut().all(ack_pending),
+                    "wave {wave} is still fencing"
+                );
+                assert_eq!(
+                    fixture.fenced(&fenced_waves(wave + 1..WAVES)).await,
+                    0,
+                    "no later wave fences before wave {wave} settles"
+                );
+
+                blocker.rollback().await.expect("release this wave's fence");
+                for ack in &mut acks[wave] {
+                    let completion = settled(ack, "this wave's append")
+                        .await
+                        .expect("this wave's append commits");
+                    assert!(completion.first_commit);
+                }
+                assert!(
+                    acks[wave + 1].iter_mut().all(ack_pending),
+                    "the next wave's IO is held"
+                );
+                for key in &keys {
+                    assert_eq!(
+                        live.row_count(key).expect("row count"),
+                        (wave + 1) * PER_KEY,
+                        "each tenant and table holds exactly its own acknowledged rows"
+                    );
+                }
+                assert_eq!(
+                    fixture.fenced(&fenced_waves(0..wave + 1)).await,
+                    i64::try_from((wave + 1) * keys.len() * PER_KEY).expect("fits i64"),
+                    "every settled wave is fenced"
+                );
+                assert_eq!(
+                    fixture.fenced(&fenced_waves(wave + 1..WAVES)).await,
+                    0,
+                    "only the oldest wave fences"
+                );
+
+                blocker = fixture.hold_fence(held(wave + 1)).await;
+                drop(release_io);
+                fixture.fence_blocked().await;
+            }
+            let wave_bytes: Vec<u64> = synced_bytes
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect();
+            assert!(
+                wave_bytes.iter().all(|bytes| *bytes == wave_bytes[0]),
+                "every wave writes the same records; the last wave's group holds no retry copy: {wave_bytes:?}"
+            );
+            assert!(
+                ack_pending(&mut retry_ack[0]),
+                "the retry waits for its first attempt's slot"
+            );
+            blocker.rollback().await.expect("release the last fence");
+            for ack in &mut acks[WAVES - 1] {
+                settled(ack, "the last wave's append")
+                    .await
+                    .expect("the last wave's append commits");
+            }
+            let retry = settled(&mut retry_ack[0], "the retry")
+                .await
+                .expect("the retry converges on its first attempt");
+            assert!(!retry.first_commit, "the retry is not a second commit");
+            for key in &keys {
+                assert_eq!(
+                    live.row_count(key).expect("row count"),
+                    WAVES * PER_KEY,
+                    "each tenant and table holds exactly its own rows once"
+                );
+            }
+            assert_eq!(
+                fixture.fenced(&fenced_waves(0..WAVES)).await,
+                i64::try_from(WAVES * keys.len() * PER_KEY).expect("fits i64"),
+                "every batch, the retried one included, is fenced once"
+            );
+            assert_eq!(
+                wal_io.sync_submissions_for_test(),
+                u64::try_from(WAVES).expect("fits u64"),
+                "each wave synced as one mixed group and the retry synced nothing"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("owner shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("owner drains and stops")
+                .expect("owner task");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            assert_eq!(
+                pending.load(Ordering::Acquire),
+                0,
+                "every accepted request left the drain count"
+            );
+        }
+
+        /// A retried batch waits for its dispatched first attempt to settle
+        /// while another table's append takes the free slot, so the retry
+        /// converges on the first attempt's rows without a second WAL record.
+        ///
+        /// The first attempt blocks inside its real fence. The retry and an
+        /// append on another table then arrive; the other table's group
+        /// writes and syncs, and only after the first attempt settles does the
+        /// retry dispatch, find its rows retained, and acknowledge without
+        /// writing. A pipeline without cross-slot identity exclusion writes
+        /// the retry's SLICE beside the first attempt's.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the other table cannot sync during the first attempt's
+        /// fence, the retry is acknowledged before the first attempt, the
+        /// retry submits WAL work, or the batch is made visible twice.
+        #[tokio::test]
+        async fn a_retried_batch_waits_for_its_in_flight_attempt_while_other_tables_proceed() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let other = SealKey::new(
+                fixture.key.tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "owner-test-other"),
+                crate::test_support::day_partition(2026, 7, 24),
+            );
+            let repeated = uuid::Uuid::now_v7();
+            let independent = uuid::Uuid::now_v7();
+            let blocker = fixture.hold_fence(repeated).await;
+            let (first, mut first_ack) = acked_group_for_key(&budget, &fixture.key, &[repeated]);
+            let (retry, mut retry_ack) = acked_group_for_key(&budget, &fixture.key, &[repeated]);
+            let (elsewhere, mut elsewhere_ack) =
+                acked_group_for_key(&budget, &other, &[independent]);
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(3, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+            let send = |append: PreparedAppend| {
+                let command_tx = command_tx.clone();
+                async move {
+                    command_tx
+                        .send(ShardCommand::Append(Box::new(append)))
+                        .await
+                        .expect("append mailbox");
+                }
+            };
+
+            send(first.into_iter().next().expect("first attempt")).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            send(retry.into_iter().next().expect("retry")).await;
+            send(elsewhere.into_iter().next().expect("other table")).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("another table syncs while the first attempt fences")
+                .expect("the held sync reports");
+            assert!(
+                ack_pending(&mut retry_ack[0]),
+                "the retry waits for its first attempt"
+            );
+
+            blocker
+                .rollback()
+                .await
+                .expect("release the first attempt's fence");
+            let first_done = tokio::time::timeout(DEADLOCK_BOUND, &mut first_ack[0])
+                .await
+                .expect("the first attempt settles")
+                .expect("ACK delivered")
+                .expect("first attempt commits");
+            assert!(first_done.first_commit);
+            drop(release_io);
+            let elsewhere_done = tokio::time::timeout(DEADLOCK_BOUND, &mut elsewhere_ack[0])
+                .await
+                .expect("the other table settles")
+                .expect("ACK delivered")
+                .expect("other table commits");
+            tokio::time::timeout(DEADLOCK_BOUND, &mut retry_ack[0])
+                .await
+                .expect("the retry settles")
+                .expect("ACK delivered")
+                .expect("the retry converges on the first attempt");
+            assert_eq!(
+                visible_rows(&live),
+                usize::try_from(first_done.rows + elsewhere_done.rows).expect("rows fit usize"),
+                "the retried batch is visible once"
+            );
+            assert_eq!(fixture.fenced(&[repeated, independent]).await, 2);
+            assert_eq!(
+                wal_io.write_submissions_for_test(),
+                4,
+                "only the first attempt and the other table write SLICE and COMMIT records"
+            );
+            assert_eq!(
+                wal_io.sync_submissions_for_test(),
+                2,
+                "the retry syncs nothing"
+            );
+
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// When an earlier tenant's fence commits and a later tenant's fence
+        /// in the same group then fails, the shard fails closed: no waiter of
+        /// the group is answered, the younger group that synced meanwhile
+        /// never fences, and a restart restores exactly the accepted batch.
+        ///
+        /// The older group holds one batch for each of two tenants, and the
+        /// second tenant's fence insert is made to fail. The first tenant's
+        /// fence key is held while the younger group writes and syncs, then
+        /// released, so the first commits before the second fails. Refusing the group would tell the first tenant its accepted
+        /// batch failed.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group cannot sync during the older fence,
+        /// the shard does not fail closed, any waiter is answered, the
+        /// younger group fences, or restart restores anything but the
+        /// accepted batch.
+        #[tokio::test]
+        async fn a_later_tenant_fence_failure_after_an_earlier_commit_fails_closed() {
+            let (mut fixture, mut owner, budget, command_tx) = PipelineFixture::start().await;
+            let other_tenant = fixture
+                .database
+                .seed_additional_tenant("pipeline-other")
+                .await
+                .expect("second tenant");
+            let other_key = SealKey::new(
+                other_tenant,
+                fixture.key.table.clone(),
+                crate::test_support::day_partition(2026, 7, 24),
+            );
+            let accepted = uuid::Uuid::now_v7();
+            let refused = uuid::Uuid::now_v7();
+            let younger = uuid::Uuid::now_v7();
+            fixture.refuse_fences_of(other_tenant).await;
+            let blocker = fixture.hold_fence(accepted).await;
+            let (first, mut first_ack) = acked_group_for_key(&budget, &fixture.key, &[accepted]);
+            let (second, mut second_ack) = acked_group_for_key(&budget, &other_key, &[refused]);
+            let (third, mut third_ack) = acked_group_for_key(&budget, &fixture.key, &[younger]);
+            for append in first.into_iter().chain(second) {
+                owner.scheduler.push(append);
+            }
+            let ownership = owner.memory_ownership.clone();
+            let wal_io = owner.wal_io.clone();
+            owner.pending.fetch_add(3, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            command_tx
+                .send(ShardCommand::Append(Box::new(
+                    third.into_iter().next().expect("younger group"),
+                )))
+                .await
+                .expect("append mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs while the older group fences")
+                .expect("the held sync reports");
+            blocker
+                .rollback()
+                .await
+                .expect("release the first tenant's fence");
+            let failed_closed = async {
+                while !ownership.is_poisoned() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, failed_closed)
+                .await
+                .expect("the shard fails closed");
+            assert!(
+                transient_bytes(&budget) > 0,
+                "the retained groups keep their charge"
+            );
+            drop(release_io);
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains its submitted IO")
+                .expect("owner task");
+
+            for (name, ack) in [
+                ("accepted", &mut first_ack[0]),
+                ("refused", &mut second_ack[0]),
+                ("younger", &mut third_ack[0]),
+            ] {
+                assert!(
+                    matches!(
+                        ack.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                    ),
+                    "the {name} batch's waiter is left for restart recovery"
+                );
+            }
+            assert_eq!(
+                fixture.fenced(&[accepted]).await,
+                1,
+                "the first tenant's fence is durable"
+            );
+            assert_eq!(
+                fixture.fenced(&[refused, younger]).await,
+                0,
+                "neither the failed tenant nor the younger group fences"
+            );
+
+            let (mut restarted, budget, command_tx, wal, stream) = fixture.open(2);
+            replay_into_owner(&mut restarted, &wal, stream, command_tx, &budget).await;
+            assert_eq!(
+                visible_rows(&restarted.memtable),
+                1,
+                "restart restores exactly the accepted batch"
+            );
+        }
+
+        /// An older group whose fence COMMIT is ambiguous and whose fresh
+        /// reconciliation lookup then fails leaves the shard failed closed:
+        /// both groups stay charged and unanswered, the younger group that
+        /// synced meanwhile never fences, its submitted IO is drained before
+        /// the owner exits, and restart restores neither provisional batch.
+        ///
+        /// A deferred constraint trigger holds the older batch's COMMIT on an
+        /// advisory lock the test owns, then fails it. While the COMMIT waits,
+        /// the younger group syncs and the test revokes read access to the
+        /// fence table, so the fresh reconciliation after the ambiguous
+        /// COMMIT cannot read it.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the shard does not fail closed, a waiter is answered,
+        /// a charge is released before restart, the younger group fences, the
+        /// owner exits before the younger IO completes, or restart restores
+        /// a batch.
+        #[tokio::test]
+        async fn an_unavailable_commit_reconciliation_retains_both_groups_for_restart() {
+            const COMMIT_GATE: i64 = 7_017;
+            let (mut fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let (older_id, younger_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE FUNCTION public.fail_commit() RETURNS trigger \
+                 LANGUAGE plpgsql SECURITY DEFINER AS $body$ BEGIN \
+                 PERFORM pg_advisory_xact_lock({COMMIT_GATE}); \
+                 RAISE EXCEPTION 'injected ambiguous COMMIT'; END $body$; \
+                 CREATE CONSTRAINT TRIGGER fail_commit AFTER INSERT \
+                 ON vala.scribe_batch_commits DEFERRABLE INITIALLY DEFERRED \
+                 FOR EACH ROW WHEN (NEW.batch_id = '{older_id}') \
+                 EXECUTE FUNCTION public.fail_commit();"
+            )))
+            .execute(&fixture.superuser)
+            .await
+            .expect("install the ambiguous COMMIT");
+            let readers: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT grantee::text FROM information_schema.role_table_grants \
+                 WHERE table_schema = 'vala' AND table_name = 'scribe_batch_commits' \
+                 AND privilege_type = 'SELECT'",
+            )
+            .fetch_all(&fixture.superuser)
+            .await
+            .expect("fence table readers");
+            let set_readers = |verb: &str| {
+                readers
+                    .iter()
+                    .map(|reader| {
+                        format!(
+                            "{verb} SELECT ON vala.scribe_batch_commits {} \"{reader}\";",
+                            if verb == "GRANT" { "TO" } else { "FROM" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let mut gate = fixture.superuser.begin().await.expect("COMMIT gate");
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(COMMIT_GATE)
+                .execute(&mut *gate)
+                .await
+                .expect("hold the COMMIT gate");
+            let (older, mut older_ack) = acked_group_for_key(&budget, &fixture.key, &[older_id]);
+            let (younger, mut younger_ack) =
+                acked_group_for_key(&budget, &fixture.key, &[younger_id]);
+            let ownership = owner.memory_ownership.clone();
+            let wal_io = owner.wal_io.clone();
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, older).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, younger).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs while the older group fences")
+                .expect("the held sync reports");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(set_readers("REVOKE")))
+                .execute(&fixture.superuser)
+                .await
+                .expect("make the fence lookup unavailable");
+            gate.rollback().await.expect("let the older COMMIT fail");
+            let failed_closed = async {
+                while !ownership.is_poisoned() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, failed_closed)
+                .await
+                .expect("the unresolved COMMIT fails the shard closed");
+            assert!(
+                ack_pending(&mut older_ack[0]),
+                "the uncertain group is unanswered"
+            );
+            assert!(
+                ack_pending(&mut younger_ack[0]),
+                "the younger group is unanswered"
+            );
+            assert!(
+                transient_bytes(&budget) > 0,
+                "the retained groups keep their charge"
+            );
+
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            assert_eq!(
+                fixture.fenced(&[older_id, younger_id]).await,
+                0,
+                "neither the uncertain nor the younger group fences"
+            );
+            assert_eq!(
+                command_tx.max_capacity() - command_tx.capacity(),
+                1,
+                "shutdown waits while the younger group's IO is outstanding"
+            );
+            assert!(
+                !task.is_finished(),
+                "the owner does not abandon submitted IO"
+            );
+            drop(release_io);
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains its submitted IO and exits")
+                .expect("owner task");
+            for (name, ack) in [
+                ("uncertain", &mut older_ack[0]),
+                ("younger", &mut younger_ack[0]),
+            ] {
+                assert!(
+                    matches!(
+                        ack.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                    ),
+                    "the {name} batch's waiter is left for restart recovery"
+                );
+            }
+            assert_eq!(
+                fixture.fenced(&[older_id, younger_id]).await,
+                0,
+                "the younger group never fences"
+            );
+
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER fail_commit ON vala.scribe_batch_commits; {}",
+                set_readers("GRANT")
+            )))
+            .execute(&fixture.superuser)
+            .await
+            .expect("restore the fence table");
+            let (mut restarted, budget, command_tx, wal, stream) = fixture.open(2);
+            replay_into_owner(&mut restarted, &wal, stream, command_tx, &budget).await;
+            assert_eq!(
+                visible_rows(&restarted.memtable),
+                0,
+                "restart restores neither provisional batch"
+            );
+        }
+
+        /// A younger group whose WAL sync fails is refused while the older
+        /// group fences, and the older group still becomes visible and
+        /// acknowledged.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group is not refused during the older fence,
+        /// the older group does not commit, or a refused row becomes visible.
+        #[tokio::test]
+        async fn a_younger_group_io_failure_leaves_the_older_group_to_commit() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let (older_id, younger_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let blocker = fixture.hold_fence(older_id).await;
+            let (older, mut older_ack) = acked_group_for_key(&budget, &fixture.key, &[older_id]);
+            let (younger, mut younger_ack) =
+                acked_group_for_key(&budget, &fixture.key, &[younger_id]);
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, older).await;
+            fixture.fence_blocked().await;
+            fixture.writers[0].trip_sync_failure_for_test();
+            submit(&command_tx, younger).await;
+            settled(&mut younger_ack[0], "the younger group")
+                .await
+                .expect_err("the younger group's sync failure refuses it");
+            assert!(
+                ack_pending(&mut older_ack[0]),
+                "the older group is still fencing"
+            );
+
+            blocker.rollback().await.expect("release the older fence");
+            let older_done = settled(&mut older_ack[0], "the older group")
+                .await
+                .expect("the older group commits");
+            assert!(older_done.first_commit);
+            assert_eq!(
+                visible_rows(&live),
+                1,
+                "only the older group's row is visible"
+            );
+            assert_eq!(fixture.fenced(&[older_id, younger_id]).await, 1);
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// FlushAll waits for the dispatched group to settle and seals
+        /// exactly what preceded it in the mailbox; a group queued after it
+        /// waits for the flush and lands in the next generation.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the flush answers before the dispatched group settles,
+        /// seals other than the preceding group's row, or a later group
+        /// dispatches before it.
+        #[tokio::test]
+        async fn flush_all_waits_for_dispatched_groups_and_keeps_its_queue_position() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let (before_id, after_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let blocker = fixture.hold_fence(before_id).await;
+            let (before, mut before_ack) = acked_group_for_key(&budget, &fixture.key, &[before_id]);
+            let (after, mut after_ack) = acked_group_for_key(&budget, &fixture.key, &[after_id]);
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, before).await;
+            fixture.fence_blocked().await;
+            let (response, mut flushed) = tokio::sync::oneshot::channel();
+            command_tx
+                .send(ShardCommand::FlushAll { response })
+                .await
+                .expect("flush mailbox");
+            submit(&command_tx, after).await;
+            assert!(
+                matches!(
+                    flushed.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the flush waits for the dispatched group"
+            );
+            assert_eq!(
+                wal_io.write_submissions_for_test(),
+                2,
+                "no group dispatches behind the waiting flush"
+            );
+
+            blocker.rollback().await.expect("release the fence");
+            settled(&mut before_ack[0], "the preceding group")
+                .await
+                .expect("the preceding group commits");
+            let sealed = tokio::time::timeout(DEADLOCK_BOUND, flushed)
+                .await
+                .expect("the flush answers")
+                .expect("flush response")
+                .expect("flush succeeds");
+            assert_eq!(sealed, 1, "the flush seals the preceding group's row");
+            settled(&mut after_ack[0], "the later group")
+                .await
+                .expect("the later group commits");
+            let stats = live.stats().expect("memtable stats");
+            assert_eq!(
+                (stats.immutable_rows, stats.writable_rows),
+                (1, 1),
+                "the later group lands in the next generation"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// Shutdown while one group fences and another holds its synced IO
+        /// drains both: the owner exits only after each is acknowledged.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the owner exits before its dispatched groups settle or
+        /// either group fails.
+        #[tokio::test]
+        async fn shutdown_drains_both_dispatched_groups() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, appends.collect()).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs")
+                .expect("the held sync reports");
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            assert!(!task.is_finished(), "shutdown waits for dispatched groups");
+
+            blocker.rollback().await.expect("release the fence");
+            settled(&mut acks[0], "the older group")
+                .await
+                .expect("the older group commits");
+            drop(release_io);
+            settled(&mut acks[1], "the younger group")
+                .await
+                .expect("the younger group commits");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner exits once drained")
+                .expect("owner task");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            assert_eq!(fixture.fenced(&ids).await, 2);
+        }
+
+        /// A group that would cross the generation threshold beside a
+        /// dispatched group waits for it to settle, and the generation
+        /// rotates before the group writes.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the waiting group writes before the older group is
+        /// acknowledged or before the rotation closes the generation.
+        #[tokio::test]
+        async fn a_group_needing_rotation_waits_for_the_dispatched_group() {
+            let (fixture, mut owner, budget, command_tx) = PipelineFixture::start().await;
+            owner.generation_rotation_bytes = 1;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, appends.collect()).await;
+            blocker.rollback().await.expect("release the fence");
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the waiting group syncs")
+                .expect("the held sync reports");
+            assert!(
+                acks[0].try_recv().is_ok(),
+                "the older group is acknowledged before the waiting group writes"
+            );
+            assert_eq!(
+                wal_io.close_submissions_for_test(),
+                1,
+                "the generation rotates before the waiting group writes"
+            );
+            drop(release_io);
+            settled(&mut acks[1], "the waiting group")
+                .await
+                .expect("the waiting group commits");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// A pressure seal that arrives while a group fences waits for the
+        /// group to settle, so the sealed generation holds that group's rows
+        /// and the next group writes into a fresh one.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the seal mutates the generation before the dispatched
+        /// group inserts, or either group fails.
+        #[tokio::test]
+        async fn pressure_seals_wait_for_the_dispatched_group() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            fixture.pressure[0].send_replace(Some(PressureSignal {
+                keys: vec![fixture.key.clone()],
+            }));
+            blocker.rollback().await.expect("release the fence");
+            settled(&mut acks[0], "the fencing group")
+                .await
+                .expect("the fencing group commits");
+            submit(&command_tx, appends.collect()).await;
+            settled(&mut acks[1], "the next group")
+                .await
+                .expect("the next group commits");
+            let stats = live.stats().expect("memtable stats");
+            assert_eq!(
+                (stats.immutable_rows, stats.writable_rows),
+                (1, 1),
+                "the seal holds the fencing group's row and the next group writes fresh"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// A normal batch conflict refuses only the older group: its waiter
+        /// gets the conflict while the younger group's IO is still held, and
+        /// the younger group then commits.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the conflict is not reported independently of the
+        /// younger group, the younger group fails, or the shard poisons.
+        #[tokio::test]
+        async fn an_older_group_conflict_refuses_it_while_the_younger_group_commits() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let (older_id, younger_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let blocker = fixture.hold_fence(older_id).await;
+            let (older, mut older_ack) = acked_group_for_key(&budget, &fixture.key, &[older_id]);
+            let (younger, mut younger_ack) =
+                acked_group_for_key(&budget, &fixture.key, &[younger_id]);
+            let ownership = owner.memory_ownership.clone();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, older).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, younger).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs")
+                .expect("the held sync reports");
+            blocker
+                .commit()
+                .await
+                .expect("commit a contradictory fence for the older batch");
+            settled(&mut older_ack[0], "the older group")
+                .await
+                .expect_err("the contradictory fence refuses the older group");
+            assert!(
+                ack_pending(&mut younger_ack[0]),
+                "the younger group's IO is still held"
+            );
+            drop(release_io);
+            settled(&mut younger_ack[0], "the younger group")
+                .await
+                .expect("the younger group commits");
+            assert!(
+                !ownership.is_poisoned(),
+                "a conflict does not fail the shard closed"
+            );
+            assert_eq!(
+                visible_rows(&live),
+                1,
+                "only the younger group's row is visible"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// An older group whose insertion fails after its fence is retained
+        /// unanswered and inserted again before the younger group fences, so
+        /// both are acknowledged in order and the older ACK reports its first
+        /// commit.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group fences while the older owner is
+        /// retained, either group fails, or a row is lost or duplicated.
+        #[tokio::test]
+        async fn a_post_fence_insertion_failure_is_retried_before_the_younger_group_fences() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            let mut retained = fixture.writers[0].post_sync_held_for_test();
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, appends.collect()).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs")
+                .expect("the held sync reports");
+            fixture.writers[0].trip_post_sync_failure_for_test();
+            blocker.rollback().await.expect("release the older fence");
+            tokio::time::timeout(DEADLOCK_BOUND, retained.changed())
+                .await
+                .expect("the older group is retained after its fence")
+                .expect("retention watch");
+            assert!(
+                ack_pending(&mut acks[0]),
+                "the retained group is unanswered"
+            );
+            assert_eq!(
+                fixture.fenced(&ids[1..]).await,
+                0,
+                "the younger group does not fence while the older owner is retained"
+            );
+
+            drop(release_io);
+            let older = settled(&mut acks[0], "the retained group")
+                .await
+                .expect("the retried insertion acknowledges");
+            assert!(
+                older.first_commit,
+                "the retried insertion is the first commit"
+            );
+            settled(&mut acks[1], "the younger group")
+                .await
+                .expect("the younger group commits");
+            assert_eq!(visible_rows(&live), 2, "each group's row is visible once");
+            assert_eq!(fixture.fenced(&ids).await, 2);
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// A client that stops waiting for its ACK does not stop its group:
+        /// the cancelled older group still fences and becomes visible, and the
+        /// younger group is acknowledged.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group fails, or the cancelled group is not
+        /// fenced and visible once the owner drains.
+        #[tokio::test]
+        async fn a_cancelled_waiter_does_not_stop_its_group() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let mut acks = acks.into_iter();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            drop(acks.next());
+            submit(&command_tx, appends.collect()).await;
+            blocker.rollback().await.expect("release the fence");
+            let mut younger_ack = acks.next().expect("younger waiter");
+            settled(&mut younger_ack, "the younger group")
+                .await
+                .expect("the younger group commits");
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            assert_eq!(
+                fixture.fenced(&ids).await,
+                2,
+                "the cancelled group still fences"
+            );
+            assert_eq!(
+                visible_rows(&live),
+                2,
+                "the cancelled group's row is visible"
+            );
+        }
+
+        /// While the older group's fence COMMIT stays unresolved, the younger
+        /// group syncs but never fences and neither group is acknowledged;
+        /// once the COMMIT lands, both commit exactly once in order.
+        ///
+        /// A deferred constraint trigger fails every COMMIT carrying the older
+        /// batch, so each attempt is ambiguous and resolves absent; a sequence
+        /// counts the failures across rollbacks.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group fences or either group is answered
+        /// during the ambiguity, or a row is lost or duplicated afterwards.
+        #[tokio::test]
+        async fn an_unresolved_older_commit_holds_the_younger_group_unfenced() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE SEQUENCE public.ambiguous_commits; \
+                 CREATE FUNCTION public.fail_commit() RETURNS trigger \
+                 LANGUAGE plpgsql SECURITY DEFINER AS $body$ BEGIN \
+                 PERFORM nextval('public.ambiguous_commits'); \
+                 RAISE EXCEPTION 'injected ambiguous COMMIT'; END $body$; \
+                 CREATE CONSTRAINT TRIGGER fail_commit AFTER INSERT \
+                 ON vala.scribe_batch_commits DEFERRABLE INITIALLY DEFERRED \
+                 FOR EACH ROW WHEN (NEW.batch_id = '{}') \
+                 EXECUTE FUNCTION public.fail_commit();",
+                ids[0]
+            )))
+            .execute(&fixture.superuser)
+            .await
+            .expect("install the ambiguous COMMIT");
+            let failures = || async {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT CASE WHEN is_called THEN last_value ELSE 0 END \
+                     FROM public.ambiguous_commits",
+                )
+                .fetch_one(&fixture.superuser)
+                .await
+                .expect("read the failed COMMITs")
+            };
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            let retried = async {
+                while failures().await < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, retried)
+                .await
+                .expect("the older COMMIT fails, resolves absent and retries");
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, appends.collect()).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs during the ambiguity")
+                .expect("the held sync reports");
+            drop(release_io);
+            let seen = failures().await;
+            let still_ambiguous = async {
+                while failures().await < seen + 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, still_ambiguous)
+                .await
+                .expect("the older COMMIT stays unresolved");
+            assert_eq!(
+                fixture.fenced(&ids[1..]).await,
+                0,
+                "the younger group never fences while the older COMMIT is unresolved"
+            );
+            assert!(
+                ack_pending(&mut acks[0]),
+                "the ambiguous group is unanswered"
+            );
+            assert!(ack_pending(&mut acks[1]), "the younger group is unanswered");
+            assert_eq!(
+                visible_rows(&live),
+                0,
+                "no row is visible during the ambiguity"
+            );
+
+            sqlx::raw_sql("DROP TRIGGER fail_commit ON vala.scribe_batch_commits")
+                .execute(&fixture.superuser)
+                .await
+                .expect("let the COMMIT land");
+            let older = settled(&mut acks[0], "the older group")
+                .await
+                .expect("the resolved group commits");
+            assert!(older.first_commit);
+            settled(&mut acks[1], "the younger group")
+                .await
+                .expect("the younger group commits");
+            assert_eq!(fixture.fenced(&ids).await, 2);
+            assert_eq!(visible_rows(&live), 2, "each row is visible exactly once");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// An age seal that arrives while a group fences waits for that group
+        /// and seals only its expired key; a group queued after it lands in
+        /// the next generation.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the seal runs before the dispatched group inserts, a later
+        /// group dispatches ahead of it, or either group fails.
+        #[tokio::test]
+        async fn age_seals_wait_for_the_dispatched_group() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            command_tx
+                .send(ShardCommand::FlushExpired {
+                    now: std::time::Instant::now() + std::time::Duration::from_hours(24),
+                })
+                .await
+                .expect("age flush mailbox");
+            submit(&command_tx, appends.collect()).await;
+            assert_eq!(
+                wal_io.write_submissions_for_test(),
+                2,
+                "no group dispatches behind the waiting age seal"
+            );
+            blocker.rollback().await.expect("release the fence");
+            settled(&mut acks[0], "the fencing group")
+                .await
+                .expect("the fencing group commits");
+            settled(&mut acks[1], "the later group")
+                .await
+                .expect("the later group commits");
+            let stats = live.stats().expect("memtable stats");
+            assert_eq!(
+                (stats.immutable_rows, stats.writable_rows),
+                (1, 1),
+                "the age seal holds the fencing group's row and the later group writes fresh"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
     }
 }

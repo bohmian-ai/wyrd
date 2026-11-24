@@ -258,8 +258,10 @@ impl<'a> VerificationControl<'a> {
     /// outcome is read back from its result records under the result
     /// identity the state selected, with the Verifier and subject the state
     /// recorded, so a deleted Card or a removed queue row changes nothing; a
-    /// recorded failure answers its status and error. Only unfinished work
-    /// answers the queue's status. Dispatches and a group execution's source
+    /// recorded failure answers its status and error. A selected outcome
+    /// answers the queue's status until its queue row commits completion
+    /// with the dispatches; otherwise only unfinished work answers the
+    /// queue's status. Dispatches and a group execution's source
     /// selection are read from the queue row and the input record. A result
     /// Scribe has not yet published leaves `result` absent, so the caller
     /// polls again. The result is the compact decision: its stored checks

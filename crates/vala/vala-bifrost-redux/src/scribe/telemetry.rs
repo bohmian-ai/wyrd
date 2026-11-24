@@ -40,6 +40,10 @@ pub struct ScribeInspectionSnapshot {
     /// A live pod can accept a write at any instant, so this is how a harness
     /// tells in-flight ingest from bucket ownership without a quiescent pod.
     pub transient_memory_by_shard: Vec<usize>,
+    /// Bytes the ingress lane's workers retain as reusable IPC encoder
+    /// contexts; no shard owns them, so with [`Self::memory_by_shard`] they
+    /// account for [`Self::total_accounted_memory`].
+    pub encoder_memory: usize,
     /// Exact bucket-level memory ownership.
     pub memory_by_bucket: Vec<ScribeBucketMemorySnapshot>,
     /// Sum of all governor category totals.

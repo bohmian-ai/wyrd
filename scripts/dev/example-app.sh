@@ -63,7 +63,7 @@ wheel() {
     && uv pip install --quiet --no-deps --reinstall "$built")
   local installed
   installed=$(cd "$app" && uv run --no-sync python -c 'import wyrd._wyrd as m; print(m.__file__)')
-  if [[ $(unzip -p "$built" "wyrd/$(basename "$installed")" | sha256sum | cut -d' ' -f1) != $(sha256sum "$installed" | cut -d' ' -f1) ]]; then
+  if [[ $(unzip -p "$built" "wyrd/$(basename "$installed")" | shasum -a 256 | cut -d' ' -f1) != $(shasum -a 256 "$installed" | cut -d' ' -f1) ]]; then
     echo "the app imports $installed, not the native module of $built" >&2
     exit 1
   fi
@@ -73,7 +73,7 @@ wheel() {
   fi
   printf 'wyrd-example-py %s, source tree %s, wheel %s (sha256 %s)\n' \
     "$base" "$(worktree_tree)" \
-    "$(basename "$built")" "$(sha256sum "$built" | cut -c1-12)"
+    "$(basename "$built")" "$(shasum -a 256 "$built" | cut -c1-12)"
 }
 
 # Point the tenant's `openai` deployment at MockServer with a placeholder key,

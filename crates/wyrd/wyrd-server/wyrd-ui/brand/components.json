@@ -971,19 +971,35 @@
         "One exact Card reference, `Kind/name@version`; a link only when the host supplies one."
       ]
     },
-    "VerdictPill": {
+    "StatusMark": {
       "status": "built",
       "catalog": false,
       "altitude": "quiet",
       "consumers": [
-        "src/routes/_gallery/+page.svelte (public package component)"
+        "packages/ui/src/lib/components/RecordTable.svelte",
+        "packages/ui/src/lib/components/ReviewSets.svelte",
+        "packages/ui/src/lib/components/VerificationExecution.svelte",
+        "packages/ui/src/lib/components/VerifierGraphNode.svelte"
       ],
-      "tokens": [],
+      "tokens": [
+        "--danger",
+        "--declare",
+        "--font-mono",
+        "--muted",
+        "--ok",
+        "--r",
+        "--text",
+        "--warn"
+      ],
       "props": {
-        "verdict": "CardTypes.VerificationVerdict"
+        "value": "string",
+        "badge?": "boolean",
+        "label?": "string",
+        "title?": "string"
       },
       "rules": [
-        "A verification verdict as a StatusPill: the word and glyph carry the result."
+        "One recorded execution status, verdict, outcome or graph word, drawn from EXECUTION_MARKS on every page: glyph, word and tone together, so hue is never the only channel.",
+        "badge boxes the mark, for a verdict; label replaces the word, never the glyph or tone; a value the mapping does not name reads as its own word in body text."
       ]
     },
     "StatusPill": {
@@ -995,7 +1011,6 @@
         "packages/ui/src/lib/components/Chart.svelte",
         "packages/ui/src/lib/components/RecordDetail.svelte",
         "packages/ui/src/lib/components/RecordTable.svelte",
-        "packages/ui/src/lib/components/VerdictPill.svelte",
         "src/routes/t/[tenantKey]/observe/+page.svelte"
       ],
       "tokens": [
@@ -1272,7 +1287,7 @@
     "Badge": {
       "implementedBy": [
         "StatusPill",
-        "VerdictPill"
+        "StatusMark"
       ],
       "tokens": [
         "--ok",

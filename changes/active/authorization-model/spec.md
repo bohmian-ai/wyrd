@@ -1,6 +1,6 @@
 ---
 id: SPEC-authorization-model
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -63,9 +63,17 @@ bounded: each start is admitted by a per-source window before it records a
 pending-login row, so a flood of starts records nothing beyond bounded
 counters (REQ-020).
 
+Revision 12 replaces the tenant Settings and platform console presentation with
+a conventional admin console (REQ-021): a visible section list, one page pattern,
+a tenant secrets inventory, and the identity fields every comparable console
+shows (your name and email; each person's sign-in method and roles). It adds a
+provider-sourced display name to Users, amended into the unshipped auth
+migration, and read projections; no new workflow.
+
 Agreement: [finalized onboarding](design/onboarding.md), [design notes](design/notes.md), the original three system scenarios
 and two-task split, [Rust responsibilities and token flow](design/rust-model.md),
-and [finalized social-login design](design/social-login.md), locked 2026-11-21.
+and [finalized social-login design](design/social-login.md), locked 2026-11-21;
+[admin console design](design/admin-console.md) and its [mock](design/admin-mock/README.md), finalized 2026-11-24.
 The Rust snippets illustrate the agreed responsibilities, not required private
 function signatures, cache containers or module layouts.
 
@@ -228,7 +236,8 @@ work without erasing retained evidence or otherwise valid Wyrd read grants.
 
 ### REQ-008 — Administer accounts and scoped grants through the UI
 
-Provide Settings → Access for Users, Service accounts, Roles and optional Groups,
+Provide tenant administration for Users, Service accounts, Roles and optional Groups
+(presented as REQ-021's Settings sections),
 using the same server contracts available through HTTP/CLI and thin first-class
 SDK/MCP projections. Tenant admins create/manage accounts and scoped assignments;
 non-admin direct requests cannot bypass the UI boundary. Preserve last-admin
@@ -854,6 +863,92 @@ signup's windows, and the device user-code entry form, whose code-guessing
 limit remains an ingress concern (RFC 8628 §5.1). Excluded: a deployment-wide
 aggregate ceiling and operator-configurable limits.
 
+### REQ-021 — Admin console presentation and identity projections
+
+Every tenant administration job is reachable from one visible Settings section
+list, and the platform console uses the same shell. The UI presents existing
+server behavior; it owns no workflow and re-derives no server-owned count,
+threshold or aggregation. Where this requirement leaves a choice, follow
+conventional admin-console practice (GitHub, Linear, Vercel, Slack, Google
+Workspace). The [mock](design/admin-mock/README.md) is the look-and-wording
+specification.
+
+Tenant Settings (`/t/{tenant}/settings/*`) shows a section list beside one work
+region:
+
+| Section | Shows | Primary action |
+|---|---|---|
+| People | Status counts; Users with name, email, sign-in method, roles, status; pending invitations as a filter with delivery, expiry, resend and revoke; a person drawer with roles, API keys and suspend | Invite people (drawer) |
+| Service accounts | Accounts, restriction, key count, status | New service account |
+| Roles | One row per Role with its description and member count; the count opens People filtered to that Role; operations on demand | New role |
+| Sign-in | Methods the tenant offers; company SSO setup (callback URL, client, test, activate); Require company SSO as a switch whose confirmation states the server's lock-out count; deactivate in a Danger zone | Set up company SSO |
+| Secrets | One inventory of tenant-owned stored secrets: gateway provider credentials, Operator connections, the company SSO client secret and trusted-issuer secrets, with state and last rotation; Replace, Renew encryption and Revoke where the owner offers them | Add provider key |
+| Integrations | GitHub, as today | — |
+
+Your account stays at `/t/{tenant}/settings/account` and opens from the
+sidebar name block for every User, not from the admin section list. The name
+block and Your account show the caller's name and email, never a placeholder or
+principal ID. A person is labelled by display name, else username, else email,
+with email as the second line.
+
+The platform console (`/platform/ui/*`) uses the same shell: Overview,
+Workspaces, Sign-in providers, Mail, Admins and Stored secrets (maintenance
+status and runs), with the light/dark control. Each action uses its existing
+platform endpoint and fresh-proof rule.
+
+Every page follows one pattern: title, one-line purpose, at most one primary
+action, then status and content. Lists use the built table, status pill, empty
+state and drawer components; settings use label/help/control rows; machine
+values are read-only with Copy; destructive actions confirm and sit in a Danger
+zone. Evidence Thread tokens and geometry remain; status carries a glyph or word.
+
+`wyrd.auth_users` gains a nullable `display_name`. Nothing has shipped, so it is
+added to the unshipped `20260601000001_auth.sql` in place rather than by a new
+migration; this explicitly authorizes that one edit and the resulting local
+database reset. Each successful sign-in sets it from the identity provider: the
+Google ID token `name` claim, the GitHub profile `name` (its `login` when the
+name is blank), or the company OIDC `name` claim. A provider that omits it leaves
+the stored value unchanged. Password Users have none. Users cannot edit it.
+
+`wyrd.auth_roles` gains a nullable `description`, added to the same unshipped
+migration in place under the same authorization. The server sets the
+description of each built-in Role; an administrator may set or clear a custom
+Role's description through `PUT /v1/access/roles/{role}`. A Role without one
+shows no summary.
+
+Read projections:
+
+| Endpoint | Adds |
+|---|---|
+| `GET /v1/principals/me` | `email` (the caller's own) and `display_name` |
+| `GET /v1/principals` items | `display_name`, `authentication` (the same shape `/me` returns) and the role assignments with scope |
+| `GET /v1/principals` page | counts by status for the requested filters |
+| `GET /v1/principals` query | a `role` filter: principals holding that Role at any scope, directly or through a Group |
+| `GET /v1/access/roles` items | `description` and `member_count`: distinct Users and service accounts holding the Role at any scope, directly or through a Group, each counted once |
+| `PUT /v1/access/roles/{role}` | optional `description` for a custom Role |
+
+The `/me` addition revises its "no email" rule for the caller's own address
+only; it discloses nothing about another principal. `architecture/wyrd-design.md`
+(the `GET /v1/principals/me` paragraph) must be reconciled before implementation. Its first
+sentence becomes: "`GET /v1/principals/me` returns the calling User's safe
+profile: principal, tenant, username, display name, the User's own email,
+authentication method and effective permissions. It never returns another
+principal's email."
+The Secrets inventory is composed by the host from the owner endpoints; no
+inventory endpoint is added. Rust, Python and TypeScript SDKs and MCP project the
+new fields.
+
+Google and GitHub sign-in buttons carry the provider's official mark, per
+Google's Sign in with Google branding guidelines and GitHub's logo guidelines:
+"Continue with Google/GitHub" on root/workspace signup, tenant sign-in and
+"Join with" on invitation acceptance. The Google "G" keeps its official colors;
+the GitHub mark is monochrome and follows the text color in both modes. The
+same marks identify the method in People and on Sign-in. The marks are fixed
+SVG assets, an explicit exception to Evidence Thread's tokens-only color rule.
+
+Excluded: a user-editable display name, editable built-in Role descriptions, a rotation-age warning threshold, per-method
+usage counts, Groups UI beyond today's, and any new administration capability.
+
 ### Revision-6 HTTP contracts (REQ-011–REQ-017)
 
 | Route | Request → response and authority |
@@ -920,6 +1015,8 @@ additional isolation or authority exception is approved.
 | platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; record the creating identity's keyed pseudonym, so the owned-workspace cap survives attempt purge (revision 5); retain the directory lifecycle |
 | New platform derivation-key record (revision 8) | One platform-scoped record holding the `WyrdKms` envelope of the platform derivation key (REQ-019), plus the owner identity and fence fields that SPEC-stored-secret-encryption maintenance uses for any other stored envelope; no raw key; forces RLS; permits only the existing platform owner. The provider, SMTP and challenge secret columns above hold `WyrdKms` envelopes instead of sealing-keyring values. |
 | Platform admission counters (revision 9) | The signup admission counters above gain one sign-in scope for REQ-020's per-source start windows: the same pseudonymous keys, fixed windows and batched expiry; no new table and no plain address. Nothing has shipped, so the unshipped workspace-signup migration's scope check is amended in place rather than by a new migration; this explicitly authorizes that one edit and the resulting local database reset |
+| Role description (revision 12) | `wyrd.auth_roles.description`, nullable text; server-set for built-in Roles, administrator-set for custom Roles (REQ-021); added to the unshipped `20260601000001_auth.sql` in place under the same authorization as the display name. Existing forced RLS applies; no new table or index. |
+| User display name (revision 12) | `wyrd.auth_users.display_name`, nullable text set from the identity provider's name at each successful sign-in (REQ-021); added to the unshipped `20260601000001_auth.sql` in place, which this explicitly authorizes with the resulting local database reset. Existing forced RLS applies; no new table or index. |
 | wyrd.auth_browser_sessions, wyrd.auth_device_authorizations, wyrd.auth_refresh_tokens | Complete social provider/revision and linked-identity anchors, invalidation/renewal constraints; preserve password/company/recovery anchors and client binding |
 | New tenant login-policy metadata | Require-company-SSO state and revision tied to current Active company connection; integrate existing freshness/invalidation owners |
 | wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption/resend and safe per-recipient send outcome; no raw invitation secret in storage |
@@ -1028,6 +1125,7 @@ absence of forbidden side effects, not only UI success messages.
 | AC-013: A platform operator signs in and manages the deployment safely | Through the production `/platform` console headed Platform admin, a pre-registered operator signs in through controlled platform OIDC (fresh IdP re-authentication/MFA policy) and, without an IdP, a platform-user password. Unknown subjects cannot enroll; fourteen-character passwords refuse and fifteen-character passphrases work unless blocklisted. Observe host-only Secure/HttpOnly/SameSite=Lax `/platform` cookies, safe metadata and no bootstrap key/API token in browser or Node. Tenant sessions refuse platform access; platform sessions refuse tenant routes even if manually replayed. Exercise 15-minute idle and eight-hour absolute expiry, logout, suspension, password/connection revision invalidation, storage failure and replica continuity. Stale, different-operator and tenant proof cannot retire a workspace or change providers/SMTP/signup; fresh same-operator proof permits the authorized action without granting tenant authority. Through the official host, `/platform` and `/platform/ui/*` render pages while existing `/platform/*` APIs retain typed responses; the BFF forwards only the platform cookie to Rust. CLI/API break-glass remains available separately. | REQ-018; preserves REQ-011, REQ-017 and platform/tenant separation |
 | AC-014: Signup and sign-in secrets survive wrapping-key rotation | With a file-backed `[kms]` key, an operator configures a social provider, SMTP and a challenge; a visitor creates workspaces up to the cap. Two replicas starting together keep one derivation key. Activate a new wrapping key with the old one retained, restart and run routine maintenance, then retire the old key and restart: provider sign-in, mail and the challenge still work, an in-flight signup completes, and the same identity is still refused at the cap. Stored values contain no plaintext secret or raw key. With the derivation key unavailable, signup, social sign-in and email-proof verification refuse with `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and record nothing, while password sign-in works. With the challenge secret unreadable, signup completion refuses and creates no tenant. | REQ-019; preserves REQ-011, REQ-014, REQ-017 |
 | AC-015: A flood of sign-in starts records only counters | Through a configured trusted ingress, one source sends company-SSO, social, platform OIDC and device authorization starts, including starts for an unknown tenant, until refused at the 301st start in its window. Each refusal is `429` with whole-second `Retry-After`: problem+json `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` with `details.retry_after_seconds`, or `temporarily_unavailable` on the device endpoint. From then on, no pending-login row, cookie or provider request is added. Another source, on the same tenant and on another tenant, still starts and completes a sign-in. The refused source can still start a signup, and a source refused by signup can still start a sign-in. Two replicas share one count. With no derivable source, the derivation key unavailable, or the counters unavailable, each start refuses with `503` and records nothing, while password and platform root sign-in still work. | REQ-020; preserves REQ-014, REQ-018, REQ-019 |
+| AC-016: An administrator runs the workspace from Settings | In the production UI, an admin opens Settings and reaches People, Service accounts, Roles, Sign-in, Secrets and Integrations from the section list. From People, Invite people sends invitations in two actions; each person shows display name, email, sign-in method and roles from the server, and status counts match the server. Roles shows each Role's description and server member count, and the count opens People filtered to that Role. Sign-in's Require company SSO confirmation shows the server's lock-out count and keeps REQ-016's proof and revision rules. Secrets lists the tenant's provider credentials, Operator connections and SSO/issuer secrets; Replace, Renew encryption and Revoke call their owner endpoints and a non-admin is refused. Google and GitHub buttons show the official marks in light and dark. Google and GitHub sign-in record the provider's name, and a later sign-in refreshes it. The name block and Your account show the caller's name and email for password, Google and GitHub Users; `/me` never returns another principal's email. The platform console shows the same shell and mode control. Rust/Python/TypeScript clients read the new `/me` and principal-list fields; another tenant's principals never appear. | REQ-021; preserves REQ-008, REQ-016, REQ-018 |
 
 Existing safeguards remain required as cases/regressions within these journeys:
 cross-tenant refusal, exact versus family scopes, direct/provider/group provenance,
@@ -1078,6 +1176,17 @@ The bounded verified-email discovery projection and email proof metadata are
 explicitly included; neither creates a global identity account.
 Email invitations do not add delivery/notifications to REQ-009's access-request
 copy flow.
+
+### Revision 12: admin console
+
+Maintainer-approved 2026-11-24 ("follow all conventional standards", "i
+approve"). [TASK-005](tasks/TASK-005-admin-console.md) owns REQ-021 and AC-016.
+It revises existing UI, adds read projections and the provider-sourced
+`display_name` and Role `description` columns. Test-first ordering and recorded
+failing tests are not required anywhere in it; every wire addition and journey
+still needs passing tests. It depends on TASK-004's code, not on TASK-004's
+review. TASK-004's paused live Google/GitHub smoke (steps 3–5) remains
+TASK-004 evidence and may run on the revised UI.
 
 ### Revision 11: remaining launch scope and SSO administration
 
@@ -1185,3 +1294,14 @@ for cycles 19–20, and requested one new execution task plus deferral markers i
 the current packet. This revision records that scope and the REQ-016 details;
 frontmatter now includes approved revisions 10 and 11. It authorizes planning,
 not production edits, deployment, staging, commits or pushes.
+
+Revision 12 — status: approved; revision: 12; approval recorded: 2026-11-24.
+The maintainer approved the admin console design and its conventional-standards
+decisions, and asked for this spec update and one task, TASK-005, in this
+packet. Adds REQ-021 and AC-016, and authorizes adding `auth_users.display_name`
+to the unshipped `20260601000001_auth.sql` in place. Requires reconciling the
+`GET /v1/principals/me` paragraph in `architecture/wyrd-design.md` before
+implementation. It authorizes planning, not production edits, staging, commits
+or pushes. Amended 2026-11-24 with maintainer agreement: adds Role
+`description` (same in-place migration edit), Role `member_count`, the
+principal-list `role` filter, and drops test-first ordering from TASK-005.

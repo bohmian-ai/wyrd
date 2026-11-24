@@ -47,14 +47,22 @@
         <h2 id="reauth-title">Confirm it is you</h2>
         <p><b>{reauth.pending.label}</b> is a destructive platform change. Confirm your own sign-in again; it stays fresh for five minutes. Nothing changes until you do.</p>
         {#if reauth.issue}<ConsoleProblem issue={reauth.issue} />{/if}
-        <form class="stack" onsubmit={confirm}>
-          <label for="reauth-password">Your password</label>
-          <PasswordInput id="reauth-password" name="password" required autocomplete="current-password" readonly={reauth.confirming} />
+        {#if data.session.method === 'password'}
+          <form class="stack" onsubmit={confirm}>
+            <label for="reauth-password">Your password</label>
+            <PasswordInput id="reauth-password" name="password" required autocomplete="current-password" readonly={reauth.confirming} />
+            <div class="row">
+              <button class="app-control primary" type="submit" disabled={reauth.confirming} aria-busy={reauth.confirming ? 'true' : undefined}>{reauth.confirming ? 'Confirming…' : 'Confirm'}</button>
+              <button class="app-control" type="button" onclick={() => reauth.cancel()}>Cancel</button>
+            </div>
+          </form>
+        {:else}
+          <p>Your identity provider asks you to sign in again, even if you are signed in there.</p>
           <div class="row">
-            <button class="app-control primary" type="submit" disabled={reauth.confirming} aria-busy={reauth.confirming ? 'true' : undefined}>{reauth.confirming ? 'Confirming…' : 'Confirm'}</button>
+            <button class="app-control primary" type="button" onclick={() => reauth.sso()} disabled={reauth.confirming} aria-busy={reauth.confirming ? 'true' : undefined}>{reauth.confirming ? 'Waiting for platform SSO…' : 'Continue with platform SSO'}</button>
             <button class="app-control" type="button" onclick={() => reauth.cancel()}>Cancel</button>
           </div>
-        </form>
+        {/if}
       </div>
     {/if}
     {@render children()}

@@ -3433,7 +3433,7 @@ async function startFakeGoogle(): Promise<{ issuer: string; account: GoogleAccou
         const now = Math.floor(Date.now() / 1000);
         const signed = `${encode({ alg: 'EdDSA', typ: 'JWT', kid: 'fake-google' })}.${encode({
           iss: google.issuer, aud: grant.aud, sub: grant.account.sub, email: grant.account.email,
-          email_verified: true, nonce: grant.nonce, iat: now, exp: now + 300
+          email_verified: true, nonce: grant.nonce, iat: now, exp: now + 300, auth_time: now
         })}`;
         json({
           access_token: randomUUID(), token_type: 'Bearer', expires_in: 300,
@@ -3792,5 +3792,71 @@ withConsole('a stale console session confirms the operator before suspending a w
   } finally {
     await browser.close();
     bff.stop();
+  }
+});
+
+/**
+ * With a platform OIDC connection the entry offers platform SSO, and only
+ * then: a registered operator signs in through it, and a stale session's
+ * Suspend asks for a forced-fresh IdP sign-in in a pop-up. Another
+ * registered operator's return refuses and changes nothing; the same
+ * operator's return applies the suspension.
+ */
+withConsole('a platform SSO operator confirms a suspension at the identity provider', async ({ server }) => {
+  const api = await platformApi(server.baseUrl, server.initializePlatformRoot());
+  const slug = server.tenantSlug;
+  const status = async () =>
+    ((await api('GET', '/platform/tenants')).body.tenants as { slug: string; status: string }[]).find((tenant) => tenant.slug === slug)?.status;
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    const sso = page.getByRole('button', { name: 'Sign in with platform SSO' });
+    await page.goto(`${bff.url}/platform`);
+    expect(await sso.count()).toBe(0);
+
+    const connected = await api('PUT', '/platform/oidc/connection', { issuer_url: google.issuer, client_id: 'wyrd-platform', client_auth: { method: 'public' } });
+    expect(connected.status, JSON.stringify(connected.body)).toBe(200);
+    await registerOperator(api, 'ops-lead', null, 'lead@ops.test');
+    await registerOperator(api, 'ops-deputy', null, 'deputy@ops.test');
+    google.account = { sub: 'idp-lead', email: 'lead@ops.test' };
+    await page.reload();
+    await sso.click();
+    await page.waitForURL(`${bff.url}/platform/ui`);
+    expect(await page.getByTestId('operator').textContent()).toBe('ops-lead');
+    expect(await page.getByRole('region', { name: 'This session' }).textContent()).toContain('Platform SSO');
+    expect((await page.context().cookies()).find((cookie) => cookie.name === 'wyrd_platform_session')).toMatchObject({ path: '/platform', httpOnly: true });
+
+    server.staleConsoleProof();
+    await page.reload();
+    const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
+    const row = page.getByRole('row').filter({ hasText: slug });
+    await row.getByRole('button', { name: 'Suspend' }).click();
+    expect(await dialog.textContent()).toContain('Your identity provider asks you to sign in again');
+    expect(await dialog.getByLabel('Your password').count()).toBe(0);
+
+    // Another registered operator signing in at the IdP confirms nothing.
+    google.account = { sub: 'idp-deputy', email: 'deputy@ops.test' };
+    const refused = page.waitForEvent('popup');
+    await dialog.getByRole('button', { name: 'Continue with platform SSO' }).click();
+    await (await refused).waitForEvent('close');
+    await expect.poll(() => dialog.getByRole('alert').textContent()).toContain('WYRD_AUTH_401_UNAUTHENTICATED');
+    expect(await status()).toBe('active');
+    expect(await page.getByTestId('operator').textContent()).toBe('ops-lead');
+
+    // The same operator's fresh IdP sign-in applies the suspension.
+    google.account = { sub: 'idp-lead', email: 'lead@ops.test' };
+    const confirmed = page.waitForEvent('popup');
+    await dialog.getByRole('button', { name: 'Continue with platform SSO' }).click();
+    await (await confirmed).waitForEvent('close');
+    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('suspended');
+    expect(await status()).toBe('suspended');
+    expect(await dialog.count()).toBe(0);
+    expect(await page.getByTestId('recent').textContent()).toContain('yes');
+  } finally {
+    await browser.close();
+    bff.stop();
+    google.account = { sub: 'google-user', email: 'user@gmail.test' };
   }
 });

@@ -65,6 +65,58 @@ export class ConsoleReauth {
     this.issue = problem;
   }
 
+  /**
+   * Prove this session again at the platform IdP, which must sign the same
+   * operator in anew, in a pop-up the callback page reports back from; then
+   * apply the change still pending. Without a pop-up the console page itself
+   * goes to the IdP and nothing is applied.
+   */
+  async sso(): Promise<void> {
+    const change = this.pending;
+    this.confirming = true;
+    this.issue = null;
+    // Opened before any await, so the click still allows it.
+    const popup = window.open('', 'wyrd-platform-reauth', 'popup,width=520,height=680');
+    let problem: WyrdProblem;
+    try {
+      const response = await fetch('/platform/ui/reauth/sso', { method: 'POST' });
+      const body = (await response.json()) as WyrdProblem & { authorization_url?: string };
+      if (response.ok && body.authorization_url) {
+        if (!popup) return location.assign(body.authorization_url);
+        // The pop-up's report; `undefined` once it closed unreported or the prompt was cancelled.
+        const returned = await new Promise<WyrdProblem | null | undefined>((resolve) => {
+          const done = (value: WyrdProblem | null | undefined) => {
+            removeEventListener('message', heard);
+            clearInterval(watch);
+            resolve(value);
+          };
+          const heard = (event: MessageEvent) => {
+            if (event.origin !== location.origin || event.source !== popup || event.data?.type !== 'wyrd-platform-reauth') return;
+            done(event.data.problem ?? null);
+          };
+          const watch = setInterval(() => {
+            if (popup.closed || this.pending !== change) done(undefined);
+          }, 500);
+          addEventListener('message', heard);
+          popup.location.assign(body.authorization_url!);
+        });
+        popup.close();
+        if (returned === null) return this.proven(change);
+        if (returned === undefined) {
+          if (this.pending === change) this.confirming = false;
+          return;
+        }
+        problem = returned;
+      } else problem = body;
+    } catch {
+      problem = { ...unreachable };
+    }
+    popup?.close();
+    if (this.pending !== change) return;
+    this.confirming = false;
+    this.issue = problem;
+  }
+
   /** Apply `change` only while it is still the one asked about. */
   proven(change: PendingChange | null): void {
     if (!change || this.pending !== change) return;

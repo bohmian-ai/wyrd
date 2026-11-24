@@ -1305,6 +1305,21 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   released after Cancel answers 204 yet applies nothing (Rust still
   `active`); the own password applies the suspension (Rust `suspended`) and
   the session shows fresh; Resume then applies at once without a prompt.
+- **S3 platform SSO sign-in and forced-fresh IdP re-authentication**
+  (`a platform SSO operator confirms a suspension at the identity provider`),
+  on part A's `GET /platform/browser/methods`. The loopback fake IdP's ID
+  token now carries `auth_time`. RED: the IdP returned to
+  `/platform/ui/callback`, which had no page (`waitForURL(/platform/ui)`
+  timeout); the entry already hid the SSO button while `oidc` was false.
+  GREEN: 1 passed. Proves the SSO button appears only once a connection
+  exists; a registered operator signs in by platform SSO (`Platform SSO`,
+  same cookie attributes); a stale session's Suspend offers only the IdP
+  route; another registered operator's IdP return in the pop-up refuses with
+  `WYRD_AUTH_401_UNAUTHENTICATED` and changes nothing; the same operator's
+  return applies the suspension and the session shows fresh.
+  **TDD violation:** the callback page, SSO begin route and pop-up flow were
+  written before this test. They were set aside (files moved out, edited files
+  restored) to record the RED above against the S1–S2 code, then restored.
 
 ### 17. An existing User explicitly connects another sign-in method
 

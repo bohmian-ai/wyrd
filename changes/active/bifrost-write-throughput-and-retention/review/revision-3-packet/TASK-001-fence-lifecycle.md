@@ -1,0 +1,427 @@
+---
+id: TASK-001
+kind: implementation
+status: complete
+spec: SPEC-bifrost-write-throughput-and-retention
+spec_revision: 2
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009]
+depends_on: []
+---
+
+# Safely retire retry receipts without losing accepted history
+
+## Outcome and scope
+
+A client can retry a recent batch, and the four application consumers can recover
+their retained decisions after its transport receipt expires. Scribe removes old
+receipts only after accepted data has independent durable custody. Failed or stale
+cleanup pauses fresh writes through existing admission while reads and recovery
+remain usable. This establishes finite recent retry history without promising a
+strict instantaneous receipt-row or physical PostgreSQL-byte ceiling.
+
+Implement [spec revision 2](../spec.md) using the
+[selected implementation and deletion proof](../design/notes.md#locked-deletion-proof-and-backlog-enforcement)
+and [final cleanup-health amendment](../design/cleanup-health-proposal.md).
+The [shared execution/checkpoint recipe](README.md) applies after each scenario.
+No prior task is required; inputs are existing client batches, PostgreSQL acceptance
+records, Bifrost domain rows, WAL attempts and staged/published custody records.
+The owning `architecture/bifrost-design.md` already records the settled recovery
+and receipt-lifecycle policy from spec authoring; consume it as authority and keep
+its description consistent with the delivered behavior, rather than reopening it.
+
+## Existing owners and connected implementation
+
+- `vala-sql/src/queries/scribe_batch_commits.rs` owns tenant-scoped acceptance,
+  replay resolution and recent receipts. Only Scribe's retry, recovery and cleanup
+  paths read receipts; `committed_batches` is no longer re-exported to application
+  code ([TASK-001-R1](../review/TASK-001-maintainer-001/TASK-001-R1-bifrost-only-readers.md)). Keep the ordinary batched transaction and conflict
+  resolution; extend this owner for bounded eligible deletion and durable ownership
+  discovery. Retention is one hour / 10,000 identities per tenant-qualified logical
+  table across clients/pods, with PostgreSQL time and canonical-coordinate rechecks.
+- `wyrd-server/src/verification/{state,approvals,evidence}.rs` and
+  `components/github/delivery.rs` read only their Bifrost records through
+  `verification/inputs.rs`. A record accepted but not yet visible reads as absent;
+  its fixed batch id refuses any different second write, so it is never
+  overwritten. Do not add a parallel PostgreSQL history store.
+- `vala-bifrost-redux/src/scribe/{shards,wal,staging_runtime}.rs` and the existing
+  rotation-cohort/manifest owners know canonical WAL coordinates and durable slices.
+  Extend the local manifest with the agreed contiguous closed-segment frontier.
+  Persist whole-batch custody before deletion; load it before missing-receipt replay
+  decisions, and retain safe stage-record retirement and torn-tail validation.
+  Replace ordinary-table unfenced salvage with accepted-only recovery, preserving
+  accepted lost-response cases and suppressing losing cross-pod WAL attempts.
+- The existing Scribe runtime and `scribe/admission.rs` own background work and
+  ingestion pressure. Add one bounded background cleaner there: coalesced push plus
+  periodic discovery, bounded SQL batches, finite sweep coverage and local admission
+  health. Reuse workload/memory/in-flight/unstaged bounds. Neither the current shard
+  loop nor Forge supplies this off-ACK cleanup workflow; do not duplicate it in Forge.
+- The committed-batch mirror must reconcile expiry with durable receipt authority.
+  Wire cleaner startup/shutdown to existing Scribe lifecycle; stale/exited workers
+  cannot leave admission healthy. No cleanup SQL or wait enters append admission.
+
+Do not enable automatic receipt deletion until the domain readers and durable
+recovery safeguards are in place. Scenario 1 and 2 may establish absent-receipt
+states through internal integration fixtures; that is not permission for raw SQL
+or private controls in a public SDK journey. Existing staged custody is the input,
+not an invented per-batch retirement record.
+
+Outputs are authoritative domain reads, durable safe frontiers, safely removed
+receipts and cleanup-health refusal/resumption. Task 2 consumes these behaviors,
+their regression tests and this task's last accepted benchmark checkpoint.
+
+## Ordered acceptance scenarios and evidence
+
+### 1. Retained domain history survives transport-receipt expiry
+
+**Obligations:** REQ-001–003.
+
+**Start/input:** Through the real existing producer paths, accept an execution's
+ordered revisions, an approval decision, deferred evidence and a GitHub delivery
+outcome. Their actual Bifrost records are retained and independently durable.
+Use internal fixture setup to remove the corresponding receipts; retain separate
+recent-acceptance fixtures whose rows are not yet visible. Ordinary recent batches
+also exercise the existing stable-identity retry/conflict boundary.
+
+**Action/result:** Reconstruct the execution and read/retry each domain operation
+through its real consumer. The revision sequence and exact decisions survive;
+matching domain retries preserve their result and contradictory decisions still
+conflict. Accepted-but-unreadable rows can appear absent; fixed batch identities
+refuse conflicting saves and trigger retry. Failed Bifrost queries remain unavailable. Same-identity transport retries
+while a receipt remains authoritative retain original version/content semantics,
+including cross-pod arbitration and tenant separation. Buffered enqueue and durable
+completion keep their existing boundaries.
+
+**Proof owner/tier:** Add/extend `wyrd-server` integration coverage beside
+`pg_approvals`, `pg_deferred_evidence`, `pg_verification_runtime` and
+`pg_github_delivery`, using real Postgres and Bifrost consumer paths. Use the
+existing `wyrd-testing` server/SDK journey owners for client-visible behavior;
+SQL fixtures belong in the internal tier. Pure row interpretation tests cannot
+substitute for the consumer reconstruction and retry paths.
+
+**Expected RED:** Current consumers interpret missing receipts as never accepted;
+retained history becomes absent or execution reconstruction truncates. Add focused
+assertions for that missing behavior before changing production code. Existing
+already-correct enqueue/ACK behavior is verification-only.
+
+**Evidence:**
+
+- Superseded by [TASK-001-R1](../review/TASK-001-maintainer-001/TASK-001-R1-bifrost-only-readers.md):
+  consumers read only their Bifrost rows; execution recovery reads the newest
+  readable revision with `InputResolver::latest_state`. The receipt-bridging
+  evidence below records the earlier implementation; R1 changes the
+  accepted-but-invisible assertions and records its own evidence.
+- Execution revisions —
+  `wyrd-testing` `lifecycle::execution_recovery_outlives_its_revision_receipts`:
+  receipts removed after publish, takeover recovers the same accepted state; a
+  recent receipt for an invisible next revision is `StateError::Unavailable`.
+  RED: `lifecycle.rs:826` "recovery neither resets nor truncates the accepted
+  revisions" (recovery came back fresh). GREEN.
+- Approvals — `pg_approvals::a_decision_outlives_its_retry_receipt`: after
+  receipt removal the completed execution serves the same decision, actor and
+  time; the same decision replays the original receipt; a contradictory one is
+  `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`; an undecided occurrence with a
+  recent receipt and no visible row is 503, never pending. RED:
+  `pg_approvals.rs:688` result `Null`, delivery `pending`. GREEN, 6/6 repeats.
+- Evidence — `pg_deferred_evidence::accepted_evidence_outlives_its_retry_receipt`:
+  after receipt removal a republish replays the original id and time, different
+  content is `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`, a later pull request
+  consumes it and passes; with receipt SELECT revoked a new publication is 503.
+  RED: `pg_deferred_evidence.rs:886` status `accepted`, expected `replayed`. GREEN.
+- GitHub delivery — `pg_github_delivery::a_recorded_outcome_outlives_its_retry_receipts`:
+  after receipt removal inspection serves the same result and `delivered`, and
+  nothing is sent again; with receipt SELECT revoked inspection is 503. RED:
+  `pg_github_delivery.rs:726` result `Null`, delivery `pending`. GREEN.
+- Limitation: evidence and delivery batch keys are private, so their
+  accepted-but-invisible case is proven through unreadable authority (revoked
+  receipt SELECT) rather than a synthetic receipt; approvals and execution state
+  use a synthetic recent receipt. Same-identity transport retry, cross-pod
+  arbitration, tenant separation and enqueue/ACK boundaries are unchanged and
+  covered by the existing suites below.
+- Diagnosis (Codex, read-only): first GREEN attempt read rows before receipts;
+  `pg_approvals` failed 1 in 5 with 503 "a recorded outcome is not visible yet".
+  Cause: Scribe commits the receipt (`scribe/shards.rs:4273`) before memtable
+  visibility (`:5097`), so a batch landing between the row read and the receipt
+  read looked accepted but invisible. Fix site: read order in all four
+  consumers. A second Codex review confirmed the execution re-read is required:
+  count retention can remove a receipt for a revision that became visible
+  between the first visible read and the probe.
+- Removed `pg_verification_runtime` assertion that a completed run stages no
+  audit: recovery now reads Bifrost as SYSTEM, and each read decision is audited
+  by design; the assertion pinned an incidental absence of reads, not a
+  requirement.
+- Commands:
+  `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 --no-fail-fast -E "test(/^(pg_approvals|pg_deferred_evidence|pg_verification_runtime|pg_github_delivery)::/)" && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(/^lifecycle::/)"'`
+  → 99/99 and 10/10 passed. `mise run fmt && mise run lints` clean;
+  `git diff --check` clean.
+- Benchmark checkpoint: skipped by maintainer direction; not run for scenario 1.
+
+### 2. Accepted recovery survives the durable whole-batch handoff
+
+**Obligations:** REQ-004–006.
+
+**Start/input:** Feed real admitted batches into Scribe/WAL, including an accepted
+batch with a lost response, a complete never-accepted attempt, and another pod's
+losing duplicate WAL attempt. Include a batch crossing closed-segment boundaries,
+multiple slices/seal keys and an earlier unresolved gap. Stage through the existing
+cohort owner, not synthetic maximum watermarks.
+
+**Action/result:** Advance and persist the frontier only after every accepted slice
+touching the contiguous prefix has independent durable custody. Internally remove
+only eligible receipts under the safe predicate, restart on the same durable state,
+and query exact accepted rows. Independently staged rows restore without the receipt;
+losing and never-accepted WAL restores no rows. Load the frontier before interpreting
+missing receipts. A crossing batch/gap, failed stage/manifest persistence, unavailable
+authority or stale/offline stream cannot manufacture safe deletion or speculative
+recovery. Recheck current canonical coordinates against stale delete candidates.
+
+Interrupt between custody, frontier persistence, proof disposal and receipt removal;
+exercise stage-record retirement and a torn tail after old fences disappear. The
+outcome must preserve accepted rows, reject ambiguous authority and delay unsafe
+cleanup. Returning from physical retirement or leaving a file behind is not the proof.
+
+**Proof owner/tier:** Extend inline WAL/shard tests for manifest ordering and replay,
+real-dependency redux integration under `tests/integration/scribe/`, and existing
+`wyrd-testing/tests/bifrost/scribe/` recovery/fencing/source-boundary journeys. Use
+the real SQL receipt owner and the multi-process harness for cross-pod/restart proof.
+The connected journey must show accepted input → actual staged custody → persisted
+frontier → receipt removal → restart → exact query result; isolated manifests alone
+do not prove it. SQL eligibility/concurrency checks live in `vala-sql` integration.
+
+**Expected RED:** Ordinary-table replay currently salvages unfenced complete attempts,
+and existing per-seal-key manifests cannot establish the required whole-shard
+frontier. Tests must expose those missing behaviors before the respective changes.
+
+**Evidence:** Complete. TDD: the safe frontier, SQL deletion, replay skip and
+crossing-batch fixes were test-first; the journeys noted below were written
+after the behavior they connect.
+
+- Accepted-only replay (REQ-004) — `wyrd-testing`
+  `lifecycle::replay_restores_only_accepted_batches`: an accepted batch and an
+  attempt refused because its receipt could not be written; after an abrupt
+  restart only the accepted rows read back. RED: `lifecycle.rs:640`, rows
+  100–123 reappeared. GREEN. Replay now suppresses `Unfenced` on every table
+  (`scribe/shards.rs` `resolve_replay_fence`); the unused `FENCED_ONLY` table
+  flag is removed. Expected consequence:
+  `shards::tests::group_commit_crash_between_sync_and_fence_restores_nothing`
+  previously asserted the crashed, never-fenced group restored its rows; it now
+  asserts none restore and the same-ID retry holds each row once.
+- Safe frontier (REQ-005) — `scribe/wal.rs` `cover_released`, called from the
+  one deletion path `delete_closed_segments` (both `retire_segments` and replay
+  pin release route there). A segment joins its shard's frontier only once its
+  last owner released it and it is no longer current; the frontier advances
+  through consecutive sequences only, is written to the shard manifest
+  (`manifest.rs` `safe_segment`, `advance_safe_segment`, atomic write) and only
+  then are covered files deleted. Inline:
+  `wal::tests::released_segments_advance_a_persisted_contiguous_frontier`
+  (segment 1 released before 0 waits; frontier 1 after 0; then 2) and
+  `wal::tests::an_unpersisted_frontier_keeps_its_segments` (blocked manifest
+  write → error, segment kept). RED: `wal.rs:4837` segment 1 deleted ahead of
+  0, and the release succeeded without a manifest. GREEN. An earlier gap, a
+  crossing batch (its receipt names its COMMIT segment, above the frontier
+  until every slice's segment is released) and failed staging (its generation
+  never releases its segments) all hold the frontier back by construction.
+- Fixture diagnosis (Codex, read-only):
+  `execution_lanes::tests::replay_retirement_settlement_has_one_pending_group`
+  wrote 8-byte fake `.wal` files; retirement now reads the segment header to
+  place it in the frontier. Fix site: the fixture, now real segments 0 and 1.
+  `wal::tests::segment_retirement_failure_preserves_retryable_source` now fails
+  at the header read rather than at removal; its retryable-path assertion holds.
+- Safe deletion (REQ-006) — `vala-sql` `delete_handed_off` with
+  `HandedOffShard`/`RetryHistory` (default one hour, 10,000 per table), one
+  tenant-scoped statement that rechecks the current row's stream, shard and
+  COMMIT segment. `pg_scribe_batch_commits::only_handed_off_receipts_outside_retry_history_are_deleted`:
+  only the old covered receipt of the named shard goes; shrinking count history
+  removes a recent covered one; uncovered, other-stream and replacement
+  acceptances stay. RED: `pg_scribe_batch_commits.rs:525` deleted 0, expected
+  1 (empty function). GREEN, 7/7 in the file.
+- Connected journey — `lifecycle::restart_restores_accepted_rows_after_handed_off_receipts_are_deleted`:
+  published batch → manifest frontier ≥ its receipt's COMMIT segment → real
+  deletion query removes it and keeps the WAL-only batch's receipt → abrupt
+  restart → exactly rows 0–47, never-accepted 100–123 absent. Written after the
+  units it connects, so not test-first; 5/5 runs passed.
+- Replay reads the frontier — Codex (read-only) showed a crash between
+  deleting two covered segments leaves a COMMIT whose slices are gone, and
+  replay then refuses recovery. `WalReader::open_paths` now removes segments
+  at or below their shard manifest's `safe_segment` instead of reading them.
+  `replay::tests::replay_skips_segments_its_frontier_covers`. RED:
+  `replay.rs:2196` "WAL v8 COMMIT closes an incomplete or unordered slice set".
+  GREEN.
+- Crossing batch — Codex (read-only) showed a batch whose partitions straddle a
+  WAL roll let one partition's selective seal free the segment holding the
+  other's slice, so the frontier could pass a batch not wholly staged. Each
+  partition in a group now retains every segment the group wrote
+  (`append_and_sync_batch_commits`).
+  `shards::tests::every_partition_of_a_batch_keeps_all_its_segments`. RED:
+  `shards.rs:10407` second partition held only `1.wal` of `{0.wal, 1.wal}`.
+  GREEN. Regression after both: 479/479 redux, 49/49 journeys.
+- Losing duplicate — `lifecycle::a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_deleted`
+  (two pods, one credential): pod A accepts and publishes; pod B writes its own
+  WAL attempt of the same batch and acknowledges it as already accepted; A's
+  receipt is deleted under its frontier; B restarts abruptly and flushes; the
+  batch reads back once. Written after accepted-only replay, so not test-first;
+  mutation (replay restores `Unfenced` again) fails at `lifecycle.rs:835` with
+  every row twice. A first run used a second principal, which is a different
+  batch, and was correctly refused with `BatchConflict`
+  (`sub_principal_id` digest differed in the trace).
+- Torn tail — the connected journey above now tears the WAL tail after the
+  abrupt stop (13 `0xff` bytes after the WAL-only batch's COMMIT), after the
+  published receipt is deleted. Restart cuts the tail and restores exactly rows
+  0–47. Torn-tail validation reads the newest remaining receipt per stream and
+  shard. Deleted receipts all sit at or below the frontier, and replay never
+  reads those segments, so the newest receipt in any segment it reads is never
+  deleted. Not test-first: this is existing behavior under the new deletion.
+- Stage-record retirement — `lifecycle::staged_rows_restore_and_retire_once_after_their_receipt_is_deleted`:
+  batch staged, not published; Scribe's own retirement pass persists a frontier
+  covering it; receipt deleted; abrupt restart serves the rows from stage
+  records; publish retires them (committed files hold the batch once); a second
+  abrupt restart reads the batch once. Not test-first (existing behavior). The
+  shared helper `delete_handed_off_receipt` waits up to 30 s for the persisted
+  frontier, since retirement runs on Scribe's lifecycle tick.
+- Limitation: `delete_handed_off` ranks all of a tenant's receipts per call
+  (`ponytail:` note); its cost is qualified with the cleaner in scenario 3.
+- Commands: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --features test-support --run-ignored=all --no-fail-fast -E "test(/scribe|replay|wal|fence|staging/)"; cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all --no-fail-fast'`
+  → 479/479 and 51/51 at the end of the scenario;
+  `cargo nextest run --locked -p vala-sql --test integration -E "test(/pg_scribe_batch_commits/)"`
+  → 7/7; `mise run lints`, `check:tenant-isolation`, `git diff --check` clean.
+- Benchmark checkpoint: skipped by maintainer direction.
+
+### 3. Background deletion keeps up or pauses fresh admission safely
+
+**Obligations:** REQ-002, REQ-006–009.
+
+**Start/input:** Use scenario 2's durable custody/frontier with receipts both inside
+and outside one-hour/10,000 history, across tables, tenants, pods and retained epochs.
+Include old recovery-pinned receipts, an already admitted write and queryable rows.
+Use repository-owned time/failure seams rather than wall-clock sleeps or changes to
+production retention defaults.
+
+**Action/result:** Trigger custody/count pushes and periodic age discovery. The
+single bounded Scribe worker removes only eligible receipts in bounded tenant SQL
+batches. A quiet table's age cleanup needs no new write; missed/full/coalesced wakes
+recover from durable discovery without blocking admission. Count covers the whole
+tenant/table; deleting one tenant's receipts cannot affect another. An actually
+removed ordinary batch identity may be accepted again, and its mirror cannot return
+the former acceptance. Retained domain rows remain queryable and decisions remain final.
+
+Start/restart cleanup-unverified with old-epoch debt; fresh writes wait for an initial
+due-work sweep. Then fail or make SQL ambiguous, hang/exit the worker, and let small
+DELETE batches progress while whole-sweep coverage falls behind. Assert local
+retryable-busy admission, anchored to captured sweep boundaries rather than heartbeat
+or old-sweep finish time. New arrivals cannot make a captured sweep infinite. Reconcile
+ambiguous commits before publishing success. Empty eligible scope and entirely
+recovery-pinned scope can complete successfully. Restore progress and complete a
+current sweep: admission resumes subject to ordinary resource pressure.
+
+While refused, already admitted work can finish its unchanged ACK, accepted rows
+and reads stay usable, and staging/recovery/cleanup continue. Existing unstaged and
+in-flight bounds still refuse their own overload. Crashes around notification, SQL
+commit and health publication delay cleanup/admission rather than lose accepted data.
+Record the local-only healthy-request check; no added request SQL, fsync or cleanup
+wait, process-readiness failure, memory poison, receipt quota or per-batch job ledger.
+
+**Proof owner/tier:** Real Postgres tests in `vala-sql` receipt integration for the
+transactional policy; inline Scribe cleaner/admission tests for bounded coverage and
+stale-worker behavior; redux lifecycle integration for durable discovery/restart;
+`wyrd-testing` Scribe backpressure/recovery/write-read journeys for actual producer
+refusal, completion and query behavior. Keep failure injection inside existing
+internal test support; do not add public operational controls.
+
+**Expected RED:** No safe background expiry/coverage signal currently drives
+admission. Eligible rows remain indefinitely, or writes remain admitted when the
+new cleanup obligations are failed/stale. Separately expose cache expiry and startup
+debt; do not claim a fixed row ceiling as the assertion.
+
+**Evidence:**
+
+- Reuse: deletion stays in `vala_sql::queries::scribe_batch_commits::delete_handed_off`
+  (age/count history and frontier rule unchanged). The gaps were a finite sweep
+  scope, discovery of earlier epochs' streams, and a driver, so the change adds
+  a PG-time `cutoff` with `RETURNING batch_id`, `receipt_streams` (operator pool,
+  one node, every tenant and epoch), and one `ReceiptCleaner` per Scribe
+  (`scribe/receipt_cleaner.rs`). Admission reads its `CleanupHealth`.
+- SQL cutoff and discovery — `pg_scribe_batch_commits::a_sweep_cutoff_bounds_deletion_to_receipts_accepted_before_it`
+  (RED: 2 ids deleted, expected only the one before the cutoff) and
+  `receipt_streams_of_a_node_span_tenants_and_epochs` (RED: `left: []`). GREEN 9/9.
+- Health rule — `receipt_cleaner::tests::cleanup_health_admits_only_a_fresh_completed_sweep`:
+  unverified at start; a completed sweep admits for 120 s from its *start*; an
+  older sweep finishing late renews nothing; failure refuses at once. A hung or
+  exited worker goes stale through the same aging. Passed first run (written
+  with the type, no RED).
+- Admission — `admission::tests::unhealthy_receipt_cleanup_refuses_fresh_admission`
+  (RED: the unverified start still admitted). The check is a local mutex read
+  in `try_reserve`, before any item moves; no request SQL, fsync or wait. It
+  records rejection reason `cleanup`. Already admitted work is unaffected since
+  the check exists only at reservation (structural). Existing unstaged and
+  in-flight tests still pass.
+- Sweep — `receipt_cleaner::pg_tests::a_sweep_deletes_every_due_receipt_of_the_node_and_reports_healthy`:
+  two tenants, two epochs (old-epoch debt), DELETE batches of 2 over 5 due
+  rows; receipts above the frontier, in a shard without a frontier (pinned)
+  and of another node stay; deleted batches leave the mirror (`forget`) and
+  kept ones stay; health admits after. `a_failed_sweep_is_unhealthy_until_a_later_sweep_completes`:
+  empty scope succeeds; revoked DELETE fails the sweep and refuses; re-grant
+  and the next sweep deletes and admits. Mirror entries are forgotten before
+  the DELETE commits, so an ambiguous commit only forgets too much and the
+  next sweep reconciles.
+- Wakes and restart: `WalWriter` notifies after any persisted frontier
+  advance (coalesced `Notify`); the loop also sweeps every 30 s and retries
+  1 s after a failure, rebuilding scope from Postgres and manifests each time.
+  `replay_wal_async` runs one sweep before readiness so a restarted pod admits
+  as soon as it is ready; a failed sweep leaves it ready but busy. Sweeps are
+  serialized, so outcomes publish in boundary order. Manifests are read in one
+  `spawn_blocking` call per sweep. Shutdown stops the loop.
+- Journey — `lifecycle::receipt_cleanup_failure_pauses_fresh_writes_until_it_recovers`:
+  a published batch's receipt aged past history is deleted by the pod's own
+  cleaner with no new write (trace: `receipt sweep completed deleted=1`); the
+  same batch id is accepted again as a new batch (rows read twice); with
+  DELETE revoked fresh appends return `WYRD_VALA_429_INGEST_BUSY` while
+  accepted rows read unchanged; after GRANT the pod admits again. Mutation:
+  passing `None` health to admission fails it with "fresh writes were still
+  admitted after cleanup could not delete".
+- TDD: SQL and admission scenarios had RED first. The health unit test, the
+  cleaner pg tests and the journey were written after their code: TDD
+  violation for those; the journey's strength is shown by the mutation above.
+- Crash during a sweep: health and the mirror are process memory only, so
+  a crash at any point is an ordinary restart (unverified until recovery's
+  sweep), covered by the restart journeys.
+- Commands: the scenario 2 command with `receipt` added to the redux filter
+  → 483/483 and 52/52; `vala-sql` `pg_scribe_batch_commits` → 9/9;
+  `mise run fmt`, `mise run lints`, `check:tenant-isolation` clean.
+- History index: `scribe_batch_commits_history_idx` (tenant, table,
+  `ingested_at DESC`, `batch_id DESC`) added to the unreleased receipts
+  migration. EXPLAIN of the ranking over 200,000 synthetic receipts shows
+  `WindowAgg` over `Index Scan using scribe_batch_commits_history_idx`, with
+  no sort. `vala-sql` lib 21/21, `pg_scribe_batch_commits|pg_migration` 12/12,
+  cleaner tests 3/3.
+- Benchmark checkpoints: skipped by maintainer direction.
+
+## Verification and boundaries
+
+Use the focused-test discipline and benchmark commands in [README](README.md).
+Owning runners, confirmed in `mise.toml`:
+
+```bash
+mise run test:bifrost:integration:sql
+mise run test:bifrost:integration:redux
+mise run test:bifrost:journey:scribe
+mise run test:bifrost:journey:server
+```
+
+The standard Bifrost server-integration lane omits several affected domain modules.
+Run their actual registered suites explicitly under the repository environment:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(/^(pg_approvals|pg_deferred_evidence|pg_verification_runtime|pg_github_delivery)::/)"'
+```
+
+Choose relevant previously green focused tests while iterating; run each affected
+owner lane once at task verification. Finish `mise run fmt`, `mise run lints`,
+`mise run check:tenant-isolation`, and `mise exec -- git diff --check`. Run dependency
+or generated-contract checks only if their inputs changed. Full shipped-surface
+journeys/aggregate checks remain integrated-review work.
+
+No ACK protocol change, extra durable acceptance marker, per-fence UPDATE, new
+database table/migration file, receipt quota, Forge scheduling, snapshot/orphan or
+stored-row retention work. Necessary unreleased migration edits stay in place as
+authorized by the spec. Private SQL/index and health timing choices remain local.
+Do not silently redesign if evidence contradicts a locked guarantee; return the
+specific conflict to the maintainer with its evidence.

@@ -1320,6 +1320,18 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   **TDD violation:** the callback page, SSO begin route and pop-up flow were
   written before this test. They were set aside (files moved out, edited files
   restored) to record the RED above against the S1–S2 code, then restored.
+- **S4 social providers view**
+  (`the console tests a provider revision before enabling it`).
+  RED: `/platform/ui/providers` had no page (h1 assertion failed). GREEN:
+  1 passed. Proves the view shows each provider's callback URL and
+  instructions; a saved client becomes an untested revision whose Enable is
+  disabled with "Test revision 1 before enabling it."; the secret is never in
+  the page or the field after save; a test of revision 1 held at the IdP and
+  finished after revision 2 was saved leaves revision 2 untested with no
+  "tested" notice; a test of the current revision shows it tested; an Enable
+  against a revision replaced through the API refuses as "This provider
+  changed" (`WYRD_SPEC_409_CONFLICT`); the current revision tested then
+  enables to "✓ enabled · offered". TDD: PASS.
 
 ### 17. An existing User explicitly connects another sign-in method
 

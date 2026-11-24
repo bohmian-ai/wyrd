@@ -32,7 +32,7 @@ export class ConsoleReauth {
           this.confirming = false;
           return;
         }
-        await update({ reset: false });
+        await update();
       };
   }
 

@@ -3860,3 +3860,95 @@ withConsole('a platform SSO operator confirms a suspension at the identity provi
     google.account = { sub: 'google-user', email: 'user@gmail.test' };
   }
 });
+
+/**
+ * The Social sign-in view shows each shared provider's callback URL and
+ * instructions, saves a client as a new untested revision without ever
+ * showing its secret, and counts a provider test only for the revision it
+ * ran against: a test finishing after a newer save proves nothing, a test of
+ * the current revision lets the operator enable it, and an Enable against a
+ * revision replaced behind the page refuses as a changed provider.
+ */
+withConsole('the console tests a provider revision before enabling it', async ({ server }) => {
+  const api = await platformApi(server.baseUrl, server.initializePlatformRoot());
+  await registerOperator(api, 'ops-oncall', OPERATOR_PASSWORD);
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
+    await page.getByRole('navigation', { name: 'Console' }).getByRole('link', { name: 'Social sign-in' }).click();
+    await page.waitForURL(`${bff.url}/platform/ui/providers`);
+    expect(await page.getByRole('heading', { level: 1 }).textContent()).toBe('Social sign-in');
+    const googleCard = page.getByTestId('provider-google');
+    const state = page.getByTestId('state-google');
+    expect(await state.textContent()).toBe('– not configured');
+    expect(await googleCard.textContent()).toContain('/auth/social/google/callback');
+    const notice = page.getByRole('status');
+    const save = async (clientId: string, secret: string) => {
+      await googleCard.getByLabel('Client ID').fill(clientId);
+      await googleCard.getByLabel('Client secret').fill(secret);
+      await googleCard.getByRole('button', { name: 'Save client' }).click();
+    };
+
+    await save('wyrd-google', 'google-secret-one');
+    await expect.poll(() => state.textContent()).toBe('◌ untested · not offered');
+    expect(await notice.textContent()).toContain('Google revision 1 saved. It is untested and not offered.');
+    expect(await googleCard.getByRole('button', { name: 'Enable' }).isDisabled()).toBe(true);
+    expect(await googleCard.textContent()).toContain('Test revision 1 before enabling it.');
+    expect(await googleCard.getByLabel('Client secret').inputValue()).toBe('');
+    expect(await serverHtml(page, `${bff.url}/platform/ui/providers`)).not.toContain('google-secret-one');
+
+    // A test of revision 1 that finishes after revision 2 is saved proves nothing about revision 2.
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let reached = () => {};
+    const atProvider = new Promise<void>((resolve) => (reached = resolve));
+    await context.route(`${google.issuer}/authorize**`, async (route) => {
+      reached();
+      await held;
+      await route.continue();
+    });
+    const stale = page.waitForEvent('popup');
+    await googleCard.getByRole('button', { name: 'Test sign-in' }).click();
+    await atProvider;
+    await save('wyrd-google-2', 'google-secret-two');
+    await expect.poll(() => googleCard.textContent()).toContain('Test revision 2 before enabling it.');
+    release();
+    await (await stale).waitForEvent('close');
+    await page.waitForTimeout(1500);
+    expect(await state.textContent()).toBe('◌ untested · not offered');
+    expect(await notice.textContent()).not.toContain('is tested');
+    await context.unroute(`${google.issuer}/authorize**`);
+
+    // A test of the current revision lets the operator enable it.
+    const current = page.waitForEvent('popup');
+    await googleCard.getByRole('button', { name: 'Test sign-in' }).click();
+    await (await current).waitForEvent('close');
+    await expect.poll(() => state.textContent()).toBe('◐ tested · not offered');
+    expect(await notice.textContent()).toContain('Signed in at Google. Revision 2 is tested; enable it to offer it.');
+
+    // A revision saved behind the page makes Enable refuse as a changed provider.
+    expect((await api('PUT', '/platform/social/providers/google', { client_id: 'wyrd-google-3', client_secret: 'google-secret-three' })).status).toBe(200);
+    await googleCard.getByRole('button', { name: 'Enable' }).click();
+    await expect.poll(() => page.getByRole('alert').textContent()).toContain('This provider changed');
+    expect(await page.getByRole('alert').textContent()).toContain('WYRD_SPEC_409_CONFLICT');
+    await page.reload();
+    expect(await state.textContent()).toBe('◌ untested · not offered');
+
+    const third = page.waitForEvent('popup');
+    await googleCard.getByRole('button', { name: 'Test sign-in' }).click();
+    await (await third).waitForEvent('close');
+    await expect.poll(() => state.textContent()).toBe('◐ tested · not offered');
+    await googleCard.getByRole('button', { name: 'Enable' }).click();
+    await expect.poll(() => state.textContent()).toBe('✓ enabled · offered');
+    expect(await notice.textContent()).toContain('Google is offered on sign-in and signup pages.');
+    const html = await serverHtml(page, `${bff.url}/platform/ui/providers`);
+    for (const secret of ['google-secret-one', 'google-secret-two', 'google-secret-three']) expect(html).not.toContain(secret);
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});

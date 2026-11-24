@@ -112,10 +112,10 @@ pub struct CaseRecord {
     /// process kept none.
     pub record: Option<Record>,
     /// Each measured repetition's window snapshots by step id, in
-    /// repetition order: the evidence the case process kept in its
-    /// temporary artifacts, which the engine record never carries.
-    /// Reading the case record puts them back on its repetitions.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// repetition order, as records kept before these local diagnostics
+    /// moved to gzipped files under the case's artifacts directory. Read
+    /// only, so those records still render in full; never written.
+    #[serde(default, skip_serializing)]
     pub timings: BTreeMap<String, Vec<Vec<TimingEvidence>>>,
     /// Teardown evidence.
     pub cleanup: Cleanup,
@@ -127,35 +127,19 @@ pub struct CaseRecord {
 }
 
 impl CaseRecord {
-    /// Moves each measured repetition's window snapshots out of `record`,
-    /// by step id, for [`Self::timings`].
-    #[must_use]
-    pub fn timings_of(record: &mut Record) -> BTreeMap<String, Vec<Vec<TimingEvidence>>> {
-        record
-            .steps
-            .iter_mut()
-            .filter(|step| {
-                step.repetitions
-                    .iter()
-                    .any(|repetition| !repetition.timings.is_empty())
-            })
-            .map(|step| {
-                let windows = step
-                    .repetitions
-                    .iter_mut()
-                    .map(|repetition| std::mem::take(&mut repetition.timings))
-                    .collect();
-                (step.id.clone(), windows)
-            })
-            .collect()
-    }
-
-    /// Moves the saved [`Self::timings`] back onto the engine record's
-    /// repetitions, so its full report lists every window series.
+    /// Puts the window snapshots back onto the engine record's
+    /// repetitions, so its full report lists every window series: an older
+    /// record's embedded [`Self::timings`], else the local diagnostics its
+    /// case kept under `target/`. Without either, the record still renders
+    /// every measurement, only without the per-window series.
     fn hydrate(&mut self) {
         let Some(record) = self.record.as_mut() else {
             return;
         };
+        if self.timings.is_empty() {
+            record.load_timings();
+            return;
+        }
         for step in &mut record.steps {
             let Some(windows) = self.timings.remove(&step.id) else {
                 continue;
@@ -333,11 +317,16 @@ struct Headline {
     work: &'static str,
     /// The throughput unit.
     unit: &'static str,
-    /// The CPU unit noun, as in `µs/<noun>`.
+    /// The work unit's noun, as in "no <noun> completed".
     noun: &'static str,
+    /// The Server CPU per unit cell's unit and its multiplier from
+    /// CPU-seconds per unit: milliseconds per unit, or per 1,000 rows for
+    /// writes, whose per-row cost would round away at three decimals.
+    cpu: (&'static str, f64),
     /// The pooled latency reading.
     latency: &'static str,
-    /// The latency label.
+    /// The latency label, naming the reading in a shared Headline latency
+    /// column; a category whose columns name their readings shows none.
     label: &'static str,
     /// Whether the row has an OTLP input column reading.
     input: Input,
@@ -346,10 +335,8 @@ struct Headline {
 /// A case's Input column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Input {
-    /// Not a Bifrost category: no column.
+    /// Not a write category: no column.
     None,
-    /// A Bifrost case without ingest input: inapplicable.
-    Inapplicable,
     /// A native write: input bytes are not measured.
     Unmeasured,
     /// An OTLP write: uncompressed protobuf input.
@@ -364,6 +351,7 @@ impl Headline {
                 work: "verifications",
                 unit: "verifications/s",
                 noun: "verification",
+                cpu: ("ms/verification", 1e3),
                 latency: "overhead_p99_ms",
                 label: "server overhead p99",
                 input: Input::None,
@@ -372,14 +360,16 @@ impl Headline {
                 work: "requests",
                 unit: "requests/s",
                 noun: "request",
+                cpu: ("ms/request", 1e3),
                 latency: "overhead_p99_ms",
                 label: "added overhead p99",
                 input: Input::None,
             },
-            (Category::Bifrost, "writes-parquet") => Self {
+            (Category::BifrostWrites, _) => Self {
                 work: "rows",
                 unit: "rows/s",
                 noun: "row",
+                cpu: ("ms/1k rows", 1e6),
                 latency: "p99_ms",
                 label: "durable ACK p99",
                 input: if case.starts_with("native-write") {
@@ -388,31 +378,79 @@ impl Headline {
                     Input::Otlp
                 },
             },
-            (Category::Bifrost, family) if family.starts_with("ui-sql") => Self {
+            (Category::BifrostReads, family) if family.starts_with("ui-sql") => Self {
                 work: "requests",
                 unit: "pages/s",
                 noun: "page",
+                cpu: ("ms/page", 1e3),
                 latency: "client_p99_ms",
                 label: "client page p99",
-                input: Input::Inapplicable,
+                input: Input::None,
             },
-            (Category::Bifrost, _) if case.starts_with("full-scan") => Self {
+            (Category::BifrostReads, _) if case.starts_with("full-scan") => Self {
                 work: "queries",
                 unit: "queries/s",
                 noun: "query",
+                cpu: ("ms/query", 1e3),
                 latency: "p95_ms",
                 label: "server query p95",
-                input: Input::Inapplicable,
+                input: Input::None,
             },
-            (Category::Bifrost, _) => Self {
+            (Category::BifrostReads, _) => Self {
                 work: "queries",
                 unit: "queries/s",
                 noun: "query",
+                cpu: ("ms/query", 1e3),
                 latency: "p99_ms",
                 label: "server query p99",
-                input: Input::Inapplicable,
+                input: Input::None,
             },
         }
+    }
+}
+
+/// The performance columns of a category's table, in order, after Case,
+/// Tier (reads only) and Status: [`cells`] fills exactly these. Verification
+/// shows its server overhead and client round trip in their own columns;
+/// every other category names its one latency inside the Headline latency
+/// cell.
+fn columns(category: Option<Category>) -> &'static [&'static str] {
+    match category {
+        Some(Category::Verification) => &[
+            "Throughput",
+            "Server CPU per unit",
+            "Server overhead p99",
+            "Client round trip p99",
+            "Target",
+        ],
+        Some(Category::BifrostWrites) => &[
+            "Throughput",
+            "Server CPU per unit",
+            "Headline latency",
+            "Input",
+            "Target",
+        ],
+        Some(Category::Gateway | Category::BifrostReads) | None => &[
+            "Throughput",
+            "Server CPU per unit",
+            "Headline latency",
+            "Target",
+        ],
+    }
+}
+
+/// The storage tier a Bifrost read case queries, from its registry
+/// identity: `hot` cases and UI pages name `memtable` or `staged` in
+/// their id, and everything else reads published Parquet.
+fn tier(family: &str, case: &str) -> &'static str {
+    if family == "parquet" {
+        "published"
+    } else if case.contains("memtable") {
+        "memtable"
+    } else if case.contains("staged") {
+        "staged"
+    } else {
+        "published"
     }
 }
 
@@ -469,7 +507,7 @@ fn aggregate(record: &Record) -> Option<&Repetition> {
 /// headline latency, input when the category has the column, and target.
 fn cells(category: Category, case: &CaseRecord) -> Vec<String> {
     let headline = Headline::of(category, &case.family, &case.case);
-    let width = if headline.input == Input::None { 4 } else { 5 };
+    let width = columns(Some(category)).len();
     let Some(record) = &case.record else {
         return vec!["unavailable: no engine record".to_owned(); width];
     };
@@ -488,23 +526,23 @@ fn cells(category: Category, case: &CaseRecord) -> Vec<String> {
         .and_then(|work| seconds.clone().map(|seconds| work / seconds));
     let per_unit = work.clone().and_then(|work| {
         if work > 0.0 {
-            cpu.clone().map(|cpu| cpu / work * 1e6)
+            cpu.clone().map(|cpu| cpu / work * headline.cpu.1)
         } else {
             Err(format!("no {} completed", headline.noun))
         }
     });
+    let latency = interval(&aggregate.reading(headline.latency));
     let mut row = vec![
         fixed(throughput, 1, headline.unit),
-        fixed(per_unit, 2, &format!("µs/{}", headline.noun)),
-        format!(
-            "{}: {}",
-            headline.label,
-            interval(&aggregate.reading(headline.latency))
-        ),
+        fixed(per_unit, 3, headline.cpu.0),
     ];
+    if category == Category::Verification {
+        row.extend([latency, interval(&aggregate.reading("client_p99_ms"))]);
+    } else {
+        row.push(format!("{}: {latency}", headline.label));
+    }
     match headline.input {
         Input::None => {}
-        Input::Inapplicable => row.push("n/a".to_owned()),
         Input::Unmeasured => {
             row.push("unavailable: native input bytes are not measured".to_owned());
         }
@@ -572,7 +610,7 @@ fn cell(text: &str) -> String {
 /// file name beside the sweep. Invalid and unstarted rows give their reason
 /// and withhold performance cells; a profiled sweep marks every reading
 /// diagnostic. Derived Bifrost readings follow, each naming the inputs it
-/// lacks.
+/// lacks, then the category's definitions ([`glossary`]).
 #[must_use]
 pub fn render_sweep(
     sweep: &SweepRecord,
@@ -598,20 +636,24 @@ pub fn render_sweep(
         }
         (mode, _) => mode.label().to_owned(),
     };
-    let input = category == Some(Category::Bifrost);
+    let reads = category == Some(Category::BifrostReads);
     let mut out = format!(
         "L1 {} sweep\n\nCoverage: {coverage}\nMode: {mode}\nSweep: {path}\n\n",
         sweep.category
     );
-    out.push_str("| Case | Status | Throughput | Server CPU per unit | Headline latency |");
-    if input {
-        out.push_str(" Input |");
+    let mut header = vec!["Case"];
+    if reads {
+        header.push("Tier");
     }
-    out.push_str(" Target | Record |\n|---|---|---|---|---|");
-    if input {
-        out.push_str("---|");
-    }
-    out.push_str("---|---|\n");
+    header.push("Status");
+    header.extend(columns(category));
+    header.push("Record");
+    let _ = writeln!(
+        out,
+        "| {} |\n|{}",
+        header.join(" | "),
+        "---|".repeat(header.len())
+    );
     let mut valid = Vec::new();
     for entry in &sweep.cases {
         let read = entry.record.as_deref().map(read);
@@ -634,16 +676,20 @@ pub fn render_sweep(
             (CaseStatus::Valid, _) => ("INVALID: the case record cannot be read".to_owned(), None),
             (status, _) => (format!("{}: {reasons}", status.label()), None),
         };
-        let width = if input { 5 } else { 4 };
-        let performance = performance.unwrap_or_else(|| vec!["—".to_owned(); width]);
-        let _ = write!(out, "| {} | {} |", cell(&entry.selector), cell(&status));
+        let performance =
+            performance.unwrap_or_else(|| vec!["—".to_owned(); columns(category).len()]);
+        let _ = write!(out, "| {} |", cell(&entry.selector));
+        if reads {
+            let _ = write!(out, " {} |", tier(&entry.family, &entry.case));
+        }
+        let _ = write!(out, " {} |", cell(&status));
         for value in performance {
             let _ = write!(out, " {} |", cell(&value));
         }
         let _ = writeln!(out, " {} |", cell(&record_cell));
     }
-    if category == Some(Category::Bifrost) {
-        let derived = derived(sweep, &valid);
+    if let Some(category) = category {
+        let derived = derived(category, sweep, &valid);
         if !derived.is_empty() {
             out.push_str("\nDerived readings:\n\n");
             for line in derived {
@@ -651,15 +697,73 @@ pub fn render_sweep(
             }
         }
     }
+    out.push_str(&glossary(category));
     out
 }
 
+/// The definitions printed under every sweep table: each column, and each
+/// latency and derived reading the category shows, with where its
+/// interval starts and stops, so a pasted table reads on its own.
+fn glossary(category: Option<Category>) -> String {
+    let mut lines: Vec<&str> = vec![
+        "- **Case**: the exact selector. Its suffix is the load: `c<N>` is N closed-loop clients, each sending its next request only once the previous one is answered; `r<N>` is an open-loop schedule of N requests per second at 64 clients.",
+    ];
+    if category == Some(Category::BifrostReads) {
+        lines.push(
+            "- **Tier**: where the queried rows live: `memtable` (in server memory, not yet flushed), `staged` (flushed to fsynced local staged runs, not yet published) or `published` (Parquet in the table's object storage).",
+        );
+    }
+    lines.extend([
+        "- **Status**: `VALID` only when every measured window met the validity rules, every phase fit its allowance and cleanup was confirmed. Do not interpret the numbers of an `INVALID` or `NOT RUN` row.",
+        "- **Throughput**: successful work units, in the unit shown, divided by the summed seconds of the case's three measured windows; warmup and drain are excluded. Higher is better.",
+        "- **Server CPU per unit**: CPU time (user and system) of the server process over the measured windows, divided by the same work units, in milliseconds per unit (per 1,000 rows for writes). It includes background work the server did in those windows, so it is the server's whole cost per unit, not one code path. Lower is better.",
+        "- **Latency cells**: one percentile of the case's latency, pooled over its three windows. `(a, b] ms` is the histogram bucket that holds it: above a and at most b, so read b as the value; a single value is exact. `n` is the number of samples pooled; a p99 needs at least 1,000 and a p95 at least 200, or the reading is unavailable.",
+    ]);
+    match category {
+        Some(Category::Verification) => lines.extend([
+            "- **Server overhead p99**: per direct verification, the server's time from the request's HTTP arrival until the execution finished (`verification.direct`), less the time spent inside its Verifier blocks: what Wyrd adds around the Verifier's own work. Network and client time are excluded.",
+            "- **Client round trip p99**: per direct verification, the caller's time from immediately before the SDK's public `verify` call until its decoded result returns: SDK serialization, transport, the whole server execution including the Verifier, and decoding. Compare the `rust`, `python` and `typescript` `r3000` cases here: they run at one shared rate, so this is where each SDK's cost shows.",
+        ]),
+        Some(Category::Gateway) => lines.push(
+            "- **Headline latency**, *added overhead p99*: per model call, the server's time from handler entry until the answer is handed off (a buffered response, or a stream's first bytes), less the time the call waited on the model provider: what the gateway adds on top of the provider. Network and client time are excluded.",
+        ),
+        Some(Category::BifrostWrites) => lines.extend([
+            "- **Headline latency**, *durable ACK p99*: per write request, the server's time from its gRPC handler entry until the rows are durably acknowledged (Gate's acknowledgement for native writes, the export response for OTLP): when the rows are safe to call stored. Network and client time are excluded.",
+            "- **Input**: OTLP writes only: encoded OTLP bytes accepted per second, and per server CPU-second. Native writes do not measure input bytes.",
+        ]),
+        Some(Category::BifrostReads) => lines.extend([
+            "- **Headline latency**, by the label in the cell:",
+            "  - *server query p99*: per query, the server's time from the request's arrival at its outermost HTTP middleware until the query's final result frame is handed to the response body: authentication, planning, execution and encoding. Network transfer and client decoding are excluded.",
+            "  - *server query p95*: the same boundary at p95, for `full-scan`, whose windows hold too few queries for a p99.",
+            "  - *client page p99* (UI SQL): per UI page (traces, verification, logs or metrics), the driver's time from sending the page's first statement until its last answer arrived; independent statements run concurrently, then those that use their results. A page is several queries, and the network and client are included, so it is larger than one query's latency.",
+            "- **Variant reads**: both count, over the same published spans, the spans matching one `attributes` key. `span-shredded` filters `region`, a key on at least 10% of spans that the server stores in its own typed column; `span-long-tail` filters a `custom.*` key on about 0.1% of spans, which stays in the Variant's encoded remainder and is decoded per row. Their difference is the cost of reading a key from the remainder instead of its own column, for two different keys.",
+        ]),
+        None => {}
+    }
+    lines.extend([
+        "- **Target**: `none`: earlier performance targets do not apply to L1 cases.",
+        "- **Record**: the case record beside the sweep record; `capacity report <record>` shows its full evidence.",
+    ]);
+    match category {
+        Some(Category::BifrostWrites) => lines.push(
+            "- **`<path>-peak`**: the higher throughput of a write path's `c1` and `c64` cases, shown only when the sweep ran both.",
+        ),
+        Some(Category::BifrostReads) => lines.push(
+            "- **`<lookup>-scaling`**: `Q64 / (64 × Q1)`, the `c64` case's throughput over 64 times the `c1` case's: 1.0 means 64 clients answer 64 times what one client does; lower means contention. Shown only when the sweep ran both cases.",
+        ),
+        _ => {}
+    }
+    format!("\nDefinitions:\n\n{}\n", lines.join("\n"))
+}
+
 /// The Bifrost readings derived from two cases of the sweep, for each one
-/// whose inputs the sweep selected at least in part: each write path's
-/// peak acknowledged rows/s and each lookup's 64-client rate scaling. A
-/// missing, unselected or invalid input makes the reading incomplete and
-/// names it; nothing derived ever starts a case.
-fn derived(sweep: &SweepRecord, valid: &[CaseRecord]) -> Vec<String> {
+/// whose two inputs the sweep both selected: each write path's peak
+/// acknowledged rows/s in a writes sweep, and each lookup's 64-client rate
+/// scaling in a reads sweep; other categories derive none. An input
+/// that is not VALID or has no reading makes the reading incomplete and
+/// names it; a reading the selection cannot fill is not printed, and
+/// nothing derived ever starts a case.
+fn derived(category: Category, sweep: &SweepRecord, valid: &[CaseRecord]) -> Vec<String> {
     let rate = |family: &str, id: &str, work: &str| -> Result<f64, String> {
         let case = valid
             .iter()
@@ -683,13 +787,20 @@ fn derived(sweep: &SweepRecord, valid: &[CaseRecord]) -> Vec<String> {
         exact(&aggregate.reading(work)).map(|work| work / aggregate.seconds)
     };
     let selected = |family: &str, ids: &[&str]| {
-        sweep
-            .cases
-            .iter()
-            .any(|entry| entry.family == family && ids.contains(&entry.case.as_str()))
+        ids.iter().all(|id| {
+            sweep
+                .cases
+                .iter()
+                .any(|entry| entry.family == family && entry.case == *id)
+        })
     };
     let mut lines = Vec::new();
-    for op in ["otlp-spans", "otlp-spans-1k", "otlp-logs", "native-write"] {
+    let peaks: &[&str] = if category == Category::BifrostWrites {
+        &["otlp-spans", "otlp-spans-1k", "otlp-logs", "native-write"]
+    } else {
+        &[]
+    };
+    for op in peaks {
         let ids = [format!("{op}-c1"), format!("{op}-c64")];
         let names = [ids[0].as_str(), ids[1].as_str()];
         if !selected("writes-parquet", &names) {
@@ -724,21 +835,26 @@ fn derived(sweep: &SweepRecord, valid: &[CaseRecord]) -> Vec<String> {
         };
         lines.push(line);
     }
-    for (family, name, base, scaled) in [
-        (
-            "hot",
-            "point-memtable-scaling",
-            "point-memtable-c1",
-            "point-memtable-c64",
-        ),
-        ("parquet", "point-scaling", "point-c1", "point-c64"),
-        (
-            "parquet",
-            "span-trace-scaling",
-            "span-trace-c1",
-            "span-trace-c64",
-        ),
-    ] {
+    let scalings: &[(&str, &str, &str, &str)] = if category == Category::BifrostReads {
+        &[
+            (
+                "hot",
+                "point-memtable-scaling",
+                "point-memtable-c1",
+                "point-memtable-c64",
+            ),
+            ("parquet", "point-scaling", "point-c1", "point-c64"),
+            (
+                "parquet",
+                "span-trace-scaling",
+                "span-trace-c1",
+                "span-trace-c64",
+            ),
+        ]
+    } else {
+        &[]
+    };
+    for &(family, name, base, scaled) in scalings {
         if !selected(family, &[base, scaled]) {
             continue;
         }
@@ -747,9 +863,9 @@ fn derived(sweep: &SweepRecord, valid: &[CaseRecord]) -> Vec<String> {
             rate(family, scaled, "queries"),
         );
         lines.push(match pair {
-            (Ok(base), Ok(scaled)) if base > 0.0 => format!(
-                "{name}: {:.3} (Q64 / (64 × Q1)) from `{scaled}` and `{base}`",
-                scaled / (64.0 * base)
+            (Ok(q1), Ok(q64)) if q1 > 0.0 => format!(
+                "{name}: {:.3} (Q64 / (64 × Q1)) from `{scaled}` ({q64:.1} queries/s) and `{base}` ({q1:.1} queries/s)",
+                q64 / (64.0 * q1)
             ),
             (base, scaled) => format!(
                 "{name}: incomplete: {}",
@@ -873,17 +989,16 @@ pub fn render_case(case: &CaseRecord) -> String {
         );
     }
     if let Some(category) = Category::parse(&case.category) {
-        let headline = Headline::of(category, &case.family, &case.case);
-        let cells = cells(category, case);
-        let _ = write!(
-            out,
-            "\nCase aggregate: throughput {}; server CPU {}; {}",
-            cells[0], cells[1], cells[2]
-        );
-        if headline.input != Input::None {
-            let _ = write!(out, "; input {}", cells[3]);
-        }
-        let _ = writeln!(out, "; target {}", cells[cells.len() - 1]);
+        let readings: Vec<String> = columns(Some(category))
+            .iter()
+            .zip(cells(category, case))
+            .map(|(column, value)| match *column {
+                "Headline latency" => value,
+                "Server CPU per unit" => format!("server CPU {value}"),
+                column => format!("{} {value}", column.to_lowercase()),
+            })
+            .collect();
+        let _ = writeln!(out, "\nCase aggregate: {}", readings.join("; "));
     }
     let profile = &record.artifacts.profile;
     if profile.requested {

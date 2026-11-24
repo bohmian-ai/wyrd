@@ -8,8 +8,9 @@ lane, `gate`, verify lane, or CI job.
 ```bash
 mise run benchmark:l1:verification   # L1: the 5 routine Verification cases
 mise run benchmark:l1:gateway        # L1: the 5 routine Gateway cases
-mise run benchmark:l1:bifrost        # L1: the 18 routine Bifrost cases
-mise run benchmark:l1:bifrost -- --list-cases
+mise run benchmark:l1:bifrost-writes # L1: the 8 routine Bifrost write cases
+mise run benchmark:l1:bifrost-reads  # L1: the 12 routine Bifrost read cases
+mise run benchmark:l1:bifrost-reads -- --list-cases
 mise run benchmark:l1:verification -- --cases direct-verify-c64 --profile cpu
 mise run bench:l2:bifrost            # Level 2, one engine
 mise run bench:l2:verification
@@ -33,14 +34,16 @@ routine sweep, in declared order:
 |---|---|
 | `mise run benchmark:l1:verification` | `direct-verify-c1`, `direct-verify-c64`, `direct-verify-r3000`, `direct-verify-python-r3000`, `direct-verify-typescript-r3000` |
 | `mise run benchmark:l1:gateway` | `buffered-1kib-capture-metadata.c1`, `buffered-1kib-capture-metadata.c64`, `streamed-1kib-capture-metadata.c64`, `buffered-64kib-capture-metadata.c64`, `buffered-64kib-capture-payload.c64` |
-| `mise run benchmark:l1:bifrost` | the eight `writes-parquet` cases (`otlp-spans`, `otlp-spans-1k`, `otlp-logs` and `native-write` at `-c1` and `-c64`), `point-memtable-c1`, `point-memtable-c64`, `point-staged-c1`, `point-c1`, `point-c64`, `full-scan-c1`, `span-trace-c64`, and `ui-sql/memtable-ui-c8`, `ui-sql/staged-ui-c8`, `ui-sql/published-ui-c8` |
+| `mise run benchmark:l1:bifrost-writes` | the eight `writes-parquet` cases: `otlp-spans`, `otlp-spans-1k`, `otlp-logs` and `native-write` at `-c1` and `-c64` |
+| `mise run benchmark:l1:bifrost-reads` | `point-memtable-c1`, `point-memtable-c64`, `point-staged-c1`, `point-c1`, `point-c64`, `full-scan-c1`, `span-trace-c64`, the Variant filters `span-shredded-c1` and `span-long-tail-c1`, and `ui-sql/memtable-ui-c8`, `ui-sql/staged-ui-c8`, `ui-sql/published-ui-c8` |
 
 Every other registered case is **targeted**: it runs only when selected,
 through the same lifecycle and report. Targeted cases include the Python
 and TypeScript closed-loop Verification cases, the intermediate Rust client
 counts `direct-verify-c4`, `-c16` and `-c32`, the Agent-only
 `direct-verify-model-c1` and `-c64`, the single-client Gateway shapes, the
-other hot and Parquet read shapes, the single-client UI pages, and the
+other hot and Parquet read shapes (including the memtable and staged
+Variant filters), the single-client UI pages, and the
 `ui-sql-10x` and `ui-sql-learned` families. Arguments go after `--`:
 
 - `--list-cases` prints every exact selector with its family and its
@@ -116,32 +119,47 @@ shown as zero.
 
 A sweep ends with one Markdown table, printed with its coverage, mode and
 the saved sweep path. Paste it verbatim and put interpretation in prose
-below it. It has one row per selected case in saved order:
+below it. It has one row per selected case in saved order. Bifrost reads
+add a Tier column after Case, and Verification shows its two latencies in
+their own columns:
 
 | Column | Content |
 |---|---|
 | Case | The exact selector |
+| Tier | Bifrost reads only: `memtable`, `staged` or `published`, the storage tier the case queries |
 | Status | `VALID`, `VALID (diagnostic)` when profiled, `INVALID: <reason>`, or `NOT RUN: <reason>` |
 | Throughput | Verifications/s, requests/s, acknowledged rows/s, queries/s, or UI pages/s |
-| Server CPU per unit | Server CPU microseconds per verification, request, row, query or page |
-| Headline latency | Verification server overhead p99; Gateway added overhead p99; Bifrost durable ACK p99, server query p99 (p95 for `full-scan-c1`), or UI client page p99; as its bucket interval with the pooled sample count |
-| Input | Bifrost only: OTLP input MiB/s and input MiB per server CPU-second; `unavailable` for native writes, whose input bytes are not measured; `n/a` for reads |
+| Server CPU per unit | Server process CPU milliseconds (user and system, background work included) per verification, request, query or page, or per 1,000 rows for writes, with three decimals |
+| Server overhead p99, Client round trip p99 | Verification only, in place of Headline latency: each as its bucket interval with the pooled sample count |
+| Headline latency | Gateway added overhead p99; Bifrost writes durable ACK p99; Bifrost reads server query p99 (p95 for `full-scan-c1`) or UI client page p99; labelled, as its bucket interval with the pooled sample count |
+| Input | Bifrost writes only: OTLP input MiB/s and input MiB per server CPU-second; `unavailable` for native writes, whose input bytes are not measured |
 | Target | `none`: previous performance targets do not apply to L1 cases |
 | Record | The case record's file beside the sweep record, or `unavailable` |
 
 INVALID and NOT RUN rows carry their reasons and no performance cells.
-Bifrost sweeps add each write path's peak rows/s and each lookup's
-64-client scaling derived from the selected cases; a derived reading whose
-input was not selected or is not VALID says which, and never starts a case.
+Bifrost writes sweeps add each write path's peak rows/s, and reads sweeps
+each lookup's 64-client scaling, `Q64 / (64 × Q1)`, derived from the
+selected cases. A
+derived reading is printed only when the sweep selected both of its cases;
+one whose input is not VALID says which, and none ever starts a case.
+
+Every table ends with `Definitions:`, the category's columns and headline
+latencies with where each interval starts and stops (for example, a Bifrost
+read's server query time runs from the request's arrival at the server's
+outermost HTTP middleware until its final result frame is handed to the
+response body, so network and client time are excluded). Keep it when
+pasting the table.
 
 `capacity report <sweep.json>` renders the same table again from the saved
 sweep and case records, without live services or temporary artifacts, and
 `capacity report <case-record.json>` renders one case's full report: its
 identity, verdict and reasons, phase timings against their allowances,
 windows, ownership and cleanup evidence, outstanding work, profile captures
-or notes, aggregate, and the engine report of its windows, with every
-window's server timing, scan, counter and gauge series from the snapshots
-the case record keeps. Keeping a case record is timed once it is written,
+or notes, aggregate, and the engine report of its windows. On the machine
+that ran it, the report also lists every window's server timing, scan,
+counter and gauge series from the local diagnostics beside the case record;
+without them (a history copy elsewhere, or `target/` removed) every
+measurement still renders and stays valid. Keeping a case record is timed once it is written,
 so that persistence time is saved in its sweep entry and the case report
 reads it from the sweep record beside it.
 
@@ -425,7 +443,7 @@ The Bifrost experiments' server inherits `WYRD_SCRIBE_SHARD_COUNT` from the
 command's environment (default 1 shard). A set value is named in the record's
 `limits` control, so L2 calibration reads only records run at the same shard
 count. For example,
-`WYRD_SCRIBE_SHARD_COUNT=4 mise run benchmark:l1:bifrost -- --cases native-write-c64`.
+`WYRD_SCRIBE_SHARD_COUNT=4 mise run benchmark:l1:bifrost-writes -- --cases native-write-c64`.
 
 ## Verdicts
 
@@ -469,7 +487,14 @@ target/benchmarks/l1/<category>/<sweep start>/NN-<family>-<case>.json
 ```
 
 A case record embeds the engine record of exactly that case with its
-lifecycle; the schema-3 comparison reader and the L2 calibration refuse it,
+lifecycle, and is compact: provenance, configuration, every window's
+readings, the aggregate, sample counts, bucket bounds, status and reasons.
+Neither record holds the window histograms the aggregate was pooled from or
+the raw timing snapshots. Those snapshots are local diagnostics, kept
+gzipped under the case's directory,
+`NN-<family>-<case>/timings/<step>/repetition-N.json.gz`, beside its
+server log and any profiles; they never enter history. The schema-3 comparison reader and the L2
+calibration refuse a case record,
 so new-protocol evidence never enters a reader that assumes the earlier
 protocol. Earlier schema-3 L1 records keep their original interpretation.
 
@@ -523,7 +548,9 @@ After the diagnostics, `capacity report` lists each measured repetition's
 server window: every timing series by boundary, outcome, case, and phase;
 every scan series; and every counter that moved, gauge, and histogram with an
 observation, read from the window's two snapshots the run keeps under
-`timings/<step>/repetition-N.json` in its raw evidence directory. Counts,
+`timings/<step>/repetition-N.json.gz` in its raw evidence directory
+(`.json` in runs before they were compressed). These are local diagnostics:
+without them the report omits only this listing. Counts,
 nearest-rank bucket bounds, and mean bounds are of that window alone.
 Oracle's `oracle_query_profile_*_total{event}` counters break a query's time
 into planning and operator stages, such as `Oracle.physical_planning`,
@@ -565,10 +592,18 @@ another checkout, move it there with `git worktree move`. The recorder writes
 history and `bench:results` and the Bifrost L2 calibration read it only
 there; neither reads any other location.
 
-To keep a run's record, commit it inside `benchmarks/history/` (on the
-`benchmark-records` branch) and push that branch. A clean, unprofiled routine
-L1 sweep is kept as `l1/<category>/<sweep>-<sha9>/` with its `sweep.json` and
-case records; `capacity report` renders it from there. Never commit records on a
+A clean, standard, routine L1 sweep (no `--cases`, `--profile` or
+`--pace`) whose every case is VALID and was measured from one clean commit
+is published at its end to `l1/<category>/<sweep>-<sha9>/`: its
+`sweep.json` and case records, never their artifact directories or
+diagnostics. Each file must fit the pre-commit 1 MiB limit; a file over it,
+or an existing destination, leaves history unchanged and the sweep exits 2
+with its records under `target/`. The sweep prints `history: <directory>`,
+or `history: not published: <reason>`. `capacity report` renders the
+published copy.
+
+To keep a run's records, commit them inside `benchmarks/history/` (on the
+`benchmark-records` branch) and push that branch. Never commit records on a
 code branch.
 
 `mise run bench:results` writes every record in history into one self-contained

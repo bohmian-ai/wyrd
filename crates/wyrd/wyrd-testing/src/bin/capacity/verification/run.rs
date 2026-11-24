@@ -3777,7 +3777,7 @@ mod tests {
             for label in ["repetition-1", "repetition-2"] {
                 let kept = options
                     .artifacts
-                    .join(format!("timings/{STEP}/{label}.json"));
+                    .join(format!("timings/{STEP}/{label}.json.gz"));
                 assert!(kept.is_file(), "{} kept", kept.display());
             }
 

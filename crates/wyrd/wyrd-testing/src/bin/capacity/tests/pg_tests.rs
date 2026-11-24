@@ -629,7 +629,7 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
             }
             let timings = run
                 .artifacts
-                .join(format!("timings/{}/repetition-1.json", step.id));
+                .join(format!("timings/{}/repetition-1.json.gz", step.id));
             if !timings.is_file() {
                 let kept: Vec<_> = std::fs::read_dir(run.artifacts.join("timings"))
                     .into_iter()
@@ -700,12 +700,13 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
 }
 
 /// The L1 sweep smoke (REQ-002, REQ-003, REQ-005, REQ-007; AC-002): the
-/// sweep path the category commands use runs a Bifrost write case and then
-/// a Bifrost read case, each as its own case process under its own fresh
-/// PostgreSQL project, server, storage root and client state, through
+/// sweep path the category commands use runs a memtable and a published
+/// Variant Bifrost read case, each as its own case process under its own
+/// fresh PostgreSQL project, server, storage root and client state, through
 /// setup, warmup, three short windows, drains, outstanding-work capture,
-/// teardown and persistence, and the saved sweep regenerates its table. A
-/// second sweep proves a failed case with confirmed cleanup lets the next
+/// teardown and persistence, and the saved sweep regenerates its table with
+/// each read's tier. A Bifrost write case runs to VALID in its own sweep. A
+/// writes sweep proves a failed case with confirmed cleanup lets the next
 /// case start, and a case whose resources cannot be confirmed as its own
 /// stops every later launch while keeping their rows. A Gateway smoke
 /// offered far more than it can serve counts every missed arrival as an
@@ -747,7 +748,7 @@ async fn l1_sweeps_isolate_and_record_cases() {
         sweep.program.clone_from(&program);
         sweep
     };
-    let sweep_of = |rest: &[&str]| sweep_in(Category::Bifrost, rest);
+    let sweep_of = |rest: &[&str]| sweep_in(Category::BifrostWrites, rest);
     let cases = |sweep: &Sweep| {
         sweep
             .cases
@@ -778,11 +779,14 @@ async fn l1_sweeps_isolate_and_record_cases() {
         !listed.is_empty()
     };
 
-    let isolated = sweep_of(&[
-        "--cases",
-        "native-write-c1,point-memtable-c1",
-        "--allow-dirty",
-    ]);
+    let isolated = sweep_in(
+        Category::BifrostReads,
+        &[
+            "--cases",
+            "point-memtable-c1,span-shredded-c1",
+            "--allow-dirty",
+        ],
+    );
     let interrupt = CancellationToken::new();
     let record = isolated
         .supervise(&interrupt, |case, n| {
@@ -880,8 +884,8 @@ async fn l1_sweeps_isolate_and_record_cases() {
     let path = isolated.directory.join(summary::SWEEP_FILE);
     let table = summary::report(&path).expect("reads").expect("a sweep");
     assert!(
-        table.contains("| native-write-c1 | VALID |")
-            && table.contains("| point-memtable-c1 | VALID |"),
+        table.contains("| point-memtable-c1 | memtable | VALID |")
+            && table.contains("| span-shredded-c1 | published | VALID |"),
         "{table}"
     );
     assert!(table.contains("Mode: smoke"));
@@ -892,6 +896,29 @@ async fn l1_sweeps_isolate_and_record_cases() {
         summary::report(&path).expect("reads").expect("a sweep"),
         table,
         "regenerated without artifacts"
+    );
+
+    let written = sweep_of(&["--cases", "native-write-c1", "--allow-dirty"]);
+    let record = written
+        .supervise(&interrupt, |case, n| {
+            let sweep = &written;
+            let interrupt = &interrupt;
+            async move { sweep.attempt(case, n, interrupt).await }
+        })
+        .await;
+    assert_eq!(
+        record.cases[0].status,
+        CaseStatus::Valid,
+        "{:?}",
+        cases(&written)
+    );
+    let table = summary::report(&written.directory.join(summary::SWEEP_FILE))
+        .expect("reads")
+        .expect("a sweep");
+    assert!(
+        table.starts_with("L1 bifrost-writes sweep\n")
+            && table.contains("| native-write-c1 | VALID |"),
+        "{table}"
     );
 
     let verified = sweep_in(
@@ -931,7 +958,11 @@ async fn l1_sweeps_isolate_and_record_cases() {
 
     let served = sweep_in(
         Category::Gateway,
-        &["--cases", "buffered-1kib-capture-metadata.c1", "--allow-dirty"],
+        &[
+            "--cases",
+            "buffered-1kib-capture-metadata.c1",
+            "--allow-dirty",
+        ],
     );
     let record = served
         .supervise(&interrupt, |case, n| {
@@ -941,7 +972,12 @@ async fn l1_sweeps_isolate_and_record_cases() {
         })
         .await;
     let case = cases(&served).remove(0).expect("a kept case record");
-    assert_eq!(record.cases[0].status, CaseStatus::Valid, "{:?}", case.reasons);
+    assert_eq!(
+        record.cases[0].status,
+        CaseStatus::Valid,
+        "{:?}",
+        case.reasons
+    );
     assert!(case.cleanup.confirmed, "{:?}", case.cleanup);
 
     let flooded = sweep_in(

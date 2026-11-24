@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <verification|gateway|bifrost> [--list-cases | --cases a,b] [--profile cpu|heap|both] [--allow-dirty]" >&2
+  echo "usage: $0 <verification|gateway|bifrost-writes|bifrost-reads> [--list-cases | --cases a,b] [--profile cpu|heap|both] [--allow-dirty]" >&2
   exit 64
 fi
 readonly category=$1
@@ -21,9 +21,9 @@ cd "$repo_root"
 for argument in "$@"; do
   if [[ $argument == --list-cases ]]; then
     case $category in
-      verification | gateway | bifrost) ;;
+      verification | gateway | bifrost-writes | bifrost-reads) ;;
       *)
-        echo "capacity l1: '$category' is not a category: verification, gateway or bifrost" >&2
+        echo "capacity l1: '$category' is not a category: verification, gateway, bifrost-writes or bifrost-reads" >&2
         exit 2
         ;;
     esac

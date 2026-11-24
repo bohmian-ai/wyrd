@@ -8,7 +8,7 @@ whoever runs it.
 ## Running
 
 - ALWAYS run L1 through its category task, `mise run
-  benchmark:l1:<verification|gateway|bifrost>`, narrowed only with its
+  benchmark:l1:<verification|gateway|bifrost-writes|bifrost-reads>`, narrowed only with its
   documented flags: `--list-cases`, `--cases <id>[,<id>...]`,
   `--profile [cpu|heap|both]`, `--allow-dirty`, and Gateway's `--pace`.
   Run L2 through `mise run bench:l2:<engine>` with its documented flags
@@ -117,8 +117,14 @@ whether an existing reading already answers the question.
 `benchmarks/history/` is the `benchmark-records` branch. A clean,
 unprofiled, full L2 run enters it. Every L1 sweep writes its sweep and case
 records under `target/benchmarks/l1/<category>/<sweep>/`; a clean, unprofiled
-routine sweep (no `--cases`) enters history as
-`l1/<category>/<sweep>-<sha9>/`, holding `sweep.json` and its case records
-without their artifact directories. L1 records never feed L2 calibration or
-`bench:results`. Every other run stays under `target/benchmarks/`. Never
-commit records on a code branch.
+routine sweep (no `--cases` or `--pace`) whose every case is VALID is
+published to history as `l1/<category>/<sweep>-<sha9>/`, holding
+`sweep.json` and its case records without their artifact directories;
+commit it on `benchmark-records` yourself. L1 records never feed L2
+calibration or `bench:results`. Every other run stays under
+`target/benchmarks/`. Never commit records on a code branch.
+
+History holds results: compact records that render every measurement on
+their own. Timing snapshots, server logs, profiles and other artifacts under
+`target/` are disposable local diagnostics: never copy them into history,
+and never treat their absence as invalidating a record.

@@ -1250,10 +1250,12 @@ pub struct Reading {
     pub rank: Option<u64>,
     /// Why the value is missing or inapplicable.
     pub reason: Option<String>,
-    /// The window histogram a percentile was read from, kept so a case's
-    /// windows pool into its aggregate percentile ([`Self::pooled`]);
-    /// `None` for any other reading.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The window histogram a percentile was read from, kept in memory so a
+    /// case's windows pool into its aggregate percentile
+    /// ([`Self::pooled`]) before the record is written; `None` for any
+    /// other reading. Never written: the aggregate already holds what it
+    /// gave, and older records that carry it still read.
+    #[serde(default, skip_serializing)]
     pub pool: Option<Pool>,
 }
 
@@ -1941,12 +1943,13 @@ impl Phase {
     }
 }
 
-/// Writes `evidence`, one repetition's server timing snapshots, to
-/// `timings/<step>/<phase>.json` under the run's `artifacts`.
+/// Writes `evidence`, one repetition's server timing snapshots, gzipped to
+/// `timings/<step>/<phase>.json.gz` under the run's `artifacts`: local
+/// diagnostics that never enter history.
 ///
 /// # Errors
 ///
-/// Returns the directory, encoding, or write failure.
+/// Returns the directory, encoding, compression, or write failure.
 fn keep_timings(
     artifacts: &Path,
     step: &str,
@@ -1955,10 +1958,10 @@ fn keep_timings(
 ) -> std::io::Result<()> {
     let directory = artifacts.join("timings").join(step);
     std::fs::create_dir_all(&directory)?;
-    std::fs::write(
-        directory.join(format!("{}.json", phase.label())),
-        serde_json::to_vec(evidence)?,
-    )
+    let file = std::fs::File::create(directory.join(format!("{}.json.gz", phase.label())))?;
+    let mut gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    serde_json::to_writer(&mut gzip, evidence)?;
+    gzip.finish()?.sync_all()
 }
 
 /// One engine's production work under the shared lifecycle.
@@ -3552,26 +3555,44 @@ impl Record {
     /// Returns the [`Self::read`] failure.
     pub fn read_with_timings(path: &Path) -> Result<Self, ExperimentError> {
         let mut record = Self::read_record(path)?;
-        let Some(directory) = record.artifacts.directory.clone() else {
-            return Ok(record);
+        record.load_timings();
+        Ok(record)
+    }
+
+    /// Puts each measured repetition's server snapshots back from the
+    /// local diagnostics the run kept under its artifacts directory
+    /// (`timings/<step>/repetition-N.json.gz`, or the uncompressed
+    /// `.json` older runs kept). Missing or unreadable diagnostics leave
+    /// the repetition's measurements as they are.
+    pub fn load_timings(&mut self) {
+        let Some(directory) = self.artifacts.directory.clone() else {
+            return;
         };
         let timings = Path::new(&directory).join("timings");
-        for step in &mut record.steps {
+        for step in &mut self.steps {
             for (index, repetition) in step.repetitions.iter_mut().enumerate() {
                 let Ok(index) = u8::try_from(index) else {
                     continue;
                 };
                 let kept = timings
                     .join(&step.id)
-                    .join(format!("{}.json", Phase::Repetition(index).label()));
-                if let Ok(bytes) = std::fs::read(kept)
-                    && let Ok(evidence) = serde_json::from_slice(&bytes)
-                {
+                    .join(Phase::Repetition(index).label());
+                let gzipped = std::fs::File::open(kept.with_extension("json.gz")).map(|file| {
+                    serde_json::from_reader(flate2::read::GzDecoder::new(std::io::BufReader::new(
+                        file,
+                    )))
+                });
+                let evidence = match gzipped {
+                    Ok(evidence) => evidence.ok(),
+                    Err(_) => std::fs::read(kept.with_extension("json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
+                };
+                if let Some(evidence) = evidence {
                     repetition.timings = evidence;
                 }
             }
         }
-        Ok(record)
     }
 
     /// Reads one record file.
@@ -6390,8 +6411,10 @@ Overloaded: do not compare languages here.
             &options(&artifacts),
         )
         .await;
-        let kept = std::fs::read(artifacts.join("timings/op-1/repetition-1.json")).expect("kept");
-        let kept: Vec<super::TimingEvidence> = serde_json::from_slice(&kept).expect("evidence");
+        let kept =
+            std::fs::File::open(artifacts.join("timings/op-1/repetition-1.json.gz")).expect("kept");
+        let kept: Vec<super::TimingEvidence> =
+            serde_json::from_reader(flate2::read::GzDecoder::new(kept)).expect("gzipped evidence");
         let [window] = kept.as_slice() else {
             panic!("one window: {kept:?}");
         };
@@ -6417,6 +6440,18 @@ Overloaded: do not compare languages here.
         assert_eq!(
             read.steps[0].repetitions[0].reconciliation,
             stored.reconciliation
+        );
+        let path = root.path().join("record.json");
+        std::fs::write(&path, serde_json::to_vec(&record).expect("record json")).expect("record");
+        assert!(
+            Record::read(&path).expect("reads").steps[0].repetitions[0]
+                .timings
+                .is_empty()
+        );
+        assert_eq!(
+            Record::read_with_timings(&path).expect("reads").steps[0].repetitions[0].timings,
+            kept,
+            "the gzipped diagnostics round-trip"
         );
 
         let blocked = root.path().join("blocked");
@@ -7278,6 +7313,15 @@ Overloaded: do not compare languages here.
             pooled.value.is_some_and(|value| value < 3.0),
             "pooled, not the mean of window p99s: {pooled:?}"
         );
+        let written = serde_json::to_value(windows[0].reading("p99_ms")).expect("json");
+        assert!(
+            written.get("pool").is_none(),
+            "the histogram is never written: {written}"
+        );
+        let mut older = written;
+        older["pool"] = serde_json::to_value(windows[0].reading("p99_ms").pool).expect("pool");
+        let read: Reading = serde_json::from_value(older).expect("an older reading still reads");
+        assert_eq!(read, windows[0].reading("p99_ms"), "with its histogram");
         let mut lost = windows.clone();
         lost[1].server_cpu_seconds = None;
         let aggregate = Repetition::aggregate(&metrics, &lost);
@@ -7836,7 +7880,11 @@ Overloaded: do not compare languages here.
         )
         .await;
         let reread = Record::parse(&serde_json::to_string(&case).expect("json")).expect("reads");
-        assert_eq!(reread, case);
+        assert_eq!(
+            serde_json::to_value(&reread).expect("json"),
+            serde_json::to_value(&case).expect("json"),
+            "everything written reads back; window histograms are never written"
+        );
         assert!(
             legacy
                 .compare(&case)

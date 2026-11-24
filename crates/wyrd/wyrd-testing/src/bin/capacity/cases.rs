@@ -18,15 +18,17 @@ use wyrd_testing::profile::ProfileMode;
 
 use crate::flags;
 
-/// The three L1 categories, each one `mise run benchmark:l1:<category>`.
+/// The four L1 categories, each one `mise run benchmark:l1:<category>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     /// Direct verification through the public SDKs.
     Verification,
     /// The AI gateway's added overhead.
     Gateway,
-    /// Bifrost ingest and reads.
-    Bifrost,
+    /// Bifrost ingest through durable acknowledgement.
+    BifrostWrites,
+    /// Bifrost queries over each storage tier.
+    BifrostReads,
 }
 
 /// One registered L1 case.
@@ -77,7 +79,12 @@ const SWITCHES: [&str; 2] = ["--list-cases", "--allow-dirty"];
 
 impl Category {
     /// Every category, in documentation order.
-    pub const ALL: [Self; 3] = [Self::Verification, Self::Gateway, Self::Bifrost];
+    pub const ALL: [Self; 4] = [
+        Self::Verification,
+        Self::Gateway,
+        Self::BifrostWrites,
+        Self::BifrostReads,
+    ];
 
     /// The category's command word, as in `benchmark:l1:<name>`.
     #[must_use]
@@ -85,7 +92,8 @@ impl Category {
         match self {
             Self::Verification => "verification",
             Self::Gateway => "gateway",
-            Self::Bifrost => "bifrost",
+            Self::BifrostWrites => "bifrost-writes",
+            Self::BifrostReads => "bifrost-reads",
         }
     }
 
@@ -103,7 +111,7 @@ impl Category {
         match self {
             Self::Verification => Engine::Verification,
             Self::Gateway => Engine::Gateway,
-            Self::Bifrost => Engine::Bifrost,
+            Self::BifrostWrites | Self::BifrostReads => Engine::Bifrost,
         }
     }
 
@@ -113,7 +121,7 @@ impl Category {
     pub const fn valued(self) -> &'static [&'static str] {
         match self {
             Self::Gateway => &["--pace"],
-            Self::Verification | Self::Bifrost => &[],
+            Self::Verification | Self::BifrostWrites | Self::BifrostReads => &[],
         }
     }
 
@@ -231,7 +239,7 @@ impl Case {
     #[must_use]
     pub fn plan_arguments(&self, flags: &[String]) -> Vec<String> {
         let mut arguments = vec!["capacity".to_owned()];
-        if self.category == Category::Bifrost {
+        if self.category.engine() == Engine::Bifrost {
             arguments.push(self.family.to_owned());
         }
         arguments.extend(["--steps".to_owned(), self.id.to_owned()]);
@@ -387,7 +395,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            selectors(&sweep(Category::Bifrost, &[])),
+            selectors(&sweep(Category::BifrostWrites, &[])),
             [
                 "otlp-spans-c1",
                 "otlp-spans-c64",
@@ -397,6 +405,11 @@ mod tests {
                 "otlp-logs-c64",
                 "native-write-c1",
                 "native-write-c64",
+            ]
+        );
+        assert_eq!(
+            selectors(&sweep(Category::BifrostReads, &[])),
+            [
                 "point-memtable-c1",
                 "point-memtable-c64",
                 "point-staged-c1",
@@ -404,6 +417,8 @@ mod tests {
                 "point-c64",
                 "full-scan-c1",
                 "span-trace-c64",
+                "span-shredded-c1",
+                "span-long-tail-c1",
                 "ui-sql/memtable-ui-c8",
                 "ui-sql/staged-ui-c8",
                 "ui-sql/published-ui-c8",
@@ -412,7 +427,7 @@ mod tests {
         let counts: Vec<(usize, usize)> = Category::ALL
             .map(|category| (category.routine().len(), category.cases().len()))
             .to_vec();
-        assert_eq!(counts, [(5, 14), (5, 8), (18, 43)]);
+        assert_eq!(counts, [(5, 14), (5, 8), (8, 8), (12, 35)]);
     }
 
     /// `--list-cases` names every exact selector once with its routine or
@@ -420,11 +435,16 @@ mod tests {
     #[test]
     fn listing_names_every_selector_and_status() {
         assert_eq!(
-            resolve(Category::Bifrost, &line(&["--list-cases"])),
+            resolve(Category::BifrostReads, &line(&["--list-cases"])),
             Ok(Request::List)
         );
-        let listed = Category::Bifrost.list();
-        assert!(listed.starts_with("bifrost L1 cases (18 routine, 25 targeted)\n"));
+        let listed = Category::BifrostReads.list();
+        assert!(listed.starts_with("bifrost-reads L1 cases (12 routine, 23 targeted)\n"));
+        assert!(listed.contains("span-shredded-c1\tparquet\troutine\n"));
+        assert!(
+            !listed.contains("otlp-spans-c1"),
+            "writes are their own category"
+        );
         assert!(listed.contains("ui-sql/memtable-ui-c8\tui-sql\troutine\n"));
         assert!(listed.contains("ui-sql-10x/memtable-ui-c8\tui-sql-10x\ttargeted\n"));
         assert!(listed.contains("ui-sql-learned/published-ui-c1\tui-sql-learned\ttargeted\n"));
@@ -451,7 +471,7 @@ mod tests {
         );
         assert!(
             resolve(
-                Category::Bifrost,
+                Category::BifrostReads,
                 &line(&["--list-cases", "--cases", "point-c1"])
             )
             .is_err()
@@ -463,7 +483,7 @@ mod tests {
     #[test]
     fn explicit_selection_keeps_request_order() {
         let selection = sweep(
-            Category::Bifrost,
+            Category::BifrostReads,
             &[
                 "--cases",
                 "ui-sql-10x/staged-ui-c1,point-c64,hot/point-staged-c1",
@@ -498,13 +518,23 @@ mod tests {
         let refused = |category: Category, rest: &[&str]| {
             resolve(category, &line(rest)).expect_err("refused")
         };
-        assert!(refused(Category::Bifrost, &["--cases", "memtable-ui-c8"]).contains("ambiguous"));
         assert!(
-            refused(Category::Bifrost, &["--cases", "memtable-ui-c8"])
+            refused(Category::BifrostReads, &["--cases", "memtable-ui-c8"]).contains("ambiguous")
+        );
+        assert!(
+            refused(Category::BifrostReads, &["--cases", "memtable-ui-c8"])
                 .contains("`ui-sql-learned/memtable-ui-c8`")
         );
         assert!(
             refused(Category::Gateway, &["--cases", "point-c1"]).contains("not a gateway case")
+        );
+        assert!(
+            refused(Category::BifrostReads, &["--cases", "otlp-logs-c1"])
+                .contains("not a bifrost-reads case")
+        );
+        assert!(
+            refused(Category::BifrostWrites, &["--cases", "point-c1"])
+                .contains("not a bifrost-writes case")
         );
         assert!(
             refused(
@@ -558,7 +588,7 @@ mod tests {
     #[test]
     fn a_case_plans_identically_in_every_selection() {
         let plans = |rest: &[&str]| {
-            sweep(Category::Bifrost, rest)
+            sweep(Category::BifrostWrites, rest)
                 .cases
                 .into_iter()
                 .map(|case| (case.selector(), case.plan_arguments(&[])))

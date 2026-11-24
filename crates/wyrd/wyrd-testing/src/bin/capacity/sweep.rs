@@ -23,8 +23,8 @@ use chrono::Utc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_testing::experiment::{
-    Allowances, Declaration, Level, Lifecycle, Mode, Options, Owned, Profiling, Record, StepKind,
-    Verdict, run,
+    Allowances, Declaration, HISTORY_DIRECTORY, Level, Lifecycle, Mode, Options, Owned, Profiling,
+    Record, StepKind, Verdict, run,
 };
 use wyrd_testing::profile::{ProfileMode, SAMPLY, SYMBOLS};
 use wyrd_testing::release_server::HostLoad;
@@ -42,6 +42,10 @@ const SWEEPS: &str = "target/benchmarks/l1";
 
 /// Where harness smoke sweeps keep their records.
 const SMOKE_SWEEPS: &str = "target/benchmarks/smoke/l1";
+
+/// The largest file history accepts: the pre-commit `check:file-size`
+/// limit, 1 MiB.
+const HISTORY_FILE_LIMIT: u64 = 1 << 20;
 
 /// The wrapper that owns each case's PostgreSQL.
 const POSTGRES: &str = "scripts/postgres/with-test-postgres.sh";
@@ -234,6 +238,120 @@ impl Sweep {
         Ok(path)
     }
 
+    /// The commit of a sweep that may enter history, or why it may not:
+    /// a standard routine sweep (no `--cases`, `--profile` or `--pace`)
+    /// whose every case is VALID and was measured from the same clean
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the sweep stays under `target/` only.
+    pub fn historical(&self, record: &SweepRecord) -> Result<String, String> {
+        if self.mode != SweepMode::Standard || self.explicit {
+            return Err(format!(
+                "a {} sweep{} is not routine",
+                self.mode.label(),
+                if self.explicit {
+                    " chosen by --cases"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if self.forwarded.iter().any(|flag| flag == "--pace") {
+            return Err("a --pace sweep is diagnostic".to_owned());
+        }
+        if record.exit_code() != 0 {
+            return Err("not every case is VALID".to_owned());
+        }
+        let mut commits = std::collections::BTreeSet::new();
+        for entry in &record.cases {
+            let name = entry
+                .record
+                .as_deref()
+                .ok_or_else(|| format!("{} kept no case record", entry.selector))?;
+            let bytes = std::fs::read(self.directory.join(name))
+                .map_err(|error| format!("{name}: {error}"))?;
+            let case: CaseRecord =
+                serde_json::from_slice(&bytes).map_err(|error| format!("{name}: {error}"))?;
+            let engine = case
+                .record
+                .ok_or_else(|| format!("{name} holds no engine record"))?;
+            if engine.dirty {
+                return Err(format!("{name} was measured from a dirty tree"));
+            }
+            commits.insert(engine.commit);
+        }
+        match commits.into_iter().collect::<Vec<_>>().as_slice() {
+            [commit] => Ok(commit.chars().take(9).collect()),
+            [] => Err("the sweep has no cases".to_owned()),
+            several => Err(format!(
+                "its cases were measured from several commits: {several:?}"
+            )),
+        }
+    }
+
+    /// Copies the sweep record and its case records, never their artifact
+    /// directories, to `l1/<category>/<stamp>-<sha9>/` under
+    /// [`HISTORY_DIRECTORY`], returning that directory. Every file is
+    /// checked against [`HISTORY_FILE_LIMIT`] before anything is copied.
+    /// The destination is claimed by creating it, which fails atomically
+    /// when it already exists, so an existing directory is never replaced;
+    /// the case records are copied first and `sweep.json` last, so a
+    /// directory without it is incomplete, and a failed copy removes the
+    /// claim. Committing it stays manual.
+    ///
+    /// # Errors
+    ///
+    /// Returns an oversized file, an existing destination, or the
+    /// directory or copy failure; history is then left unchanged.
+    pub fn publish(&self, record: &SweepRecord, short: &str) -> Result<PathBuf, String> {
+        let names: Vec<&str> = record
+            .cases
+            .iter()
+            .filter_map(|entry| entry.record.as_deref())
+            .chain(std::iter::once(SWEEP_FILE))
+            .collect();
+        for name in &names {
+            let path = self.directory.join(name);
+            let size = std::fs::metadata(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?
+                .len();
+            if size > HISTORY_FILE_LIMIT {
+                return Err(format!(
+                    "{name} is {size} bytes, over history's {HISTORY_FILE_LIMIT}-byte file limit"
+                ));
+            }
+        }
+        let parent = self
+            .root
+            .join(HISTORY_DIRECTORY)
+            .join("l1")
+            .join(self.category.name());
+        let destination = parent.join(format!("{}-{short}", self.stamp));
+        std::fs::create_dir_all(&parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+        std::fs::create_dir(&destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{} already exists", destination.display())
+            } else {
+                format!("{}: {error}", destination.display())
+            }
+        })?;
+        let copied = names.iter().try_for_each(|name| {
+            std::fs::copy(self.directory.join(name), destination.join(name))
+                .map(drop)
+                .map_err(|error| format!("{name}: {error}"))
+        });
+        if let Err(error) = copied {
+            // The directory is this sweep's own claim, so removing it on
+            // failure never touches another publisher's records.
+            let _ = std::fs::remove_dir_all(&destination);
+            return Err(error);
+        }
+        Ok(destination)
+    }
+
     /// Runs case `case`, the `n`th, as its own process under the PostgreSQL
     /// wrapper and returns its case record: started only when its Compose
     /// project does not yet exist, stopped when it has not begun teardown
@@ -384,7 +502,7 @@ impl Sweep {
             .or_else(|| announced(Instant::now()))
             .unwrap_or_else(Instant::now);
         let deadline = ends(began);
-        let mut record = match Record::read_with_timings(&record_path) {
+        let mut record = match Record::read(&record_path) {
             Ok(record) => Some(record),
             Err(error) => {
                 reasons.push(format!("the case process kept no engine record: {error}"));
@@ -431,7 +549,7 @@ impl Sweep {
         &self,
         case: Case,
         started_at: chrono::DateTime<Utc>,
-        mut record: Option<Record>,
+        record: Option<Record>,
         cleanup: Cleanup,
         mut reasons: Vec<String>,
     ) -> CaseRecord {
@@ -460,10 +578,7 @@ impl Sweep {
             mode: self.mode,
             profile: self.profile,
             started_at,
-            timings: record
-                .as_mut()
-                .map(CaseRecord::timings_of)
-                .unwrap_or_default(),
+            timings: std::collections::BTreeMap::new(),
             record,
             verdict: if unique.is_empty() {
                 Verdict::Valid
@@ -832,7 +947,29 @@ pub async fn command(category: Category, arguments: &[String], root: &Path) -> u
             async move { sweep.attempt(case, n, interrupt).await }
         })
         .await;
-    print_summary(&sweep, &record)
+    let code = print_summary(&sweep, &record);
+    match sweep.historical(&record) {
+        Err(reason) => {
+            println!("history: not published: {reason}");
+            code
+        }
+        Ok(short) => match sweep.publish(&record, &short) {
+            Ok(directory) => {
+                println!(
+                    "history: {} (commit it on benchmark-records)",
+                    directory.display()
+                );
+                code
+            }
+            Err(error) => {
+                eprintln!(
+                    "INVALID: the sweep could not enter history: {error}; its records stay under {}",
+                    sweep.directory.display()
+                );
+                2
+            }
+        },
+    }
 }
 
 /// Prints the sweep's summary table, rendered from the saved files as
@@ -910,7 +1047,7 @@ mod tests {
     async fn unconfirmed_cleanup_stops_later_launches() {
         let root = tempfile::tempdir().expect("root");
         let sweep = sweep(
-            Category::Bifrost,
+            Category::BifrostWrites,
             &[
                 "--cases",
                 "otlp-logs-c1,otlp-logs-c64,native-write-c1,native-write-c64",
@@ -979,7 +1116,7 @@ mod tests {
             .build()
             .expect("runtime");
         let case = runtime.block_on(crate::tests::case_record(
-            Category::Bifrost,
+            Category::BifrostWrites,
             "native-write-c1",
             None,
             crate::tests::case_script("rows", 30_000.0, 0.0, 300_000),
@@ -1029,7 +1166,7 @@ mod tests {
         );
         let docker_path = root.join("docker");
         script(&docker_path, &format!("{helpers}{docker}"));
-        let mut sweep = sweep(Category::Bifrost, &["--cases", cases], root);
+        let mut sweep = sweep(Category::BifrostWrites, &["--cases", cases], root);
         sweep.docker = docker_path;
         sweep
     }
@@ -1395,6 +1532,14 @@ mod tests {
         let table = summary::report(&sweep_file)
             .expect("reads")
             .expect("a sweep");
+        let case_file = sweep
+            .directory
+            .join("01-writes-parquet-native-write-c1.json");
+        let local = summary::report(&case_file).expect("reads").expect("a case");
+        assert!(
+            local.contains("    - timing bifrost.ingest success case"),
+            "the local report loads the diagnostics beside it: {local}"
+        );
         std::fs::remove_dir_all(&artifacts).expect("artifacts removed");
         assert_eq!(
             summary::report(&sweep_file)
@@ -1403,9 +1548,26 @@ mod tests {
             table,
             "the same sweep table"
         );
-        let case_file = sweep
-            .directory
-            .join("01-writes-parquet-native-write-c1.json");
+        let full = summary::report(&case_file).expect("reads").expect("a case");
+        assert!(
+            full.contains(&format!("| persist and report | {persisted:.1} | 20 |")),
+            "{full}"
+        );
+        assert!(
+            !full.contains("timing bifrost.ingest"),
+            "no diagnostics left: {full}"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&case_file).expect("case file")).expect("json");
+        assert!(
+            saved.get("timings").is_none(),
+            "the case record carries no snapshots"
+        );
+
+        // An older case record embedding its snapshots still renders them.
+        let mut older = saved;
+        older["timings"] = serde_json::json!({ step.clone(): [evidence.clone()] });
+        std::fs::write(&case_file, serde_json::to_vec(&older).expect("json")).expect("older");
         let full = summary::report(&case_file).expect("reads").expect("a case");
         for line in [
             "  - repetition 1 server measured window (nearest-rank bucket bounds):",
@@ -1416,14 +1578,147 @@ mod tests {
         ] {
             assert!(full.contains(line), "{line} in {full}");
         }
-        assert!(
-            full.contains(&format!("| persist and report | {persisted:.1} | 20 |")),
-            "{full}"
-        );
         let read = summary::read_case(&case_file).expect("case record");
         assert_eq!(
             read.record.as_ref().expect("record").steps[0].repetitions[0].timings,
             evidence
+        );
+    }
+
+    /// A clean, standard, routine, all-VALID sweep publishes its sweep and
+    /// case records, without artifact directories or diagnostics, under
+    /// `benchmarks/history/l1/<category>/<stamp>-<sha9>/`, once; a sweep
+    /// chosen by `--cases`, profiled, paced, with an INVALID case or
+    /// measured dirty never does; and a file over the 1 MiB limit leaves
+    /// history unchanged.
+    #[test]
+    fn eligible_sweeps_publish_compact_records_to_history() {
+        let root = tempfile::tempdir().expect("root");
+        let mut record = engine_record(130.0, 10.0);
+        record.dirty = false;
+        record.commit = "0123456789abcdef".to_owned();
+        let fixture = root.path().join("fixture.json");
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let mut sweep = faked(
+            root.path(),
+            "native-write-c1",
+            &format!("cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (swept, _) = runtime.block_on(attempted_sweep(&sweep));
+        assert_eq!(
+            swept.cases[0].status,
+            CaseStatus::Valid,
+            "{:?}",
+            swept.cases[0].reasons
+        );
+        assert!(
+            sweep.historical(&swept).is_err(),
+            "a smoke sweep chosen by --cases stays local"
+        );
+
+        sweep.mode = summary::SweepMode::Standard;
+        assert!(
+            sweep
+                .historical(&swept)
+                .expect_err("explicit")
+                .contains("--cases")
+        );
+        sweep.explicit = false;
+        let short = sweep.historical(&swept).expect("eligible");
+        assert_eq!(short, "012345678");
+        let mut profiled = sweep.clone();
+        profiled.mode = summary::SweepMode::Diagnostic;
+        assert!(profiled.historical(&swept).is_err(), "profiled");
+        let mut paced = sweep.clone();
+        paced.forwarded.push("--pace".to_owned());
+        assert!(paced.historical(&swept).is_err(), "paced");
+        let mut invalid = swept.clone();
+        invalid.cases[0].status = CaseStatus::Invalid;
+        assert!(sweep.historical(&invalid).is_err(), "INVALID");
+
+        let case_file = sweep
+            .directory
+            .join("01-writes-parquet-native-write-c1.json");
+        let saved = std::fs::read(&case_file).expect("case file");
+        let mut dirty: serde_json::Value = serde_json::from_slice(&saved).expect("json");
+        dirty["record"]["dirty"] = serde_json::Value::Bool(true);
+        std::fs::write(&case_file, serde_json::to_vec(&dirty).expect("json")).expect("dirty");
+        assert!(
+            sweep
+                .historical(&swept)
+                .expect_err("dirty")
+                .contains("dirty")
+        );
+        std::fs::write(&case_file, &saved).expect("clean again");
+
+        let history = root.path().join("benchmarks/history/l1/bifrost-writes");
+        std::fs::File::create(&case_file)
+            .and_then(|file| file.set_len(super::HISTORY_FILE_LIMIT + 1))
+            .expect("oversized");
+        assert!(
+            sweep
+                .publish(&swept, &short)
+                .expect_err("oversized")
+                .contains("file limit")
+        );
+        assert!(!history.exists(), "nothing published");
+        std::fs::write(&case_file, &saved).expect("restored");
+
+        let claimed = history.join(format!("{}-012345678", sweep.stamp));
+        std::fs::create_dir_all(&claimed).expect("another publisher's empty directory");
+        assert!(
+            sweep
+                .publish(&swept, &short)
+                .expect_err("claimed")
+                .contains("already exists")
+        );
+        assert_eq!(
+            std::fs::read_dir(&claimed).expect("kept").count(),
+            0,
+            "never replaced"
+        );
+        std::fs::remove_dir(&claimed).expect("released");
+        let published = sweep.publish(&swept, &short).expect("published");
+        assert_eq!(
+            published,
+            history.join(format!("{}-012345678", sweep.stamp))
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&published)
+            .expect("published directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "01-writes-parquet-native-write-c1.json",
+                summary::SWEEP_FILE
+            ]
+        );
+        assert_eq!(
+            summary::report(&published.join(summary::SWEEP_FILE))
+                .expect("reads")
+                .expect("a sweep")
+                .replace(&published.display().to_string(), ""),
+            summary::report(&sweep.directory.join(summary::SWEEP_FILE))
+                .expect("reads")
+                .expect("a sweep")
+                .replace(&sweep.directory.display().to_string(), ""),
+            "history renders the same table"
+        );
+        assert!(
+            sweep
+                .publish(&swept, &short)
+                .expect_err("once")
+                .contains("already exists")
         );
     }
 

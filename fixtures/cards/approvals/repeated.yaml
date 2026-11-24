@@ -1,0 +1,27 @@
+# A review asked again after a rejection, beside an independent release
+# sign-off, while CI evidence is still to come.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: release-signoff
+  version: 1.0.0
+spec:
+  description: A reviewer approves, asked again after a rejection, and a release owner signs off once CI is green.
+  inputs:
+    ci: {type: json, deferred: true}
+  steps:
+    - id: review
+      repeat:
+        max_iterations: 2
+        until: {path: iteration.output.status, operator: equals, expected: approved}
+      action: {kind: approval, message: Reviewed?}
+      requirements:
+        - id: reviewed
+          statement: A reviewer approved the change
+          check: {kind: assert, path: steps.review.output.status, operator: equals, expected: approved}
+    - id: release
+      action: {kind: approval, message: Release?}
+  requirements:
+    - id: green
+      statement: CI is green
+      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}

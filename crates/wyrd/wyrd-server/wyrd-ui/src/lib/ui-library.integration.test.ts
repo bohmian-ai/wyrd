@@ -62,6 +62,7 @@ import { AGENT, PROMPT, agent as agentCard, card, inventory, notFound, observeAn
 import { declarePolicy, exportOtlp, nanos, seedPopulated, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
+import { POST as decideApproval } from '../routes/t/[tenantKey]/verify/executions/[executionId]/approvals/[approvalId]/+server';
 import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
 import { AGREES, assistantTest, judgeReply, toolCall, toolTurn } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { configureGateway } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/local-development';
@@ -2479,6 +2480,154 @@ deferred('TASK-005: a requirement judged while its execution waits stays readabl
   expect(view.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'waiting');
   expect(view.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
   view.unmount();
+});
+
+deferred('TASK-006: each reached approval occurrence is read without the Verifier and decided only with approve on that Verifier and read on its Repository', async ({ server }) => {
+  // Setup: `release-signoff` runs on pull request 7 of `acme/web`. Its `review` approval repeats until approved, `release` waits beside it, and its `ci` input is still to come.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  const principals = await Principals.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/approvals/repeated-repository.yaml'));
+  github.setPullRequest(2, 7, 'b2'.repeat(20), REVIEW_HEAD);
+  const accepted = await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '2', number: 7 }, 'task-006-decide');
+  const [executionId] = accepted.executions;
+  const execution = await verify.Execution.connect(executionId, { client: admin });
+  const occurrence = async (step: string, iteration: number | null = null) => (await execution.status()).approvals?.find((each) => each.step_id === step && (each.iteration ?? null) === iteration);
+  await vi.waitFor(async () => expect([await occurrence('review', 0), await occurrence('release')].map((each) => each?.status)).toEqual(['pending', 'pending']), { timeout: 30_000, interval: 200 });
+  const firstReview = (await occurrence('review', 0))!;
+  const release = (await occurrence('release'))!;
+  const parked = await execution.status();
+  expect([parked.status, parked.waiting, parked.result]).toEqual(['waiting', ['ci'], undefined]);
+
+  // Five readers: the Repository's viewer, an approver of the exact Verifier who cannot read the Repository, an approver of another Verifier who can, a custom approve role beside the Repository viewer, and another tenant's admin.
+  await principals.putRole('verifier_approver', { operations: [{ resource: 'verifier', action: 'approve' }] });
+  const repository = { card: { family: { kind: 'Repository', name: 'web' } } } as const;
+  const verifierScope = (name: string) => ({ card: { family: { kind: 'Verifier', name } } }) as const;
+  const principal = async (name: string, assignments: object[]) => (await principals.createServicePrincipal({ name, assignments } as never)).credential;
+  const keys = {
+    parentReader: await principal('decide-parent-reader', [{ role: 'viewer', scope: repository }]),
+    approverOnly: await principal('decide-approver-only', [{ role: 'approver', scope: verifierScope('release-signoff') }]),
+    wrongVerifier: await principal('decide-wrong-verifier', [{ role: 'approver', scope: verifierScope('staged-signoff') }, { role: 'viewer', scope: repository }]),
+    both: await principal('decide-both', [{ role: 'verifier_approver', scope: verifierScope('release-signoff') }, { role: 'viewer', scope: repository }])
+  };
+  const foreign = server.bootstrapServiceInTenant(server.seedTenant('ui-decide-foreign'), ['admin'], 'ui-decide-admin');
+
+  // Shared readers: the Repository viewer reads every occurrence through Node and MCP while the Verifier definition is refused.
+  const readerClient = WyrdClient.connect({ credential: keys.parentReader });
+  const mcp = await mcpOver(server.baseUrl, readerClient);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(readerClient)], ['mcp', mcp.executor]] as const) {
+      const opened = data(await loadExecution({ executionId, node: 'step:review' }, { executor }), surface);
+      expect([opened.status.status, opened.status.result, opened.definition.state === 'populated'], surface).toEqual(['waiting', undefined, false]);
+      expect(opened.status.approvals?.map((each) => [each.step_id, each.iteration ?? null, each.message, each.status]), surface).toEqual([
+        ['review', 0, 'Reviewed?', 'pending'],
+        ['release', null, 'Release?', 'pending']
+      ]);
+    }
+  } finally {
+    await mcp.close();
+  }
+  const readerView = render(VerificationExecution, await loadExecution({ executionId, node: 'step:review' }, { executor: nodeExecutor(readerClient) }));
+  const recorded = within(readerView.container).getByRole('group', { name: 'Recorded without the definition' });
+  expect(within(recorded).getByRole('button', { name: /Step release/ })).toHaveTextContent('waiting');
+  expect(readerView.container.querySelector(`[data-approval="${firstReview.approval_id}"]`)).toHaveTextContent(`${executionId} · step review · iteration 0`);
+  readerView.unmount();
+
+  // Browser sessions of each reader, through the host route.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const session = async (tenant: string, key: string) => {
+    const url = new URL(`http://ui.test/t/${tenant}/verify`);
+    const cookies = jar();
+    await browserSessions.signInWithApiKey(tenant, key, url, cookies);
+    return browserSessions.read(tenant, url, cookies);
+  };
+  const decide = async (browserSession: unknown, approvalId: string, body: unknown, tenantKey = 'test-tenant-1') => {
+    const response = await decideApproval({
+      locals: { browserSession },
+      params: { tenantKey, executionId, approvalId },
+      request: new Request('http://ui.test/decide', { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } })
+    } as never);
+    return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+  };
+  const sessions = {
+    parentReader: await session('test-tenant-1', keys.parentReader),
+    approverOnly: await session('test-tenant-1', keys.approverOnly),
+    wrongVerifier: await session('test-tenant-1', keys.wrongVerifier),
+    both: await session('test-tenant-1', keys.both),
+    foreign: await session('ui-decide-foreign', foreign)
+  };
+
+  // Read alone, approve alone, approve on another Verifier and another tenant are each refused, and nothing is decided.
+  expect(await decide(sessions.parentReader, firstReview.approval_id, { decision: 'approved' })).toMatchObject({ status: 403, body: { code: DENIED } });
+  expect(await decide(sessions.approverOnly, firstReview.approval_id, { decision: 'approved' })).toMatchObject({ status: 403, body: { code: DENIED } });
+  expect(await decide(sessions.wrongVerifier, firstReview.approval_id, { decision: 'approved' })).toMatchObject({ status: 403, body: { code: DENIED } });
+  expect(await decide(sessions.foreign, firstReview.approval_id, { decision: 'approved' }, 'ui-decide-foreign')).toMatchObject({ status: 404, body: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+  // A body that is not a decision is refused by the host before anything is sent.
+  expect(await decide(sessions.both, firstReview.approval_id, { decision: 'expired' })).toMatchObject({ status: 400, body: { code: 'WYRD_SPEC_400_VALIDATION' } });
+  expect((await occurrence('review', 0))?.status).toBe('pending');
+
+  // Both grants: rejecting with no reason returns the durable receipt; the same decision again replays it, and another decision is refused.
+  const rejected = await decide(sessions.both, firstReview.approval_id, { decision: 'rejected' });
+  expect(rejected).toMatchObject({ status: 200, body: { approval_id: firstReview.approval_id, status: 'rejected', reason: null } });
+  expect(rejected.body.actor_id).toBeTruthy();
+  expect(await decide(sessions.both, firstReview.approval_id, { decision: 'rejected' })).toEqual(rejected);
+  expect(await decide(sessions.both, firstReview.approval_id, { decision: 'approved' })).toMatchObject({ status: 409 });
+
+  // The rejection continues the same execution: the review is asked again as a new occurrence of iteration 1.
+  await vi.waitFor(async () => expect((await occurrence('review', 1))?.status).toBe('pending'), { timeout: 30_000, interval: 200 });
+  const secondReview = (await occurrence('review', 1))!;
+  expect(secondReview.approval_id).not.toBe(firstReview.approval_id);
+
+  // A lost answer: the approval is committed and its answer dropped. Reading that occurrence shows it decided; an explicit retry of the same decision and reason replays one receipt.
+  await decide(sessions.both, secondReview.approval_id, { decision: 'approved', reason: 'reviewed the diff' });
+  const readBack = data(await loadExecution({ executionId, node: 'step:review' }, { executor: nodeExecutor(readerClient) }), 'reader after decision');
+  const decided = readBack.status.approvals?.find((each) => each.approval_id === secondReview.approval_id);
+  expect(decided).toMatchObject({ status: 'approved', reason: 'reviewed the diff' });
+  expect(await decide(sessions.both, secondReview.approval_id, { decision: 'approved', reason: 'reviewed the diff' })).toMatchObject({
+    status: 200,
+    body: { approval_id: secondReview.approval_id, status: 'approved', actor_id: decided?.actor_id, decided_at: decided?.decided_at, reason: 'reviewed the diff' }
+  });
+
+  // The same execution continues from that decision: its `reviewed` requirement is judged while `release` and the input still wait.
+  await vi.waitFor(
+    async () => {
+      const { invocations } = data(await loadExecution({ executionId, node: 'req:reviewed' }, { executor: nodeExecutor(admin) }), 'admin');
+      expect(invocations?.state === 'populated' && invocations.data.items.some((item) => item.state === 'requirement' && item.producer.step_id === 'reviewed' && item.outcome === 'passed')).toBe(true);
+    },
+    { timeout: 30_000, interval: 200 }
+  );
+  const continued = await execution.status();
+  expect([continued.execution_id, continued.status, continued.waiting, continued.approvals?.map((each) => [each.step_id, each.iteration ?? null, each.status])]).toEqual([
+    executionId,
+    'waiting',
+    ['ci'],
+    [
+      ['review', 0, 'rejected'],
+      ['release', null, 'pending'],
+      ['review', 1, 'approved']
+    ]
+  ]);
+
+  // Removing the Repository grant after the page loaded refuses the next decision in the same session.
+  const bothId = (await principals.list({ kind: 'service' })).principals.find((each) => each.name === 'decide-both')!.principal_id;
+  const viewerBinding = (await principals.bindings({ principal_id: bothId })).bindings.find((binding) => binding.role === 'viewer')!;
+  await principals.unbind(viewerBinding.id);
+  await vi.waitFor(async () => expect((await decide(sessions.both, release.approval_id, { decision: 'approved' })).status).toBe(403), { timeout: 30_000, interval: 500 });
+  expect((await occurrence('release'))?.status).toBe('pending');
+
+  // Cancelling the parked execution ends it; the undecided occurrence is recorded expired and can no longer be decided, while the recorded progress stays readable.
+  const owner = await session('test-tenant-1', server.apiKey);
+  const cancel = await cancelExecution({ locals: { browserSession: owner }, params: { tenantKey: 'test-tenant-1', executionId } } as never);
+  expect(await cancel.json()).toEqual({ execution_id: executionId, status: 'cancelled' });
+  expect((await occurrence('release'))?.status).toBe('expired');
+  expect(await decide(owner, release.approval_id, { decision: 'approved' })).toMatchObject({ status: 409 });
+  const ended = await loadExecution({ executionId, node: 'step:release' }, { executor: nodeExecutor(admin) });
+  expect(data(ended, 'after cancel').invocations?.state).toBe('populated');
+  const endedView = render(VerificationExecution, { ...ended, onaction: () => {} });
+  expect(endedView.container.querySelector(`[data-approval="${release.approval_id}"] [data-approval-status]`)).toHaveTextContent('expired');
+  expect(within(endedView.container).queryByRole('button', { name: 'Approve' })).toBeNull();
+  endedView.unmount();
 });
 
 test('a reader of the subject but not the Verifier previews and downloads a recorded step output', async ({ server }) => {

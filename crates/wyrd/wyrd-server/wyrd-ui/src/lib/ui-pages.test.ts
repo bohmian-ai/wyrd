@@ -727,6 +727,15 @@ test('an exact execution page keeps its selection in the URL and cancels once th
 });
 
 
+/** A copy of loaded execution page data in which the server has recorded `decision` for occurrence `approvalId`. */
+function withRecordedDecision<T>(data: T, approvalId: string, decision: { status: 'approved' | 'rejected'; actor_id: string; decided_at: string }): T {
+  const copy = structuredClone(data) as { execution: { result: { data: { status: { approvals: { approval_id: string }[] } } } } };
+  const occurrence = copy.execution.result.data.status.approvals.find((each) => each.approval_id === approvalId);
+  if (!occurrence) throw new Error(`no occurrence ${approvalId} in the loaded page`);
+  Object.assign(occurrence, decision);
+  return copy as T;
+}
+
 test('TASK-006: an execution page decides one exact approval occurrence once and reads it back', async () => {
   // Setup: the page shows `exec_approval` on its `release` step, whose occurrence `apo_release_0` is pending.
   host.executor = fixtureExecutor;
@@ -778,9 +787,7 @@ test('TASK-006: an execution page decides one exact approval occurrence once and
   expect(approve()).toBeEnabled();
   expect(fetched).toHaveBeenCalledTimes(5);
   // The retry is the same decision and reason, sent only when asked; this time the server recorded it before its answer was lost.
-  const decided = structuredClone(loaded);
-  const status = ((decided as unknown as { execution: unknown }).execution as { result: { data: { status: { approvals: { approval_id: string; status: string; actor_id: string | null; decided_at: string | null }[] } } } }).result.data.status;
-  Object.assign(status.approvals.find((each) => each.approval_id === 'apo_release_0')!, { status: 'approved', actor_id: 'pr_me', decided_at: '2026-10-20T11:52:00Z' });
+  const decided = withRecordedDecision(loaded, 'apo_release_0', { status: 'approved', actor_id: 'pr_me', decided_at: '2026-10-20T11:52:00Z' });
   vi.mocked(invalidateAll).mockImplementationOnce(async () => void (await page.rerender({ data: decided } as never)));
   await fireEvent.click(approve());
   expect(fetched.mock.calls[5]).toEqual([`${here}/approvals/apo_release_0`, sent]);

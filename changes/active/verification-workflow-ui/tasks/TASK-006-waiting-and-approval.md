@@ -315,3 +315,13 @@ vitest run <file> -t "TASK-006"`: [I1] and the cancel journeys 2 passed; [B1]
 Planning runs no implementation or runtime verification. Backend approval/
 recovery is consumed, not reimplemented; integrated change review owns complete
 shipped-surface journey qualification.
+
+## Revision 9 continuation — 2026-11-24
+
+The maintainer approved server-owned task-local input-wait reporting in spec
+revision 9. TASK-006A (`tasks/TASK-006A-task-local-input-waits.md` in this packet)
+implements REQ-022/AC-015 and supplies the remaining simultaneous-state proof.
+Earlier backend/architecture exclusions are superseded only for that work;
+completed approval/idempotency and Origin evidence remains intact. The explicit
+no-TDD exception applies only to TASK-006A. Prior recorded evidence and this
+task's original revision metadata remain historical, not proof of 006A delivery.

@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -24,7 +24,8 @@ The [finalized design](design/notes.md), [composition](design/consolidation.md)
 and [centralized mock](design/mock/README.md) record the agreement. The
 [tasks 005–007 resumption design](design/resume-005-007.md) records revision 8's
 authorization alignment, presentation decisions and retained-read correction.
-The mock is
+The [task-local wait design](design/input-wait-reporting.md) records revision 9's
+server-owned reporting and recovery contract. The mock is
 the approved visual target; its sample IDs, hash routes and simulated responses
 are illustrative, not production contracts. The preserved original
 [canvases](references/original-canvas/README.md) explain the retained foundation.
@@ -40,7 +41,9 @@ apart from REQ-015's status recording and revision 5's bounded verdict/citation
 correction under REQ-016/017, and revision 6's public EXPLAIN support under
 REQ-018, and revision 7's PR rerequest and retained-membership prerequisite under
 REQ-019/020, and revision 8's existing retained-status read correction under
-REQ-021. TASK-004A owns the verdict/citation correction and its development
+REQ-021, and revision 9's task-local input-wait reporting under REQ-022.
+TASK-006A owns that reporting across the existing engine, state, clients and UI.
+TASK-004A owns the verdict/citation correction and its development
 journey; TASK-004B owns explanation and UI query consolidation; TASK-005A owns
 the bounded admission extension before TASK-005. TASK-007 owns REQ-021's
 backend read correction before consuming that response in the UI. All other
@@ -434,6 +437,45 @@ family, query service, permission model or execution hot-path change is authoriz
 TASK-007 proves this backend output before its UI consumes it; TASK-005/006 do
 not depend on this correction.
 
+### Task-local input-wait reporting
+
+**REQ-022 — Report each deferred-input consumer while peers run.** The existing
+execution-status response exposes optional `input_waits`, omitted when empty
+and decoded as empty when absent. Each entry is `{task_id, slots}`: the declared
+step or whole-Verifier requirement ID and its nonempty set of missing deferred
+slot names. Entries are unique and ordered by task ID; slot names are ordered
+and unique. Attached requirements contribute to their owning step. Report direct
+pending consumers even when their dependencies are also unfinished; do not mark
+indirect dependents or unused inputs as input consumers. Gating precedes fanout
+and dispatch, so no invocation, attempt, item or iteration is invented.
+
+Publish the engine's current wait snapshot through its existing checkpoint and
+asynchronous retained-state writer before waiting for independent work to settle.
+While peers run, the run stays `running`; `input_waits` does not determine run
+status. Existing `waiting` status and slot summary still mean the run is parked.
+Approval occurrences remain independent and no wait supplies a verdict. The UI
+uses reported task IDs/slots, including without definition access, rather than
+inferring task waits from the definition. Definitions supply labels and layout;
+unknown task kinds use `Task <id>` in the recorded-work fallback.
+
+Retain the snapshot through existing fenced state revisions. Identical snapshots
+produce no revision. Once the runner consumes accepted evidence, remove its slot
+from all entries and drop empty entries; publishing successfully alone does not
+change a running drive's evidence snapshot. Recompute on resumption under the
+same execution identity and original deadline. Terminal selection/failure clears
+active waits; terminal inspection exposes none, including cancellation,
+supersession, deadline and access-loss paths. Keep existing stale-writer refusal,
+parent authorization, tenant isolation and explicit retained-read failures.
+
+Add the same projection to existing Rust/Python/TypeScript, HTTP, MCP and CLI
+status surfaces. Store it in execution-state format 6; formats 3–5 remain readable
+with an empty list and resumed scheduling populates it. Do not reconstruct
+historical waits. Use a coordinated upgrade: stop old workers before format-6
+writers start; old binaries cannot consume format 6. No mixed-version rolling
+compatibility, writer switch, SQL migration, endpoint, new persistence owner,
+scheduling model, extra synchronous IO or PostgreSQL operation is authorized.
+This is reporting over the existing deferred-input scheduler and Scribe path.
+
 No visual workflow editor, new verification kind, finding schema, separate PR
 dashboard, general Cards redesign, activation/pause/rollback editor or broader
 Changes/collaboration product is included. No new server API, response field, query service, authorization behavior,
@@ -447,7 +489,10 @@ REQ-019/020 are the additional bounded exception for one explicit PR-wide write
 operation, its normal client projections and complete retained admission records;
 they authorize no other server extension or migration. REQ-021 is the bounded
 exception for correcting the existing retained-status projection; it adds no
-public operation, response field, durable behavior or migration. Internal layout algorithms, cursor encoding,
+public operation, response field, durable behavior or migration. REQ-022 is the
+bounded exception for task-local reporting, retained format 6 and its client/UI
+projections; it preserves scheduling behavior and adds no endpoint or migration.
+Internal layout algorithms, cursor encoding,
 refresh scheduling and component decomposition remain implementation-owned.
 
 ## Dependencies, authority and scope transfer
@@ -480,8 +525,8 @@ and historical proof separately. Contract approval is not delivery evidence.
 Positive approval receipts retain durable decision acceptance; direct/live
 results do not certify retained visibility. This packet neither implements those
 semantics nor changes their storage, credential or permission owners, apart from
-REQ-019/020's explicit admission extension and REQ-021's read correction under
-those same existing owners.
+REQ-019/020's explicit admission extension, REQ-021's read correction and
+REQ-022's task-local reporting/state-format extension under those same owners.
 
 Approval of revision 2 enacts the following bounded transfer. The original
 packet records it beside the affected requirements and tasks:
@@ -498,10 +543,11 @@ enumerated above and was synchronized into the original packet on approval
 here, and its retained Changes obligations are unchanged. Do not execute conflicting original tasks
 or mark the entire original Changes task superseded. Discovery/review-set UI queries and adapters belong to this packet over existing
 read surfaces. Apart from REQ-015's status recording and REQ-016/017's verdict/PR citation
-correction, REQ-018's query explanation, REQ-019/020's admission prerequisite
-and REQ-021's retained-status projection repair,
-server contract, engine and installation changes remain outside this packet; a missing input is an external dependency, not an implementation
-assignment here.
+correction, REQ-018's query explanation, REQ-019/020's admission prerequisite,
+REQ-021's retained-status projection repair and REQ-022's task-local reporting,
+server contract, engine and installation changes remain outside this packet.
+TASK-006A supplies the explicitly approved missing reporting; other missing
+backend capabilities remain external dependencies.
 
 The following backend-owned authority amendments are dependencies of the tasks
 that consume them. They are not a prerequisite for approving the UI behavior
@@ -509,7 +555,7 @@ or starting unrelated work:
 
 | Owning document | Required backend amendment and current boundary |
 |---|---|
-| `architecture/wyrd-design.md` and root contributor Card inventory | Current native Repository/Card identity, closed PR activation, deferred-input/approval and retained inspection/delivery contracts. Consume them without changing Card kinds or backend ownership. |
+| `architecture/wyrd-design.md` and root contributor Card inventory | Current native Repository/Card identity, closed PR activation, deferred-input/approval and retained inspection/delivery contracts. Consume them without changing Card kinds or backend ownership; REQ-022 adds task-local wait reporting to the deferred-input section. |
 | `architecture/wyrd-security-posture.md` | Current trusted-parent visibility, exact-Verifier approve plus parent read and accepted-authority rules. Definitions and GitHub configuration remain independently authorized; no UI-created authority. |
 | `architecture/bifrost-design.md` | Current managed-row source visibility and evidence custody. Consume existing authorized queries/reads; REQ-021 repairs the existing status projection without new fields or payload reclassification. |
 
@@ -531,6 +577,7 @@ its applicable current authority.
 | 005A — PR admission prerequisite | Existing GitHub admission, queue and Scribe owners; implements REQ-019/020 and proves the retained input consumed by 005. |
 | 005 — PR review sets | Existing 002/003/004 and 005A admission/retention outputs under current parent visibility; extend shared recorded-selection navigation without requiring a readable definition. |
 | 006 — Waiting/approval | 002 inspector and existing occurrence/decision/readback/continuation operations. Reuse 005's shared fallback if available; PR-set UI and 007's correction are not prerequisites. |
+| 006A — Task-local waits | Existing 002/006 inspector, deferred-input scheduler, fenced state writer and controlled running-peer fixture; supplies simultaneous input/approval/running proof for the remaining 006 remediation gap. |
 | 007 — Delivery status | 002 inspector and 005 PR context; first correct/prove the existing backend retained-status response under REQ-021, then consume it in the UI. |
 
 TASK-005A delivers the explicit Wyrd request and retained membership required by
@@ -563,8 +610,20 @@ not merely the existence of a route/component or a successful command.
 | AC-012 Public query explanation | Through existing SDK/HTTP/MCP query paths and the query editor, explain a bound SELECT and analyze its real execution. Plain EXPLAIN performs no underlying data execution; ANALYZE retains the SELECT's execution selection and governs its work. Both preserve tenant/table/payload checks and complete-stream semantics. Invalid statements, denied access, resource/output exhaustion, deadline and cancellation remain typed failures without successful partial plans. | 018 |
 | AC-013 PR admission prerequisite | Through the real Wyrd HTTP/SDK/MCP operation, rerequest a multi-member PR at the same head, retry concurrently and after restart, then change policy/head and retry the older request. Accepted identities stay stable and obsolete work is never reactivated. Query mixed/all-refused sets and interrupt/recover handoff: every authorized member is retained with exact source/policy/status, incomplete visibility is distinguishable, and denied/foreign callers learn no membership/counts. Refused members never run; ordinary source-event replay remains unchanged. | 019,020 |
 | AC-014 Queue-free PR inspection | Complete actual admitted PR work and record delivery, capture the public status, then clean up its terminal scheduling row while Postgres and retained records remain available. A Repository-scoped reader obtains the same PR/generation/members, selected result/verdict and recorded delivery through HTTP, Rust/Python/TypeScript SDKs, MCP and the connected UI. Another Repository/shared-Verifier-only/foreign reader remains refused or not-found as applicable. The browser reopens a pinned set/member after cleanup; provider failure/skip/retry stays separate from the judgment, and no queue row, execution or provider write is created by inspection. | 002,005,006,009,014,020,021 |
+| AC-015 Task-local waits | Hold an actual independent step running while a direct step/requirement awaits deferred evidence and an approval is pending. Inspect all three together through real public status and the shared UI, without a verdict or definition-based wait inference. Exercise consumption, recovery and terminal clearing, readable older states, scoped reads and shipped client projections. | 005,008,014,022 |
 
 ## Approval and revision history
+
+Revision 9 records the maintainer's explicit 2026-11-24 agreement to the
+[task-local wait proposal](design/input-wait-reporting.md) and instruction to
+revise the spec and write one complete task. REQ-022/AC-015 authorize the bounded
+cross-tier reporting exception in TASK-006A, including format 6 and a coordinated
+upgrade. For TASK-006A only, the maintainer waives TDD ordering and historical
+RED evidence; behavioral tests, required checks and evidence remain mandatory.
+Record TDD as `NOT_APPLICABLE` with this waiver. Earlier approval/idempotency and
+Origin remediation remain intact. [Revision 8](spec-revisions/revision-8.md)
+is preserved unchanged. This approval authorizes the contract and planning;
+this turn does not execute runtime implementation or authorize Git actions.
 
 Revision 8 records the maintainer's explicit 2026-11-23 instruction to revise,
 approve and commit the selected spec/task amendments. It aligns reads with
@@ -629,3 +688,4 @@ capability readiness is still checked per task; unavailable data is not invented
 | 6 | approved scope (2026-11-18) | Add maintainer-requested public EXPLAIN and selected EXPLAIN ANALYZE in TASK-004B; all-route consolidation verified with existing tests and query plans, without benchmarks or dev:full. |
 | 7 | approved (2026-11-19) | Add TASK-005A under REQ-019/020 and AC-013: explicit Wyrd PR-wide rerequest via HTTP/SDKs/MCP, replay identity and complete retained membership including refusals. Preserve UI exclusions and existing admission/security owners; no migration authorized. |
 | 8 | approved (2026-11-23) | Align tasks 005–007 with current Repository-parent reads, definition-independent recorded selection and exact approval permissions/lifecycle; add REQ-021/AC-014 for the existing queue-free PR/delivery status correction in TASK-007. Preserve implemented TASK-003 and existing wire/storage boundaries. |
+| 9 | approved (2026-11-24) | Add REQ-022/AC-015 and TASK-006A for immediate task-local deferred-input waits through existing status, retained format 6, clients and UI. Preserve scheduling/parking and authorization; coordinated upgrade, no migration. Maintainer waives TDD ordering for this task only; passing behavioral verification remains required. |

@@ -1725,7 +1725,21 @@ published later for one connected repository's commit with
 `POST /v1/verification/evidence/publish` (`repository` as `owner/name`,
 `tags.commit`, `input`, `value`). References alone make a step or check a
 consumer of the slot, so a consumer and its dependents wait while independent
-steps run; there is no wait action, Trigger, or `depends_on` for it. When no
+steps run; there is no wait action, Trigger, or `depends_on` for it. Execution
+inspection reports each direct pending consumer immediately in `input_waits`:
+`{task_id, slots}`, with one entry per declared step or whole-Verifier requirement,
+ordered by task ID and nonempty sorted unique missing-slot names. Attached checks
+contribute to their owning step; indirect dependents are not input consumers.
+This is pre-dispatch state and creates no invocation or fanout occurrence.
+Independent work keeps the execution `running`; input waits do not determine run
+status or verdict. The engine records the snapshot through the existing fenced
+asynchronous state writer. Consuming accepted evidence removes its slots;
+publication acceptance alone does not refresh a running engine's inputs. Recovery
+recomputes the snapshot, terminal selection clears it, and terminal inspection
+exposes no active waits. Definitions never determine recorded task waits.
+Execution-state format 6 retains this list; formats 3–5 load it empty until
+resumed scheduling. Upgrade by stopping old workers before format-6 writers
+start; no mixed-version reader guarantee or SQL migration is implied. When no
 runnable work remains the execution reports `waiting` with the slot names,
 releases its workspace, Python, and model capacity, keeps its claim and lease
 until Scribe acknowledges the parked revision, and only then releases its

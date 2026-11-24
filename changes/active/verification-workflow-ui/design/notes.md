@@ -1,8 +1,21 @@
 # Verification workflows and repository UI
 
-Status: finalized — the 2026-11-23 request to revise tasks 005–007 selects the
-resumption recommendations below. The centralized visual design remains approved;
-specification revision 8 records the maintainer's explicit approval.
+Status: finalized — task-local input-wait reporting agreed on 2026-11-24.
+The prior visual design and approved revision-8 decisions remain settled.
+
+## Task-local waits — 2026-11-24
+
+The maintainer requires established step-engine behavior: report a consuming
+step's missing input immediately while independent steps continue and the run
+stays running. The [decision-complete proposal](input-wait-reporting.md) reviews
+the diagnosis and records the wire/retention/engine/client/UI flow, transitions,
+compatibility, proof and required specification scope revision. It changes
+reporting through existing owners, preserving existing parked-run semantics.
+The maintainer agreed to the proposal and requested the spec revision and task.
+Approved revision 9 records the bounded backend exception; TASK-006A implements
+it with behavioral verification and the explicit no-TDD-ordering exception.
+The owning architecture section is amended; runtime implementation is not part
+of this planning turn. No fresh runtime verification is claimed.
 
 ## Task revision handoff — 2026-11-23
 

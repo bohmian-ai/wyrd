@@ -95,6 +95,36 @@ fixtures alone cannot establish queue-free retained projection.
    inspection tests with repository Postgres/Bifrost and controlled provider.
    Current queue-free absent PR/delivery fields should produce behavioral RED.
    Fix only this read projection before later UI scenarios.
+   **Evidence (2026-11-24).** Dependency inputs: TASK-002 inspector/loader and
+   TASK-005 PR context at `e031fbd11`. Assertions:
+   `pg_github_delivery.rs` `after_queue_cleanup` (deletes the terminal row via
+   the superuser pool, asserts one row deleted, re-reads and compares
+   `status`/`pull_request`/`result`/`github_delivery`, no new execution, queue
+   or `delivery_requests` row) used by
+   `a_delivered_execution_reads_the_same_after_queue_cleanup`,
+   `a_new_head_during_delivery_skips_every_later_write` (skipped/superseded)
+   and `a_permanent_refusal_is_a_visible_failed_outcome` (failed/github_refused).
+   Command (`<sel>` = each `test(=pg_github_delivery::…)`):
+   `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "<sel>"'`.
+   RED: all three failed at `pg_github_delivery.rs:634` "pull_request is
+   retained" (left `null`). GREEN after `service.rs` reads the PR association
+   from the Scribe-acknowledged input record (`ExecutionRecord::pull_request`,
+   `inputs.rs`) when no queue row remains, returning
+   `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` if that record is not visible:
+   those three, `a_recorded_outcome_outlives_its_retry_receipts` and
+   `pg_github_pull_requests::pull_request_inspection_requires_repository_read`
+   pass; non-PR queue-free regressions
+   `pg_durable_verifier_work::failures_read_back_from_state_instead_of_the_queue_payload`
+   and `pg_deferred_evidence::task_input_waits_are_reported_while_an_independent_step_runs`
+   pass. Commit `5215b54d9`. **Mechanical deviation:** no owner deletes terminal
+   `wyrd.verifier_executions` rows, so the server tier deletes the row directly
+   and SDK/UI tiers use the new test seam `remove_settled_execution_row`.
+   **FAIL — open gap (see Handoff):** an execution cancelled before it ran
+   (superseded, closed, draft, access lost, public cancel of pending work,
+   refused member) writes no checkpoint, so after cleanup
+   `retained()` cannot prove its parent and returns
+   `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` even for the tenant admin.
+
 
 2. **Preserve authority and public consumers.** Against those same retained
    records, readers without the Repository parent, a shared-Verifier-only
@@ -109,6 +139,35 @@ fixtures alone cannot establish queue-free retained projection.
    owners; reuse their fixtures/runners and add actual selectors before RED.
    A new projection bypass or consumer loss should fail; unchanged authorization/
    decoding can be already-green regression proof with no manufactured churn.
+   **Evidence (2026-11-24).** Server: `pull_request_inspection_requires_repository_read`
+   (`pg_github_pull_requests.rs`) after queue-row delete asserts verifier-only
+   reader 404, a directly granted custom role holding only
+   `executions:read` on the Repository's exact scope (no Verifier or GitHub
+   configuration grant) reads equal `status`/`pull_request`/`result`/`github_delivery`,
+   `revoke_role` refuses it within `AUTHORITY_PROPAGATION` as
+   `WYRD_PERMISSION_403_DENIED_RBAC` (route-level, names no execution), and
+   another tenant's admin reads 404. Same command as scenario 1 with
+   `test(=pg_github_pull_requests::pull_request_inspection_requires_repository_read)`: GREEN
+   (commits `9f07f9c70`, `0c0a6ac3a`). Diagnoses: (a) an immediate read after revoke
+   returned 200 — cause: cache refresh is notification-driven, bounded at 5s
+   (`wyrd-security-posture.md` "Current authority and freshness"); (b) still 200
+   after 5s — cause: `bootstrap_user` binds roles with `RoleSource::Idp` and
+   `revoke_role` deletes only `source = 'direct'` bindings, silently returning
+   `Ok`; fixed in the test by a direct `grant_role`. **Risk:** the same silent
+   no-op makes `crates/wyrd/wyrd-testing/tests/bifrost/server/verification_runtime.rs:3073`
+   prove nothing about its revoked runner (outside this task's write set).
+   Consumers (already-green regression proof, added after the server fix; the
+   Rust SDK selector FAILED at `deferred_evidence.rs:530` with `service.rs`
+   restored to `5215b54d9~1`, establishing assertion strength):
+   Rust `WYRD_REG_E2E=1 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=deferred_evidence::pg_tests::a_person_approves_the_pending_signoff)'"`;
+   Python `… -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q tests/integration/test_deferred_evidence.py -k approves"`;
+   TypeScript `… -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/deferred-evidence.test.ts -t 'approves the pending signoff'"`;
+   MCP `… -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(/github::.*an_agent_approves_a_pending_signoff/)'"`.
+   All GREEN (commit `71ceaa21e`). `py:typecheck` found the Python
+   `ExecutionState` stub lacked `github_delivery`; added `GithubDelivery`/`AnchorProblem`
+   TypedDicts. `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`,
+   `ts:lints`, `ts:typecheck` pass. Not run: `check:deps`, `check:tenant-isolation`.
+
 
 3. **Render recorded delivery independently.** Load that corrected status through
    shared Node/MCP UI executors and the inspector. Present pending/delivered/
@@ -120,6 +179,22 @@ fixtures alone cannot establish queue-free retained projection.
    `ui-library.test.ts` and actual records through
    `ui-library.integration.test.ts`. Missing delivery rendering should produce
    RED; no new read op is needed.
+   **Evidence (2026-11-24).** Component: `ui-library.test.ts` "a pull request
+   execution shows its recorded GitHub delivery apart from its verdict, and
+   other work shows none" covers delivered, failed (`github_refused` + anchor
+   problem), skipped (`superseded`), pending (never "queued"), refused Verifier
+   definition, no section for non-PR work, one status read only, and a refused
+   status read showing its code with no delivery. Command:
+   `cd crates/wyrd/wyrd-server/wyrd-ui && pnpm --filter wyrd-ai-ui build && pnpm exec vitest run src/lib/ui-library.test.ts -t "a pull request execution shows its recorded GitHub delivery"`.
+   RED: `[data-github-delivery]` null at `ui-library.test.ts:4185`. GREEN after a
+   "GitHub delivery" fact in `VerificationExecution.svelte` (StatusMark + one new
+   `delivered` mark in `observe.ts`; reason and anchor words are display
+   mapping). `mise run ui:check` GREEN (119 tests). Commit `ef5c858eb`.
+   Real records: the uncommitted TASK-007 test in `ui-library.integration.test.ts`
+   (`WYRD_UI_INTEGRATION=1`, `removeSettledExecutionRow`, Node and MCP executors,
+   Repository family viewer) is **FAIL**: the superseded member reads 404 after
+   cleanup (scenario 1 gap).
+
 
 4. **Follow actual provider outcomes without re-verifying.** Use existing
    backend-controlled success, permanent refusal, lost-answer/retry/recovery and
@@ -131,6 +206,13 @@ fixtures alone cannot establish queue-free retained projection.
    delivery fixtures, UI host integration and production BFF/browser journeys.
    Reuse backend reconciliation evidence and add RED for missing connected UI
    association/refresh behavior, not a second retry engine.
+   **Evidence (2026-11-24).** Not complete. Observed in the real UI host: an
+   execution superseded before any delivery attempt records nothing, so its
+   delivery is `pending` indefinitely (matches `wyrd-design.md` "pending until
+   recorded"; only public cancellation and revocation deliver a cancelled
+   outcome). The TS GitHub mock exposes no refusal/outage control, so
+   failed/retry outcomes in UI hosts rest on the server fixtures in scenario 1.
+
 
 5. **Reopen pinned history and compare the approved context.** Follow TASK-005's
    earlier set/member link after queue cleanup, refresh/copy/reload and return
@@ -144,6 +226,11 @@ fixtures alone cannot establish queue-free retained projection.
    delivery wiring should produce RED; record AC-009 comparison evidence and get
    the maintainer's ruling on remaining mock differences under
    [wyrd-ui](../../../../.agents/skills/wyrd-ui/SKILL.md#matching-an-approved-mock).
+   **Evidence (2026-11-24).** Not started: blocked on the scenario 1 gap (a
+   pinned earlier-set member is exactly the cancelled-before-start case). The
+   approved mock has no GitHub delivery element; AC-009 comparison and the
+   maintainer's ruling are pending.
+
 
 ## Verification and handoff
 

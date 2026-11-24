@@ -163,6 +163,12 @@ approved wording/approval and changed paragraph location here. This is a
 document prerequisite, not a runtime test or authorization to revise other
 architecture boundaries. This planning task does not itself edit architecture.
 
+
+**Evidence.** Maintainer approved the wording as written. `f1efb9a5f` replaces
+the paragraph at `architecture/wyrd-design.md:1040` with the REQ-021 sentence;
+`CurrentUserProfile` rustdoc (`crates/wyrd-spec/src/auth/tenant_principals.rs:187`)
+matches it. Secret exclusions and self-only authorization unchanged.
+
 ### 2. Successful provider sign-ins store and refresh the display name
 
 Start with the repository-managed Postgres database created from the revised
@@ -191,6 +197,25 @@ are not TASK-004's paused live-provider smoke. Record actual assertion
 locations, focused commands and passing results. Fresh fixture
 creation and the authorized local reset must apply the edited migration without
 an added migration, table or index.
+
+
+**Evidence.** Storage and refresh in `1a4fefbad` (edited unshipped
+`20260601000001_auth.sql`; no new migration, table or index), proven in `7dcb3a869`:
+- Tier 2: `pg_admin_principals::pg_tests::display_names_are_nullable_refreshed_and_tenant_confined`
+  (`crates/wyrd/wyrd-sql/tests/integration/pg_admin_principals.rs:1157`) — nullable
+  storage, refresh, omitted-value preservation, RLS. Passed.
+- Tier 1: `platform_admin_e2e::company_sso::provider_sign_ins_store_and_refresh_the_display_name`
+  (`crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/company_sso.rs:548`) — Google
+  `name`, GitHub `name`, GitHub blank `name` + `login`, company OIDC `name`, a changed name
+  refreshes, an omitted one preserves; read back through `/me` and the directory; another
+  tenant's names never disclosed. Passed.
+- Production UI: the Alice journey asserts the name block, Your account and People
+  render stored names (`ui-pages.integration.test.ts`, `-t "Alice is given payments"`); an
+  API-key session shows "API key", never its principal id (`212595e99`). Passed.
+- Limitation: the Rust SDK cannot seed a provider display name; social/company names
+  are proven by the server end-to-end test above, not through each SDK.
+Commands: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E 'test(display_names_are_nullable_refreshed_and_tenant_confined)' --run-ignored=all"`;
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E 'test(provider_sign_ins_store_and_refresh_the_display_name)' --run-ignored=all"`.
 
 ### 3. Real clients receive the safe read projections
 
@@ -222,6 +247,28 @@ fields and schemas on the existing tools that project them, including
 `principals.me`, through the actual MCP consumer. No raw HTTP substitute for
 SDK journeys. Record actual new test names and exact focused commands once added.
 
+
+**Evidence.** All passed.
+- Tier 2: `pg_principal_roles::directory_projects_names_methods_roles_and_counts`
+  (`pg_principal_roles.rs:847`), `pg_admin_principals::pg_tests::role_holders_filter_count_and_member_count_alike`
+  (`pg_admin_principals.rs:1257`), `pg_openapi_contract::principal_read_projections_publish_their_contract`
+  (`pg_openapi_contract.rs:644`); platform console cookie scheme declared in `f24b3d6a5`
+  (all 27 `pg_openapi_contract` tests pass; `codegen:check` clean).
+- Rust SDK: `principal_roles::administrators_read_people_roles_and_counts`
+  (`sdks/wyrd-sdk-rust/tests/integration/principal_roles.rs:423`).
+- Python (`c85ceae22`, 14/14): `test_a_role_filter_pages_this_tenants_holders_with_their_counts`,
+  `test_a_role_nobody_holds_lists_no_one`, `test_roles_carry_their_description_and_member_count`,
+  `test_a_built_in_role_refuses_a_new_description` in `test_principal_roles.py`; `/me` asserts
+  `display_name`/`email`.
+- TypeScript (`fab0027ee`, 12/12): the same four scenarios in `principal-roles.test.ts`.
+- MCP (`1965511f3`): `principals.me` and `list_roles` fields and catalog schemas in
+  `mcp/discovery.rs` (`agent_discovers_mcp_guide_and_sql_examples`) and
+  `mcp/principals.rs` (`users_manage_personal_key_metadata`, `an_agent_administers_scoped_access`).
+- CLI (`15623f08e`): `wyrd principal access put-role --description`, proven by
+  `card_lifecycle::pg_tests::administrators_manage_scoped_access_through_the_cli`.
+Commands: `mise run test:principals:integration`; `cd sdks/wyrd-sdk-python && uv run python -m pytest -q tests/integration/test_principal_roles.py`;
+`cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/principal-roles.test.ts`; `mise run test:bifrost:journey:mcp`.
+
 ### 4. Settings and Your account lead with a usable identity
 
 From a real signed-in tenant page, open Settings and reach all six named
@@ -236,6 +283,15 @@ replaces that identity. Existing account/key controls remain usable under their 
 Tier 1: production UI → BFF → real Rust profile and Postgres; prove the page
 consumes the outputs of entries 2–3 rather than hardcoded mock data. Component
 checks and light/dark captures pin shell/section hierarchy and account wording.
+
+
+**Evidence.** `d1cf5b3aa` shell and section list; `1a64fe226` Your account. Production
+journeys: `local signup and personal settings` (password User reaches
+`settings/account` from the name block, name + email lines, existing key/password
+controls) and `Alice is given payments…` (Alice, an ordinary User, opens Your account;
+admin reaches all six sections). Session journeys moved to `/settings/account`
+(`51686999d`). Captures `user-account-*` and `admin-*` at 1280/390, light/dark. Passed.
+Command: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.integration.test.ts -t "local signup and personal settings|Alice is given payments"`.
 
 ### 5. People, Service accounts and Roles use existing administration
 
@@ -264,6 +320,17 @@ Tier 1: extend the production UI fixture for these page/form → server → relo
 journeys, preserving existing SDK account/Role regressions. Add focused component
 checks only where needed to prove table, drawer and state presentation.
 
+
+**Evidence.** `708aec7f6`. Production journeys, all passed:
+`an administrator manages direct and custom-role grants in People and Roles, sees group grants, and a refused grant saves nothing`;
+`an administrator suspends a User and a Service account in Settings, and their sessions and keys stop working`;
+`an administrator creates a runtime Service account in Settings, and its one key runs two releases of the family`;
+`People tells an unavailable server apart from a refusal`;
+`People and Service accounts work from the keyboard and fit a phone and a desktop in light and dark`;
+`Alice is given payments…` (invite drawer, role filter from a member count, server
+counts). Groups dropped from the UI per maintainer ruling.
+Command: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.integration.test.ts -t "People|Service account|Alice is given payments"`.
+
 ### 6. Sign-in presents the existing company-SSO lifecycle and policy
 
 From no company connection, the admin sees actual available methods and enters
@@ -280,6 +347,13 @@ fallback claim, invented session total or ten-minute proof window is shown.
 Tier 1: extend the production UI company-policy journey over the existing real
 identity-provider fixture and two replicas; retain TASK-004's server regression
 proof. The UI refactor must not weaken non-admin, stale-proof or conflict cases.
+
+
+**Evidence.** `c2f1fd44b`. `production required company SSO settings`,
+`production SSO account settings` and `production provider replacement settings` in
+`production-auth.integration.test.ts`, run by `mise run test:identity:ui`
+(`identity_ui_e2e::production_ui_bff_journey`). Captures `admin-sign-in-*`,
+`admin-sign-in-setup-1-*`.
 
 ### 7. Tenant Secrets and Integrations call their existing owners
 
@@ -298,6 +372,12 @@ Tier 1: production UI/BFF → actual owner endpoints → reload, including refus
 and cancellation; reuse owner integration tests for secret lifecycle and
 redaction. Do not replace these connections with a static inventory fixture.
 
+
+**Evidence.** `c2f1fd44b`. `a tenant connects GitHub from Settings, reads its Repository
+Cards apart from GitHub access, and disconnects without losing them` (Integrations);
+Secrets inventory composed from owner metadata, captured `admin-secrets-*`. Passed.
+Command: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.integration.test.ts -t "connects GitHub from Settings"`.
+
 ### 8. The platform console shares the presentation and keeps its authority
 
 A real platform operator reaches Overview, Workspaces, Sign-in providers,
@@ -311,6 +391,16 @@ changing mode mutates no platform configuration. Mock totals are not production
 data. Tier 1: extend the real platform production-page journeys and their
 server fixtures; prove navigation plus existing mutations/refusals, not links
 alone.
+
+
+**Evidence.** `1a64fe226`. Production journeys, all passed:
+`a platform operator signs in to the console with a password` (six destinations,
+name block, mode), `a stale console session confirms the operator before suspending a
+workspace`, `a platform SSO operator confirms a suspension at the identity provider`,
+`the console tests a provider revision before enabling it`, `the console keeps a relay
+password unless the operator removes it`, `the console saves signup settings and keeps
+the challenge secret` (also captures `platform-*`).
+Command: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.integration.test.ts -t "console|platform"`.
 
 ### 9. Provider marks identify sign-in choices and methods
 
@@ -332,6 +422,12 @@ rendering a mark alone never starts sign-in or changes account state. Reuse the
 production UI journey fixture for these interactions and matched screenshots
 for appearance. Presentation work needs no manufactured RED/GREEN ordering.
 
+
+**Evidence.** `1a64fe226`: `Mark.svelte`'s Google "G" (official colours) and GitHub
+mark (`currentColor`) on Continue/Join buttons and in People/Sign-in method cells;
+`brand/DESIGN.md` carries the provider-mark exception. `an invited person joins with
+Google and returns with Google` exercises the button destinations. Passed.
+
 ### 10. Production presentation matches the agreed states
 
 Compare mock and production at 1280 and 390 pixels in both light and dark,
@@ -346,6 +442,32 @@ strip, sample identity or fake live state ships. Record every remaining mock
 difference and obtain the maintainer's ruling, including approved-contract
 corrections noted above. Visual comparison supplements the connected journeys;
 it does not substitute for entries 2–9.
+
+
+**Evidence.** Mock captured with `node selfcheck.mjs --shots`; production with
+`WYRD_UI_CAPTURE_DIR` through the journeys above (`a54c012a1`). An independent
+side-by-side review found 15 items; fixed in `212595e99` and `c821c73d2` (pill word
+colour, copy-field contrast, overlay focus ring, row control alignment, phone row
+wrap, brand and "(you)" spacing, radio alignment, avatar centring, account column
+width, plain-link underline, role chip wrap, phone section strip).
+
+Remaining differences, for maintainer ruling:
+1. The rail keeps the disabled "Find or ask…" control from the shared shell.
+2. At 390 the shell keeps a top navigation bar; the mock hides the rail.
+3. No Secrets count in the section list (no server count exists).
+4. People has no Last sign-in column and no Suspended segment (Suspended is a stat);
+   search is exact email or username, not a name filter.
+5. Service accounts has no Keys/Last used columns or key stats; it shows Roles and a
+   Suspended stat.
+6. Your account adds Password, API keys and Session sections; no Roles row or
+   "Verified by".
+7. Roles are listed by name as the server returns them.
+8. Secrets shows "last rotated" only for provider keys; stats are row counts.
+9. Platform: no rewrap status, New workspace or Add admin; Mail shows "set";
+   Workspaces lacks People and Created columns (the tenant list carries neither).
+10. Invitation Expires is an absolute instant, not relative ("in 21 h").
+11. A key-signed-in administrator's name block reads "API key".
+12. Signup creators get no display name until their next provider sign-in.
 
 ## Verification and handoff
 

@@ -732,6 +732,12 @@ export const components = {
         input: z.object({ execution_id: z.string().min(1) }).strict(),
         completion: 'host-action'
       },
+      'approval.decide': {
+        description:
+          'Approve or reject one exact pending approval occurrence of this execution through the existing decision operation; the host reports the receipt or refusal and reads the status again.',
+        input: z.object({ execution_id: z.string().min(1), approval_id: z.string().min(1), decision: z.enum(['approved', 'rejected']), reason: z.string().min(1).max(4096).optional() }).strict(),
+        completion: 'host-action'
+      },
       'publication.download': {
         description: 'Download one retained file of a publication through the host.',
         input: z.object({ step_id: z.string().min(1), name: z.string().min(1), producer: ProducerSchema, path: z.string().min(1).optional() }).strict(),

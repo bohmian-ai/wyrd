@@ -48,6 +48,7 @@ import { tick } from 'svelte';
 import { vi } from 'vitest';
 import {
   type ActionIntent,
+  type ActionState,
   ArtifactTable,
   CardFacts,
   CardHeader,
@@ -3208,6 +3209,95 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(render(VerificationExecution, { input: { executionId: 'exec_x' }, result: { state: 'loading' } }).container).toHaveTextContent('Loading execution exec_x');
 });
 
+
+test('TASK-006: a waiting execution shows each reached approval occurrence and decides only the exact one', async () => {
+  // Setup: `exec_approval` waits for its `eval_report` input while `audit` runs; `release` fanned out to two approval occurrences and `review` repeated twice. Its Verifier definition is refused.
+  const onaction = vi.fn();
+  const sent = () => onaction.mock.lastCall?.[0];
+  const actions = reactive<Record<string, ActionState>>({});
+  const blind = fixtureRecording((request) => (request.op === 'cards.get_by_uid' || request.op === 'cards.get_by_ref' ? { ok: false, problem: denied } : undefined)).executor;
+  const load = (node?: string) => loadExecution({ executionId: EXECUTIONS.approval, ...(node ? { node } : {}) }, { executor: blind });
+  const view = render(VerificationExecution, { ...(await load()), onaction, actions });
+
+  // Waiting is a status without a verdict; the missing input is named apart from the approvals.
+  const head = within(view.container).getByRole('region', { name: 'Execution' });
+  expect(head.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'waiting');
+  expect(head.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  expect(within(head).getByText('Waiting for input').nextElementSibling).toHaveTextContent('eval_report');
+  expect(within(head).getByRole('button', { name: /Cancel execution/ })).toBeEnabled();
+
+  // Without the definition, each approval step is selectable though it recorded no invocation; a pending occurrence reads as waiting.
+  const recorded = within(view.container).getByRole('group', { name: 'Recorded without the definition' });
+  expect(within(recorded).getAllByRole('button').map((each) => each.textContent?.replace(/\s+/g, ' ').trim())).toEqual(['Step gather succeeded', 'Step audit started', 'Step release ◷waiting', 'Step review ◷waiting']);
+  await fireEvent.click(within(recorded).getByRole('button', { name: /Step release/ }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:release' } });
+  await view.rerender({ ...(await load('step:release')), onaction, actions });
+
+  // Each occurrence: its message, exact identity and recorded state; expiry is the execution's lifecycle, never a timestamp.
+  const step = (id: string) => within(view.container).getByRole('region', { name: `Step ${id}` });
+  const occurrence = (id: string) => view.container.querySelector(`[data-approval="${id}"]`) as HTMLElement;
+  expect([...step('release').querySelectorAll('[data-approval]')].map((each) => [each.getAttribute('data-approval'), each.querySelector('[data-approval-status]')?.textContent])).toEqual([
+    ['apo_release_0', '◷pending'],
+    ['apo_release_1', '✓approved']
+  ]);
+  expect(occurrence('apo_release_0')).toHaveTextContent('Promote item 0 of refund-classifier?');
+  expect(occurrence('apo_release_0')).toHaveTextContent('exec_approval · step release · item 0');
+  expect(occurrence('apo_release_0')).toHaveTextContent("It expires with this execution: when the execution's own deadline passes, it is cancelled or newer work supersedes it.");
+  expect(occurrence('apo_release_0').textContent).not.toMatch(/Requested|Expires at|UTC/);
+  expect(occurrence('apo_release_1')).toHaveTextContent('approved by pr_ana at 2026-10-20T11:40:00Z · “reviewed the diff”');
+  expect(within(occurrence('apo_release_1')).queryByRole('button', { name: 'Approve' })).toBeNull();
+
+  // Approve sends the exact execution, occurrence, decision and reason as one host action.
+  const pending = occurrence('apo_release_0');
+  await fireEvent.input(within(pending).getByRole('textbox', { name: /Reason/ }), { target: { value: 'metrics hold' } });
+  await fireEvent.click(within(pending).getByRole('button', { name: 'Approve' }));
+  expect(sent()).toEqual({ name: 'approval.decide', input: { execution_id: 'exec_approval', approval_id: 'apo_release_0', decision: 'approved', reason: 'metrics hold' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  expect(catalog.components.VerificationExecution.emits.find((action) => action.name === 'approval.decide')?.completion).toBe('host-action');
+  expect(validateIntent('VerificationExecution', { name: 'approval.decide', input: { execution_id: 'exec_approval', approval_id: 'apo_release_0', decision: 'expired' } })).toHaveProperty('code');
+
+  // While the host answers, no decision can be sent again, from this occurrence or another.
+  actions['approval.decide'] = { state: 'pending' };
+  await tick();
+  expect(within(pending).getByRole('button', { name: /Approve/ })).toBeDisabled();
+  expect(within(pending).getByRole('button', { name: /Reject/ })).toBeDisabled();
+  const sends = onaction.mock.calls.length;
+  await fireEvent.click(within(pending).getByRole('button', { name: /Reject/ }));
+  expect(onaction.mock.calls).toHaveLength(sends);
+
+  // Another step selected meanwhile shows none of that answer, and its own pending occurrence waits too.
+  await view.rerender({ ...(await load('step:review')), onaction, actions });
+  expect(within(occurrence('apo_review_1')).getByRole('button', { name: /Approve/ })).toBeDisabled();
+  actions['approval.decide'] = { state: 'denied', problem: denied };
+  await tick();
+  expect(step('review')).not.toHaveTextContent(denied.code);
+  expect(occurrence('apo_review_0')).toHaveTextContent('rejected by pr_bo at 2026-10-20T11:41:00Z');
+  expect(occurrence('apo_review_0')).toHaveTextContent('Occurrenceapo_review_0');
+  expect(occurrence('apo_review_0')).toHaveTextContent('exec_approval · step review · iteration 0');
+  // The answer stays with the occurrence it was sent for.
+  await view.rerender({ ...(await load('step:release')), onaction, actions });
+  expect(occurrence('apo_release_0')).toHaveTextContent(denied.code);
+
+  // Reject with no reason sends no reason.
+  await view.rerender({ ...(await load('step:review')), onaction, actions });
+  await fireEvent.click(within(occurrence('apo_review_1')).getByRole('button', { name: 'Reject' }));
+  expect(sent()).toEqual({ name: 'approval.decide', input: { execution_id: 'exec_approval', approval_id: 'apo_review_1', decision: 'rejected' } });
+  view.unmount();
+
+  // Ended before anyone decided: the occurrence is recorded as expired, with nothing to submit.
+  const expired = { ...executionStatus.exec_approval, status: 'timed_out', waiting: [], approvals: executionStatus.exec_approval.approvals?.map((each) => (each.status === 'pending' ? { ...each, status: 'expired' } : each)) };
+  const ended = await loadExecution({ executionId: EXECUTIONS.approval, node: 'step:release' }, { executor: fixtureRecording((request) => (request.op === 'verification.get_execution' ? { ok: true, value: expired as never } : undefined)).executor });
+  const late = render(VerificationExecution, { ...ended, onaction });
+  expect(late.container.querySelector('[data-approval="apo_release_0"] [data-approval-status]')).toHaveTextContent('⧗expired');
+  expect(late.container.querySelector('[data-approval="apo_release_0"]')).toHaveTextContent('The execution ended before anyone decided.');
+  expect(within(late.container).queryByRole('button', { name: 'Approve' })).toBeNull();
+  late.unmount();
+
+  // A host without actions draws the occurrence and sends nothing.
+  const readOnly = render(VerificationExecution, await load('step:release'));
+  expect(within(readOnly.container.querySelector('[data-approval="apo_release_0"]') as HTMLElement).getByRole('button', { name: 'Approve' })).toBeDisabled();
+  readOnly.unmount();
+});
 test('a retained text file previews as inert text within the bound, and says when it cannot', async () => {
   const file = (output: string) => ({ executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output });
   // A single file within the bound is read once, after its manifest, for the exact producer attempt.

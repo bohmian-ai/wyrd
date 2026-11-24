@@ -286,7 +286,8 @@ function together(values: readonly string[]): Pick<NodeState, 'value' | 'word'> 
 
 /**
  * The recorded state of every step and requirement node, by node key. A step
- * reads the last attempt of each of its items and iterations; a requirement
+ * of an unfinished execution with a pending approval occurrence is waiting;
+ * otherwise a step reads the last attempt of each of its items and iterations; a requirement
  * reads the compact result, else its recorded requirement attempts. Nothing
  * here positions or sizes a node.
  */
@@ -300,7 +301,8 @@ export function executionStates(graph: DefinitionGraph, status: VerificationExec
     const last = [...latest.values()];
     const speculation = last.find((item) => item.speculation !== 'none')?.speculation;
     const dim = speculation === 'discarded' || speculation === 'blocked';
-    if (last.length === 0) states[step.key] = idle;
+    if (!done && status.approvals?.some((each) => each.step_id === step.id && each.status === 'pending')) states[step.key] = { value: 'waiting' };
+    else if (last.length === 0) states[step.key] = idle;
     else if (last.some((item) => item.state === 'started')) states[step.key] = done ? { value: 'not finished', dim: true } : { value: 'running', dim };
     else {
       const recorded = last.map((item) => (item.state === 'action' ? item.status : item.state === 'requirement' ? item.outcome : 'started'));

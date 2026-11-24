@@ -473,8 +473,8 @@ function emptied(value: unknown): unknown {
   return value;
 }
 
-/** Execution ids the fixtures answer: running, settled, a session judgment, and a drift judgment. */
-export const EXECUTIONS = { running: 'exec_running', settled: 'exec_settled', session: 'exec_session', drift: 'exec_drift' } as const;
+/** Execution ids the fixtures answer: running, settled, a session judgment, a drift judgment, and one waiting for input and approvals. */
+export const EXECUTIONS = { running: 'exec_running', settled: 'exec_settled', session: 'exec_session', drift: 'exec_drift', approval: 'exec_approval' } as const;
 const produced = (step_id: string, attempt = 1, item_index: number | null = null, iteration_index: number | null = null) => ({ step_id, attempt, item_index, iteration_index });
 const judged = (id: string, outcome: CardTypes.RequirementOutcome, statement: string, extra: object = {}) => ({ id, outcome, statement, reason: outcome === 'passed' ? null : `${id} did not hold`, ...extra });
 /** The drift judgment `exec_drift` recorded: one drifted feature, one stable, one without a score. */
@@ -506,12 +506,25 @@ export const executionStatus = {
     result: resultOf('exec_session', SESSION_VERIFIER, 'failed', [judged('all-passed', 'failed', 'No reply in the session failed', { actual: ['failed', 'passed'] })])
   },
   exec_drift: { execution_id: 'exec_drift', status: 'completed', dispatches: [], result: resultOf('exec_drift', DRIFT_VERIFIER, 'failed', [judged('latency-stable', 'failed', 'Latency stays within its fitted baseline', { detail: { drift: driftReport } })]) },
-  exec_m2: { execution_id: 'exec_m2', status: 'completed', dispatches: [], result: resultOf('exec_m2', VERIFIER, 'passed', []) }
+  exec_m2: { execution_id: 'exec_m2', status: 'completed', dispatches: [], result: resultOf('exec_m2', VERIFIER, 'passed', []) },
+  exec_approval: {
+    execution_id: 'exec_approval',
+    status: 'waiting',
+    dispatches: [],
+    waiting: ['eval_report'],
+    approvals: [
+      { approval_id: 'apo_release_0', step_id: 'release', item: 0, iteration: null, message: 'Promote item 0 of refund-classifier?', status: 'pending', actor_id: null, decided_at: null, reason: null },
+      { approval_id: 'apo_release_1', step_id: 'release', item: 1, iteration: null, message: 'Promote item 1 of refund-classifier?', status: 'approved', actor_id: 'pr_ana', decided_at: '2026-10-20T11:40:00Z', reason: 'reviewed the diff' },
+      { approval_id: 'apo_review_0', step_id: 'review', item: null, iteration: 0, message: 'Reviewed?', status: 'rejected', actor_id: 'pr_bo', decided_at: '2026-10-20T11:41:00Z', reason: null },
+      { approval_id: 'apo_review_1', step_id: 'review', item: null, iteration: 1, message: 'Reviewed again?', status: 'pending', actor_id: null, decided_at: null, reason: null }
+    ]
+  }
 } as unknown as Record<string, VerificationExecutionState>;
 const action = (producer: ReturnType<typeof produced>, status: string, speculation = 'none', reason: string | null = null) => ({ state: 'action', producer, status, speculation, reason });
 /** Recorded invocations by execution id: retries, a started step, and requirement judgments. */
 export const invocations = {
   exec_running: [action(produced('read-photo'), 'succeeded'), action(produced('score'), 'failed', 'none', 'timed out'), action(produced('score', 2), 'succeeded'), { state: 'started', producer: produced('classify'), speculation: 'none' }],
+  exec_approval: [action(produced('gather'), 'succeeded'), { state: 'started', producer: produced('audit'), speculation: 'none' }],
   exec_settled: [
     action(produced('read-photo'), 'succeeded'),
     action(produced('score'), 'failed', 'none', 'timed out'),

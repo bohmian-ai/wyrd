@@ -2552,6 +2552,43 @@
           "completion": "host-action"
         },
         {
+          "name": "approval.decide",
+          "description": "Approve or reject one exact pending approval occurrence of this execution through the existing decision operation; the host reports the receipt or refusal and reads the status again.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "approval_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "approved",
+                  "rejected"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "execution_id",
+              "approval_id",
+              "decision"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
           "name": "publication.download",
           "description": "Download one retained file of a publication through the host.",
           "input": {

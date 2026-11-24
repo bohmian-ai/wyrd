@@ -69,6 +69,12 @@
 
   /** Steps that recorded an invocation, in recorded order; the only steps known when the definition is unavailable. */
   const ran = $derived([...new Set(items.filter((each) => each.state !== 'requirement').map((each) => each.producer.step_id))]);
+  /** Every approval occurrence the execution reached, in step order, read from its status alone. */
+  const approvals = $derived(data?.status.approvals ?? []);
+  /** Steps known without the definition: those that recorded an invocation, then those that reached an approval. */
+  const reached = $derived([...new Set([...ran, ...approvals.map((each) => each.step_id)])]);
+  /** Whether `step` of this unfinished execution waits for a decision. */
+  const awaiting = (step: string) => !!data && !settled(data.status.status) && approvals.some((each) => each.step_id === step && each.status === 'pending');
   /** Requirements judged in the result or by a settled invocation, each once, in recorded order; the only requirements known when the definition is unavailable. */
   const judgedIds = $derived([...new Set([...(data?.status.result?.outcome.requirements.map((each) => each.id) ?? []), ...items.flatMap((each) => (each.state === 'requirement' ? [each.producer.step_id] : []))])]);
   const attempts = $derived(type === 'step' ? attemptsOf(items, id) : []);
@@ -103,6 +109,17 @@
 
   const act = (name: string) => actions[name];
   const off = (name: string) => !onaction || act(name)?.state === 'pending' || act(name)?.state === 'unavailable';
+
+  /** The reason typed for each pending occurrence, by approval id. */
+  let reasons = $state<Record<string, string>>({});
+  /** The occurrence the last decision was sent for: the host's answer belongs to it alone, whatever is selected since. */
+  let decidedFor = $state<string>();
+  function decide(occurrence: CardTypes.ApprovalOccurrenceState, decision: CardTypes.ApprovalDecision) {
+    if (!data || off('approval.decide')) return;
+    decidedFor = occurrence.approval_id;
+    const reason = reasons[occurrence.approval_id]?.trim();
+    onaction?.({ name: 'approval.decide', input: { execution_id: data.status.execution_id, approval_id: occurrence.approval_id, decision, ...(reason ? { reason } : {}) } });
+  }
 </script>
 
 {#snippet refused(part: Part<unknown>, what: string)}
@@ -233,6 +250,39 @@
   </div>
 {/snippet}
 
+{#snippet approval(each: CardTypes.ApprovalOccurrenceState)}
+  {@const mine = decidedFor === each.approval_id}
+  <div class="approval" data-approval={each.approval_id}>
+    <div class="approval-head">
+      <span class="label">Human approval</span>
+      <span data-approval-status><StatusMark value={each.status === 'pending' ? 'waiting' : each.status} label={each.status === 'pending' ? 'pending' : undefined} /></span>
+    </div>
+    <p class="description">{each.message}</p>
+    <dl>
+      {@render fact('Occurrence', each.approval_id)}
+      {@render fact('For', [input.executionId, `step ${each.step_id}`, each.item == null ? '' : `item ${each.item}`, each.iteration == null ? '' : `iteration ${each.iteration}`].filter(Boolean).join(' · '))}
+      {@render fact('Decided', each.actor_id ? `${each.status} by ${each.actor_id} at ${each.decided_at}${each.reason ? ` · “${each.reason}”` : ''}` : undefined)}
+    </dl>
+    {#if each.status === 'expired'}
+      <p class="hint">The execution ended before anyone decided.</p>
+    {:else if each.status === 'pending'}
+      <p class="hint">It expires with this execution: when the execution's own deadline passes, it is cancelled or newer work supersedes it.</p>
+    {/if}
+    {#if each.status === 'pending' && data && !settled(data.status.status)}
+      <label class="reason">
+        <span class="label">Reason (optional)</span>
+        <textarea rows="2" maxlength="4096" bind:value={reasons[each.approval_id]} disabled={off('approval.decide')}></textarea>
+      </label>
+      <div class="decide">
+        <ActionButton variant="primary" label="Approve" disabled={off('approval.decide')} onclick={() => decide(each, 'approved')} />
+        <ActionButton label="Reject" disabled={off('approval.decide')} onclick={() => decide(each, 'rejected')} />
+        {#if mine && act('approval.decide')?.state === 'pending'}<span class="hint" role="status">Submitting for {each.approval_id}…</span>{/if}
+      </div>
+    {/if}
+    {#if mine}<ActionNote state={act('approval.decide')} />{/if}
+  </div>
+{/snippet}
+
 {#if result.state === 'populated' && data}
   {@const status = data.status}
   <div class="execution">
@@ -283,7 +333,7 @@
         {@render fact('Run', status.result?.run_id)}
         {@render fact('Session', status.group_id)}
         {@render fact('Owner Card', status.owner_card_uid)}
-        {#if status.waiting?.length}{@render fact('Waiting for', status.waiting.join(', '))}{/if}
+        {#if status.waiting?.length}{@render fact('Waiting for input', status.waiting.join(', '))}{/if}
       </dl>
       {#if status.error}
         <p class="failure" role="note"><span aria-hidden="true">✕</span> {status.error.code}: {status.error.message}</p>
@@ -299,16 +349,19 @@
     {:else}
       <Panel title="Graph" note="The Verifier this execution ran">
         {@render refused(data.definition, 'Verifier definition')}
-        {#if judgedIds.length + ran.length}
+        {#if judgedIds.length + reached.length}
           <div class="recorded" role="group" aria-label="Recorded without the definition">
             <p class="hint">Recorded requirements and invocations stay selectable. Declared order and edges need the definition.</p>
             {#each judgedIds as requirement (requirement)}
               {@const mark = requirementState(status, items, requirement)}
               <button type="button" class="tool" aria-pressed={selection.node === `req:${requirement}`} onclick={() => select({ node: `req:${requirement}` })}><span class="label">Requirement</span> {requirement} <span class="muted">{mark.word ?? mark.value.replace('_', ' ')}</span></button>
             {/each}
-            {#each ran as step (step)}
+            {#each reached as step (step)}
               {@const last = attemptsOf(items, step).at(-1)}
-              <button type="button" class="tool" aria-pressed={selection.node === `step:${step}`} onclick={() => select({ node: `step:${step}` })}><span class="label">Step</span> {step} {#if last}<span class="muted">{recorded(last)}</span>{/if}</button>
+              <button type="button" class="tool" aria-pressed={selection.node === `step:${step}`} onclick={() => select({ node: `step:${step}` })}
+                ><span class="label">Step</span> {step}
+                {#if awaiting(step)}<StatusMark value="waiting" />{:else if last}<span class="muted">{recorded(last)}</span>{/if}</button
+              >
             {/each}
           </div>
         {/if}
@@ -364,6 +417,9 @@
     {:else if type && id}
       <Panel title="{WORDS[type]} {id}" note={type === 'req' ? 'Recorded judgment' : type === 'step' ? 'Recorded invocations' : 'Recorded input'}>
         {#if type === 'step'}
+          {#each approvals.filter((each) => each.step_id === id) as each (each.approval_id)}
+            {@render approval(each)}
+          {/each}
           {#if attempts.length > 1}
             <div class="attempts" role="radiogroup" aria-label="Invocations of {id}">
               {#each attempts as each (where(each.producer))}
@@ -520,6 +576,44 @@
 {/if}
 
 <style>
+  .approval {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border: 1px solid var(--warn);
+    border-left-width: 2px;
+    border-radius: var(--r);
+    padding: 12px 14px;
+  }
+  .approval-head,
+  .decide {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .approval-head [data-approval-status] {
+    margin-left: auto;
+  }
+  .reason {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  textarea {
+    min-height: 52px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 6px 8px;
+    background: var(--surface);
+    color: var(--text);
+    font: 13px/1.5 var(--font-sans);
+    resize: vertical;
+  }
+  textarea:focus-visible {
+    outline: 2px solid var(--declare);
+    outline-offset: 2px;
+  }
   .recorded {
     display: flex;
     flex-wrap: wrap;

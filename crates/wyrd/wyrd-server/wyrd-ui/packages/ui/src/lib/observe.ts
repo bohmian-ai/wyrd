@@ -1225,7 +1225,10 @@ export const EXECUTION_MARKS: Readonly<Record<string, ExecutionMark>> = {
   'not started': ['○', 'not started', 'muted'],
   'not run': ['○', 'not run', 'muted'],
   'not finished': ['○', 'not finished', 'muted'],
-  'not judged': ['○', 'not judged', 'muted']
+  'not judged': ['○', 'not judged', 'muted'],
+  approved: ['✓', 'approved', 'ok'],
+  rejected: ['✕', 'rejected', 'danger'],
+  expired: ['⧗', 'expired', 'muted']
 };
 /** The verdicts an execution records, in the order a summary counts them. */
 export const EXECUTION_VERDICTS = ['passed', 'failed', 'inconclusive'] as const;

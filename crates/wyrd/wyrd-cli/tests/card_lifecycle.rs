@@ -3446,6 +3446,8 @@ mod pg_tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the repository-managed Postgres journey lifecycle"]
     async fn administrators_manage_scoped_access_through_the_cli() {
+        use wyrd_client::principals::Principals;
+
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
             .bootstrap_user("cli-access-admin", &["admin"])
@@ -3590,9 +3592,35 @@ mod pg_tests {
                     "cli_reader",
                     "--operation",
                     "cards:read",
+                    "--description",
+                    "Reads Cards",
                 ],
             )
             .await,
+        );
+        let mut config = ClientConfig::default();
+        config.http.base_url.clone_from(&base_url);
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::BearerToken(SecretString::from(jwt.clone())),
+        )
+        .expect("admin auth builds");
+        let transport =
+            HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
+        let roles = Principals::connect_with(&WyrdClient::from_parts(auth, transport, config.grpc))
+            .await
+            .expect("principals connect")
+            .roles()
+            .await
+            .expect("roles read")
+            .roles;
+        assert_eq!(
+            roles
+                .iter()
+                .find(|role| role.name == "cli_reader")
+                .and_then(|role| role.description.as_deref()),
+            Some("Reads Cards"),
+            "the server keeps the summary the CLI sent"
         );
         let group = succeeded(
             &run(

@@ -138,6 +138,10 @@ pub struct PutRoleArgs {
     /// Operation such as `cards:read`; repeat for several.
     #[arg(long = "operation", value_name = "RESOURCE:ACTION", required = true)]
     pub operations: Vec<Permission>,
+    /// One-line summary People and Roles show; the role is replaced whole, so
+    /// omitting it clears any summary the role had.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
     /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
@@ -326,7 +330,7 @@ pub async fn dispatch(command: AccessCommand) -> Result<ExitCode, WyrdCliError> 
         AccessCommand::PutRole(args) => {
             let request = PutRoleRequest {
                 operations: args.operations.iter().map(Operation::of).collect(),
-                description: None,
+                description: args.description.clone(),
             };
             let role = principals
                 .put_role(&args.role, &request)

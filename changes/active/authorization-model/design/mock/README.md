@@ -56,7 +56,7 @@ switches light and dark.
 | `#/signup/workspace?preview=invalid` | Inline slug validation |
 | `#/signup/workspace?preview=taken` | `409`: the slug is taken |
 | `#/signup/workspace?preview=throttled` | `429` with the retry time |
-| `#/signup/workspace?preview=limit` | `403 WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT` |
+| `#/signup/workspace?preview=limit` | `403 WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`; no form, only "Sign in to an existing workspace" |
 | `#/signup/workspace?challenge=on&preview=challenge` | The challenge was not passed |
 | `#/signup/workspace?preview=disabled` | Signup was turned off after proof; the form is replaced by a way out |
 | `#/signup/workspace?preview=expired` | The proof expired; Start again |

@@ -37,7 +37,9 @@
   const slugProblem = $derived(checked ? slugError(slug) : '');
   const takenSlug = $derived(issue === PROBLEMS.taken);
   // A refusal that ends this attempt leaves nothing to submit.
-  const ended = $derived(issue === PROBLEMS.disabled || issue === PROBLEMS.expired || issue === PROBLEMS.contactNoMail);
+  const ended = $derived(issue === PROBLEMS.disabled || issue === PROBLEMS.limit || issue === PROBLEMS.expired || issue === PROBLEMS.contactNoMail);
+  // Past the limit or with signup off, an existing workspace is the way on; otherwise a fresh proof.
+  const signIn = $derived(issue === PROBLEMS.disabled || issue === PROBLEMS.limit);
   const userError = $derived(local && checked && !username.trim() ? 'Enter a username.' : '');
   const pwError = $derived(local && checked ? passwordError(password) : '');
   const contactError = $derived(contactSent || !contactEmail ? '' : emailError(contactEmail));
@@ -151,7 +153,7 @@
 <svelte:head><title>Name your workspace · Wyrd</title></svelte:head>
 <Entry heading="Name your workspace" {issue}>
   {#if ended}
-    <a class="app-control primary wide" href={issue === PROBLEMS.disabled ? '/' : '/signup'}>{issue === PROBLEMS.disabled ? 'Sign in to an existing workspace' : 'Start again'}</a>
+    <a class="app-control primary wide" href={signIn ? '/' : '/signup'}>{signIn ? 'Sign in to an existing workspace' : 'Start again'}</a>
   {:else if !method}
     <p class="center" role="status" aria-busy="true">Checking this browser’s sign-in…</p>
   {:else}

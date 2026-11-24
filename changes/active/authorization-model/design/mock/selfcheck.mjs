@@ -186,6 +186,8 @@ try {
     assert.ok(await p.locator('[data-testid=create]').isEnabled());
     await open(p, '#/signup/workspace?preview=limit');
     assert.match(await problem(p), /maximum number of workspaces\. [\s\S]*WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT/);
+    assert.equal(await p.locator('form').count(), 0);
+    assert.ok(await p.getByRole('link', { name: 'Sign in to an existing workspace' }).isVisible());
     await open(p, '#/signup/workspace?preview=disabled');
     assert.equal(await p.locator('form').count(), 0);
     assert.ok(await p.getByRole('link', { name: 'Sign in to an existing workspace' }).isVisible());

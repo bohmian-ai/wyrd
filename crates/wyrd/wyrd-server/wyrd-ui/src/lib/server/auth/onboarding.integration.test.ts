@@ -238,6 +238,40 @@ test('an emailed proof creates a workspace whose administrator signs in with a p
   }
 }, journeyTimeout);
 
+test('at the owned-workspace limit the page replaces creation with the way back', async () => {
+  const ws = await signedUpWorkspace('capped');
+  await platform('PUT', '/platform/login-settings', { password_enabled: true, signup_enabled: true, signup_workspace_cap: 1 });
+  const second = `capped-second-${run}`;
+  const { context, page } = await visitor();
+  try {
+    await page.goto(`${journey.origin}/signup`);
+    await page.getByLabel('Email').fill(ws.owner);
+    await page.getByRole('button', { name: 'Continue with email' }).click();
+    await page.getByRole('heading', { name: 'Check your email' }).waitFor();
+    await expect.poll(() => mailCount(ws.owner)).toBe(2);
+    await page.goto(mailedLink(await newestMail(ws.owner)));
+    await page.getByRole('link', { name: 'Name your workspace' }).click();
+    await page.getByLabel('Workspace name').fill('Capped second');
+    await page.getByLabel('URL slug').fill(second);
+    await page.getByLabel('Your username').fill(ws.username);
+    await page.getByLabel('Your password', { exact: true }).fill(ws.password);
+    await page.getByRole('button', { name: 'Create workspace' }).click();
+
+    const alert = page.getByRole('alert');
+    await alert.getByText('Workspace limit reached').waitFor();
+    expect(await alert.textContent()).toContain('WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT');
+    // Nothing is left to submit: the way on is an existing workspace.
+    expect(await page.locator('form').count()).toBe(0);
+    expect(await page.getByRole('button', { name: 'Create workspace' }).count()).toBe(0);
+    expect(await page.getByRole('link', { name: 'Sign in to an existing workspace' }).getAttribute('href')).toBe('/');
+    const tenants = JSON.stringify(await platform('GET', '/platform/tenants'));
+    expect(tenants).toContain(ws.slug);
+    expect(tenants).not.toContain(second);
+  } finally {
+    await context.close();
+  }
+}, journeyTimeout);
+
 test('a verified address finds its workspaces by link or pasted code', async () => {
   const { slug, name, owner } = await signedUpWorkspace('discovery');
   const { context, page } = await visitor();

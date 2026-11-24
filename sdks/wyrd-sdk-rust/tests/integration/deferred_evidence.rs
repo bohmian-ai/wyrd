@@ -18,6 +18,7 @@ mod pg_tests {
     use wyrd_ai::verify::{
         ApprovalDecision, ApprovalStatus, Evidence, EvidenceStatus, Execution, File, InputWait,
     };
+    use wyrd_spec::ids::SlotName;
     use wyrd_spec::verification::{VerificationExecutionStatus, VerificationVerdict};
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
@@ -45,7 +46,7 @@ mod pg_tests {
             .map(|wait| {
                 (
                     wait.task_id.as_str(),
-                    wait.slots.iter().map(|slot| slot.as_str()).collect(),
+                    wait.slots.iter().map(SlotName::as_str).collect(),
                 )
             })
             .collect()

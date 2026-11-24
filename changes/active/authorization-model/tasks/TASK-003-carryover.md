@@ -1563,6 +1563,50 @@ GREEN:
 - `platform_admin_e2e` 97/97, the console journeys 6/6, `ui:check`, and clippy are clean. TDD: PASS.
 
 
+#### Cycle 16 mock sweep
+
+**Method.** Each of the mock's preview states, plus the new ones below, was opened in the production build (`node build`). The build ran against a stub upstream that answered each refusal, throttle and held (busy) request, and the matching mock hash was opened beside it. Each pair was captured in light and dark, at 1280 and 390 wide, which makes 72 pairs and 288 shots. For each pair the harness compared page text, a pixel diff, and computed style (font, colour, background, border, decoration and size) for every text element and control. The harness lived in the session scratchpad and never entered the tree.
+
+**Fixed in production:**
+- `/platform/ui/providers` now puts its problem and notice above the lead paragraph, in the mock's order.
+- A problem without a code (`/signup?signup=failed`) no longer renders an empty code line, which had made the card 6px taller. This applies to `Entry.svelte` and `ConsoleProblem.svelte`.
+  - RED: ui-pages `a refused provider proof has no code to show, so the problem shows none` found an empty `<code>`.
+  - GREEN: the same test passes.
+- Code and bold text now follow the mock's base styles: code 11px in the text colour, bold at the strong weight in the text colour. The rules are zero-specificity (`:where`) in the card and the console, so a page's own rule wins.
+  - Workspace route keys on `/workspaces/verify` are muted again; the old rule had made them text-coloured.
+  - Console keys and URLs moved from 12px to 11px.
+  - The re-auth "Suspending …" label moved from 700 muted to strong text.
+- Root page links are underlined, like every other entry-card link.
+
+**Mock updated to the approved readings** (build and `selfcheck` green, 17 checks):
+- The platform SSO button appears only with platform OIDC (`?sso=off`). `nosso` shows the 404 without the button. A new selfcheck assertion covers this.
+- The SSO callback has `reauth` ("Your sign-in is confirmed for five minutes.") and `popup` ("Returning to the console…"). The "Finishing…" state is gone, and a sign-in opens the console.
+- A new `#/platform?preview=unavailable` state shows a sign-in that answered 5xx with "Sign-in unavailable".
+- The workspace page has a new `?preview=checking` state ("Checking this browser's sign-in…").
+  - The identity line names only the provider.
+  - The workspace-limit remediation gives no number.
+- The relay copy now reads "Leave it blank to keep it; a new username needs its password." The form adds the "Remove the stored username and password" box.
+  - The mock refuses a new username without its password, so the stored credentials stay intact.
+- The overview footnote states that `wyrd-system` never suspends.
+- The console's `p.done` lines use the text colour, as the mock's own `app.css` intends; the mock's cascade had been muting them.
+- The README's contract readings now record the cycle 15 rulings.
+
+**Result.** After these changes, every pair matches in text and computed style in both modes and at both widths, apart from the deviations below. Pixel diffs remain only from sample input the harness typed, hover, focus and scroll position, and the items below.
+- Teammates' lists: Part B's "Signed in … as", Checking state, limit number, 5xx state and Turnstile items are resolved by the mock updates.
+- Part C's mail copy, "Finishing…" and SSO-button items are resolved the same way.
+- Part C's "390-wide margin" no longer differs: the 390 pairs are pixel-identical.
+- Provider text from Rust is sample data, not a deviation.
+
+**Justified deviations (final):**
+1. **Show button on new-password fields** (`/signup/workspace` with an email proof, `/t/{slug}/reset`). These fields use the existing `PasswordInput`, as the tenant sign-in, invitation signup and Account pages on the same card do. The mock draws a plain field. The console's re-auth and relay fields are plain, as in the mock.
+2. **Turnstile.** Production renders Cloudflare's widget from the published site key, and the widget brings its own look. The mock keeps a labelled placeholder that simulates passing.
+3. **Recovery email width.** The section is as wide as the Account page's other sections. The mock shows it alone on a placeholder page; the section's own layout is identical.
+4. **Root and tenant sign-in pages** are existing pages. The mock draws placeholders for both and does not redesign them.
+5. **Preview strip.** The mock reserves 33px for chrome that is not product, so production pages start 33px higher.
+6. **Native `required`** on the reset request and the console forms, so they work as plain posts without script. The mock focuses the empty field instead. The two look the same until someone submits an empty field.
+7. **Password form hidden when `methods.password` is false** on `/platform`. Rust's methods read forces this, and the mock has no such state.
+
+
 ### 17. An existing User explicitly connects another sign-in method
 
 **Status: DEFERRED — maintainer-approved 2026-11-23.** Not required for launch

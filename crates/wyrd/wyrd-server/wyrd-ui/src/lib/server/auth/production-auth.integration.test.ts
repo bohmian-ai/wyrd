@@ -704,7 +704,7 @@ test('production provider replacement settings', async () => {
     const html = await (await alice.go(1, settings)).text();
     return {
       ids: [...html.matchAll(/name="id" value="([0-9a-f-]{36})"/g)].map(([, id]) => id),
-      revision: /action="\?\/test">[\s\S]*?name="revision" value="(\d+)"/.exec(html)?.[1]
+      revision: /action="\?\/test"[^>]*>[\s\S]*?name="revision" value="(\d+)"/.exec(html)?.[1]
     };
   };
 

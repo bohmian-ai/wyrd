@@ -352,7 +352,7 @@ proof. The UI refactor must not weaken non-admin, stale-proof or conflict cases.
 **Evidence.** `c2f1fd44b`. `production required company SSO settings`,
 `production SSO account settings` and `production provider replacement settings` in
 `production-auth.integration.test.ts`, run by `mise run test:identity:ui`
-(`identity_ui_e2e::production_ui_bff_journey`). Captures `admin-sign-in-*`,
+(`identity_ui_e2e::production_ui_bff_journey`): 6/6 and 7/7 Vitest, 2/2 nextest passed. Captures `admin-sign-in-*`,
 `admin-sign-in-setup-1-*`.
 
 ### 7. Tenant Secrets and Integrations call their existing owners

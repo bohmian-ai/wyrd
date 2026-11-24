@@ -1,4 +1,4 @@
-<!-- The signed-out entry card, as wyrd-ui's src/lib/Entry.svelte: mark, heading, the safe problem, then the page. -->
+<!-- The signed-out entry card, as wyrd-ui's src/lib/Entry.svelte: mark, heading, the safe problem, then the page; a 5xx hides the page. -->
 <script>
   import logo from '../../../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/logo.svg';
   import Problem from './Problem.svelte';
@@ -12,8 +12,18 @@
       <span class="product">WYRD</span>
     </header>
     <h1>{heading}</h1>
-    {#if issue}<Problem {issue} />{/if}
-    {@render children()}
+    {#if issue?.status >= 500}
+      <div role="alert">
+        <div class="app-problem" id="problem" data-testid="problem" data-state="error">
+          <strong>✕ Sign-in unavailable</strong>
+          <p>Please try again later.</p>
+          <code>{issue.code}</code>
+        </div>
+      </div>
+    {:else}
+      {#if issue}<Problem {issue} />{/if}
+      {@render children()}
+    {/if}
   </div>
 </main>
 

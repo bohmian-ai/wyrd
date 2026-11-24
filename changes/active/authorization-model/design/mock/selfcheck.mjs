@@ -341,6 +341,14 @@ try {
     await p.close();
   });
 
+  await check('a server failure (5xx) shows the production "Sign-in unavailable" state and hides the form', async () => {
+    const p = await fresh('#/signup/workspace?preview=unavailable');
+    assert.match(await problem(p), /^✕ Sign-in unavailable\s+Please try again later\.\s+WYRD_SPEC_502_UPSTREAM_FAILURE$/);
+    assert.equal(await p.locator('[data-testid=problem]').getAttribute('data-state'), 'error');
+    assert.equal(await p.locator('form').count(), 0, 'a 5xx hides the page forms');
+    await p.close();
+  });
+
   for (const mode of ['dark', 'light']) {
     await check(`keyboard reaches every control with a visible focus ring in ${mode} mode`, async () => {
       const p = await fresh('#/signup/workspace?challenge=on', mode);

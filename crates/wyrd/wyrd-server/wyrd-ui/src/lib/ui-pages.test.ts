@@ -1327,17 +1327,26 @@ test('the workspace page renders the configured Turnstile challenge and sends it
     posted.push(JSON.parse(String(init?.body)));
     return Response.json({ status: 403, code: 'WYRD_AUTH_403_SIGNUP_CHALLENGE', title: 'Forbidden', remediation: '' }, { status: 403 });
   }));
-  const widgets: { element: Element; options: Record<string, unknown> }[] = [];
+  // A stub of Cloudflare's widget: each render or reset solves the challenge with the next token.
+  type Options = { sitekey: string; action: string; callback: (token: string) => void };
+  const widgets: { element: Element; options: Options }[] = [];
   const reset = vi.fn();
   const remove = vi.fn();
-  let token = 0;
+  let issued = 0;
+  const solve = () => {
+    issued += 1;
+    widgets[0].options.callback(`tok-${issued}`);
+  };
   vi.stubGlobal('turnstile', {
-    render: (element: Element, options: Record<string, unknown>) => {
+    render(element: Element, options: Options) {
       widgets.push({ element, options });
-      (options.callback as (token: string) => void)(`tok-${++token}`);
+      solve();
       return 'widget-1';
     },
-    reset: (id: string) => (reset(id), (widgets[0].options.callback as (token: string) => void)(`tok-${++token}`)),
+    reset(id: string) {
+      reset(id);
+      solve();
+    },
     remove
   });
   try {

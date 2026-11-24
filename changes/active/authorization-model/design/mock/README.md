@@ -59,6 +59,7 @@ switches light and dark.
 | `#/signup/workspace?challenge=on&preview=challenge` | The challenge was not passed |
 | `#/signup/workspace?preview=disabled` | Signup was turned off after proof; the form is replaced by a way out |
 | `#/signup/workspace?preview=expired` | The proof expired; Start again |
+| `#/signup/workspace?preview=unavailable` | Any 5xx (here `502 WYRD_SPEC_502_UPSTREAM_FAILURE`): the production card's "✕ Sign-in unavailable", "Please try again later." and the code; the page's forms are hidden |
 | `#/signup/workspace?preview=creating` | Creation in progress: busy, disabled button and read-only fields |
 | `#/signup/workspace?preview=created` | "Workspace created", held still for review |
 | `#/t/<slug>` | Minimal placeholder for the workspace landing page |

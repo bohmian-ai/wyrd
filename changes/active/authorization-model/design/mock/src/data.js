@@ -27,6 +27,8 @@ export const PROBLEMS = {
   challenge: { status: 403, code: 'WYRD_AUTH_403_SIGNUP_CHALLENGE', title: 'Challenge not passed', remediation: 'Complete the challenge below, then create the workspace again.' },
   disabled: { status: 401, code: 'WYRD_AUTH_401_INVALID_TOKEN', title: 'Workspace signup is no longer available', remediation: 'The operator turned off signup, or this sign-in method, after you started. No workspace was created.' },
   expired: { status: 400, code: 'WYRD_AUTH_400_INVALID_STATE', title: 'This signup expired', remediation: 'Start again to confirm who you are, then name your workspace.' },
+  // Any 5xx; Entry words it as wyrd-ui's Entry.svelte does ("Sign-in unavailable"). Code: catalog.
+  unavailable: { status: 502, code: 'WYRD_SPEC_502_UPSTREAM_FAILURE', title: 'Upstream dependency failed', remediation: 'Please try again later.' },
 };
 
 /** As wyrd-ui's Entry.svelte `guidance`: when to retry a throttled attempt, else the remediation. */
@@ -79,6 +81,7 @@ export const STATES = [
   ['Workspace · challenge failed', '#/signup/workspace?challenge=on&preview=challenge'],
   ['Workspace · signup no longer enabled', '#/signup/workspace?preview=disabled'],
   ['Workspace · proof expired', '#/signup/workspace?preview=expired'],
+  ['Workspace · server failure (5xx)', '#/signup/workspace?preview=unavailable'],
   ['Workspace · creating', '#/signup/workspace?preview=creating'],
   ['Workspace · created', '#/signup/workspace?preview=created'],
   ['Landing · /t/acme-research', '#/t/acme-research'],

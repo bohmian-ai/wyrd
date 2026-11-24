@@ -2024,7 +2024,11 @@ pub(crate) async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (S
 /// Inspecting a PR execution, and its sibling progress read, needs
 /// `executions:read` on its trusted parent, the Repository: the same grant
 /// on the shared Verifier reads it as unknown, also once the queue row is gone and
-/// only the accepted state remains.
+/// only the accepted state remains. Then a role reading only that
+/// Repository's executions reads the same PR source, result and delivery
+/// until it is revoked, which refuses it within the authority propagation
+/// bound without naming the execution, and another tenant's administrator
+/// reads it as unknown.
 ///
 /// # Panics
 /// Panics when a caller reading only the Verifier reads a PR execution, or
@@ -2126,6 +2130,98 @@ async fn pull_request_inspection_requires_repository_read() {
     let (code, body) = read_as(&deployment, &both, &status).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "completed");
+    let members = body["pull_request"]["members"].as_array().expect("members");
+    assert!(members.contains(&json!(execution)), "{body}");
+
+    // A custom role reading only executions of this Repository, with no
+    // Verifier definition or GitHub configuration grant, reads the same
+    // retained PR execution until its grant is revoked; another tenant's
+    // administrator learns nothing.
+    let repository = {
+        let uid: wyrd_spec::ids::CardUid =
+            serde_json::from_value(body["result"]["subject"]["uid"].clone())
+                .expect("the subject is the exact Repository");
+        let mut conn = deployment.conn().await;
+        let mut scopes =
+            wyrd_sql::queries::cards::card_scopes(&mut conn, std::slice::from_ref(&uid))
+                .await
+                .expect("scope reads");
+        conn.commit().await.expect("read commits");
+        scopes.remove(&uid).expect("the Repository is registered")
+    };
+    server
+        .seed_role(
+            "pr_repository_only",
+            &[Permission::executions_read(repository)],
+        )
+        .await
+        .expect("role seeds");
+    let Bootstrap::User {
+        jwt: repository_only,
+        ..
+    } = server
+        .bootstrap_user("pr-repository-only", &["pr_repository_only"])
+        .await
+        .expect("reader bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let (code, scoped) = read_as(&deployment, &repository_only, &status).await;
+    assert_eq!(code, StatusCode::OK, "{scoped}");
+    for field in ["status", "pull_request", "result", "github_delivery"] {
+        assert_eq!(scoped[field], body[field], "{field}: {scoped}");
+    }
+    let principal = server
+        .bootstrap_user("pr-repository-revoked", &[])
+        .await
+        .expect("reader bootstraps");
+    // A direct grant, which revocation removes; provider-sourced bindings
+    // belong to the provider projection.
+    server
+        .grant_role(&principal, "pr_repository_only")
+        .await
+        .expect("the role is granted");
+    let Bootstrap::User { jwt: revoked, .. } = &principal else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let granted = wyrd_testing::principal::within_propagation(&StatusCode::OK, || async {
+        read_as(&deployment, revoked, &status).await.0
+    })
+    .await;
+    assert_eq!(granted, StatusCode::OK, "the granted reader reads it");
+    server
+        .revoke_role(&principal, "pr_repository_only")
+        .await
+        .expect("the role is revoked");
+    // The revocation reaches the existing bearer through the authority
+    // cache's notification, within its propagation bound. With no
+    // executions grant left the route itself refuses, naming no execution.
+    let refused = wyrd_testing::principal::within_propagation(&StatusCode::FORBIDDEN, || async {
+        read_as(&deployment, revoked, &status).await.0
+    })
+    .await;
+    assert_eq!(
+        refused,
+        StatusCode::FORBIDDEN,
+        "the revoked reader is refused"
+    );
+    let (_, body) = read_as(&deployment, revoked, &status).await;
+    assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC", "{body}");
+
+    let foreign = server
+        .seed_tenant("pr-foreign")
+        .await
+        .expect("another tenant seeds");
+    let Bootstrap::User { jwt: foreign, .. } = server
+        .bootstrap_user_in_tenant(foreign, "pr-foreign-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let (code, body) = read_as(&deployment, &foreign, &status).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
 }
 
 /// One PR execution's retained input record, as an authorized SDK Bifrost

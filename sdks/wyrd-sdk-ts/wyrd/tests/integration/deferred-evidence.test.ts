@@ -11,6 +11,7 @@ import { expect, vi } from "vitest";
 import {
   Cards,
   GithubConnection,
+  type InputWait,
   Principals,
   type VerificationExecutionState,
   WyrdClient,
@@ -71,7 +72,8 @@ test("published evidence resumes the waiting execution", async ({ server, admin 
   });
   const { last_execution_id: id } = (await response.json()) as { last_execution_id: string };
   const execution = await verify.Execution.connect(id, { client: admin });
-  expect((await until(execution, "waiting")).waiting).toEqual(["ci"]);
+  const waiting = await until(execution, "waiting");
+  expect([waiting.waiting, waiting.input_waits]).toEqual([["ci"], [{ task_id: "green", slots: ["ci"] }]]);
 
   const evidence = await verify.Evidence.connect({ client: admin });
   const accepted = await evidence.publish("ci", { status: "green" }, { repository: "acme/web", commit: HEAD });
@@ -82,6 +84,7 @@ test("published evidence resumes the waiting execution", async ({ server, admin 
     tags: { commit: HEAD },
   });
   expect((await execution.wait({ timeoutMs: 30_000 })).outcome.verdict).toBe("passed");
+  expect((await execution.status()).input_waits).toBeUndefined();
 
   const cwd = process.cwd();
   vi.stubEnv("WYRD_REPOSITORY", "acme/web");
@@ -126,6 +129,23 @@ test("another principal approves the pending signoff and the same execution pass
   expect(waiting.approvals).toHaveLength(1);
   const [pending] = waiting.approvals ?? [];
   expect(pending).toMatchObject({ step_id: "signoff", message: "Ship this change?", status: "pending" });
+  const ciWait: InputWait[] = [{ task_id: "green", slots: ["ci"] }];
+  expect(waiting.input_waits).toEqual(ciWait);
+
+  // A reader of the Repository family alone, with no grant on the Verifier's definition, reads the same task wait;
+  // a reader of only the shared Verifier, not the execution's parent, reads it as unknown.
+  const principals = await Principals.connect({ client: admin });
+  const reader = async (name: string, kind: string, card: string): Promise<verify.Execution> => {
+    const { credential } = await principals.createServicePrincipal({
+      name,
+      assignments: [{ role: "viewer", scope: { card: { family: { kind, name: card } } } }],
+    } as never);
+    return verify.Execution.connect(id, { client: WyrdClient.connect({ credential }) });
+  };
+  expect((await (await reader("signoff-repository-reader", "Repository", "web")).status()).input_waits).toEqual(ciWait);
+  await expect((await reader("signoff-verifier-reader", "Verifier", "signoff")).status()).rejects.toMatchObject({
+    code: "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+  });
 
   const evidence = await verify.Evidence.connect({ client: admin });
   await evidence.publish("ci", { status: "green" }, { repository: "acme/web", commit: HEAD });
@@ -133,6 +153,7 @@ test("another principal approves the pending signoff and the same execution pass
   for (;;) {
     const state = await execution.status();
     if (state.status === "waiting" && (state.waiting ?? []).length === 0) {
+      expect(state.input_waits).toBeUndefined();
       break;
     }
     expect(Date.now(), JSON.stringify(state)).toBeLessThan(deadline);
@@ -153,7 +174,6 @@ test("another principal approves the pending signoff and the same execution pass
   expect(editorRefused).toBeInstanceOf(WyrdError);
   expect((editorRefused as WyrdError).code).toBe("WYRD_PERMISSION_403_DENIED_RBAC");
 
-  const principals = await Principals.connect({ client: admin });
   const created = await principals.createServicePrincipal({
     name: "signoff-approver",
     assignments: [{ role: "approver", scope: { card: { family: { kind: "Verifier", name: "signoff" } } } }],

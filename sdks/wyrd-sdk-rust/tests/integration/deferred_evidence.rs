@@ -16,7 +16,7 @@ mod pg_tests {
     use wyrd_ai::cards::CardSelector;
     use wyrd_ai::github::GithubConnection;
     use wyrd_ai::verify::{
-        ApprovalDecision, ApprovalStatus, Evidence, EvidenceStatus, Execution, File,
+        ApprovalDecision, ApprovalStatus, Evidence, EvidenceStatus, Execution, File, InputWait,
     };
     use wyrd_spec::verification::{VerificationExecutionStatus, VerificationVerdict};
     use wyrd_testing::WyrdTestServer;
@@ -41,6 +41,22 @@ mod pg_tests {
     /// A deployment whose administrator connected installation 101
     /// (`acme/api`, `acme/web`) and declared the Repository file at
     /// `repository`, with pull request 7 of `acme/web` opened at [`head`].
+    /// Each task `waits` names as its step or requirement ID and slot names.
+    fn named(waits: &[InputWait]) -> Vec<(&str, Vec<&str>)> {
+        waits
+            .iter()
+            .map(|wait| {
+                (
+                    wait.task_id.as_str(),
+                    wait.slots
+                        .iter()
+                        .map(wyrd_spec::ids::SlotName::as_str)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     struct Opened {
         /// The running deployment.
         deployment: Deployment,
@@ -187,6 +203,12 @@ mod pg_tests {
         let head = head();
         let opened =
             Opened::waiting_for(&fixture("cards/deferred_evidence/repository.yaml"), "ci").await;
+        let state = opened
+            .execution
+            .status()
+            .await
+            .expect("the execution reads");
+        assert_eq!(named(&state.input_waits), [("green", vec!["ci"])]);
         let evidence = opened.evidence().await;
         let green = serde_json::json!({ "status": "green" });
         let accepted = evidence
@@ -198,6 +220,12 @@ mod pg_tests {
         assert_eq!(accepted.repository.repository_id.as_str(), "2");
         assert_eq!(accepted.tags.commit.as_str(), head);
         assert_eq!(opened.verdict().await, VerificationVerdict::Passed);
+        let state = opened
+            .execution
+            .status()
+            .await
+            .expect("the execution reads");
+        assert!(state.input_waits.is_empty(), "{state:?}");
 
         let replayed = evidence
             .publish("ci", green, Some("acme/web"), Some(&head))
@@ -308,6 +336,40 @@ mod pg_tests {
         assert_eq!(pending.message, "Ship this change?");
         assert_eq!(pending.status, ApprovalStatus::Pending);
         let approval = pending.approval_id;
+        assert_eq!(named(&state.input_waits), [("green", vec!["ci"])]);
+
+        // A reader of the Repository family alone, with no grant on the
+        // Verifier's definition, reads the same task wait; a reader of only the
+        // shared Verifier, not the execution's parent, reads it as unknown.
+        let deployment = &opened.deployment;
+        let id = *opened.execution.id();
+        let reader = |name: &'static str, kind: &'static str, card: &'static str| async move {
+            let scope = serde_json::json!({"card": {"family": {"kind": kind, "name": card}}});
+            let key = deployment
+                .granted_key(
+                    name,
+                    &[
+                        serde_json::json!({"resource": "cards", "action": "read", "scope": scope}),
+                        serde_json::json!({"resource": "executions", "action": "read", "scope": scope}),
+                    ],
+                )
+                .await;
+            Execution::connect_with(id, &deployment.client(&key))
+                .await
+                .expect("the execution handle connects")
+        };
+        let seen = reader("signoff_repository_reader", "Repository", "web")
+            .await
+            .status()
+            .await
+            .expect("the Repository reader reads the execution");
+        assert_eq!(named(&seen.input_waits), [("green", vec!["ci"])]);
+        let unseen = reader("signoff_verifier_reader", "Verifier", "signoff")
+            .await
+            .status()
+            .await
+            .expect_err("a reader of another parent learns nothing");
+        assert_eq!(unseen.code(), "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
         opened
             .evidence()
             .await
@@ -327,6 +389,7 @@ mod pg_tests {
                 .await
                 .expect("the execution reads");
             if state.status == VerificationExecutionStatus::Waiting && state.waiting.is_empty() {
+                assert!(state.input_waits.is_empty(), "{state:?}");
                 break;
             }
             assert!(Instant::now() < deadline, "{state:?}");

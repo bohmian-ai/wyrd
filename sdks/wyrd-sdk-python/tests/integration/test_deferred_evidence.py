@@ -80,7 +80,9 @@ def test_published_evidence_resumes_the_waiting_execution(
     payload = mock.pull_request_event(101, 2, 7, "opened")
     assert mock.deliver(server.base_url, "pull_request", payload) == 202
     execution = verify.Execution(binding_status(server, binding)["last_execution_id"], admin)
-    assert until(execution, "waiting")["waiting"] == ["ci"]
+    state = until(execution, "waiting")
+    assert state["waiting"] == ["ci"]
+    assert state["input_waits"] == [{"task_id": "green", "slots": ["ci"]}]
 
     evidence = verify.Evidence(admin)
     accepted = evidence.publish("ci", {"status": "green"}, repository="acme/web", commit=HEAD)
@@ -89,6 +91,7 @@ def test_published_evidence_resumes_the_waiting_execution(
     assert accepted["repository"]["repository_id"] == "2"
     assert accepted["tags"] == {"commit": HEAD}
     assert execution.wait(30).verdict == "passed"
+    assert "input_waits" not in execution.status()
 
     monkeypatch.setenv("WYRD_REPOSITORY", "acme/web")
     monkeypatch.setenv("WYRD_COMMIT", HEAD)
@@ -134,12 +137,32 @@ def test_a_person_approves_the_pending_signoff(
     assert pending["status"] == "pending"
     assert pending["actor_id"] is None
     approval_id = pending["approval_id"]
+    assert state["input_waits"] == [{"task_id": "green", "slots": ["ci"]}]
+
+    principals = Principals(admin)
+
+    def reader(name: str, kind: str, card: str) -> verify.Execution:
+        scope = {"card": {"family": {"kind": kind, "name": card}}}
+        created = principals.create_service_principal(
+            {"name": name, "assignments": [{"role": "viewer", "scope": scope}]}
+        )
+        client = WyrdClient(
+            server_url=server.base_url, credential=created["credential"], grpc_url=server.grpc_url
+        )
+        return verify.Execution(execution_id, client)
+
+    seen = reader("signoff-repository-reader", "Repository", "web").status()
+    assert seen["input_waits"] == [{"task_id": "green", "slots": ["ci"]}]
+    with pytest.raises(WyrdError) as unseen:
+        reader("signoff-verifier-reader", "Verifier", "signoff").status()
+    assert unseen.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
 
     verify.Evidence(admin).publish("ci", {"status": "green"}, repository="acme/web", commit=HEAD)
     deadline = time.monotonic() + 30
     while (state := execution.status())["status"] != "waiting" or state.get("waiting"):
         assert time.monotonic() < deadline, state
         time.sleep(0.1)
+    assert "input_waits" not in state
 
     viewer = verify.Execution(execution_id, client_for(server, "viewer"))
     with pytest.raises(WyrdError) as refused:
@@ -151,7 +174,6 @@ def test_a_person_approves_the_pending_signoff(
         editor.decide(approval_id, "approved")
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
-    principals = Principals(admin)
     created = principals.create_service_principal(
         {
             "name": "signoff-approver",

@@ -1,4 +1,5 @@
-import type { Cookies } from '@sveltejs/kit';
+import { fail, isHttpError, type Cookies } from '@sveltejs/kit';
+import { safeProblem } from '../problem';
 import { call, refuse, relayCookies } from './browser-sessions';
 import { reject } from './session';
 
@@ -53,6 +54,12 @@ export class PlatformSession {
     const response = await call(`/platform${path}`, this.#url, { method, cookie: presented(this.#cookies), body });
     relayCookies(response, this.#cookies);
     return response;
+  }
+
+  /** `api` refusing a non-2xx with its safe problem. */
+  async change(method: 'POST' | 'PUT', path: string, body?: unknown): Promise<void> {
+    const response = await this.api(method, path, body);
+    if (!response.ok) await refuse(response);
   }
 
   /** `api` answering the JSON body of a 2xx, else refusing with its safe problem. */
@@ -145,3 +152,19 @@ export class PlatformConsole {
 }
 
 export const platformConsole = new PlatformConsole();
+
+/**
+ * Run one console form action's Rust change: its result, or the safe
+ * problem it was refused with as a form failure. A stale proof fails with
+ * `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` and the page asks the operator to
+ * confirm it is them, then submits the same form again.
+ */
+export async function consoleChange<T>(work: () => Promise<T>) {
+  try {
+    return await work();
+  } catch (cause) {
+    if (!isHttpError(cause)) throw cause;
+    const problem = safeProblem(cause);
+    return fail(problem.status, { problem });
+  }
+}

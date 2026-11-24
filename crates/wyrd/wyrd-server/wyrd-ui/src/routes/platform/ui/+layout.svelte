@@ -6,8 +6,17 @@
 <script lang="ts">
   import { page } from '$app/state';
   import logo from '../../../../brand/logo.svg?inline';
+  import { setContext } from 'svelte';
+  import ConsoleProblem from '$lib/ConsoleProblem.svelte';
+  import PasswordInput from '$lib/PasswordInput.svelte';
+  import { ConsoleReauth } from '$lib/console-reauth.svelte';
   import type { LayoutProps } from './$types';
   let { data, children }: LayoutProps = $props();
+  const reauth = setContext('console-reauth', new ConsoleReauth());
+  async function confirm(event: SubmitEvent & { currentTarget: HTMLFormElement }) {
+    event.preventDefault();
+    await reauth.password(String(new FormData(event.currentTarget).get('password') ?? ''));
+  }
   const views = [
     ['/platform/ui', 'Overview'],
     ['/platform/ui/providers', 'Social sign-in'],
@@ -33,6 +42,21 @@
   </header>
   <main class="body">
     <h1>{label}</h1>
+    {#if reauth.pending}
+      <div class="reauth" role="dialog" aria-labelledby="reauth-title">
+        <h2 id="reauth-title">Confirm it is you</h2>
+        <p><b>{reauth.pending.label}</b> is a destructive platform change. Confirm your own sign-in again; it stays fresh for five minutes. Nothing changes until you do.</p>
+        {#if reauth.issue}<ConsoleProblem issue={reauth.issue} />{/if}
+        <form class="stack" onsubmit={confirm}>
+          <label for="reauth-password">Your password</label>
+          <PasswordInput id="reauth-password" name="password" required autocomplete="current-password" readonly={reauth.confirming} />
+          <div class="row">
+            <button class="app-control primary" type="submit" disabled={reauth.confirming} aria-busy={reauth.confirming ? 'true' : undefined}>{reauth.confirming ? 'Confirming…' : 'Confirm'}</button>
+            <button class="app-control" type="button" onclick={() => reauth.cancel()}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    {/if}
     {@render children()}
   </main>
 </div>
@@ -105,6 +129,14 @@
   h1 {
     margin: 0;
     font: var(--weight-strong) 24px var(--font-sans);
+  }
+  .reauth {
+    display: grid;
+    gap: 12px;
+    padding: 16px;
+    border: 2px solid var(--warn);
+    border-radius: var(--r);
+    background: var(--surface);
   }
   .body :global(section) {
     display: grid;

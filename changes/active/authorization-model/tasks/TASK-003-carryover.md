@@ -1293,6 +1293,18 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   `wyrd_platform_*` cookies although the browser held a tenant session; a
   tenant session alone opens no console page; sign-out ends the session at
   Rust.
+- **S2 same-operator re-authentication before Suspend/Resume**
+  (`a stale console session confirms the operator before suspending a workspace`).
+  Adds one native test control, `staleConsoleProof` (ages `fresh_at` of every
+  platform browser session by ten minutes through the operator pool).
+  RED: no Suspend control on the overview (`locator.click` timeout); the
+  stale-proof assertion itself passed. GREEN: 1 passed. Proves a stale
+  session's Suspend opens "Confirm it is you" naming the change while Rust's
+  tenant stays active; another operator's password and a wrong one refuse
+  with `WYRD_AUTH_401_UNAUTHENTICATED`; a confirmation held in flight and
+  released after Cancel answers 204 yet applies nothing (Rust still
+  `active`); the own password applies the suspension (Rust `suspended`) and
+  the session shows fresh; Resume then applies at once without a prompt.
 
 ### 17. An existing User explicitly connects another sign-in method
 

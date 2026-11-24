@@ -3703,3 +3703,94 @@ withConsole('a platform operator signs in to the console with a password', async
     hop.stop();
   }
 });
+
+/** Sign `name` in to the console at `base` with `password`, landing on the overview. */
+async function consoleSignIn(page: Page, base: string, name: string, password: string): Promise<void> {
+  await page.goto(`${base}/platform`);
+  await page.getByLabel('Username').fill(name);
+  await page.getByLabel('Password').fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.waitForURL(`${base}/platform/ui`);
+}
+
+/**
+ * Suspend and Resume ask the signed-in operator to confirm it is them once
+ * Rust's five-minute proof is stale: nothing changes while the dialog is
+ * open, another operator's password and a wrong one refuse, a confirmation
+ * finishing after Cancel applies nothing, the operator's own password applies
+ * the change, and the now-fresh session resumes at once.
+ */
+withConsole('a stale console session confirms the operator before suspending a workspace', async ({ server }) => {
+  const api = await platformApi(server.baseUrl, server.initializePlatformRoot());
+  await registerOperator(api, 'ops-oncall', OPERATOR_PASSWORD);
+  await registerOperator(api, 'ops-backup', 'garnet otter 16');
+  const slug = server.tenantSlug;
+  const status = async () =>
+    ((await api('GET', '/platform/tenants')).body.tenants as { slug: string; status: string }[]).find((tenant) => tenant.slug === slug)?.status;
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await consoleSignIn(page, bff.url, 'ops-oncall', OPERATOR_PASSWORD);
+    server.staleConsoleProof();
+    await page.reload();
+    expect(await page.getByTestId('recent').textContent()).toContain('no');
+
+    const dialog = page.getByRole('dialog', { name: 'Confirm it is you' });
+    const row = page.getByRole('row').filter({ hasText: slug });
+    await row.getByRole('button', { name: 'Suspend' }).click();
+    await dialog.waitFor();
+    expect(await dialog.textContent()).toContain(`Suspending ${slug} is a destructive platform change.`);
+    expect(await status()).toBe('active');
+
+    // Another operator's password and a wrong one refuse; the workspace stays active.
+    for (const password of ['garnet otter 16', 'not the password']) {
+      await dialog.getByLabel('Your password').fill(password);
+      await dialog.getByRole('button', { name: 'Confirm' }).click();
+      await expect.poll(() => dialog.getByRole('alert').textContent()).toContain('Password not accepted');
+      expect(await dialog.getByRole('alert').textContent()).toContain('WYRD_AUTH_401_UNAUTHENTICATED');
+    }
+    expect(await status()).toBe('active');
+
+    // A confirmation that finishes after Cancel applies nothing.
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route('**/platform/ui/reauth', async (route) => {
+      await held;
+      await route.continue();
+    });
+    await dialog.getByLabel('Your password').fill(OPERATOR_PASSWORD);
+    await dialog.getByRole('button', { name: 'Confirm' }).click();
+    await dialog.getByRole('button', { name: 'Confirming…' }).waitFor();
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    expect(await dialog.count()).toBe(0);
+    const late = page.waitForResponse('**/platform/ui/reauth');
+    release();
+    expect((await late).status()).toBe(204);
+    await page.waitForTimeout(500);
+    expect(await status()).toBe('active');
+    expect(await dialog.count()).toBe(0);
+    expect(await page.getByTestId(`status-${slug}`).textContent()).toContain('active');
+    await page.unroute('**/platform/ui/reauth');
+
+    // The operator's own password applies the suspension it was asked for.
+    server.staleConsoleProof();
+    await row.getByRole('button', { name: 'Suspend' }).click();
+    await dialog.getByLabel('Your password').fill(OPERATOR_PASSWORD);
+    await dialog.getByRole('button', { name: 'Confirm' }).click();
+    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('suspended');
+    expect(await status()).toBe('suspended');
+    expect(await page.getByRole('status').textContent()).toContain(`${slug} is suspended.`);
+    expect(await page.getByTestId('recent').textContent()).toContain('yes');
+
+    // Fresh proof applies Resume at once, without asking again.
+    await row.getByRole('button', { name: 'Resume' }).click();
+    await expect.poll(() => page.getByTestId(`status-${slug}`).textContent()).toContain('active');
+    expect(await dialog.count()).toBe(0);
+    expect(await status()).toBe('active');
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});

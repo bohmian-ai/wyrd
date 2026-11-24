@@ -1,9 +1,17 @@
 <script lang="ts">
+  import { getContext } from 'svelte';
+  import { enhance } from '$app/forms';
+  import ConsoleProblem from '$lib/ConsoleProblem.svelte';
+  import type { ConsoleReauth } from '$lib/console-reauth.svelte';
   import { utc } from '$lib/platform-copy';
   import type { PageProps } from './$types';
-  let { data }: PageProps = $props();
+  let { data, form }: PageProps = $props();
+  const reauth = getContext<ConsoleReauth>('console-reauth');
   const status: Record<string, string> = { active: '✓ active', suspended: '⊘ suspended', provisioning: '◌ provisioning', failed: '✕ failed' };
 </script>
+
+{#if form?.problem && form.problem.code !== 'WYRD_AUTH_403_RECENT_LOGIN_REQUIRED'}<ConsoleProblem issue={form.problem} />{/if}
+<div role="status" aria-live="polite">{#if form?.notice}<p>✓ {form.notice}</p>{/if}</div>
 
 <section aria-labelledby="session">
   <h2 id="session">This session</h2>
@@ -26,7 +34,17 @@
             <td>{tenant.display_name}</td>
             <td><code>{tenant.slug}</code></td>
             <td data-testid="status-{tenant.slug}">{status[tenant.status] ?? tenant.status}</td>
-            <td></td>
+            <td>
+              {#if tenant.status === 'active' || tenant.status === 'suspended'}
+                {@const next = tenant.status === 'active' ? 'suspended' : 'active'}
+                <form method="POST" action="?/status" use:enhance={reauth.guard(`${next === 'suspended' ? 'Suspending' : 'Resuming'} ${tenant.slug}`)}>
+                  <input type="hidden" name="id" value={tenant.id} />
+                  <input type="hidden" name="slug" value={tenant.slug} />
+                  <input type="hidden" name="status" value={next} />
+                  <button class="app-control" type="submit">{next === 'suspended' ? 'Suspend' : 'Resume'}</button>
+                </form>
+              {/if}
+            </td>
           </tr>
         {/each}
       </tbody>
@@ -36,6 +54,9 @@
 </section>
 
 <style>
+  [role='status']:empty {
+    display: none;
+  }
   .scroll {
     overflow-x: auto;
   }

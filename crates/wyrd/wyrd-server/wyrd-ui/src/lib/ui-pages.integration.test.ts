@@ -3815,7 +3815,7 @@ withConsole('a platform SSO operator confirms a suspension at the identity provi
     const page = await browser.newPage();
     const sso = page.getByRole('button', { name: 'Sign in with platform SSO' });
     await page.goto(`${bff.url}/platform`);
-    expect(await sso.count()).toBe(0);
+    expect(await sso.isDisabled()).toBe(true);
 
     const connected = await api('PUT', '/platform/oidc/connection', { issuer_url: google.issuer, client_id: 'wyrd-platform', client_auth: { method: 'public' } });
     expect(connected.status, JSON.stringify(connected.body)).toBe(200);

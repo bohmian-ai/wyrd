@@ -1354,6 +1354,34 @@ Runner: `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`
   "Confirm it is you" and changes nothing until the operator's password
   confirms; a blank secret keeps the stored challenge; turning the challenge
   off removes it (`signup_challenge: null`). TDD: PASS.
+- **Mock alignment sweep.** Each production page and state was captured in
+  light and dark at 1280 and 390 wide (entry, refused sign-in, ended session,
+  refused SSO return, overview, password and SSO re-auth, refused re-auth,
+  providers, provider conflict, mail with and without a relay, refused mail
+  test, signup) and compared with `node selfcheck.mjs --shots`. Fixed: plain
+  password fields in place of the Show/Hide control; the entry's "Signing in…"
+  busy state with read-only fields; the SSO button always shown and disabled
+  without platform SSO; "Too many sign-in attempts" for the 429; notices as
+  `.done` with a green `.ok` tick, and the mail test result the same way;
+  the mail "Sending…" busy state; problem block spacing inside the console;
+  the workspaces table as a labelled scroll region; the hidden provider test
+  and enable forms no longer adding a gap. The six journeys pass after the
+  sweep (S3's no-SSO check now expects the disabled button). Remaining
+  deviations and why:
+  - Mail password copy and the "Remove the stored username and password"
+    box: Part A's `PUT /platform/mail` contract keeps an omitted password.
+  - Provider registration text, callback URLs and revisions come from Rust's
+    provider view, not the mock's sample text.
+  - The SSO return has no "Finishing platform SSO sign-in…" state: the
+    callback load finishes with Rust before the page renders. A pop-up
+    re-auth shows "Returning to the console…" instead, which the mock's
+    simulated re-auth has no page for.
+  - The password form is hidden when Rust's `methods.password` is false.
+  - Fields use native `required` rather than the mock's focus-on-empty
+    script, so the forms work as plain posts.
+  - The entry card's 390-wide side margin comes from the shared
+    `Entry.svelte`, which the tenant pages also use.
+  - No preview bar, so pages start 33px higher.
 
 ### 17. An existing User explicitly connects another sign-in method
 

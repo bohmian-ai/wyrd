@@ -11,7 +11,7 @@
 </script>
 
 {#if form?.problem && form.problem.code !== 'WYRD_AUTH_403_RECENT_LOGIN_REQUIRED'}<ConsoleProblem issue={form.problem} />{/if}
-<div role="status" aria-live="polite">{#if form?.notice}<p>✓ {form.notice}</p>{/if}</div>
+<div role="status" aria-live="polite">{#if form?.notice}<p class="done" data-testid="notice"><span class="ok">✓</span> {form.notice}</p>{/if}</div>
 
 <section aria-labelledby="session">
   <h2 id="session">This session</h2>
@@ -25,7 +25,7 @@
 </section>
 <section aria-labelledby="workspaces">
   <h2 id="workspaces">Workspaces</h2>
-  <div class="scroll">
+  <div class="scroll" role="region" aria-label="Workspaces" tabindex="-1">
     <table>
       <thead><tr><th>Workspace</th><th>Key</th><th>Status</th><th></th></tr></thead>
       <tbody>
@@ -54,9 +54,6 @@
 </section>
 
 <style>
-  [role='status']:empty {
-    display: none;
-  }
   .scroll {
     overflow-x: auto;
   }

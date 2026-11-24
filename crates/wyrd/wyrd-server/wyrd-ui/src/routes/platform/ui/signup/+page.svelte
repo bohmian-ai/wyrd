@@ -12,7 +12,7 @@
 </script>
 
 {#if problem}<ConsoleProblem issue={problem} />{/if}
-<div role="status" aria-live="polite">{#if form?.notice}<p>✓ {form.notice}</p>{/if}</div>
+<div role="status" aria-live="polite">{#if form?.notice}<p class="done" data-testid="notice"><span class="ok">✓</span> {form.notice}</p>{/if}</div>
 
 <section aria-labelledby="login">
   <h2 id="login">Login and signup</h2>
@@ -46,8 +46,5 @@
     padding: 10px 12px;
     border: 1px solid var(--border-soft);
     border-radius: var(--r);
-  }
-  [role='status']:empty {
-    display: none;
   }
 </style>

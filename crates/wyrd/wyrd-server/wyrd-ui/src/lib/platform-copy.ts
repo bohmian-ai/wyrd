@@ -5,6 +5,7 @@ const titles = {
   signIn: { title: 'Sign-in not accepted', remediation: 'Check your operator username and password. Workspace accounts and API keys do not sign in here.' },
   identity: { title: 'That identity is not a platform operator', remediation: 'Only operators registered on this deployment sign in here. Try again, or ask another operator to register you.' },
   reauth: { title: 'Password not accepted', remediation: "Enter your own operator password. Another operator's password or a bootstrap key does not confirm this session." },
+  throttled: { title: 'Too many sign-in attempts' },
   noSso: { title: 'Platform SSO is not configured', remediation: 'Sign in with your operator username and password.' },
   conflict: { title: 'This provider changed', remediation: 'A newer revision was saved since this page loaded. Reload, then test that revision.' }
 } as const;

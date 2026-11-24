@@ -1,6 +1,7 @@
 <script lang="ts">
   import { getContext } from 'svelte';
   import { enhance } from '$app/forms';
+  import type { SubmitFunction } from '@sveltejs/kit';
   import ConsoleProblem from '$lib/ConsoleProblem.svelte';
   import type { ConsoleReauth } from '$lib/console-reauth.svelte';
   import type { PageProps } from './$types';
@@ -9,10 +10,20 @@
   const security = { starttls: 'STARTTLS', tls: 'TLS (SMTPS)', none: 'None' } as const;
   const problem = $derived(form?.problem?.code === 'WYRD_AUTH_403_RECENT_LOGIN_REQUIRED' ? null : form?.problem);
   const result = $derived(form && 'result' in form ? form.result : null);
+  let sending = $state(false);
+  const guarded = reauth.guard('Sending a test message', false);
+  /** The test form's guard, showing the send as busy until Rust answers. */
+  const send: SubmitFunction = (input) => {
+    sending = true;
+    return async (outcome) => {
+      sending = false;
+      await (await guarded(input))?.(outcome);
+    };
+  };
 </script>
 
 {#if problem}<ConsoleProblem issue={problem} />{/if}
-<div role="status" aria-live="polite">{#if form && 'notice' in form && form.notice}<p>✓ {form.notice}</p>{/if}</div>
+<div role="status" aria-live="polite">{#if form && 'notice' in form && form.notice}<p class="done" data-testid="notice"><span class="ok">✓</span> {form.notice}</p>{/if}</div>
 
 <section aria-labelledby="relay">
   <h2 id="relay">SMTP relay</h2>
@@ -25,7 +36,7 @@
       <dt>Sender</dt><dd>{data.relay.sender}</dd>
     </dl>
   {:else}
-    <p data-testid="no-relay">– No relay. Wyrd emails nothing: invitations are copied links, and email signup, finding workspaces by email, recovery email and reset requests are not offered.</p>
+    <p class="absent" data-testid="no-relay">– No relay. Wyrd emails nothing: invitations are copied links, and email signup, finding workspaces by email, recovery email and reset requests are not offered.</p>
   {/if}
   <form class="stack" method="POST" action="?/save" use:enhance={reauth.guard('Replacing the mail relay')}>
     <label for="host">Host</label><input id="host" class="app-input mono" name="host" required autocomplete="off" defaultValue={data.relay?.host ?? ''} />
@@ -49,22 +60,17 @@
 {#if data.relay}
   <section aria-labelledby="test">
     <h2 id="test">Send a test message</h2>
-    <form class="stack" method="POST" action="?/test" use:enhance={reauth.guard('Sending a test message', false)}>
+    <form class="stack" method="POST" action="?/test" use:enhance={send}>
       <label for="recipient">Recipient</label><input id="recipient" class="app-input" name="recipient" type="email" required />
-      <button class="app-control" type="submit">Send test</button>
+      <button class="app-control" type="submit" disabled={sending} aria-busy={sending ? 'true' : undefined}>{sending ? 'Sending…' : 'Send test'}</button>
     </form>
     <div role="status">
       {#if result?.accepted}
-        <p data-testid="test-result">✓ The relay accepted the message. That does not prove it reached the inbox.</p>
+        <p class="done" data-testid="test-result"><span class="ok">✓</span> The relay accepted the message. That does not prove it reached the inbox.</p>
       {:else if result}
-        <p data-testid="test-result"><span class="bad">✕</span> The relay did not accept the message. <code>{result.error}</code></p>
+        <p class="done" data-testid="test-result"><span class="bad">✕</span> The relay did not accept the message. <code>{result.error}</code></p>
       {/if}
     </div>
   </section>
 {/if}
 
-<style>
-  [role='status']:empty {
-    display: none;
-  }
-</style>

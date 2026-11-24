@@ -62,7 +62,7 @@
 
 <p class="lead">Shared Google and GitHub.com sign-in for every workspace. Register the client in the provider console first. A saved client is a new, untested revision that no page offers until a real sign-in tests it and you enable it.</p>
 {#if problem}<ConsoleProblem issue={problem} />{/if}
-<div role="status" aria-live="polite">{#if notice}<p>✓ {notice}</p>{/if}</div>
+<div role="status" aria-live="polite">{#if notice}<p class="done" data-testid="notice"><span class="ok">✓</span> {notice}</p>{/if}</div>
 
 {#each data.providers as p (p.provider)}
   <section aria-labelledby="provider-{p.provider}" data-testid="provider-{p.provider}">
@@ -90,11 +90,11 @@
       {#if p.state === 'untested'}<p id="why-{p.provider}">Test revision {p.revision} before enabling it.</p>{/if}
     </form>
     {#if p.state}
-      <form id="test-{p.provider}" method="POST" action="?/test" use:enhance={test}>
+      <form id="test-{p.provider}" hidden method="POST" action="?/test" use:enhance={test}>
         <input type="hidden" name="provider" value={p.provider} />
         <input type="hidden" name="revision" value={p.revision} />
       </form>
-      <form id="enabled-{p.provider}" method="POST" action="?/enabled" use:enhance={reauth.guard(`${p.state === 'enabled' ? 'Disabling' : 'Enabling'} ${names[p.provider]}`)}>
+      <form id="enabled-{p.provider}" hidden method="POST" action="?/enabled" use:enhance={reauth.guard(`${p.state === 'enabled' ? 'Disabling' : 'Enabling'} ${names[p.provider]}`)}>
         <input type="hidden" name="provider" value={p.provider} />
         <input type="hidden" name="revision" value={p.revision} />
         <input type="hidden" name="enabled" value={p.state !== 'enabled'} />
@@ -111,8 +111,5 @@
     margin-left: 8px;
     font: 11px var(--font-mono);
     color: var(--muted);
-  }
-  [role='status']:empty {
-    display: none;
   }
 </style>

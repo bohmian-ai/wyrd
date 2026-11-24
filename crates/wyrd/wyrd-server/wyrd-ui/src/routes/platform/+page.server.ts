@@ -17,7 +17,7 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
 
 /** The safe problem a refused sign-in answers, telling a throttled browser when it may retry. */
 function refusal(cause: unknown, setHeaders: (headers: Record<string, string>) => void) {
-  const value = worded(safeProblem(cause), 'signIn', 401);
+  const value = worded(worded(safeProblem(cause), 'signIn', 401), 'throttled', 429);
   const wait = retryAfter(value);
   if (wait) setHeaders({ 'retry-after': String(wait) });
   return value;

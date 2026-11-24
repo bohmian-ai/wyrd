@@ -8,7 +8,6 @@
   import logo from '../../../../brand/logo.svg?inline';
   import { setContext } from 'svelte';
   import ConsoleProblem from '$lib/ConsoleProblem.svelte';
-  import PasswordInput from '$lib/PasswordInput.svelte';
   import { ConsoleReauth } from '$lib/console-reauth.svelte';
   import type { LayoutProps } from './$types';
   let { data, children }: LayoutProps = $props();
@@ -50,7 +49,7 @@
         {#if data.session.method === 'password'}
           <form class="stack" onsubmit={confirm}>
             <label for="reauth-password">Your password</label>
-            <PasswordInput id="reauth-password" name="password" required autocomplete="current-password" readonly={reauth.confirming} />
+            <input id="reauth-password" class="app-input" type="password" name="password" required autocomplete="current-password" readonly={reauth.confirming} />
             <div class="row">
               <button class="app-control primary" type="submit" disabled={reauth.confirming} aria-busy={reauth.confirming ? 'true' : undefined}>{reauth.confirming ? 'Confirming…' : 'Confirm'}</button>
               <button class="app-control" type="button" onclick={() => reauth.cancel()}>Cancel</button>
@@ -205,8 +204,24 @@
     flex-wrap: wrap;
     gap: 8px;
   }
+  .body :global(.app-problem p),
+  .body :global(.app-problem code) {
+    margin: 6px 0 0;
+  }
+  .body :global(p.done) {
+    color: var(--text);
+  }
+  .body :global(.ok) {
+    color: var(--ok);
+  }
   .body :global(.bad) {
     color: var(--danger);
+  }
+  .body :global(.app-input[readonly]) {
+    opacity: 0.6;
+  }
+  .body :global([role='status']:empty) {
+    display: none;
   }
   @media (max-width: 767px) {
     header,

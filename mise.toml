@@ -1573,7 +1573,8 @@ description = """Full repository aggregate for nightly, release, mixed, global, 
 each exactly once. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at
 the first failed lane. CI runs each `gate:*` shard as its own parallel job, read from this list, so a lane belongs to
 exactly one shard. The only tests outside gate are the scheduled production-geometry qualifications
-(performance.yml) and the live-credential lanes (storage-integration-cloud.yml, the *:smoke:live tasks)."""
+(performance.yml), the live-credential lanes (storage-integration-cloud.yml, the *:smoke:live tasks), and the official
+image journeys (test:server:startup), which build a Linux image and so run only on Linux, in CI's image job."""
 depends = [
   "gate:checks",
   "gate:rust:families",

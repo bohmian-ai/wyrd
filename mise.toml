@@ -790,7 +790,13 @@ description = "Build the dev wyrd-server binary that in-process test servers (Ru
 # The first launch of a freshly linked binary can pay a one-time operating
 # system verification cost longer than a code block's deadline; launching it
 # here keeps that cost out of every test server's first worker spawn.
-run = "cargo run --locked -p wyrd-server --bin wyrd-server -- --version"
+# workspace-hack and wyrd-testing are dev-only, so selecting them resolves the
+# binary with the test builds' features: the test builds that follow reuse its
+# dependency graph instead of compiling a second copy of it.
+run = [
+  "cargo build --locked -p wyrd-server --bin wyrd-server -p workspace-hack -p wyrd-testing",
+  "\"${CARGO_TARGET_DIR:-target}/debug/wyrd-server\" --version",
+]
 
 [tasks."test:verification:sandbox"]
 description = "Run the Verifier Python sandbox and registered-Artifact code tests against the real Monty worker and test Postgres"

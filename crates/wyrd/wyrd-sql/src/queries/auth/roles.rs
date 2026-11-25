@@ -8,6 +8,28 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 
 use crate::TenantConn;
+use crate::queries::auth::principal_directory::assignable_principals_union;
+
+/// Ids of accounts holding a Role at any scope, directly or through a Group,
+/// for the Role rows `r` the predicate selects. Group bindings contribute
+/// each member once; a Group without members contributes nothing.
+macro_rules! role_holders {
+    ($role_predicate:literal) => {
+        concat!(
+            r"
+                SELECT COALESCE(b.user_id, b.service_account_id, m.user_id, m.service_account_id)
+                  FROM wyrd.auth_role_bindings b
+                  JOIN wyrd.auth_roles r
+                    ON r.data_tenant_id = b.data_tenant_id AND r.id = b.role_id
+                  LEFT JOIN wyrd.auth_group_memberships m
+                    ON m.data_tenant_id = b.data_tenant_id AND m.group_id = b.group_id
+                 WHERE b.data_tenant_id = wyrd.current_tenant()
+                   AND ",
+            $role_predicate
+        )
+    };
+}
+pub(crate) use role_holders;
 
 const ROLES_BY_NAME_SQL: &str = r"
 SELECT id, name, permissions, description

@@ -9,7 +9,38 @@ use sqlx::types::Uuid;
 use wyrd_spec::auth::WorkloadFamily;
 
 use crate::TenantConn;
+use crate::queries::auth::roles::role_holders;
 use crate::queries::auth::service_accounts::workload_family;
+
+/// Users and Service accounts a tenant administrator can assign Roles to, in
+/// one shape. The tenant administrator and the internal `system` writer are
+/// absent: their authority is fixed and never re-assigned. Shared by the
+/// principal directory and Role member counts so both describe the same
+/// people.
+macro_rules! assignable_principals_union {
+    () => {
+        r"
+                SELECT u.id, 'user'::text AS kind, u.status, u.email,
+                       u.username AS name, u.display_name,
+                       (SELECT i.issuer FROM wyrd.auth_user_identities i
+                         WHERE i.data_tenant_id = u.data_tenant_id AND i.user_id = u.id
+                         ORDER BY i.created_at, i.issuer LIMIT 1) AS identity_issuer,
+                       NULL::text AS restriction_kind, NULL::text AS restriction_name
+                  FROM wyrd.auth_users u
+                 WHERE u.data_tenant_id = wyrd.current_tenant()
+                   AND u.status <> 'deleted'
+                UNION ALL
+                SELECT s.id, s.principal_kind AS kind, s.status, NULL::text AS email,
+                       s.name, NULL::text AS display_name, NULL::text AS identity_issuer,
+                       s.restriction_kind, s.restriction_name
+                  FROM wyrd.auth_service_accounts s
+                 WHERE s.data_tenant_id = wyrd.current_tenant()
+                   AND s.principal_kind = 'service'
+                   AND s.status <> 'deleted'
+        "
+    };
+}
+pub(crate) use assignable_principals_union;
 
 /// Each assignable principal with the Roles it holds; each statement below
 /// appends its own predicate.

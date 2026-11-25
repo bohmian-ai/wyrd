@@ -1,0 +1,1021 @@
+22:04:56 [34m[test:wyrd][0m [1m$ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:wyrd:inner'[0m
+22:05:02  mailpit Pulling 
+22:05:02  postgres Pulling 
+22:05:03  2d35ebdb57d9 Pulling fs layer 
+22:05:03  b143aff5074c Pulling fs layer 
+22:05:03  e38fa431e774 Pulling fs layer 
+22:05:03  40748add9f4f Pulling fs layer 
+22:05:03  1be8baae3c53 Pulling fs layer 
+22:05:03  e91b6b814ba6 Pulling fs layer 
+22:05:03  46e4f78fd254 Pulling fs layer 
+22:05:03  111f378001d9 Pulling fs layer 
+22:05:03  c362828e9ca3 Pulling fs layer 
+22:05:03  9be9d0609035 Pulling fs layer 
+22:05:03  72bd85048465 Pulling fs layer 
+22:05:03  3b9319a24e33 Pulling fs layer 
+22:05:03  cc2ed79b34db Pulling fs layer 
+22:05:03  34ff39ac908b Pulling fs layer 
+22:05:03  91d82016f303 Pulling fs layer 
+22:05:03  cfa3776983f1 Pulling fs layer 
+22:05:03  40748add9f4f Waiting 
+22:05:03  c362828e9ca3 Waiting 
+22:05:03  1be8baae3c53 Waiting 
+22:05:03  9be9d0609035 Waiting 
+22:05:03  e91b6b814ba6 Waiting 
+22:05:03  72bd85048465 Waiting 
+22:05:03  3b9319a24e33 Waiting 
+22:05:03  46e4f78fd254 Waiting 
+22:05:03  cc2ed79b34db Waiting 
+22:05:03  111f378001d9 Waiting 
+22:05:03  34ff39ac908b Waiting 
+22:05:03  91d82016f303 Waiting 
+22:05:03  cfa3776983f1 Waiting 
+22:05:03  2d35ebdb57d9 Downloading [>                                                  ]  48.51kB/3.802MB
+22:05:03  2d35ebdb57d9 Verifying Checksum 
+22:05:03  2d35ebdb57d9 Download complete 
+22:05:03  2d35ebdb57d9 Extracting [>                                                  ]  65.54kB/3.802MB
+22:05:03  b143aff5074c Downloading [>                                                  ]    114kB/10.16MB
+22:05:03  e38fa431e774 Downloading [>                                                  ]  3.458kB/173.3kB
+22:05:03  e38fa431e774 Download complete 
+22:05:03  2d35ebdb57d9 Extracting [==================================================>]  3.802MB/3.802MB
+22:05:03  b143aff5074c Downloading [==================================================>]  10.16MB/10.16MB
+22:05:03  b143aff5074c Download complete 
+22:05:03  2d35ebdb57d9 Pull complete 
+22:05:03  b143aff5074c Extracting [>                                                  ]  131.1kB/10.16MB
+22:05:03  b143aff5074c Extracting [==================================================>]  10.16MB/10.16MB
+22:05:03  b143aff5074c Pull complete 
+22:05:03  e38fa431e774 Extracting [=========>                                         ]  32.77kB/173.3kB
+22:05:03  e38fa431e774 Extracting [==================================================>]  173.3kB/173.3kB
+22:05:03  e38fa431e774 Extracting [==================================================>]  173.3kB/173.3kB
+22:05:03  40748add9f4f Downloading [>                                                  ]  310.7kB/29.84MB
+22:05:03  e38fa431e774 Pull complete 
+22:05:03  mailpit Pulled 
+22:05:03  1be8baae3c53 Downloading [==================================================>]  1.329kB/1.329kB
+22:05:03  1be8baae3c53 Verifying Checksum 
+22:05:03  1be8baae3c53 Download complete 
+22:05:03  e91b6b814ba6 Downloading [>                                                  ]  64.94kB/6.443MB
+22:05:03  40748add9f4f Verifying Checksum 
+22:05:03  40748add9f4f Download complete 
+22:05:03  40748add9f4f Extracting [>                                                  ]  327.7kB/29.84MB
+22:05:03  e91b6b814ba6 Verifying Checksum 
+22:05:03  e91b6b814ba6 Download complete 
+22:05:03  40748add9f4f Extracting [===============>                                   ]  9.503MB/29.84MB
+22:05:03  46e4f78fd254 Downloading [>                                                  ]  15.79kB/1.258MB
+22:05:03  111f378001d9 Downloading [>                                                  ]  97.71kB/8.204MB
+22:05:03  40748add9f4f Extracting [============================>                      ]  16.71MB/29.84MB
+22:05:03  46e4f78fd254 Download complete 
+22:05:03  c362828e9ca3 Downloading [>                                                  ]  15.79kB/1.312MB
+22:05:03  111f378001d9 Verifying Checksum 
+22:05:03  111f378001d9 Download complete 
+22:05:03  c362828e9ca3 Verifying Checksum 
+22:05:03  c362828e9ca3 Download complete 
+22:05:03  40748add9f4f Extracting [===========================================>       ]  25.89MB/29.84MB
+22:05:04  40748add9f4f Extracting [===============================================>   ]  28.51MB/29.84MB
+22:05:04  9be9d0609035 Downloading [==================================================>]     116B/116B
+22:05:04  9be9d0609035 Download complete 
+22:05:04  72bd85048465 Downloading [==================================================>]   3.14kB/3.14kB
+22:05:04  72bd85048465 Verifying Checksum 
+22:05:04  72bd85048465 Download complete 
+22:05:04  3b9319a24e33 Downloading [>                                                  ]  540.7kB/119.1MB
+22:05:04  40748add9f4f Extracting [=================================================> ]  29.82MB/29.84MB
+22:05:04  40748add9f4f Extracting [==================================================>]  29.84MB/29.84MB
+22:05:04  40748add9f4f Pull complete 
+22:05:04  1be8baae3c53 Extracting [==================================================>]  1.329kB/1.329kB
+22:05:04  1be8baae3c53 Extracting [==================================================>]  1.329kB/1.329kB
+22:05:04  1be8baae3c53 Pull complete 
+22:05:04  e91b6b814ba6 Extracting [>                                                  ]  65.54kB/6.443MB
+22:05:04  3b9319a24e33 Downloading [===================>                               ]  46.32MB/119.1MB
+22:05:04  cc2ed79b34db Downloading [=================>                                 ]  3.501kB/10.11kB
+22:05:04  cc2ed79b34db Downloading [==================================================>]  10.11kB/10.11kB
+22:05:04  cc2ed79b34db Verifying Checksum 
+22:05:04  cc2ed79b34db Download complete 
+22:05:04  34ff39ac908b Downloading [==================================================>]     164B/164B
+22:05:04  34ff39ac908b Verifying Checksum 
+22:05:04  34ff39ac908b Download complete 
+22:05:04  e91b6b814ba6 Extracting [==================================================>]  6.443MB/6.443MB
+22:05:04  3b9319a24e33 Downloading [======================================>            ]  91.56MB/119.1MB
+22:05:04  e91b6b814ba6 Pull complete 
+22:05:04  46e4f78fd254 Extracting [=>                                                 ]  32.77kB/1.258MB
+22:05:04  46e4f78fd254 Extracting [==================================================>]  1.258MB/1.258MB
+22:05:04  46e4f78fd254 Extracting [==================================================>]  1.258MB/1.258MB
+22:05:04  46e4f78fd254 Pull complete 
+22:05:04  111f378001d9 Extracting [>                                                  ]   98.3kB/8.204MB
+22:05:04  3b9319a24e33 Verifying Checksum 
+22:05:04  3b9319a24e33 Download complete 
+22:05:04  111f378001d9 Extracting [===================================>               ]  5.898MB/8.204MB
+22:05:04  91d82016f303 Downloading [============================>                      ]  3.502kB/6.101kB
+22:05:04  91d82016f303 Downloading [==================================================>]  6.101kB/6.101kB
+22:05:04  91d82016f303 Verifying Checksum 
+22:05:04  91d82016f303 Download complete 
+22:05:04  111f378001d9 Extracting [==================================================>]  8.204MB/8.204MB
+22:05:04  111f378001d9 Pull complete 
+22:05:04  c362828e9ca3 Extracting [=>                                                 ]  32.77kB/1.312MB
+22:05:04  cfa3776983f1 Downloading [==================================================>]     184B/184B
+22:05:04  cfa3776983f1 Verifying Checksum 
+22:05:04  cfa3776983f1 Download complete 
+22:05:04  c362828e9ca3 Extracting [==================================================>]  1.312MB/1.312MB
+22:05:04  c362828e9ca3 Pull complete 
+22:05:04  9be9d0609035 Extracting [==================================================>]     116B/116B
+22:05:04  9be9d0609035 Extracting [==================================================>]     116B/116B
+22:05:04  9be9d0609035 Pull complete 
+22:05:04  72bd85048465 Extracting [==================================================>]   3.14kB/3.14kB
+22:05:04  72bd85048465 Extracting [==================================================>]   3.14kB/3.14kB
+22:05:04  72bd85048465 Pull complete 
+22:05:04  3b9319a24e33 Extracting [>                                                  ]  557.1kB/119.1MB
+22:05:04  3b9319a24e33 Extracting [===>                                               ]  8.913MB/119.1MB
+22:05:04  3b9319a24e33 Extracting [======>                                            ]  16.15MB/119.1MB
+22:05:04  3b9319a24e33 Extracting [=========>                                         ]   23.4MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [=============>                                     ]  32.31MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [==================>                                ]  42.89MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [======================>                            ]  53.48MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [=========================>                         ]  61.28MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [==============================>                    ]  71.86MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [==================================>                ]     83MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [=======================================>           ]  93.03MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [==========================================>        ]  100.3MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [============================================>      ]    107MB/119.1MB
+22:05:05  3b9319a24e33 Extracting [===============================================>   ]  113.1MB/119.1MB
+22:05:06  3b9319a24e33 Extracting [================================================>  ]  116.4MB/119.1MB
+22:05:06  3b9319a24e33 Extracting [=================================================> ]  118.1MB/119.1MB
+22:05:06  3b9319a24e33 Extracting [==================================================>]  119.1MB/119.1MB
+22:05:06  3b9319a24e33 Pull complete 
+22:05:06  cc2ed79b34db Extracting [==================================================>]  10.11kB/10.11kB
+22:05:06  cc2ed79b34db Extracting [==================================================>]  10.11kB/10.11kB
+22:05:06  cc2ed79b34db Pull complete 
+22:05:06  34ff39ac908b Extracting [==================================================>]     164B/164B
+22:05:06  34ff39ac908b Extracting [==================================================>]     164B/164B
+22:05:06  34ff39ac908b Pull complete 
+22:05:06  91d82016f303 Extracting [==================================================>]  6.101kB/6.101kB
+22:05:06  91d82016f303 Extracting [==================================================>]  6.101kB/6.101kB
+22:05:06  91d82016f303 Pull complete 
+22:05:06  cfa3776983f1 Extracting [==================================================>]     184B/184B
+22:05:06  cfa3776983f1 Extracting [==================================================>]     184B/184B
+22:05:06  cfa3776983f1 Pull complete 
+22:05:06  postgres Pulled 
+22:05:06  Network wyrd-test-16512-16518-wyrd_default  Creating
+22:05:06  Network wyrd-test-16512-16518-wyrd_default  Created
+22:05:06  Container wyrd-test-16512-16518-wyrd-mailpit-1  Creating
+22:05:06  Container wyrd-test-16512-16518-wyrd-postgres-1  Creating
+22:05:10  Container wyrd-test-16512-16518-wyrd-mailpit-1  Created
+22:05:10  Container wyrd-test-16512-16518-wyrd-postgres-1  Created
+22:05:10  Container wyrd-test-16512-16518-wyrd-mailpit-1  Starting
+22:05:10  Container wyrd-test-16512-16518-wyrd-postgres-1  Starting
+22:05:10  Container wyrd-test-16512-16518-wyrd-mailpit-1  Started
+22:05:10  Container wyrd-test-16512-16518-wyrd-postgres-1  Started
+22:05:10  Container wyrd-test-16512-16518-wyrd-postgres-1  Waiting
+22:05:10  Container wyrd-test-16512-16518-wyrd-mailpit-1  Waiting
+22:05:12  Container wyrd-test-16512-16518-wyrd-mailpit-1  Healthy
+22:05:13  Container wyrd-test-16512-16518-wyrd-postgres-1  Healthy
+22:05:13 [36m[db:migrate:all:inner][0m [1m$ cargo nextest run --locked -p wyrd-sql --test integration -E 'test(=pg_migration::pg_tests::migrations_apply_and_are_idempotent)'[0m
+22:05:13     Updating crates.io index
+22:05:15    Compiling libc v0.2.186
+22:05:15    Compiling proc-macro2 v1.0.106
+22:05:15    Compiling unicode-ident v1.0.24
+22:05:15    Compiling quote v1.0.46
+22:05:16    Compiling syn v2.0.118
+22:05:16    Compiling serde_core v1.0.228
+22:05:17    Compiling jobserver v0.1.35
+22:05:17    Compiling shlex v2.0.1
+22:05:18    Compiling find-msvc-tools v0.1.9
+22:05:18    Compiling cc v1.2.67
+22:05:19    Compiling serde v1.0.228
+22:05:19    Compiling cfg-if v1.0.4
+22:05:19    Compiling memchr v2.8.3
+22:05:19    Compiling serde_derive v1.0.228
+22:05:19    Compiling equivalent v1.0.2
+22:05:19    Compiling allocator-api2 v0.2.21
+22:05:19    Compiling foldhash v0.2.0
+22:05:19    Compiling itoa v1.0.18
+22:05:19    Compiling hashbrown v0.17.1
+22:05:20    Compiling indexmap v2.14.2
+22:05:20    Compiling once_cell v1.21.4
+22:05:20    Compiling zmij v1.0.21
+22:05:20    Compiling serde_json v1.0.150
+22:05:20    Compiling bytes v1.12.1
+22:05:21    Compiling autocfg v1.5.1
+22:05:21    Compiling libm v0.2.16
+22:05:21    Compiling num-traits v0.2.19
+22:05:21    Compiling pkg-config v0.3.33
+22:05:22    Compiling scopeguard v1.2.0
+22:05:22    Compiling smallvec v1.15.2
+22:05:22    Compiling pin-project-lite v0.2.17
+22:05:22    Compiling version_check v0.9.5
+22:05:22    Compiling lock_api v0.4.14
+22:05:22    Compiling parking_lot_core v0.9.12
+22:05:22    Compiling futures-core v0.3.32
+22:05:22    Compiling zeroize v1.9.0
+22:05:22    Compiling parking_lot v0.12.5
+22:05:22    Compiling tree-sitter-language v0.1.7
+22:05:22    Compiling zerocopy v0.8.54
+22:05:22    Compiling futures-sink v0.3.32
+22:05:22    Compiling zerocopy-derive v0.8.54
+22:05:22    Compiling futures-channel v0.3.32
+22:05:22    Compiling futures-macro v0.3.32
+22:05:23    Compiling synstructure v0.13.2
+22:05:23    Compiling syn v3.0.5
+22:05:25    Compiling slab v0.4.12
+22:05:25    Compiling futures-task v0.3.32
+22:05:25    Compiling futures-io v0.3.32
+22:05:25    Compiling futures-util v0.3.32
+22:05:26    Compiling log v0.4.34
+22:05:26    Compiling zerofrom-derive v0.1.7
+22:05:26    Compiling errno v0.3.14
+22:05:26    Compiling getrandom v0.3.4
+22:05:26    Compiling signal-hook-registry v1.4.8
+22:05:26    Compiling zerofrom v0.1.8
+22:05:27    Compiling yoke-derive v0.8.2
+22:05:27    Compiling tokio-macros v2.7.0
+22:05:27    Compiling mio v1.2.1
+22:05:27    Compiling socket2 v0.6.4
+22:05:27    Compiling typenum v1.20.1
+22:05:27    Compiling stable_deref_trait v1.2.1
+22:05:27    Compiling yoke v0.8.3
+22:05:27    Compiling tokio v1.52.3
+22:05:28    Compiling iana-time-zone v0.1.65
+22:05:28    Compiling subtle v2.6.1
+22:05:28    Compiling percent-encoding v2.3.2
+22:05:28    Compiling chrono v0.4.45
+22:05:29    Compiling tracing-core v0.1.36
+22:05:29    Compiling zerovec-derive v0.11.3
+22:05:29    Compiling tracing-attributes v0.1.31
+22:05:30    Compiling tracing v0.1.44
+22:05:30    Compiling zerovec v0.11.6
+22:05:30    Compiling num-integer v0.1.46
+22:05:30    Compiling displaydoc v0.2.6
+22:05:31    Compiling tokio-util v0.7.18
+22:05:31    Compiling cmake v0.1.58
+22:05:31    Compiling fs_extra v1.3.0
+22:05:31    Compiling dunce v1.0.5
+22:05:31    Compiling thiserror v2.0.21
+22:05:31    Compiling aws-lc-sys v0.45.0
+22:05:31    Compiling thiserror-impl v2.0.21
+22:05:32    Compiling tinystr v0.8.3
+22:05:32    Compiling siphasher v1.0.3
+22:05:32    Compiling writeable v0.6.3
+22:05:32    Compiling litemap v0.8.2
+22:05:32    Compiling icu_locale_core v2.2.0
+22:05:33    Compiling zerotrie v0.2.4
+22:05:33    Compiling potential_utf v0.1.5
+22:05:33    Compiling generic-array v0.14.7
+22:05:33    Compiling getrandom v0.2.17
+22:05:33    Compiling icu_normalizer_data v2.2.0
+22:05:33    Compiling icu_properties_data v2.2.0
+22:05:33    Compiling utf8_iter v1.0.4
+22:05:33    Compiling fnv v1.0.7
+22:05:33    Compiling base64 v0.22.1
+22:05:33    Compiling aws-lc-rs v1.18.1
+22:05:33    Compiling icu_collections v2.2.0
+22:05:34    Compiling rand_core v0.6.4
+22:05:34    Compiling icu_provider v2.2.0
+22:05:34    Compiling phf_shared v0.12.1
+22:05:34    Compiling rustls-pki-types v1.15.0
+22:05:34    Compiling fastrand v2.4.1
+22:05:34    Compiling phf_generator v0.12.1
+22:05:35    Compiling form_urlencoded v1.2.2
+22:05:35    Compiling ahash v0.8.12
+22:05:35    Compiling bitflags v2.13.0
+22:05:35    Compiling icu_properties v2.2.0
+22:05:35    Compiling icu_normalizer v2.2.0
+22:05:36    Compiling phf_macros v0.12.1
+22:05:36    Compiling num-complex v0.4.6
+22:05:36    Compiling crossbeam-utils v0.8.22
+22:05:36    Compiling rustls v0.23.41
+22:05:36    Compiling untrusted v0.9.0
+22:05:36    Compiling rand_core v0.10.1
+22:05:36    Compiling getrandom v0.4.3
+22:05:36    Compiling ryu v1.0.23
+22:05:37    Compiling phf v0.12.1
+22:05:37    Compiling idna_adapter v1.2.2
+22:05:37    Compiling crypto-common v0.1.7
+22:05:37    Compiling block-buffer v0.10.4
+22:05:37    Compiling const-oid v0.9.6
+22:05:37    Compiling digest v0.10.7
+22:05:37    Compiling idna v1.1.0
+22:05:37    Compiling http v1.4.2
+22:05:38    Compiling zstd-sys v2.1.0+zstd.1.5.7
+22:05:47    Compiling http-body v1.0.1
+22:05:47    Compiling aho-corasick v1.1.4
+22:05:48    Compiling chrono-tz v0.10.4
+22:05:48    Compiling cpufeatures v0.2.17
+22:05:48    Compiling regex-syntax v0.8.11
+22:05:49    Compiling strsim v0.11.1
+22:05:49    Compiling regex-automata v0.4.18
+22:05:52    Compiling url v2.5.8
+22:05:52    Compiling sha1_smol v1.0.1
+22:05:52    Compiling uuid v1.23.4
+22:05:55    Compiling hybrid-array v0.4.13
+22:05:55    Compiling either v1.16.0
+22:05:55    Compiling cpufeatures v0.3.0
+22:05:55    Compiling rustversion v1.0.23
+22:05:55    Compiling ident_case v1.0.1
+22:05:55    Compiling httparse v1.10.1
+22:05:55    Compiling tower-service v0.3.3
+22:05:56    Compiling regex v1.13.0
+22:05:56    Compiling num-bigint v0.5.1
+22:05:56    Compiling half v2.7.1
+22:05:57    Compiling hashbrown v0.16.1
+22:05:57    Compiling cmov v0.5.4
+22:05:57    Compiling atomic-waker v1.1.2
+22:05:57    Compiling try-lock v0.2.5
+22:05:57    Compiling ref-cast v1.0.25
+22:05:57    Compiling want v0.3.1
+22:05:57    Compiling h2 v0.4.15
+22:06:00    Compiling ctutils v0.4.2
+22:06:00    Compiling arrow-buffer v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:01    Compiling crypto-common v0.2.2
+22:06:01    Compiling block-buffer v0.12.1
+22:06:01    Compiling sha2 v0.10.9
+22:06:01    Compiling tokio-stream v0.1.18
+22:06:02    Compiling arrow-schema v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:02    Compiling ref-cast-impl v1.0.25
+22:06:03    Compiling heck v0.5.0
+22:06:03    Compiling const-oid v0.10.2
+22:06:03    Compiling httpdate v1.0.3
+22:06:03    Compiling hyper v1.10.1
+22:06:04    Compiling digest v0.11.3
+22:06:04    Compiling arrow-data v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:05    Compiling http-body-util v0.1.3
+22:06:05    Compiling concurrent-queue v2.5.0
+22:06:05    Compiling ppv-lite86 v0.2.21
+22:06:05    Compiling sync_wrapper v1.0.2
+22:06:05    Compiling semver v1.0.28
+22:06:05    Compiling tower-layer v0.3.3
+22:06:05    Compiling parking v2.2.1
+22:06:05    Compiling ipnet v2.12.0
+22:06:05    Compiling hyper-util v0.1.20
+22:06:06    Compiling event-listener v5.4.1
+22:06:06    Compiling arrow-array v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:09    Compiling num-bigint v0.4.8
+22:06:10    Compiling rand_core v0.9.5
+22:06:10    Compiling liblzma-sys v0.4.7
+22:06:10    Compiling crc32fast v1.5.2
+22:06:10    Compiling zstd-safe v7.2.4
+22:06:10    Compiling alloc-no-stdlib v2.0.4
+22:06:10    Compiling alloc-stdlib v0.2.4
+22:06:17    Compiling rustls-webpki v0.103.13
+22:06:18    Compiling tower v0.5.3
+22:06:18    Compiling chacha20 v0.10.1
+22:06:18    Compiling serde_derive_internals v0.29.1
+22:06:19    Compiling tinyvec_macros v0.1.1
+22:06:19    Compiling adler2 v2.0.1
+22:06:19    Compiling simd-adler32 v0.3.10
+22:06:19    Compiling miniz_oxide v0.8.9
+22:06:19    Compiling tinyvec v1.12.0
+22:06:19    Compiling schemars_derive v1.2.1
+22:06:20    Compiling rand v0.10.2
+22:06:21    Compiling brotli-decompressor v5.0.3
+22:06:21    Compiling rand_chacha v0.9.0
+22:06:21    Compiling serde_urlencoded v0.7.1
+22:06:21    Compiling spin v0.9.8
+22:06:21    Compiling serde_path_to_error v0.1.20
+22:06:21    Compiling lexical-util v1.0.7
+22:06:21    Compiling dyn-clone v1.0.20
+22:06:21    Compiling crc-catalog v2.5.0
+22:06:21    Compiling openssl-probe v0.2.1
+22:06:21    Compiling bit-vec v0.8.0
+22:06:21    Compiling hex v0.4.3
+22:06:21    Compiling zlib-rs v0.6.6
+22:06:21    Compiling libbz2-rs-sys v0.2.5
+22:06:22    Compiling bzip2 v0.6.1
+22:06:22    Compiling bit-set v0.8.0
+22:06:22    Compiling rustls-native-certs v0.8.4
+22:06:22    Compiling crc v3.4.0
+22:06:22    Compiling schemars v1.2.1
+22:06:23    Compiling lazy_static v1.5.0
+22:06:23    Compiling brotli v8.0.4
+22:06:23    Compiling flate2 v1.1.9
+22:06:24    Compiling rand v0.9.5
+22:06:24    Compiling zstd v0.13.3
+22:06:24    Compiling liblzma v0.4.7
+22:06:24    Compiling unicode-normalization v0.1.25
+22:06:24    Compiling tokio-rustls v0.26.4
+22:06:24    Compiling arrow-cmp v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:24    Compiling md-5 v0.11.0
+22:06:25    Compiling hmac v0.13.0
+22:06:25    Compiling hashlink v0.11.1
+22:06:25    Compiling crossbeam-queue v0.3.13
+22:06:25    Compiling webpki-roots v1.0.8
+22:06:25    Compiling futures-intrusive v0.5.0
+22:06:25    Compiling unicode-properties v0.1.4
+22:06:25    Compiling compression-core v0.4.32
+22:06:25    Compiling unicode-bidi v0.3.18
+22:06:25    Compiling compression-codecs v0.4.38
+22:06:25    Compiling stringprep v0.1.5
+22:06:26    Compiling sqlx-core v0.9.0
+22:06:26    Compiling hkdf v0.13.0
+22:06:26    Compiling arrow-select v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:27    Compiling sha2 v0.11.0
+22:06:28    Compiling strum_macros v0.27.2
+22:06:29    Compiling atoi v2.0.0
+22:06:29    Compiling dotenvy v0.15.7
+22:06:29    Compiling whoami v2.1.2
+22:06:29    Compiling byteorder v1.5.0
+22:06:29    Compiling sqlx-postgres v0.9.0
+22:06:30    Compiling strum v0.27.2
+22:06:30    Compiling async-compression v0.4.42
+22:06:30    Compiling lexical-write-integer v1.0.6
+22:06:30    Compiling lexical-parse-integer v1.0.6
+22:06:31    Compiling num-rational v0.4.2
+22:06:31    Compiling darling_core v0.20.11
+22:06:32    Compiling bohmian-code-review-core v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:06:32    Compiling num-iter v0.1.46
+22:06:32    Compiling tree-sitter v0.25.10
+22:06:33    Compiling unicode-general-category v1.1.0
+22:06:33    Compiling base64 v0.23.1
+22:06:33    Compiling borrow-or-share v0.2.4
+22:06:33    Compiling arrayvec v0.7.8
+22:06:33    Compiling unicode-width v0.2.2
+22:06:33    Compiling anyhow v1.0.103
+22:06:33    Compiling fluent-uri v0.4.1
+22:06:34    Compiling num v0.4.3
+22:06:34    Compiling darling_macro v0.20.11
+22:06:34    Compiling sqlx-macros-core v0.9.0
+22:06:34    Compiling lexical-parse-float v1.0.6
+22:06:34    Compiling lexical-write-float v1.0.6
+22:06:34    Compiling tower-http v0.6.11
+22:06:35    Compiling rustc_version v0.4.1
+22:06:35    Compiling futures-executor v0.3.32
+22:06:35    Compiling async-trait v0.1.92
+22:06:35    Compiling secrecy v0.10.3
+22:06:35    Compiling tree-sitter-go v0.23.4
+22:06:35    Compiling tree-sitter-swift v0.7.3
+22:06:35    Compiling tree-sitter-php v0.24.2
+22:06:35    Compiling tree-sitter-c-sharp v0.23.5
+22:06:35    Compiling tree-sitter-ruby v0.23.1
+22:06:35    Compiling tree-sitter-java v0.23.5
+22:06:35    Compiling tree-sitter-typescript v0.23.2
+22:06:35    Compiling tree-sitter-python v0.23.6
+22:06:35    Compiling tree-sitter-cpp v0.23.4
+22:06:35    Compiling tree-sitter-rust v0.24.2
+22:06:35    Compiling tree-sitter-javascript v0.25.0
+22:06:35    Compiling tree-sitter-luau v1.2.0
+22:06:36    Compiling tree-sitter-c v0.24.2
+22:06:36    Compiling tree-sitter-r v1.2.0
+22:06:36    Compiling zstd-safe v8.0.0
+22:06:36    Compiling outref v0.5.2
+22:06:36    Compiling crossbeam-epoch v0.9.20
+22:06:36    Compiling simdutf8 v0.1.5
+22:06:36    Compiling vsimd v0.8.0
+22:06:36    Compiling mime v0.3.17
+22:06:36    Compiling micromap v0.3.0
+22:06:36    Compiling unicode-segmentation v1.13.3
+22:06:36    Compiling referencing v0.46.4
+22:06:36    Compiling comfy-table v8.0.1
+22:06:36    Compiling uuid-simd v0.8.0
+22:06:36    Compiling axum-core v0.5.6
+22:06:42    Compiling flatbuffers v25.12.19
+22:06:43    Compiling sqlx-macros v0.9.0
+22:06:43    Compiling lexical-core v1.0.6
+22:06:43    Compiling darling v0.20.11
+22:06:43    Compiling fraction v0.15.4
+22:06:44    Compiling bohmian-code-review-index v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:06:44    Compiling arrow-ord v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:44    Compiling hyper-rustls v0.27.9
+22:06:45    Compiling rustls-platform-verifier v0.7.0
+22:06:45    Compiling fancy-regex v0.18.0
+22:06:45    Compiling encoding_rs v0.8.42
+22:06:45    Compiling rapidhash v4.5.1
+22:06:46    Compiling darling_core v0.24.1
+22:06:47    Compiling itertools v0.14.0
+22:06:48    Compiling atoi v3.1.0
+22:06:48    Compiling email_address v0.2.9
+22:06:48    Compiling pin-project-internal v1.1.13
+22:06:48    Compiling bohmian-code-review-extract v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:06:48    Compiling blake3 v1.8.5
+22:06:48    Compiling num-cmp v0.1.0
+22:06:48    Compiling matchit v0.8.4
+22:06:48    Compiling streaming-iterator v0.1.9
+22:06:48    Compiling cfg_aliases v0.2.1
+22:06:48    Compiling foldhash v0.1.5
+22:06:49    Compiling bytecount v0.6.9
+22:06:49    Compiling utf8parse v0.2.2
+22:06:49    Compiling data-encoding v2.11.1
+22:06:49    Compiling anstyle-parse v1.0.0
+22:06:49    Compiling jsonschema v0.46.4
+22:06:49    Compiling hashbrown v0.15.5
+22:06:49    Compiling nix v0.31.3
+22:06:49    Compiling axum v0.8.9
+22:06:52    Compiling pin-project v1.1.13
+22:06:52    Compiling prost-derive v0.14.4
+22:06:53    Compiling arrow-cast v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:06:58    Compiling darling_macro v0.24.1
+22:06:58    Compiling metrics v0.24.6
+22:06:58    Compiling reqwest v0.13.4
+22:07:01    Compiling bohmian-code-review-resolve v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:07:01    Compiling derive_builder_core v0.20.2
+22:07:01    Compiling sqlx v0.9.0
+22:07:02    Compiling hyper-timeout v0.5.2
+22:07:02    Compiling csv-core v0.1.13
+22:07:02    Compiling anstyle-query v1.1.5
+22:07:02    Compiling multiversion_no_op v1.0.0
+22:07:02    Compiling portable-atomic v1.13.1
+22:07:02    Compiling twox-hash v2.1.2
+22:07:02    Compiling is_terminal_polyfill v1.70.2
+22:07:02    Compiling unsafe-libyaml v0.2.11
+22:07:03    Compiling core_detect v1.0.0
+22:07:03    Compiling ryu-js v0.2.2
+22:07:03    Compiling constant_time_eq v0.4.2
+22:07:03    Compiling colorchoice v1.0.5
+22:07:03    Compiling arrayref v0.3.9
+22:07:03    Compiling fixedbitset v0.4.2
+22:07:03    Compiling anstyle v1.0.14
+22:07:03    Compiling anstream v1.0.0
+22:07:03    Compiling petgraph v0.6.5
+22:07:04    Compiling serde_jcs v0.1.0
+22:07:05    Compiling serde_yaml v0.9.34+deprecated
+22:07:06    Compiling lz4_flex v0.14.0
+22:07:06    Compiling csv v1.4.0
+22:07:06    Compiling tonic v0.14.9
+22:07:09    Compiling zstd v0.14.0
+22:07:09    Compiling derive_builder_macro v0.20.2
+22:07:09    Compiling bohmian-code-review-select v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:07:09    Compiling darling v0.24.1
+22:07:09    Compiling prost v0.14.4
+22:07:10    Compiling wyrd-skald-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-spec)
+22:07:18    Compiling futures v0.3.32
+22:07:18    Compiling wyrd-semver v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-semver)
+22:07:18    Compiling event-listener-strategy v0.5.4
+22:07:18    Compiling opentelemetry v0.31.0
+22:07:19    Compiling bigdecimal v0.4.10
+22:07:19    Compiling sketches-ddsketch v0.3.1
+22:07:19    Compiling wyrd-error-derive v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-error-derive)
+22:07:19    Compiling rustix v1.1.4
+22:07:20    Compiling time-core v0.1.9
+22:07:20    Compiling num-conv v0.2.2
+22:07:20    Compiling same-file v1.0.6
+22:07:20    Compiling clap_lex v1.1.0
+22:07:20    Compiling spin v0.10.1
+22:07:20    Compiling rmcp v3.3.0
+22:07:20    Compiling crc-fast v1.10.0
+22:07:21    Compiling clap_builder v4.6.0
+22:07:21    Compiling walkdir v2.5.0
+22:07:21    Compiling time-macros v0.2.31
+22:07:22    Compiling wyrd-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd-spec)
+22:07:23    Compiling bohmian-code-review v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:07:23    Compiling opentelemetry_sdk v0.31.0
+22:07:25    Compiling async-lock v3.4.2
+22:07:26    Compiling tonic-prost v0.14.6
+22:07:26    Compiling rmcp-macros v3.3.0
+22:07:27    Compiling derive_builder v0.20.2
+22:07:27    Compiling arrow-ipc v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:07:28    Compiling arrow-csv v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:07:28    Compiling quick-xml v0.41.0
+22:07:29    Compiling arrow-json v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:07:30    Compiling arrow-string v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:07:32    Compiling arrow-arith v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:07:34    Compiling arrow-row v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:07:35    Compiling rand_chacha v0.3.1
+22:07:35    Compiling sse-stream v0.2.6
+22:07:35    Compiling clap_derive v4.6.1
+22:07:36    Compiling itertools v0.15.0
+22:07:37    Compiling sha1 v0.10.7
+22:07:37    Compiling const-hex v1.19.1
+22:07:37    Compiling crossbeam-channel v0.5.16
+22:07:37    Compiling toml_datetime v0.6.11
+22:07:37    Compiling serde_spanned v0.6.9
+22:07:37    Compiling linux-raw-sys v0.12.1
+22:07:37    Compiling tagptr v0.2.0
+22:07:37    Compiling toml_write v0.1.2
+22:07:38    Compiling pastey v0.2.3
+22:07:38    Compiling deranged v0.5.8
+22:07:38    Compiling powerfmt v0.2.0
+22:07:38    Compiling winnow v0.7.15
+22:07:39    Compiling humantime v2.4.0
+22:07:39    Compiling fixedbitset v0.5.7
+22:07:39    Compiling petgraph v0.8.3
+22:07:40    Compiling object_store v0.14.2
+22:07:47    Compiling wyrd-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-runtime)
+22:07:48    Compiling toml_edit v0.22.27
+22:07:50    Compiling time v0.3.53
+22:07:56    Compiling moka v0.12.15
+22:07:59    Compiling opentelemetry-proto v0.31.0
+22:08:00    Compiling bohmian-code-review-pipeline v0.1.0 (https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d103)
+22:08:02    Compiling clap v4.6.1
+22:08:02    Compiling rand v0.8.7
+22:08:02    Compiling arrow v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:08:02    Compiling croner v4.0.0
+22:08:02    Compiling temp-env v0.3.6
+22:08:02    Compiling reqwest v0.12.28
+22:08:03    Compiling console v0.16.4
+22:08:03    Compiling ulid v1.2.1
+22:08:03    Compiling wyrd-tls v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-tls)
+22:08:03    Compiling signature v2.2.0
+22:08:03    Compiling hmac v0.12.1
+22:08:03    Compiling raw-cpuid v11.6.0
+22:08:04    Compiling phf_shared v0.11.3
+22:08:04    Compiling thiserror v1.0.69
+22:08:04    Compiling hashbrown v0.14.5
+22:08:04    Compiling quanta v0.12.6
+22:08:05    Compiling wyrd-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-sql)
+22:08:05    Compiling workspace-hack v0.4.1 (/home/runner/work/wyrd/wyrd/crates/shared/workspace-hack)
+22:08:05    Compiling rand_xoshiro v0.7.0
+22:08:05    Compiling thiserror-impl v1.0.69
+22:08:05    Compiling paste v1.0.15
+22:08:06    Compiling metrics-util v0.19.1
+22:08:06    Compiling metrics-exporter-prometheus v0.16.2
+22:08:08    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+22:08:10    Compiling wyrd-dev-fixtures v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-dev-fixtures)
+22:08:16     Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 01s
+22:08:16 ────────────
+22:08:16  Nextest run ID 4139a719-4d51-47e9-a0e9-76683c19ae53 with nextest profile: default
+22:08:16     Starting 1 test across 1 binary (149 tests skipped)
+22:08:17         PASS [   0.371s] (1/1) wyrd-sql::integration pg_migration::pg_tests::migrations_apply_and_are_idempotent
+22:08:17 ────────────
+22:08:17      Summary [   0.374s] 1 test run: 1 passed, 149 skipped
+22:08:18    Compiling sharded-slab v0.1.7
+22:08:18    Compiling matchers v0.2.0
+22:08:18    Compiling tracing-log v0.2.0
+22:08:18    Compiling thread_local v1.1.10
+22:08:18    Compiling nu-ansi-term v0.50.3
+22:08:18    Compiling tracing-subscriber v0.3.23
+22:08:19    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+22:08:21     Finished `test` profile [unoptimized + debuginfo] target(s) in 4.11s
+22:08:21 ────────────
+22:08:21  Nextest run ID 3dd2fe20-9a63-4e0c-8b82-f321fc3389ee with nextest profile: default
+22:08:21     Starting 1 test across 1 binary (70 tests skipped)
+22:08:22         PASS [   0.164s] (1/1) vala-sql::integration pg_migration::pg_tests::vala_migrations_apply_and_are_idempotent
+22:08:22 ────────────
+22:08:22      Summary [   0.164s] 1 test run: 1 passed, 70 skipped
+22:08:22 [35m[build:server][0m [1m$ cargo build --locked -p wyrd-server --bin wyrd-server -p workspace-hack -p wyrd-testing[0m
+22:08:22    Compiling ring v0.17.14
+22:08:22    Compiling object v0.37.3
+22:08:24    Compiling ar_archive_writer v0.5.2
+22:08:24    Compiling psm v0.1.31
+22:08:24    Compiling stacker v0.1.24
+22:08:25    Compiling bohmian-parquet-variant v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:08:25    Compiling bohmian-parquet-variant-json v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:08:25    Compiling bohmian-parquet-variant-compute v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:08:27    Compiling alloc-no-stdlib v3.0.0
+22:08:27    Compiling snap v1.1.1
+22:08:27    Compiling alloc-stdlib v0.3.0
+22:08:27    Compiling brotli-decompressor v6.0.1
+22:08:27    Compiling seq-macro v0.3.6
+22:08:27    Compiling brotli v9.0.0
+22:08:27    Compiling recursive-proc-macro-impl v0.1.1
+22:08:28    Compiling recursive v0.1.1
+22:08:28    Compiling sqlparser_derive v0.6.0 (https://github.com/bohmian-ai/datafusion-sqlparser-rs?rev=016ff514f2c0aa18b7a97b6d4c63ed89b9aa052d#016ff514)
+22:08:28    Compiling sqlparser v0.63.0 (https://github.com/bohmian-ai/datafusion-sqlparser-rs?rev=016ff514f2c0aa18b7a97b6d4c63ed89b9aa052d#016ff514)
+22:08:29    Compiling parquet v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:08:39    Compiling datafusion-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:39    Compiling tempfile v3.27.0
+22:08:39    Compiling utoipa-gen v5.5.0
+22:08:42    Compiling datafusion-proto-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:43    Compiling datafusion-proto-models v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:44    Compiling datafusion-expr-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:45    Compiling datafusion-doc v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:45    Compiling utoipa v5.5.0
+22:08:46    Compiling datafusion-physical-expr-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:47    Compiling datafusion-functions-window-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:47    Compiling datafusion-functions-aggregate-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:47    Compiling wyrd-semver v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-semver)
+22:08:47    Compiling wyrd-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd-spec)
+22:08:49    Compiling datafusion-expr v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:08:55    Compiling base64ct v1.8.3
+22:08:55    Compiling datafusion-physical-expr v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:02    Compiling datafusion-macros v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:02    Compiling dashmap v6.2.1
+22:09:03    Compiling datafusion-execution v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:04    Compiling blake2 v0.11.0
+22:09:04    Compiling datafusion-functions v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:10    Compiling pem-rfc7468 v0.7.0
+22:09:11    Compiling proc-macro-utils v0.10.0
+22:09:11    Compiling der v0.7.10
+22:09:11    Compiling datafusion-common-runtime v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:12    Compiling datafusion-physical-plan v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:26    Compiling spki v0.7.3
+22:09:26    Compiling darling_core v0.23.0
+22:09:27    Compiling prettyplease v0.2.37
+22:09:27    Compiling darling_macro v0.23.0
+22:09:28    Compiling pkcs8 v0.10.2
+22:09:28    Compiling datafusion-session v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:28    Compiling manyhow-macros v0.14.1
+22:09:28    Compiling quote-use-macros v0.9.0
+22:09:28    Compiling datafusion-physical-expr-adapter v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:29    Compiling glob v0.3.3
+22:09:29    Compiling datafusion-datasource v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:29    Compiling quote-use v0.9.0
+22:09:29    Compiling manyhow v0.14.1
+22:09:29    Compiling darling v0.23.0
+22:09:29    Compiling interpolator v0.5.0
+22:09:29    Compiling collection_literals v1.0.3
+22:09:30    Compiling attribute-derive-macro v0.11.0
+22:09:30    Compiling inout v0.1.4
+22:09:30    Compiling cipher v0.4.4
+22:09:30    Compiling attribute-derive v0.11.0
+22:09:30    Compiling castaway v0.2.4
+22:09:30    Compiling universal-hash v0.5.1
+22:09:31    Compiling opaque-debug v0.3.1
+22:09:31    Compiling static_assertions v1.1.0
+22:09:31    Compiling bytemuck v1.25.1
+22:09:31    Compiling compact_str v0.10.0
+22:09:31    Compiling polyval v0.6.2
+22:09:31    Compiling get-size-derive2 v0.11.1
+22:09:31    Compiling ff v0.13.1
+22:09:31    Compiling ordermap v1.2.2
+22:09:31    Compiling thin-vec v0.2.21
+22:09:31    Compiling base16ct v0.2.0
+22:09:31    Compiling get-size2 v0.11.1
+22:09:31    Compiling sec1 v0.7.3
+22:09:31    Compiling group v0.13.0
+22:09:32    Compiling ghash v0.5.1
+22:09:32    Compiling ctr v0.9.2
+22:09:32    Compiling aes v0.8.4
+22:09:32    Compiling simple_asn1 v0.6.4
+22:09:32    Compiling serde_with_macros v3.21.0
+22:09:32    Compiling hkdf v0.12.4
+22:09:32    Compiling wyrd-utils v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-utils)
+22:09:32    Compiling prost-types v0.14.4
+22:09:32    Compiling pem v3.0.6
+22:09:32    Compiling aead v0.5.2
+22:09:32    Compiling crypto-bigint v0.5.5
+22:09:33    Compiling nom v8.0.0
+22:09:33    Compiling serde_bytes v0.11.19
+22:09:33    Compiling elliptic-curve v0.13.8
+22:09:33    Compiling aes-gcm v0.10.3
+22:09:33    Compiling jsonwebtoken v9.3.1
+22:09:34    Compiling serde_with v3.21.0
+22:09:34    Compiling phf_generator v0.11.3
+22:09:34    Compiling wyrd-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-runtime)
+22:09:35    Compiling pulldown-cmark v0.13.4
+22:09:35    Compiling phf_codegen v0.11.3
+22:09:35    Compiling ruff_text_size v0.0.14
+22:09:35    Compiling rfc6979 v0.4.0
+22:09:35    Compiling getopts v0.2.24
+22:09:35    Compiling curve25519-dalek v4.1.3
+22:09:35    Compiling typeid v1.0.3
+22:09:35    Compiling num-bigint-dig v0.8.6
+22:09:35    Compiling unicase v2.9.0
+22:09:35    Compiling unicode_names2_generator v1.3.0
+22:09:36    Compiling ecdsa v0.16.9
+22:09:36    Compiling ruff_source_file v0.0.14
+22:09:36    Compiling primeorder v0.13.6
+22:09:36    Compiling datafusion-pruning v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:36    Compiling datafusion-catalog v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:37    Compiling block-padding v0.4.2
+22:09:37    Compiling curve25519-dalek-derive v0.1.1
+22:09:38    Compiling rustc-hash v2.1.3
+22:09:38    Compiling erased-serde v0.4.10
+22:09:38    Compiling gimli v0.34.0
+22:09:38    Compiling ruff_python_trivia v0.0.14
+22:09:38    Compiling inout v0.2.3
+22:09:39    Compiling pulldown-cmark-to-cmark v22.0.1
+22:09:39    Compiling unicode_names2 v1.3.0
+22:09:39    Compiling addr2line v0.27.1
+22:09:39    Compiling oauth2 v5.0.0
+22:09:39    Compiling char_str v0.0.4
+22:09:40    Compiling ed25519 v2.2.3
+22:09:40    Compiling bon-macros v3.9.3
+22:09:40    Compiling pkcs1 v0.7.5
+22:09:40    Compiling datafusion-functions-aggregate v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:42    Compiling is-macro v0.3.8
+22:09:42    Compiling miniz_oxide v0.9.1
+22:09:42    Compiling ordered-float v2.10.1
+22:09:42    Compiling serde-big-array v0.5.1
+22:09:42    Compiling object v0.40.0
+22:09:45    Compiling radium v0.7.0
+22:09:45    Compiling rustc-demangle v0.1.28
+22:09:45    Compiling io-lifetimes v3.0.1
+22:09:45    Compiling multimap v0.10.1
+22:09:45    Compiling typetag v0.2.23
+22:09:45    Compiling fastnum v0.7.5
+22:09:45    Compiling mini-moka v0.10.3
+22:09:45    Compiling io-lifetimes v2.0.4
+22:09:46    Compiling prost-build v0.14.4
+22:09:46    Compiling backtrace v0.3.77
+22:09:47    Compiling datafusion-functions-nested v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:48    Compiling bnum v0.12.1
+22:09:50    Compiling serde-value v0.7.0
+22:09:50    Compiling ruff_python_ast v0.0.14
+22:09:50    Compiling bon v3.9.3
+22:09:50    Compiling rsa v0.9.10
+22:09:51    Compiling ed25519-dalek v2.2.0
+22:09:52    Compiling cipher v0.5.2
+22:09:52    Compiling datafusion-functions-table v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:52    Compiling datafusion-catalog-listing v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:52    Compiling datafusion-datasource-parquet v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:53    Compiling p384 v0.13.1
+22:09:53    Compiling p256 v0.13.2
+22:09:54    Compiling hdrhistogram v7.6.0
+22:09:54    Compiling phf v0.11.3
+22:09:54    Compiling safe_arch v0.7.4
+22:09:54    Compiling datafusion-datasource-csv v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:55    Compiling datafusion-datasource-json v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:55    Compiling datafusion-datasource-arrow v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:09:56    Compiling tonic-build v0.14.6
+22:09:57    Compiling password-hash v0.5.0
+22:09:57    Compiling dashmap v5.5.3
+22:09:57    Compiling heapless v0.7.17
+22:09:57    Compiling itertools v0.10.5
+22:09:57    Compiling blake2 v0.10.6
+22:09:57    Compiling typetag-impl v0.2.23
+22:09:57    Compiling matrixmultiply v0.3.10
+22:09:57    Compiling serde_plain v1.0.2
+22:09:57    Compiling typed-builder-macro v0.20.1
+22:09:57    Compiling io-extras v0.19.0
+22:09:58    Compiling jiff-tzdb v0.1.9
+22:09:58    Compiling inventory v0.3.24
+22:09:58    Compiling jiff-core v0.1.1
+22:09:58    Compiling tap v1.0.1
+22:09:58    Compiling regex-lite v0.1.9
+22:09:58    Compiling dissimilar v1.0.11
+22:09:58    Compiling urlencoding v2.1.3
+22:09:58    Compiling base64 v0.21.7
+22:09:58    Compiling ucd-trie v0.1.7
+22:09:59    Compiling triomphe v0.1.16
+22:09:59    Compiling pest v2.8.7
+22:09:59    Compiling openidconnect v4.0.1
+22:09:59    Compiling apache-avro v0.21.0
+22:10:00    Compiling expect-test v1.5.1
+22:10:01    Compiling wyz v0.5.1
+22:10:01    Compiling typed-builder v0.20.1
+22:10:01    Compiling jiff v0.2.38
+22:10:01    Compiling argon2 v0.5.3
+22:10:01    Compiling tonic-prost-build v0.14.6
+22:10:01    Compiling wide v0.7.33
+22:10:02    Compiling wyrd-benchmark v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-benchmark)
+22:10:03    Compiling datafusion-sql v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:10:04    Compiling datafusion-physical-optimizer v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:10:05    Compiling opentelemetry-http v0.31.0
+22:10:05    Compiling wyrd-interfaces v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-interfaces)
+22:10:06    Compiling roaring v0.11.4
+22:10:07    Compiling datafusion-functions-window v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:10:07    Compiling datafusion-optimizer v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:10:08    Compiling datafusion-functions-variant v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:10:09    Compiling hash32 v0.2.1
+22:10:09    Compiling itertools v0.13.0
+22:10:09    Compiling backon v1.6.0
+22:10:09    Compiling bstr v1.12.3
+22:10:10    Compiling ruff_python_stdlib v0.0.14
+22:10:10    Compiling approx v0.5.1
+22:10:10    Compiling ordered-float v4.6.0
+22:10:10    Compiling serde_repr v0.1.20
+22:10:10    Compiling monty-macros v1.6.0 (https://github.com/bohmian-ai/monty?rev=e54ecafaad8323d88ded7ca2a73ede62d30cf441#e54ecafa)
+22:10:10    Compiling funty v2.0.0
+22:10:11    Compiling bumpalo v3.20.3
+22:10:11    Compiling bimap v0.6.3
+22:10:11    Compiling cap-primitives v4.0.3
+22:10:11    Compiling drop_bomb v0.1.5
+22:10:11    Compiling murmur3 v0.5.2
+22:10:11    Compiling crossbeam-deque v0.8.7
+22:10:11    Compiling array-init v2.1.0
+22:10:11    Compiling rawpointer v0.2.1
+22:10:11    Compiling as-any v0.3.2
+22:10:11    Compiling jiter v0.17.0
+22:10:11    Compiling iceberg v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4f)
+22:10:15    Compiling ruff_python_parser v0.0.14
+22:10:16    Compiling zopfli v0.8.4
+22:10:16    Compiling bitvec v1.1.1
+22:10:17    Compiling monty-types v1.6.0 (https://github.com/bohmian-ai/monty?rev=e54ecafaad8323d88ded7ca2a73ede62d30cf441#e54ecafa)
+22:10:19    Compiling simba v0.9.1
+22:10:21    Compiling datafusion v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:10:26    Compiling wyrd-skald-prompt v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-prompt)
+22:10:26    Compiling wyrd-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-sql)
+22:10:27    Compiling opentelemetry-otlp v0.31.1
+22:10:28    Compiling fs-set-times v0.20.3
+22:10:28    Compiling wyrd-tonic v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-tonic)
+22:10:28    Compiling wyrd-crypt v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-crypt)
+22:10:28    Compiling wyrd-auth-oidc v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-oidc)
+22:10:30    Compiling pest_meta v2.8.7
+22:10:31    Compiling toml v0.8.23
+22:10:31    Compiling wyrd-skald-providers v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-providers)
+22:10:32    Compiling ruff_python_literal v0.0.14
+22:10:32    Compiling tracing-opentelemetry v0.32.1
+22:10:32    Compiling rand_distr v0.4.3
+22:10:32    Compiling lru v0.12.5
+22:10:32    Compiling rustix-linux-procfs v0.1.1
+22:10:32    Compiling cobs v0.3.0
+22:10:32    Compiling async-stream-impl v0.3.6
+22:10:33    Compiling rayon-core v1.13.0
+22:10:33    Compiling cpubits v0.1.1
+22:10:33    Compiling maybe-owned v0.3.4
+22:10:33    Compiling debug_unsafe v0.1.4
+22:10:33    Compiling ambient-authority v0.0.2
+22:10:33    Compiling minicbor v2.3.0
+22:10:33    Compiling typed-path v0.12.3
+22:10:33    Compiling cap-std v4.0.3
+22:10:33    Compiling zip v8.6.0
+22:10:34    Compiling minicbor-serde v0.7.1
+22:10:34    Compiling atoi_simd v0.18.1
+22:10:34    Compiling aes v0.9.3
+22:10:34    Compiling async-stream v0.3.6
+22:10:34    Compiling postcard v1.1.3
+22:10:34    Compiling wyrd-auth-verify v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-verify)
+22:10:34    Compiling nalgebra v0.33.3
+22:10:35    Compiling wyrd-telemetry v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-telemetry)
+22:10:36    Compiling ruff_python_codegen v0.0.14
+22:10:36    Compiling wyrd-config v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-config)
+22:10:36    Compiling pest_generator v2.8.7
+22:10:37    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+22:10:37    Compiling wyrd-vault v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-vault)
+22:10:38    Compiling wyrd-skald-cache v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-cache)
+22:10:38    Compiling cbc v0.2.1
+22:10:39    Compiling ecb v0.2.1
+22:10:39    Compiling tonic-reflection v0.14.6
+22:10:39    Compiling tonic-health v0.14.6
+22:10:39    Compiling tonic-types v0.14.6
+22:10:39    Compiling wyrd-types v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-types)
+22:10:39    Compiling fancy-regex v0.20.2
+22:10:39    Compiling speedate v0.17.0
+22:10:40    Compiling codepage v0.1.3
+22:10:40    Compiling sha1 v0.11.0
+22:10:40    Compiling crc32c v0.6.8
+22:10:40    Compiling arc-swap v1.9.2
+22:10:40    Compiling libmimalloc-sys v0.1.49
+22:10:40    Compiling rangemap v1.8.0
+22:10:40    Compiling fast-float2 v0.2.4
+22:10:40    Compiling weezl v0.2.1
+22:10:40    Compiling option-ext v0.2.0
+22:10:40    Compiling dirs-sys v0.5.0
+22:10:40    Compiling lopdf v0.45.0
+22:10:40    Compiling calamine v0.36.1
+22:10:44    Compiling monty v1.6.0 (https://github.com/bohmian-ai/monty?rev=e54ecafaad8323d88ded7ca2a73ede62d30cf441#e54ecafa)
+22:10:44    Compiling wyrd-queue v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-queue)
+22:10:46    Compiling wyrd-skald-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-runtime)
+22:10:47    Compiling wyrd-kms v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-kms)
+22:10:47    Compiling statrs v0.18.0
+22:10:48    Compiling pest_derive v2.8.7
+22:10:48    Compiling iceberg-datafusion v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4f)
+22:10:59    Compiling datafusion-proto v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a#1a0f1af0)
+22:11:02    Compiling arrow-flight v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137c)
+22:11:03    Compiling wyrd-skald-tool v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-tool)
+22:11:03    Compiling wyrd-version v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-version)
+22:11:03    Compiling mixtrics v0.2.5
+22:11:03    Compiling email-encoding v0.4.3
+22:11:03    Compiling bincode v1.3.3
+22:11:03    Compiling delegate v0.13.5
+22:11:03    Compiling ctor v0.2.9
+22:11:04    Compiling unit-prefix v0.5.2
+22:11:04    Compiling quoted_printable v0.5.2
+22:11:04    Compiling cty v0.2.2
+22:11:04    Compiling port_scanner v0.1.5
+22:11:04    Compiling iceberg-compaction-core v0.1.0 (https://github.com/bohmian-ai/iceberg-compaction?rev=21ceaf7172d7666e30e2f8527e70f22a7aea9741#21ceaf71)
+22:11:09    Compiling lettre v0.11.24
+22:11:10    Compiling indicatif v0.18.6
+22:11:11    Compiling datafusion-distributed v4.0.0 (https://github.com/bohmian-ai/datafusion-distributed?rev=bbbd1d9af4633499b736a98da62868ce32bc3d16#bbbd1d9a)
+22:11:13    Compiling vala-drift v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-drift)
+22:11:13    Compiling wyrd-skald-agent v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-agent)
+22:11:14    Compiling monty-proto v1.6.0 (https://github.com/bohmian-ai/monty?rev=e54ecafaad8323d88ded7ca2a73ede62d30cf441#e54ecafa)
+22:11:16    Compiling monty-fs v1.6.0 (https://github.com/bohmian-ai/monty?rev=e54ecafaad8323d88ded7ca2a73ede62d30cf441#e54ecafa)
+22:11:17    Compiling jsonpath-rust v0.7.5
+22:11:17    Compiling rayon v1.12.0
+22:11:19    Compiling wyrd-loader v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-loader)
+22:11:20    Compiling dirs v6.0.0
+22:11:20    Compiling wyrd-storage v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-storage)
+22:11:21    Compiling wyrd-cards v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-cards)
+22:11:22    Compiling wyrd-auth-issue v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-issue)
+22:11:22    Compiling iceberg-catalog-sql v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4f)
+22:11:22    Compiling sysinfo v0.39.6
+22:11:23    Compiling filetime v0.2.29
+22:11:23    Compiling tar v0.4.46
+22:11:23    Compiling vala-bifrost-redux v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-bifrost-redux)
+22:11:23    Compiling wyrd-auth v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-auth)
+22:11:27    Compiling wyrd-client v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-client)
+22:11:34    Compiling shellexpand v3.1.2
+22:11:34    Compiling vala-verify v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-verify)
+22:11:36    Compiling monty-pool v1.6.0 (https://github.com/bohmian-ai/monty?rev=e54ecafaad8323d88ded7ca2a73ede62d30cf441#e54ecafa)
+22:11:37    Compiling mimalloc v0.1.52
+22:11:37    Compiling wyrd-gateway v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-gateway)
+22:11:40    Compiling utoipa-axum v0.2.0
+22:11:51    Compiling wyrd-server v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-server)
+22:14:48     Finished `dev` profile [unoptimized + debuginfo] target(s) in 6m 26s
+22:14:48 [35m[build:server][0m [1m$ "${CARGO_TARGET_DIR:-target}/debug/wyrd-server" --version[0m
+22:14:48 wyrd-server 0.4.2
+22:14:48 [36m[1m[test:wyrd:inner][0m [1m$ bash scripts/run-family-tests.sh wyrd[0m
+22:14:48 testing wyrd packages: wyrd  wyrd-interfaces  wyrd-spec  wyrd-auth  wyrd-sql  wyrd-kms  wyrd-cards  wyrd-config  wyrd-cli  wyrd-tonic  wyrd-storage  wyrd-testing  wyrd-gateway  wyrd-server  wyrd-mcp
+22:14:49    Compiling num_cpus v1.17.0
+22:14:49    Compiling deadpool-runtime v0.1.4
+22:14:49    Compiling wyrd-dev-fixtures v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-dev-fixtures)
+22:14:49    Compiling deadpool v0.12.3
+22:14:49    Compiling assert-json-diff v2.0.2
+22:14:49    Compiling yasna v0.6.0
+22:14:50    Compiling wiremock v0.6.5
+22:14:50    Compiling pem v4.0.0
+22:14:50    Compiling rcgen v0.14.10
+22:14:50    Compiling wyrd-testing v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-testing)
+22:14:50    Compiling wait-timeout v0.2.1
+22:14:50    Compiling wyrd-mcp v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-mcp)
+22:14:50    Compiling predicates-core v1.0.10
+22:14:50    Compiling webbrowser v1.2.4
+22:14:51    Compiling float-cmp v0.10.0
+22:14:51    Compiling assert_cmd v2.2.2
+22:14:51    Compiling difflib v0.4.0
+22:14:51    Compiling normalize-line-endings v0.3.0
+22:14:51    Compiling termtree v0.5.1
+22:14:51    Compiling quick-error v1.2.3
+22:14:51    Compiling rusty-fork v0.3.1
+22:14:51    Compiling predicates-tree v1.0.13
+22:14:51    Compiling predicates v3.1.4
+22:14:52    Compiling rand_xorshift v0.4.0
+22:14:52    Compiling unarray v0.1.4
+22:14:52    Compiling diff v0.1.13
+22:14:52    Compiling yansi v1.0.1
+22:14:52    Compiling pretty_assertions v1.4.1
+22:14:52    Compiling proptest v1.11.0
+22:14:54    Compiling wyrd-cli v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-cli)
+22:14:59    Compiling similar v2.7.0
+22:15:00    Compiling insta v1.48.0
+22:15:01    Compiling wyrd v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd)
+22:15:01    Compiling serial_test_derive v3.5.0
+22:15:01    Compiling serial_test v3.5.0
+22:15:02    Compiling wyrd-config v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-config)
+22:15:07    Compiling wyrd-server v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-server)

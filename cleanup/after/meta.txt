@@ -1,0 +1,4 @@
+image=ubuntu24/20261122.23.1
+taken=2026-11-25T22:03:33Z
+Runner.Listener=/home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener
+Runner.Worker=/home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker

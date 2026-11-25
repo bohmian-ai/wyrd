@@ -1605,7 +1605,7 @@ impl ShardOwner {
             }
             let idle = self.pipeline.is_idle();
             let pressure_waits = self.pressure_receiver.has_changed().unwrap_or(false) && !idle;
-            let collected = self.pipeline.collection.deadline();
+            let collected = self.collection_wake();
             let wake = tokio::select! {
                 biased;
                 (meta, done) = GroupPipeline::stage_done(&mut self.pipeline.older) => {
@@ -4193,6 +4193,32 @@ impl ShardOwner {
         Ok(())
     }
 
+    /// Reports whether a dispatch barrier holds the next group: a waiting
+    /// lifecycle command, an unhandled pressure signal, a running WAL stage,
+    /// a full pipeline, or a rotation waiting for dispatched groups to settle.
+    ///
+    /// Every barrier lifts only after a dispatched stage completes, which
+    /// wakes the run loop on its own.
+    fn dispatch_held(&self) -> bool {
+        !self.pipeline.deferred.is_empty()
+            || self.pressure_receiver.has_changed().unwrap_or(false)
+            || self.pipeline.is_writing()
+            || self.pipeline.newer.is_some()
+            || (self.pipeline.rotating.is_some() && !self.pipeline.is_idle())
+    }
+
+    /// The collecting group's deadline, while a dispatch could act on it.
+    ///
+    /// A barrier keeps an expired deadline from dispatching, so arming it
+    /// would wake the run loop at once on every pass until the barrier lifts.
+    /// The stage completion that lifts the barrier wakes the loop instead.
+    fn collection_wake(&self) -> Option<tokio::time::Instant> {
+        self.pipeline
+            .collection
+            .deadline()
+            .filter(|_| !self.dispatch_held())
+    }
+
     /// Dispatches the next collected group when the pipeline allows one.
     ///
     /// A group dispatches only while no group writes the WAL, a slot is free,
@@ -4201,18 +4227,10 @@ impl ShardOwner {
     /// second slot until the older group settles. Returns whether the owner
     /// changed state.
     async fn dispatch_next(&mut self) -> bool {
-        if !self.pipeline.deferred.is_empty()
-            || self.pressure_receiver.has_changed().unwrap_or(false)
-            || self.pipeline.is_writing()
-            || self.pipeline.newer.is_some()
-        {
+        if self.dispatch_held() {
             return false;
         }
         if let Some(group) = self.pipeline.rotating.take() {
-            if !self.pipeline.is_idle() {
-                self.pipeline.rotating = Some(group);
-                return false;
-            }
             self.dispatch_logged(group).await;
             return true;
         }
@@ -11246,6 +11264,55 @@ mod tests {
             "the held table keeps its retries queued"
         );
         assert_eq!(owner.pipeline.collection.deadline(), None);
+    }
+
+    /// A collected group's deadline stays disarmed while a dispatch barrier
+    /// holds it, so an expired deadline cannot wake the run loop on every
+    /// pass, and rearms once the barrier lifts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the short group dispatches early, the deadline stays armed
+    /// behind the barrier, or it does not rearm after the barrier lifts.
+    #[tokio::test(start_paused = true)]
+    async fn a_dispatch_barrier_disarms_an_expired_collection_deadline() {
+        let (_wal_root, mut owner, budget, _command_tx, _pressure) = mailbox_owner();
+        let key = owner_key();
+        let (head, _head_ack) = acked_group_for_key(&budget, &key, &[uuid::Uuid::now_v7()]);
+        fencing_head(&mut owner, head).await;
+        let other_key = other_table(&key, "owner-test-other");
+        owner.scheduler.push(prepared_append_for_key(
+            &budget,
+            other_key,
+            uuid::Uuid::now_v7(),
+        ));
+        assert!(!owner.dispatch_next().await, "a short group waits");
+        let deadline = owner
+            .collection_wake()
+            .expect("the short group arms its deadline");
+
+        owner
+            .route_command(ShardCommand::FlushExpired {
+                now: std::time::Instant::now(),
+            })
+            .await;
+        tokio::time::advance(COLLECTION_WAIT * 2).await;
+        assert!(
+            !owner.dispatch_next().await,
+            "the waiting command holds dispatch past the deadline"
+        );
+        assert_eq!(
+            owner.collection_wake(),
+            None,
+            "the held deadline is not armed"
+        );
+
+        owner.pipeline.deferred.clear();
+        assert_eq!(
+            owner.collection_wake(),
+            Some(deadline),
+            "the deadline rearms once the barrier lifts"
+        );
     }
 
     /// A short eligible group waiting beside held retries dispatches as soon

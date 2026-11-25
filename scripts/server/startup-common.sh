@@ -80,7 +80,7 @@ ui_sign_in() {
 # answers.
 platform_console_routes() {
   local path answer
-  curl -fsS -H 'accept: text/html' "$http/platform" | grep '<h1>Platform admin</h1>' >/dev/null \
+  curl -fsS -H 'accept: text/html' "$http/platform" | grep -E '<h1[^>]*>Platform admin</h1>' >/dev/null \
     || fail "platform entry page through nginx"
   for path in /platform/ui /platform/ui/providers /platform/ui/callback; do
     answer="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' -H 'accept: text/html' "$http$path")"

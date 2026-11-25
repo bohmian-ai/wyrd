@@ -1,0 +1,14 @@
+Filesystem              1B-blocks        Used    Available Use% Mounted on
+tmpfs                  1646432256     1159168   1645273088   1% /run
+efivarfs                   131072        3671       122281   3% /sys/firmware/efi/efivars
+/dev/mapper/cow-root 154894188544 27017498624 127859912704  18% /
+tmpfs                  8232148992       86016   8232062976   1% /dev/shm
+tmpfs                     5242880           0      5242880   0% /run/lock
+/dev/nvme0n1p16         923156480   119603200    738910208  14% /boot
+/dev/nvme0n1p15         109395456     6399488    102995968   6% /boot/efi
+tmpfs                  1646428160       12288   1646415872   1% /run/user/1001
+
+               total        used        free      shared  buff/cache   available
+Mem:     16464302080  1001029632 13757784064    47501312  2065227776 15463272448
+Swap:              0           0           0
+

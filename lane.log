@@ -1,0 +1,1132 @@
+19:59:19 [35m[test:shared][0m [1m$ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:shared:inner'[0m
+19:59:19  postgres Pulling 
+19:59:19  mailpit Pulling 
+19:59:20  2d35ebdb57d9 Pulling fs layer 
+19:59:20  b143aff5074c Pulling fs layer 
+19:59:20  e38fa431e774 Pulling fs layer 
+19:59:20  e38fa431e774 Downloading [>                                                  ]  3.456kB/173.3kB
+19:59:20  e38fa431e774 Downloading [==================================================>]  173.3kB/173.3kB
+19:59:20  e38fa431e774 Verifying Checksum 
+19:59:20  e38fa431e774 Download complete 
+19:59:20  b143aff5074c Downloading [>                                                  ]    114kB/10.16MB
+19:59:20  40748add9f4f Pulling fs layer 
+19:59:20  1be8baae3c53 Pulling fs layer 
+19:59:20  e91b6b814ba6 Pulling fs layer 
+19:59:20  46e4f78fd254 Pulling fs layer 
+19:59:20  111f378001d9 Pulling fs layer 
+19:59:20  c362828e9ca3 Pulling fs layer 
+19:59:20  9be9d0609035 Pulling fs layer 
+19:59:20  72bd85048465 Pulling fs layer 
+19:59:20  1be8baae3c53 Waiting 
+19:59:20  3b9319a24e33 Pulling fs layer 
+19:59:20  46e4f78fd254 Waiting 
+19:59:20  cc2ed79b34db Pulling fs layer 
+19:59:20  34ff39ac908b Pulling fs layer 
+19:59:20  111f378001d9 Waiting 
+19:59:20  91d82016f303 Pulling fs layer 
+19:59:20  cfa3776983f1 Pulling fs layer 
+19:59:20  c362828e9ca3 Waiting 
+19:59:20  9be9d0609035 Waiting 
+19:59:20  72bd85048465 Waiting 
+19:59:20  3b9319a24e33 Waiting 
+19:59:20  cc2ed79b34db Waiting 
+19:59:20  91d82016f303 Waiting 
+19:59:20  34ff39ac908b Waiting 
+19:59:20  cfa3776983f1 Waiting 
+19:59:20  e91b6b814ba6 Waiting 
+19:59:20  2d35ebdb57d9 Downloading [>                                                  ]  48.51kB/3.802MB
+19:59:20  b143aff5074c Verifying Checksum 
+19:59:20  b143aff5074c Download complete 
+19:59:20  2d35ebdb57d9 Verifying Checksum 
+19:59:20  2d35ebdb57d9 Download complete 
+19:59:20  2d35ebdb57d9 Extracting [>                                                  ]  65.54kB/3.802MB
+19:59:20  2d35ebdb57d9 Extracting [==================================================>]  3.802MB/3.802MB
+19:59:20  40748add9f4f Downloading [>                                                  ]  310.7kB/29.84MB
+19:59:20  2d35ebdb57d9 Pull complete 
+19:59:20  b143aff5074c Extracting [>                                                  ]  131.1kB/10.16MB
+19:59:20  1be8baae3c53 Downloading [==================================================>]  1.329kB/1.329kB
+19:59:20  1be8baae3c53 Download complete 
+19:59:20  40748add9f4f Downloading [=============================================>     ]  27.39MB/29.84MB
+19:59:20  e91b6b814ba6 Downloading [>                                                  ]  64.94kB/6.443MB
+19:59:20  40748add9f4f Verifying Checksum 
+19:59:20  40748add9f4f Download complete 
+19:59:20  b143aff5074c Extracting [===============================================>   ]  9.568MB/10.16MB
+19:59:20  b143aff5074c Extracting [==================================================>]  10.16MB/10.16MB
+19:59:20  e91b6b814ba6 Verifying Checksum 
+19:59:20  e91b6b814ba6 Download complete 
+19:59:20  46e4f78fd254 Downloading [>                                                  ]  15.79kB/1.258MB
+19:59:20  40748add9f4f Extracting [>                                                  ]  327.7kB/29.84MB
+19:59:20  46e4f78fd254 Downloading [==================================================>]  1.258MB/1.258MB
+19:59:20  46e4f78fd254 Download complete 
+19:59:20  111f378001d9 Downloading [>                                                  ]  97.71kB/8.204MB
+19:59:20  40748add9f4f Extracting [===============>                                   ]  9.503MB/29.84MB
+19:59:20  c362828e9ca3 Downloading [>                                                  ]  15.79kB/1.312MB
+19:59:20  111f378001d9 Verifying Checksum 
+19:59:20  111f378001d9 Download complete 
+19:59:20  c362828e9ca3 Verifying Checksum 
+19:59:20  c362828e9ca3 Download complete 
+19:59:20  9be9d0609035 Downloading [==================================================>]     116B/116B
+19:59:20  9be9d0609035 Verifying Checksum 
+19:59:20  9be9d0609035 Download complete 
+19:59:20  40748add9f4f Extracting [=========================>                         ]   15.4MB/29.84MB
+19:59:21  72bd85048465 Downloading [==================================================>]   3.14kB/3.14kB
+19:59:21  72bd85048465 Verifying Checksum 
+19:59:21  72bd85048465 Download complete 
+19:59:21  40748add9f4f Extracting [======================================>            ]  22.94MB/29.84MB
+19:59:21  cc2ed79b34db Downloading [=================>                                 ]    3.5kB/10.11kB
+19:59:21  cc2ed79b34db Downloading [==================================================>]  10.11kB/10.11kB
+19:59:21  cc2ed79b34db Verifying Checksum 
+19:59:21  cc2ed79b34db Download complete 
+19:59:21  3b9319a24e33 Downloading [>                                                  ]  538.8kB/119.1MB
+19:59:21  b143aff5074c Pull complete 
+19:59:21  34ff39ac908b Downloading [==================================================>]     164B/164B
+19:59:21  34ff39ac908b Verifying Checksum 
+19:59:21  34ff39ac908b Download complete 
+19:59:21  40748add9f4f Extracting [===========================================>       ]  26.21MB/29.84MB
+19:59:21  3b9319a24e33 Downloading [===========>                                       ]  28.55MB/119.1MB
+19:59:21  91d82016f303 Downloading [============================>                      ]  3.501kB/6.101kB
+19:59:21  91d82016f303 Download complete 
+19:59:21  3b9319a24e33 Downloading [============================>                      ]  66.79MB/119.1MB
+19:59:21  cfa3776983f1 Downloading [==================================================>]     184B/184B
+19:59:21  cfa3776983f1 Verifying Checksum 
+19:59:21  cfa3776983f1 Download complete 
+19:59:21  e38fa431e774 Extracting [=========>                                         ]  32.77kB/173.3kB
+19:59:21  e38fa431e774 Extracting [==================================================>]  173.3kB/173.3kB
+19:59:21  40748add9f4f Extracting [================================================>  ]  28.84MB/29.84MB
+19:59:21  3b9319a24e33 Downloading [=============================================>     ]  107.7MB/119.1MB
+19:59:21  3b9319a24e33 Verifying Checksum 
+19:59:21  3b9319a24e33 Download complete 
+19:59:21  40748add9f4f Extracting [=================================================> ]  29.49MB/29.84MB
+19:59:21  40748add9f4f Extracting [==================================================>]  29.84MB/29.84MB
+19:59:21  e38fa431e774 Extracting [==================================================>]  173.3kB/173.3kB
+19:59:21  40748add9f4f Pull complete 
+19:59:22  1be8baae3c53 Extracting [==================================================>]  1.329kB/1.329kB
+19:59:22  1be8baae3c53 Extracting [==================================================>]  1.329kB/1.329kB
+19:59:23  1be8baae3c53 Pull complete 
+19:59:23  e91b6b814ba6 Extracting [>                                                  ]  65.54kB/6.443MB
+19:59:24  e91b6b814ba6 Extracting [==>                                                ]  262.1kB/6.443MB
+19:59:24  e91b6b814ba6 Extracting [==================================================>]  6.443MB/6.443MB
+19:59:24  e91b6b814ba6 Pull complete 
+19:59:24  e38fa431e774 Pull complete 
+19:59:24  46e4f78fd254 Extracting [=>                                                 ]  32.77kB/1.258MB
+19:59:24  mailpit Pulled 
+19:59:24  46e4f78fd254 Extracting [==================================================>]  1.258MB/1.258MB
+19:59:24  46e4f78fd254 Extracting [==================================================>]  1.258MB/1.258MB
+19:59:24  46e4f78fd254 Pull complete 
+19:59:24  111f378001d9 Extracting [>                                                  ]   98.3kB/8.204MB
+19:59:24  111f378001d9 Extracting [===================================>               ]  5.898MB/8.204MB
+19:59:24  111f378001d9 Extracting [==================================================>]  8.204MB/8.204MB
+19:59:25  111f378001d9 Pull complete 
+19:59:25  c362828e9ca3 Extracting [=>                                                 ]  32.77kB/1.312MB
+19:59:25  c362828e9ca3 Extracting [==================================================>]  1.312MB/1.312MB
+19:59:25  c362828e9ca3 Pull complete 
+19:59:25  9be9d0609035 Extracting [==================================================>]     116B/116B
+19:59:25  9be9d0609035 Extracting [==================================================>]     116B/116B
+19:59:25  9be9d0609035 Pull complete 
+19:59:25  72bd85048465 Extracting [==================================================>]   3.14kB/3.14kB
+19:59:25  72bd85048465 Extracting [==================================================>]   3.14kB/3.14kB
+19:59:25  72bd85048465 Pull complete 
+19:59:25  3b9319a24e33 Extracting [>                                                  ]  557.1kB/119.1MB
+19:59:25  3b9319a24e33 Extracting [===>                                               ]   9.47MB/119.1MB
+19:59:25  3b9319a24e33 Extracting [======>                                            ]  16.15MB/119.1MB
+19:59:25  3b9319a24e33 Extracting [=========>                                         ]   23.4MB/119.1MB
+19:59:25  3b9319a24e33 Extracting [==============>                                    ]  34.54MB/119.1MB
+19:59:25  3b9319a24e33 Extracting [===================>                               ]  46.79MB/119.1MB
+19:59:25  3b9319a24e33 Extracting [========================>                          ]  57.38MB/119.1MB
+19:59:25  3b9319a24e33 Extracting [============================>                      ]  67.96MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [==================================>                ]  81.33MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [=======================================>           ]  93.03MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [==========================================>        ]  100.3MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [============================================>      ]  106.4MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [===============================================>   ]  112.5MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [================================================>  ]  115.3MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [=================================================> ]  117.5MB/119.1MB
+19:59:26  3b9319a24e33 Extracting [==================================================>]  119.1MB/119.1MB
+19:59:28  3b9319a24e33 Pull complete 
+19:59:28  cc2ed79b34db Extracting [==================================================>]  10.11kB/10.11kB
+19:59:28  cc2ed79b34db Extracting [==================================================>]  10.11kB/10.11kB
+19:59:28  cc2ed79b34db Pull complete 
+19:59:28  34ff39ac908b Extracting [==================================================>]     164B/164B
+19:59:28  34ff39ac908b Extracting [==================================================>]     164B/164B
+19:59:28  34ff39ac908b Pull complete 
+19:59:28  91d82016f303 Extracting [==================================================>]  6.101kB/6.101kB
+19:59:28  91d82016f303 Extracting [==================================================>]  6.101kB/6.101kB
+19:59:28  91d82016f303 Pull complete 
+19:59:28  cfa3776983f1 Extracting [==================================================>]     184B/184B
+19:59:28  cfa3776983f1 Extracting [==================================================>]     184B/184B
+19:59:28  cfa3776983f1 Pull complete 
+19:59:28  postgres Pulled 
+19:59:28  Network wyrd-test-16344-16350-wyrd_default  Creating
+19:59:28  Network wyrd-test-16344-16350-wyrd_default  Created
+19:59:28  Container wyrd-test-16344-16350-wyrd-postgres-1  Creating
+19:59:28  Container wyrd-test-16344-16350-wyrd-mailpit-1  Creating
+19:59:28  Container wyrd-test-16344-16350-wyrd-mailpit-1  Created
+19:59:28  Container wyrd-test-16344-16350-wyrd-postgres-1  Created
+19:59:28  Container wyrd-test-16344-16350-wyrd-postgres-1  Starting
+19:59:28  Container wyrd-test-16344-16350-wyrd-mailpit-1  Starting
+19:59:28  Container wyrd-test-16344-16350-wyrd-postgres-1  Started
+19:59:28  Container wyrd-test-16344-16350-wyrd-mailpit-1  Started
+19:59:28  Container wyrd-test-16344-16350-wyrd-mailpit-1  Waiting
+19:59:28  Container wyrd-test-16344-16350-wyrd-postgres-1  Waiting
+19:59:30  Container wyrd-test-16344-16350-wyrd-mailpit-1  Healthy
+19:59:31  Container wyrd-test-16344-16350-wyrd-postgres-1  Healthy
+19:59:31 [36m[db:migrate:all:inner][0m [1m$ cargo nextest run --locked -p wyrd-sql --test integration -E 'test(=pg_migration::pg_tests::migrations_apply_and_are_idempotent)'[0m
+19:59:31     Updating crates.io index
+19:59:34    Compiling wyrd-skald-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-spec)
+19:59:34    Compiling wyrd-semver v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-semver)
+19:59:34    Compiling wyrd-error-derive v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-error-derive)
+19:59:34    Compiling wyrd-tls v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-tls)
+19:59:34    Compiling workspace-hack v0.4.1 (/home/runner/work/wyrd/wyrd/crates/shared/workspace-hack)
+19:59:38    Compiling wyrd-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd-spec)
+19:59:57    Compiling wyrd-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-runtime)
+19:59:58    Compiling wyrd-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-sql)
+20:00:03    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+20:00:04    Compiling wyrd-dev-fixtures v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-dev-fixtures)
+20:00:12     Finished `test` profile [unoptimized + debuginfo] target(s) in 38.01s
+20:00:12 ────────────
+20:00:12  Nextest run ID 8e47eaa1-7f80-4c38-b9ee-e3b9c659b823 with nextest profile: default
+20:00:12     Starting 1 test across 1 binary (149 tests skipped)
+20:00:12         PASS [   0.339s] (1/1) wyrd-sql::integration pg_migration::pg_tests::migrations_apply_and_are_idempotent
+20:00:12 ────────────
+20:00:12      Summary [   0.340s] 1 test run: 1 passed, 149 skipped
+20:00:13    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+20:00:17     Finished `test` profile [unoptimized + debuginfo] target(s) in 4.24s
+20:00:17 ────────────
+20:00:17  Nextest run ID 183eb527-9b84-40b4-a95c-b0326bbea151 with nextest profile: default
+20:00:17     Starting 1 test across 1 binary (70 tests skipped)
+20:00:17         PASS [   0.146s] (1/1) vala-sql::integration pg_migration::pg_tests::vala_migrations_apply_and_are_idempotent
+20:00:17 ────────────
+20:00:17      Summary [   0.146s] 1 test run: 1 passed, 70 skipped
+20:00:17 [32m[1m[test:shared:inner][0m [1m$ bash scripts/run-family-tests.sh shared[0m
+20:00:17 testing shared packages: workspace-hack  wyrd-error-derive  wyrd-semver  wyrd-utils  wyrd-tls  wyrd-telemetry  wyrd-runtime  wyrd-dev-fixtures  wyrd-auth-issue  wyrd-auth-verify  wyrd-auth-oidc  wyrd-crypt  wyrd-vault  wyrd-client  wyrd-benchmark  wyrd-loader  wyrd-queue  wyrd-types  wyrd-version  wyrd-bench  wyrd-ai
+20:00:18    Compiling wyrd-semver v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-semver)
+20:00:18    Compiling wyrd-benchmark v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-benchmark)
+20:00:18    Compiling wyrd-tonic v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-tonic)
+20:00:18    Compiling wyrd-crypt v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-crypt)
+20:00:18    Compiling wyrd-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd-spec)
+20:00:18    Compiling wyrd-vault v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-vault)
+20:00:19    Compiling wyrd-skald-providers v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-providers)
+20:00:19    Compiling wyrd-skald-cache v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-cache)
+20:00:19    Compiling wyrd-version v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-version)
+20:00:19    Compiling wyrd-testing v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-testing)
+20:00:20    Compiling wyrd-bench v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-bench)
+20:00:20    Compiling wyrd-error-derive v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-error-derive)
+20:00:21    Compiling wyrd-skald-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-runtime)
+20:00:24    Compiling wyrd-tls v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-tls)
+20:00:24    Compiling workspace-hack v0.4.1 (/home/runner/work/wyrd/wyrd/crates/shared/workspace-hack)
+20:00:41    Compiling wyrd-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-runtime)
+20:00:41    Compiling wyrd-utils v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-utils)
+20:00:41    Compiling wyrd-types v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-types)
+20:00:42    Compiling wyrd-auth-oidc v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-oidc)
+20:00:42    Compiling wyrd-interfaces v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-interfaces)
+20:00:42    Compiling wyrd-config v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-config)
+20:00:42    Compiling wyrd-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-sql)
+20:00:43    Compiling wyrd-skald-prompt v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-prompt)
+20:00:43    Compiling wyrd-telemetry v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-telemetry)
+20:00:43    Compiling wyrd-auth-verify v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-verify)
+20:00:44    Compiling wyrd-queue v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-queue)
+20:00:46    Compiling wyrd-loader v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-loader)
+20:00:47    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+20:00:48    Compiling wyrd-cards v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-cards)
+20:00:49    Compiling wyrd-client v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-client)
+20:00:50    Compiling wyrd-auth-issue v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-issue)
+20:00:50    Compiling wyrd-kms v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-kms)
+20:00:50    Compiling wyrd-skald-tool v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-tool)
+20:00:50    Compiling wyrd-skald-agent v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-agent)
+20:00:50    Compiling wyrd-storage v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-storage)
+20:00:52    Compiling vala-drift v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-drift)
+20:00:52    Compiling vala-bifrost-redux v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-bifrost-redux)
+20:00:53    Compiling vala-verify v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-verify)
+20:00:55    Compiling wyrd-gateway v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-gateway)
+20:00:57    Compiling wyrd-auth v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-auth)
+20:00:58    Compiling wyrd-dev-fixtures v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-dev-fixtures)
+20:00:59    Compiling wyrd-mcp v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-mcp)
+20:00:59    Compiling wyrd-cli v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-cli)
+20:01:05    Compiling wyrd-ai v0.4.2 (/home/runner/work/wyrd/wyrd/sdks/wyrd-sdk-rust)
+20:01:23    Compiling wyrd-server v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-server)
+20:05:13     Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 55s
+20:05:15 ────────────
+20:05:15  Nextest run ID dfeb09a4-3a74-4304-aa4c-ab6caf4371c1 with nextest profile: default
+20:05:15     Starting 879 tests across 24 binaries (231 tests skipped)
+20:05:15         PASS [   0.007s] (  1/879) wyrd-ai tests::sdk_bifrost_names_the_compaction_type
+20:05:15         PASS [   0.008s] (  2/879) wyrd-ai tests::sdk_root_exposes_the_supported_surface
+20:05:15         PASS [   0.011s] (  3/879) wyrd-auth-issue tests::from_ed_pem_rejects_invalid_pem
+20:05:15         PASS [   0.020s] (  4/879) wyrd-auth-issue tests::generated_ephemeral_key_mints_tokens_verifiable_by_its_derived_key
+20:05:15         PASS [   0.007s] (  5/879) wyrd-auth-issue tests::generated_ephemeral_keys_are_distinct
+20:05:15         PASS [   0.012s] (  6/879) wyrd-auth-issue tests::issue_access_token_carries_credential_id
+20:05:15         PASS [   0.015s] (  7/879) wyrd-auth-issue tests::issue_access_token_delegated_accepts_depth_at_max
+20:05:15         PASS [   0.008s] (  8/879) wyrd-auth-issue tests::issue_access_token_delegated_rejects_depth_over_max
+20:05:15         PASS [   0.011s] (  9/879) wyrd-auth-issue tests::issue_access_token_delegated_names_subject_and_outer_actor
+20:05:15         PASS [   0.006s] ( 10/879) wyrd-auth-issue tests::issue_access_token_rejects_negative_ttl
+20:05:15         PASS [   0.005s] ( 11/879) wyrd-auth-issue tests::issue_access_token_rejects_platform_kind
+20:05:15         PASS [   0.013s] ( 12/879) wyrd-auth-issue tests::issue_access_token_refuses_every_system_grant
+20:05:15         PASS [   0.004s] ( 13/879) wyrd-auth-issue tests::issue_access_token_rejects_zero_ttl
+20:05:15         PASS [   0.005s] ( 14/879) wyrd-auth-issue tests::issue_access_token_signs_exact_root_scope_and_refuses_inconsistent_access
+20:05:15         PASS [   0.009s] ( 15/879) wyrd-auth-issue tests::issue_access_token_uses_principal_version_audience_and_jti_shape
+20:05:15         PASS [   0.092s] ( 16/879) wyrd-ai::integration authoring::public_paths_author_every_native_family
+20:05:15         PASS [   0.008s] ( 17/879) wyrd-auth-issue tests::issue_refresh_token_is_principal_generic
+20:05:15         PASS [   0.006s] ( 18/879) wyrd-auth-issue tests::issued_token_sets_iat_and_exp
+20:05:15         PASS [   0.007s] ( 19/879) wyrd-auth-issue tests::issued_token_header_is_eddsa_with_kid
+20:05:15         PASS [   0.006s] ( 20/879) wyrd-auth-issue tests::kid_validation_accepts_locked_shape
+20:05:15         PASS [   0.044s] ( 21/879) wyrd-auth-issue tests::issue_access_token_rejects_token_over_bearer_limit
+20:05:15         PASS [   0.005s] ( 22/879) wyrd-auth-issue tests::no_sqlx_in_crate
+20:05:15         PASS [   0.009s] ( 23/879) wyrd-auth-issue tests::kid_validation_rejects_empty_space_and_too_long
+20:05:15         PASS [   0.007s] ( 24/879) wyrd-auth-issue tests::platform_token_carries_scope_principal_and_credential
+20:05:15         PASS [   0.006s] ( 25/879) wyrd-auth-issue tests::secret_matches_only_its_own_sha256_verifier
+20:05:15         PASS [   0.006s] ( 26/879) wyrd-auth-issue tests::the_two_planes_cannot_replay_each_others_tokens
+20:05:15         PASS [   0.008s] ( 27/879) wyrd-auth-issue tests::verifying_key_pem_derives_a_key_that_verifies_issued_tokens
+20:05:15         PASS [   0.014s] ( 28/879) wyrd-auth-oidc claims::tests::absent_groups_path_yields_empty_vec
+20:05:15         PASS [   0.007s] ( 29/879) wyrd-auth-oidc claims::tests::mapped_claims_has_no_card_ref_field
+20:05:15         PASS [   0.014s] ( 30/879) wyrd-auth-oidc claims::tests::dotted_path_traverses_nested_objects
+20:05:15         PASS [   0.005s] ( 31/879) wyrd-auth-oidc claims::tests::missing_optional_email_is_not_an_error
+20:05:15         PASS [   0.006s] ( 32/879) wyrd-auth-oidc claims::tests::maps_standard_claims
+20:05:15         PASS [   0.008s] ( 33/879) wyrd-auth-oidc claims::tests::mapped_claims_is_not_a_principal
+20:05:15         PASS [   0.005s] ( 34/879) wyrd-auth-oidc claims::tests::missing_subject_claim_returns_error
+20:05:15         PASS [   0.006s] ( 35/879) wyrd-auth-oidc claims::tests::no_groups_mapping_yields_empty_vec
+20:05:15         PASS [   0.008s] ( 36/879) wyrd-auth-oidc claims::tests::name_is_the_trimmed_standard_claim_when_nonblank
+20:05:15         PASS [   0.019s] ( 37/879) wyrd-auth-oidc jwks::tests::a_refresh_refuses_an_internal_jwks_without_reaching_it
+20:05:15         PASS [   0.080s] ( 38/879) wyrd-auth-oidc jwks::tests::jwks_unavailable_on_network_error
+20:05:15         PASS [   0.103s] ( 39/879) wyrd-auth-oidc github::tests::a_refused_code_reads_no_user
+20:05:15         PASS [   0.030s] ( 40/879) wyrd-auth-oidc jwks::tests::resolves_ec_key
+20:05:15         PASS [   0.152s] ( 41/879) wyrd-auth-oidc jwks::tests::concurrent_misses_coalesce_to_single_fetch
+20:05:15         PASS [   0.059s] ( 42/879) wyrd-auth-oidc jwks::tests::refetch_on_unknown_kid_succeeds_after_rotation
+20:05:15         PASS [   0.029s] ( 43/879) wyrd-auth-oidc jwks::tests::resolves_ed25519_key
+20:05:15         PASS [   0.006s] ( 44/879) wyrd-auth-oidc registry::tests::claim_mapping_has_no_card_ref_field
+20:05:15         PASS [   0.007s] ( 45/879) wyrd-auth-oidc registry::tests::same_issuer_different_tenants_resolves_independently
+20:05:15         PASS [   0.008s] ( 46/879) wyrd-auth-oidc registry::tests::unknown_issuer_returns_none
+20:05:15         PASS [   0.007s] ( 47/879) wyrd-auth-oidc registry::tests::unknown_tenant_returns_none
+20:05:15         PASS [   0.040s] ( 48/879) wyrd-auth-oidc jwks::tests::resolves_rsa_key
+20:05:15         PASS [   0.062s] ( 49/879) wyrd-auth-oidc jwks::tests::unknown_kid_after_refetch_returns_error
+20:05:15         PASS [   0.039s] ( 50/879) wyrd-auth-oidc relying_party::tests::a_mismatched_issuer_is_refused
+20:05:15         PASS [   0.118s] ( 51/879) wyrd-auth-oidc relying_party::tests::a_provider_outage_fails_closed
+20:05:15         PASS [   0.157s] ( 52/879) wyrd-auth-oidc relying_party::tests::a_still_unknown_key_fails_after_one_rediscovery
+20:05:15         PASS [   0.176s] ( 53/879) wyrd-auth-oidc relying_party::tests::a_redirecting_token_endpoint_is_refused_without_following
+20:05:15         PASS [   0.097s] ( 54/879) wyrd-auth-oidc relying_party::tests::a_valid_id_token_maps_its_identity
+20:05:16         PASS [   0.009s] ( 55/879) wyrd-auth-oidc relying_party::tests::an_unsafe_issuer_is_refused_before_any_request
+20:05:16         PASS [   0.037s] ( 56/879) wyrd-auth-oidc relying_party::tests::an_unsafe_key_set_url_is_refused_before_any_request
+20:05:16         PASS [   0.090s] ( 57/879) wyrd-auth-oidc relying_party::tests::an_unadvertised_signing_algorithm_is_refused
+20:05:16         PASS [   0.143s] ( 58/879) wyrd-auth-oidc relying_party::tests::an_unknown_key_rediscovers_exactly_once
+20:05:16         PASS [   0.864s] ( 59/879) wyrd-auth-oidc relying_party::tests::id_token_refusals_fail_closed
+20:05:16         PASS [   0.042s] ( 60/879) wyrd-auth-oidc relying_party::tests::the_authorization_request_carries_state_nonce_and_pkce
+20:05:17         PASS [   0.041s] ( 61/879) wyrd-auth-oidc relying_party::tests::the_cache_serves_a_discovered_provider
+20:05:17         PASS [   0.027s] ( 62/879) wyrd-auth-oidc screening::tests::a_body_at_the_limit_is_read_whole
+20:05:17         PASS [   0.007s] ( 63/879) wyrd-auth-oidc screening::tests::a_hostless_url_is_refused
+20:05:17         PASS [   0.009s] ( 64/879) wyrd-auth-oidc screening::tests::a_mapped_spelling_does_not_evade_the_screen
+20:05:17         PASS [   0.010s] ( 65/879) wyrd-auth-oidc screening::tests::a_stalled_lookup_is_unresolved_at_the_deadline
+20:05:17         PASS [   0.065s] ( 66/879) wyrd-auth-oidc screening::tests::an_ambient_proxy_cannot_observe_a_screened_request
+20:05:17         PASS [   0.048s] ( 67/879) wyrd-auth-oidc screening::tests::an_oversized_chunked_body_is_refused
+20:05:17         PASS [   0.035s] ( 68/879) wyrd-auth-oidc screening::tests::an_oversized_declared_body_is_refused
+20:05:17         PASS [   1.121s] ( 69/879) wyrd-auth-oidc relying_party::tests::overlapping_cache_misses_share_one_discovery
+20:05:17         PASS [   0.012s] ( 70/879) wyrd-auth-oidc screening::tests::cloud_metadata_is_blocked_in_every_profile
+20:05:17         PASS [   0.037s] ( 71/879) wyrd-auth-oidc screening::tests::loopback_depends_on_the_deployment_policy
+20:05:17         PASS [   0.111s] ( 72/879) wyrd-auth-oidc screening::tests::an_oversized_decompressed_body_is_refused
+20:05:17         PASS [   0.008s] ( 73/879) wyrd-auth-oidc screening::tests::screened_request_child
+20:05:17         PASS [   0.007s] ( 74/879) wyrd-auth-oidc screening::tests::the_policy_decides_only_the_internal_ranges
+20:05:17         PASS [   0.039s] ( 75/879) wyrd-auth-oidc screening::tests::only_the_permissive_policy_accepts_cleartext_http
+20:05:17         PASS [   0.036s] ( 76/879) wyrd-auth-oidc turnstile::tests::siteverify_receives_the_form_and_decodes_a_refusal
+20:05:17         PASS [   0.045s] ( 77/879) wyrd-auth-oidc turnstile::tests::an_unavailable_siteverify_is_an_error
+20:05:17         PASS [   0.022s] ( 78/879) wyrd-auth-verify tests::access_token_claims_round_trip_ceiling
+20:05:17         PASS [   0.032s] ( 79/879) wyrd-auth-verify tests::a_remembered_token_answers_only_its_tenant_and_surface
+20:05:17         PASS [   0.006s] ( 80/879) wyrd-auth-verify tests::auth_error_is_clone
+20:05:17         PASS [   0.008s] ( 81/879) wyrd-auth-verify tests::an_accepted_token_is_remembered_until_it_expires
+20:05:17         PASS [   0.006s] ( 82/879) wyrd-auth-verify tests::decode_kid_reads_header
+20:05:17         PASS [   0.008s] ( 83/879) wyrd-auth-verify tests::bifrost_audience_is_accepted_only_on_the_bifrost_surface
+20:05:17         PASS [   0.007s] ( 84/879) wyrd-auth-verify tests::explicit_card_access_claims_are_fail_closed
+20:05:17         PASS [   0.006s] ( 85/879) wyrd-auth-verify tests::into_verified_accepts_delegation_depth_at_max
+20:05:17         PASS [   0.006s] ( 86/879) wyrd-auth-verify tests::into_verified_keeps_subject_and_orders_actors_earliest_first
+20:05:17         PASS [   0.006s] ( 87/879) wyrd-auth-verify tests::into_verified_rejects_delegation_depth_over_max
+20:05:17         PASS [   0.007s] ( 88/879) wyrd-auth-verify tests::into_verified_rejects_system_delegation_layer
+20:05:17         PASS [   0.009s] ( 89/879) wyrd-auth-verify tests::no_sqlx_in_crate
+20:05:17         PASS [   0.006s] ( 90/879) wyrd-auth-verify tests::principal_ref_projects_runtime_principal
+20:05:17         PASS [   0.006s] ( 91/879) wyrd-auth-verify tests::public_key_from_pem_rejects_garbage
+20:05:17         PASS [   0.010s] ( 92/879) wyrd-auth-verify tests::token_verifier_carries_identity_and_ceiling_but_no_authority
+20:05:17         PASS [   0.010s] ( 93/879) wyrd-auth-verify tests::token_verifier_refuses_every_system_claim_set
+20:05:17         PASS [   0.007s] ( 94/879) wyrd-auth-verify tests::token_verifier_rejects_cross_tenant_token
+20:05:17         PASS [   0.010s] ( 95/879) wyrd-auth-verify tests::token_verifier_refuses_other_versions_and_removed_claims
+20:05:17         PASS [   0.008s] ( 96/879) wyrd-auth-verify tests::token_verifier_rejects_expired_token
+20:05:17         PASS [   0.008s] ( 97/879) wyrd-auth-verify tests::token_verifier_rejects_malformed_ceiling
+20:05:17         PASS [   0.008s] ( 98/879) wyrd-auth-verify tests::token_verifier_rejects_oversize_token
+20:05:17         PASS [   0.009s] ( 99/879) wyrd-auth-verify tests::token_verifier_rejects_wrong_audience
+20:05:17         PASS [   0.010s] (100/879) wyrd-auth-verify tests::token_verifier_rejects_wrong_issuer
+20:05:17         PASS [   0.008s] (101/879) wyrd-auth-verify tests::token_verifier_rejects_wrong_signature
+20:05:17         PASS [   0.007s] (102/879) wyrd-auth-verify tests::verify_eddsa_enforces_issuer
+20:05:17         PASS [   0.007s] (103/879) wyrd-auth-verify tests::verify_eddsa_rejects_expired
+20:05:17         PASS [   0.005s] (104/879) wyrd-auth-verify tests::verify_eddsa_rejects_hs256_token
+20:05:17         PASS [   0.006s] (105/879) wyrd-auth-verify tests::verify_eddsa_roundtrips_access_token
+20:05:17         PASS [   0.007s] (106/879) wyrd-auth-verify tests::verify_eddsa_with_overrides_caller_algorithms
+20:05:17         PASS [   0.052s] (107/879) wyrd-auth-verify tests::verify_external_expired_token_returns_token_expired
+20:05:17         PASS [   0.047s] (108/879) wyrd-auth-verify tests::verify_external_happy_path_returns_verified_identity_not_principal
+20:05:17         PASS [   0.028s] (109/879) wyrd-auth-verify tests::verify_external_jwks_unreachable_returns_verify_unavailable
+20:05:17         PASS [   0.029s] (110/879) wyrd-auth-verify tests::verify_external_tenant_isolation_wrong_audience_is_invalid_token
+20:05:17         PASS [   0.005s] (111/879) wyrd-auth-verify tests::verify_external_unknown_tenant_issuer_pair_returns_invalid_token
+20:05:17         PASS [   0.025s] (112/879) wyrd-auth-verify tests::verify_external_wrong_audience_returns_invalid_token
+20:05:17         PASS [   0.048s] (113/879) wyrd-auth-verify tests::verify_external_unknown_kid_refetches_and_succeeds_after_rotation
+20:05:17         PASS [   0.006s] (114/879) wyrd-bench cluster::tests::fairness_uses_separate_vector_equation
+20:05:17         PASS [   0.031s] (115/879) wyrd-auth-verify tests::workload_assertion_requires_binding_claims
+20:05:18         PASS [   2.538s] (116/879) wyrd-auth-oidc relying_party::tests::concurrent_rotated_key_redemptions_share_one_refresh
+20:05:19         PASS [   1.569s] (117/879) wyrd-bench lane::tests::bifrost_comparator_rejects_incompatible_report_versions
+20:05:19         PASS [   0.007s] (118/879) wyrd-bench lane::tests::scenario_defaults_are_bounded_before_harness_setup
+20:05:19         PASS [   0.006s] (119/879) wyrd-bench lane::tests::smoke_scenarios_validate_for_each_lane
+20:05:19         PASS [   0.712s] (120/879) wyrd-bench lane::tests::stale_report_schema_is_rejected
+20:05:20         PASS [   1.013s] (121/879) wyrd-bench lane::tests::summary_counts_only_durable_identity_verified_samples
+20:05:21         PASS [   3.724s] (122/879) wyrd-bench lane::tests::all_four_adapters_emit_the_shared_envelope
+20:05:21         PASS [   0.909s] (123/879) wyrd-bench lane::tests::summary_fails_the_scribe_ack_slo_when_p99_is_over_limit
+20:05:21         PASS [   0.015s] (124/879) wyrd-bench recorder::tests::interval_reset_preserves_series_and_resets_values_and_peaks
+20:05:21         PASS [   0.042s] (125/879) wyrd-bench recorder::tests::missing_required_metric_and_series_overflow_fail_closed
+20:05:21         PASS [   0.016s] (126/879) wyrd-bench recorder::tests::normalized_labels_share_one_series
+20:05:21         PASS [   0.013s] (127/879) wyrd-bench recorder::tests::recorder_accumulates_counter_gauge_peak_and_histogram
+20:05:21         PASS [   0.012s] (128/879) wyrd-bench report::tests::case_filter_selects_only_requested_cases
+20:05:21         PASS [   0.011s] (129/879) wyrd-bench report::tests::compact_matrix_retains_base_cases_and_explicit_fault_cases
+20:05:21         PASS [   0.011s] (130/879) wyrd-bench workload::tests::missing_edge_case_is_rejected
+20:05:21         PASS [   0.010s] (131/879) wyrd-bench workload::tests::required_workload_contains_all_edge_cases
+20:05:22         PASS [   0.287s] (132/879) wyrd-benchmark heap::tests::samples_live_allocations_from_the_start
+20:05:22         PASS [   0.014s] (133/879) wyrd-benchmark heap::tests::stacks_start_at_the_requesting_code
+20:05:22         PASS [   0.012s] (134/879) wyrd-benchmark observation_tests::inactive_observations_read_no_clock_and_record_nothing
+20:05:22         PASS [   0.018s] (135/879) wyrd-benchmark observation_tests::observations_keep_roots_outcomes_and_reached_components
+20:05:22         PASS [   0.011s] (136/879) wyrd-benchmark recorder::tests::unrelated_series_record_while_one_series_is_held
+20:05:22         PASS [   1.017s] (137/879) wyrd-bench lane::tests::unsupported_preflight_cannot_report_slo_pass
+20:05:22         PASS [   0.040s] (138/879) wyrd-benchmark recording_tests::benchmark_histograms_preserve_bounded_intervals
+20:05:22         PASS [   0.013s] (139/879) wyrd-benchmark registry::tests::cohort_headers_declare_only_closed_labels
+20:05:22         PASS [   0.017s] (140/879) wyrd-benchmark registry::tests::counts_above_a_threshold_bound_its_bucket
+20:05:22         PASS [   0.033s] (141/879) wyrd-benchmark recording_tests::snapshots_preserve_complete_timing_groups_during_recording
+20:05:22         PASS [   0.011s] (142/879) wyrd-benchmark registry::tests::labels_are_closed
+20:05:22         PASS [   0.018s] (143/879) wyrd-benchmark registry::tests::kept_distributions_restore_and_pool
+20:05:22         PASS [   0.013s] (144/879) wyrd-benchmark registry::tests::standard_metrics_and_request_timings_share_one_snapshot
+20:05:22         PASS [   0.015s] (145/879) wyrd-client auth::tests::cached_token_debug_redacts_secret
+20:05:22         PASS [   0.092s] (146/879) wyrd-client auth::tests::concurrent_bearer_callers_single_flight
+20:05:22         PASS [   0.184s] (147/879) wyrd-client auth::tests::disk_cache_writes_token_beside_its_api_key
+20:05:22         PASS [   0.061s] (148/879) wyrd-client auth::tests::exchange_caches_access_token_and_drops_refresh
+20:05:22         PASS [   0.043s] (149/879) wyrd-client auth::tests::force_refresh_re_exchanges_once
+20:05:22         PASS [   0.009s] (150/879) wyrd-client auth::tests::is_stale_false_outside_skew
+20:05:22         PASS [   0.008s] (151/879) wyrd-client auth::tests::is_stale_true_at_and_within_skew_boundary
+20:05:22         PASS [   0.040s] (152/879) wyrd-client auth::tests::on_behalf_of_caches_the_exchange_and_redacts_the_subject
+20:05:22         PASS [   0.531s] (153/879) wyrd-benchmark registry::tests::series_beyond_the_bound_are_dropped
+20:05:22         PASS [   0.087s] (154/879) wyrd-client auth::tests::renewable_source_uses_the_shared_refresh_lifecycle
+20:05:23         PASS [   0.047s] (155/879) wyrd-client auth::tests::renewable_tokens_are_never_persisted
+20:05:23         PASS [   0.063s] (156/879) wyrd-client auth::tests::request_id_forwards_supplied_id
+20:05:23         PASS [   0.039s] (157/879) wyrd-client auth::tests::request_id_mints_uuid_v7_when_absent
+20:05:23         PASS [   0.140s] (158/879) wyrd-client auth::tests::renewal_and_caches_keep_workload_context_separate
+20:05:23         PASS [   0.055s] (159/879) wyrd-client auth::tests::revoked_key_maps_to_wyrd_error
+20:05:23         PASS [   0.039s] (160/879) wyrd-client auth::tests::stale_token_re_exchanges_without_error
+20:05:23         PASS [   0.131s] (161/879) wyrd-client auth::tests::token_exchange_never_follows_a_redirect
+20:05:23         PASS [   0.377s] (162/879) wyrd-client auth::tests::saved_login_token_is_reused_until_expiry
+20:05:23         PASS [   0.199s] (163/879) wyrd-client auth::tests::token_exchange_refuses_remote_cleartext
+20:05:23         PASS [   0.074s] (164/879) wyrd-client auth::tests::workload_exchange_caches_and_serves_from_shared_cache
+20:05:23         PASS [   0.056s] (165/879) wyrd-client auth::tests::workload_force_refresh_re_exchanges_once
+20:05:23         PASS [   8.164s] (166/879) wyrd-ai::integration action_timeline::service_action_timeline_survives_a_quiet_operator_policy
+20:05:23         PASS [   0.051s] (167/879) wyrd-client auth::tests::workload_invalid_tenant_slug_is_client_error_preflight
+20:05:23         PASS [   0.009s] (168/879) wyrd-client authoring::tests::captures_share_descendants_and_graphs_borrow_them
+20:05:23         PASS [   0.027s] (169/879) wyrd-client authoring::tests::canonical_objects_match_constructed_values
+20:05:23         PASS [   0.052s] (170/879) wyrd-client auth::tests::workload_server_rejection_maps_to_server_error
+20:05:23         PASS [   0.025s] (171/879) wyrd-client authoring::tests::drift_references_compose
+20:05:23         PASS [   0.039s] (172/879) wyrd-client authoring::tests::entry_built_objects_keep_nested_references
+20:05:23         PASS [   0.081s] (173/879) wyrd-client authoring::tests::declarations_match_file_authored_tree
+20:05:23         PASS [   0.092s] (174/879) wyrd-client authoring::tests::core_primitives_match_canonical_contracts
+20:05:23         PASS [   0.030s] (175/879) wyrd-client authoring::tests::field_edits_defer_validation_and_preserve_snapshots
+20:05:23         PASS [   0.032s] (176/879) wyrd-client authoring::tests::fields_of_declares_one_slot_per_field
+20:05:23         PASS [   0.037s] (177/879) wyrd-client authoring::tests::local_artifact_siblings_match_the_whole_capture
+20:05:23         PASS [   0.033s] (178/879) wyrd-client authoring::tests::model_slot_carries_the_derived_schema
+20:05:23         PASS [   0.059s] (179/879) wyrd-client authoring::tests::offline_edits_preserve_snapshots
+20:05:23         PASS [   0.047s] (180/879) wyrd-client authoring::tests::shared_children_join_once_and_plain_graphs_keep_no_targets
+20:05:23         PASS [   0.011s] (181/879) wyrd-client authoring::tests::trace_field_declares_a_trace_slot
+20:05:23         PASS [   0.019s] (182/879) wyrd-client authoring::tests::tables_match_their_canonical_entries
+20:05:23         PASS [   0.068s] (183/879) wyrd-client authoring::tests::replacements_keep_only_current_dependencies
+20:05:23         PASS [   0.010s] (184/879) wyrd-client bifrost::bounded_ipc_tests::bounded_ipc_retains_client_authority_through_transfer
+20:05:23         PASS [   0.022s] (185/879) wyrd-client authoring::tests::yaml_and_code_share_diagnostics
+20:05:23         PASS [   0.030s] (186/879) wyrd-client authoring::tests::unversioned_definitions_take_the_original_prompt_and_typed_values
+20:05:23         PASS [   0.018s] (187/879) wyrd-client bifrost::facade::tests::blank_explicit_options_are_refused_by_their_public_name
+20:05:23         PASS [   0.070s] (188/879) wyrd-client bifrost::facade::tests::omitted_server_url_comes_from_the_global_config_file
+20:05:23         PASS [   5.372s] (189/879) wyrd-bench lane::tests::fault_profiles_execute_their_required_negative_flows
+20:05:24         PASS [   0.267s] (190/879) wyrd-client bifrost::grpc::tests::ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal
+20:05:24         PASS [   0.007s] (191/879) wyrd-client bifrost::grpc::tests::invalid_batch_id_is_rejected_before_transport
+20:05:24         PASS [   0.006s] (192/879) wyrd-client bifrost::grpc::tests::only_transport_loss_statuses_are_retryable
+20:05:24         PASS [   0.043s] (193/879) wyrd-client bifrost::grpc::tests::unauthenticated_refusal_forces_one_shared_refresh_and_resends
+20:05:24         PASS [   0.012s] (194/879) wyrd-client bifrost::handle::tests::shutdown_and_producer_admission_share_the_pool_lock
+20:05:24         PASS [   0.209s] (195/879) wyrd-client bifrost::handle::tests::shutdown_waits_for_admitted_direct_write
+20:05:24         PASS [   0.008s] (196/879) wyrd-client bifrost::query::tests::bifrost_client_error_projects_onto_the_catalog
+20:05:24         PASS [   0.074s] (197/879) wyrd-client bifrost::query::tests::bifrost_query_bounded_collection_counts_schema_and_framing_bytes
+20:05:24         PASS [   0.073s] (198/879) wyrd-client bifrost::query::tests::bifrost_query_bounded_collection_rejects_rows_and_bytes
+20:05:24         PASS [   0.040s] (199/879) wyrd-client bifrost::query::tests::bifrost_query_collection_rejects_missing_schema
+20:05:24         PASS [   0.041s] (200/879) wyrd-client bifrost::query::tests::bifrost_query_decodes_arrow_and_terminal
+20:05:24         PASS [   0.040s] (201/879) wyrd-client bifrost::query::tests::bifrost_query_degraded_terminal_completes
+20:05:24         PASS [   0.008s] (202/879) wyrd-client bifrost::query::tests::bifrost_query_drop_releases_response_stream
+20:05:24         PASS [   0.007s] (203/879) wyrd-client bifrost::query::tests::bifrost_query_eof_before_terminal_is_rejected
+20:05:24         PASS [   0.042s] (204/879) wyrd-client bifrost::query::tests::bifrost_query_failed_terminal_is_retained_and_rejected
+20:05:24         PASS [   0.008s] (205/879) wyrd-client bifrost::query::tests::bifrost_query_frame_decoder_accepts_arbitrary_chunk_splits
+20:05:24         PASS [   0.007s] (206/879) wyrd-client bifrost::query::tests::bifrost_query_rejects_duplicate_schema
+20:05:24         PASS [   0.042s] (207/879) wyrd-client bifrost::query::tests::bifrost_query_rejects_standalone_batch_stream
+20:05:24         PASS [   0.042s] (208/879) wyrd-client bifrost::query::tests::bifrost_query_zero_rows_retains_authoritative_schema
+20:05:25         PASS [   0.343s] (209/879) wyrd-client bifrost::query::tests::cancelled_terminal_eof_wait_resumes_safely
+20:05:25         PASS [   0.042s] (210/879) wyrd-client bifrost::query::tests::coalesced_chunk_decodes_one_batch_per_delivery
+20:05:25         PASS [   0.047s] (211/879) wyrd-client bifrost::query::tests::deadline_terminal_followed_by_a_frame_is_a_protocol_error
+20:05:25         PASS [   0.094s] (212/879) wyrd-client bifrost::query::tests::deadline_terminal_with_late_eof_keeps_the_typed_timeout
+20:05:25         PASS [   0.043s] (213/879) wyrd-client bifrost::query::tests::describe_builds_writable_schema_without_duplicate_correlation
+20:05:25         PASS [   0.043s] (214/879) wyrd-client bifrost::query::tests::failed_healthy_drain_settles_once
+20:05:25         PASS [   0.009s] (215/879) wyrd-client bifrost::query::tests::failed_terminal_problem_rebuilds_its_catalog_error
+20:05:25         PASS [   0.105s] (216/879) wyrd-client bifrost::query::tests::failed_terminal_requires_clean_eof
+20:05:25         PASS [   0.026s] (217/879) wyrd-client bifrost::query::tests::query_body_failure_is_structured_transport_error
+20:05:26         PASS [   0.825s] (218/879) wyrd-client bifrost::query::tests::query_result_stream_settles_every_incomplete_exit_once
+20:05:26         PASS [   0.045s] (219/879) wyrd-client bifrost::query::tests::resource_terminal_rejects_partial_rows
+20:05:26         PASS [   0.042s] (220/879) wyrd-client bifrost::query::tests::sql_forwards_bind_values_without_interpolation
+20:05:26         PASS [   0.101s] (221/879) wyrd-client bifrost::query::tests::stateful_ipc_decoder_contract
+20:05:26         PASS [   0.142s] (222/879) wyrd-client bifrost::query::tests::terminal_without_eof_fails_at_the_transport_timeout
+20:05:26         PASS [   0.101s] (223/879) wyrd-client bifrost::sdk::a_thousand_tables_share_one_handle_budget
+20:05:26         PASS [   0.007s] (224/879) wyrd-client bifrost::sdk::bifrost_owns_the_complete_query_lifecycle
+20:05:26         PASS [   0.007s] (225/879) wyrd-client bifrost::sdk::different_credential_yields_different_scope
+20:05:27         PASS [   0.052s] (226/879) wyrd-client bifrost::sdk::downstream_stall_remains_bounded_and_recovers_after_drain
+20:05:27         PASS [   0.009s] (227/879) wyrd-client bifrost::sdk::identical_key_reuses_one_pooled_producer
+20:05:27         PASS [   0.007s] (228/879) wyrd-client bifrost::sdk::ingest_sink_forwards_batch_id_unchanged
+20:05:27         PASS [   0.046s] (229/879) wyrd-client bifrost::sdk::insert_propagates_queue_full
+20:05:27         PASS [   0.040s] (230/879) wyrd-client bifrost::sdk::insert_without_an_active_table_refuses
+20:05:27         PASS [   0.009s] (231/879) wyrd-client bifrost::sdk::lifecycle_drains_all_producers_after_first_error
+20:05:27         PASS [   0.008s] (232/879) wyrd-client bifrost::sdk::omitted_card_uid_is_accepted
+20:05:27         PASS [   0.042s] (233/879) wyrd-client bifrost::sdk::register_never_stamps_one_tables_identity_onto_another
+20:05:27         PASS [   0.007s] (234/879) wyrd-client bifrost::sdk::same_url_and_credential_collapse_to_one_scope
+20:05:27         PASS [   0.041s] (235/879) wyrd-client bifrost::sdk::swapping_the_active_table_keeps_the_previous_producer
+20:05:27         PASS [   0.007s] (236/879) wyrd-client bifrost::sdk::table_config_from_a_schemars_model_matches_its_json_schema
+20:05:27         PASS [   0.007s] (237/879) wyrd-client bifrost::sdk::table_config_from_json_schema_declares_the_model_columns
+20:05:27         PASS [   0.006s] (238/879) wyrd-client bifrost::sdk::table_config_rejects_a_reserved_column
+20:05:27         PASS [   0.006s] (239/879) wyrd-client bifrost::sdk::table_config_requires_a_namespaced_name
+20:05:27         PASS [   0.007s] (240/879) wyrd-client cards::download_progress::tests::tracks_multiple_artifacts_and_clears_after_success
+20:05:27         PASS [   0.041s] (241/879) wyrd-client cards::error::tests::cards_client_failures_keep_client_catalog_identity
+20:05:27         PASS [   0.046s] (242/879) wyrd-client cards::handle::tests::bad_second_digest_preserves_destination_and_removes_staging
+20:05:27         PASS [   0.053s] (243/879) wyrd-client cards::handle::tests::pull_publishes_a_bundle_the_state_loads
+20:05:27         PASS [   0.010s] (244/879) wyrd-client cards::handle::tests::selector_constructors_keep_latest_and_exact_distinct
+20:05:27         PASS [   0.053s] (245/879) wyrd-client cards::handle::tests::supported_kinds_project_typed_specs_and_status
+20:05:27         PASS [   0.008s] (246/879) wyrd-client cards::pull::bundle::tests::artifact_paths_are_validated_in_metadata_mode
+20:05:27         PASS [   0.008s] (247/879) wyrd-client cards::pull::bundle::tests::tagged_enums_are_written_as_mappings
+20:05:27         PASS [   0.007s] (248/879) wyrd-client cards::pull::graph::tests::aliases_are_path_safe
+20:05:27         PASS [   0.006s] (249/879) wyrd-client cards::pull::graph::tests::aliases_cannot_point_at_two_exact_cards
+20:05:27         PASS [   0.006s] (250/879) wyrd-client cards::pull::graph::tests::default_alias_contains_exact_identity_without_uid
+20:05:27         PASS [   0.006s] (251/879) wyrd-client cards::pull::tests::bundle_mode_uses_bundle_wire_values
+20:05:27         PASS [   0.006s] (252/879) wyrd-client cards::pull::workspace::tests::cleanup_failure_does_not_hide_a_published_bundle
+20:05:27         PASS [   0.006s] (253/879) wyrd-client cards::pull::workspace::tests::failed_replacement_restores_the_previous_bundle
+20:05:27         PASS [   0.007s] (254/879) wyrd-client cards::pull::workspace::tests::rollback_failure_is_reported_as_unrecoverable
+20:05:27         PASS [   0.007s] (255/879) wyrd-client cards::saga::complete::tests::merge_preserves_composite_root_and_outcome_order
+20:05:27         PASS [   0.007s] (256/879) wyrd-client cards::saga::complete::tests::rejects_duplicate_or_unrelated_completion_outcomes
+20:05:27         PASS [   0.006s] (257/879) wyrd-client cards::saga::complete::tests::rejects_missing_completion_outcome
+20:05:27         PASS [   0.009s] (258/879) wyrd-client cards::saga::hash_artifacts::tests::missing_metadata_is_computed_and_declared_mismatch_is_refused
+20:05:27         PASS [   0.008s] (259/879) wyrd-client cards::saga::hash_artifacts::tests::rejects_short_and_long_sources_before_upload
+20:05:27         PASS [   0.007s] (260/879) wyrd-client cards::saga::hash_artifacts::tests::rejects_source_digest_mismatch_before_upload
+20:05:27         PASS [   0.008s] (261/879) wyrd-client cards::saga::hash_artifacts::tests::validates_sources_and_stamps_sorted_manifest_hash
+20:05:27         PASS [   0.007s] (262/879) wyrd-client cards::saga::upload::tests::rejects_declared_source_without_server_plan
+20:05:27         PASS [   0.007s] (263/879) wyrd-client cards::saga::upload::tests::rejects_server_plan_without_local_source
+20:05:27         PASS [   0.006s] (264/879) wyrd-client cards::tests::public_surface_compiles_without_staged_card_or_transport_exports
+20:05:27         PASS [   0.042s] (265/879) wyrd-client client::tests::access_token_uses_the_shared_refreshing_auth_path
+20:05:27         PASS [   0.042s] (266/879) wyrd-client client::tests::browser_session_bifrost_connects_without_an_ingest_channel
+20:05:27         PASS [   0.042s] (267/879) wyrd-client client::tests::browser_session_client_presents_only_the_forwarded_session
+20:05:27         PASS [   0.162s] (268/879) wyrd-client client::tests::server_handles_connect_eagerly_and_share_the_client_auth_path
+20:05:27         PASS [   0.009s] (269/879) wyrd-client config::tests::debug_does_not_leak_credential
+20:05:27         PASS [   0.009s] (270/879) wyrd-client config::tests::env_api_key_resolves_when_no_explicit
+20:05:27         PASS [   0.009s] (271/879) wyrd-client config::tests::explicit_access_token_beats_workload_token
+20:05:27         PASS [   0.008s] (272/879) wyrd-client config::tests::explicit_credential_beats_env_wyrd_api_key
+20:05:27         PASS [   0.007s] (273/879) wyrd-client config::tests::explicit_credential_beats_workload_token
+20:05:27         PASS [   0.007s] (274/879) wyrd-client config::tests::file_values_beat_environment_values
+20:05:27         PASS [   0.006s] (275/879) wyrd-client config::tests::from_env_uses_defaults_when_no_env_vars
+20:05:27         PASS [   0.006s] (276/879) wyrd-client config::tests::grpc_endpoint_derives_from_server_url_unless_overridden
+20:05:27         PASS [   0.007s] (277/879) wyrd-client config::tests::missing_file_values_fall_back_to_environment
+20:05:27         PASS [   0.007s] (278/879) wyrd-client config::tests::no_credentials_when_chain_empty
+20:05:27         PASS [   0.028s] (279/879) wyrd-client config::tests::saved_login_ranks_between_env_and_credentials_file
+20:05:27         PASS [   0.008s] (280/879) wyrd-client config::tests::tenant_selector_is_refused_beside_a_self_naming_credential
+20:05:27         PASS [   0.007s] (281/879) wyrd-client config::tests::workload_token_beats_env_api_key
+20:05:27         PASS [   0.007s] (282/879) wyrd-client config::tests::workload_token_without_tenant_yields_no_source
+20:05:28         PASS [   0.006s] (283/879) wyrd-client config::tests::wyrd_grpc_url_overrides_default_endpoint
+20:05:28         PASS [   0.006s] (284/879) wyrd-client config::tests::wyrd_server_url_overrides_default_base_url
+20:05:28         PASS [   0.007s] (285/879) wyrd-client error::tests::bifrost_problem_details_reconstruct_exact_variant
+20:05:28         PASS [   0.007s] (286/879) wyrd-client error::tests::bifrost_problems_reconstruct_their_exact_variant
+20:05:28         PASS [   0.006s] (287/879) wyrd-client error::tests::client_error_code_accessor_reports_stable_codes
+20:05:28         PASS [   0.006s] (288/879) wyrd-client error::tests::client_error_has_only_expected_variants
+20:05:28         PASS [   0.006s] (289/879) wyrd-client error::tests::fieldless_bifrost_code_reconstructs_without_details
+20:05:28         PASS [   0.008s] (290/879) wyrd-client error::tests::grpc_convergence::capacity_http_and_grpc_reconstruct_retryability_identically
+20:05:28         PASS [   0.007s] (291/879) wyrd-client error::tests::grpc_convergence::grpc_and_http_same_code_produce_equal_wyrd_error
+20:05:28         PASS [   0.007s] (292/879) wyrd-client error::tests::grpc_convergence::grpc_unknown_code_preserved_in_catch_all
+20:05:28         PASS [   0.008s] (293/879) wyrd-client error::tests::grpc_convergence::payload_limit_reconstructs_identically_across_transports
+20:05:28         PASS [   0.006s] (294/879) wyrd-client error::tests::known_code_reconstructs_correct_variant
+20:05:28         PASS [   0.006s] (295/879) wyrd-client error::tests::no_credentials_guidance_names_the_credential_field
+20:05:28         PASS [   0.007s] (296/879) wyrd-client error::tests::previously_collapsed_code_now_keeps_its_status
+20:05:28         PASS [   0.007s] (297/879) wyrd-client error::tests::storage_problem_json_reconstructs_delegated_error
+20:05:28         PASS [   0.006s] (298/879) wyrd-client error::tests::unknown_code_preserved_in_catch_all
+20:05:28         PASS [   0.007s] (299/879) wyrd-client gateway_admin::tests::named_routes_use_the_admin_gateway_prefix
+20:05:28         PASS [   0.007s] (300/879) wyrd-client global_config::tests::full_file_populates_client_settings
+20:05:28         PASS [   0.011s] (301/879) wyrd-client global_config::tests::local_dev_settings_keep_database_urls_protected
+20:05:28         PASS [   0.010s] (302/879) wyrd-client global_config::tests::local_setup_preserves_content_and_existing_key
+20:05:28         PASS [   0.006s] (303/879) wyrd-client global_config::tests::missing_file_returns_default
+20:05:28         PASS [   0.007s] (304/879) wyrd-client global_config::tests::unknown_fields_are_rejected
+20:05:28         PASS [   0.049s] (305/879) wyrd-client observe::tests::a_sole_declared_table_is_active_after_startup
+20:05:28         PASS [   0.055s] (306/879) wyrd-client observe::tests::a_state_created_with_a_client_keeps_it_for_every_server_call
+20:05:28         PASS [   0.107s] (307/879) wyrd-client observe::tests::ambiguous_shutdown_retries_the_same_batch_on_the_same_state
+20:05:28         PASS [   0.048s] (308/879) wyrd-client observe::tests::concurrent_first_writes_describe_each_table_once
+20:05:28         PASS [   0.009s] (309/879) wyrd-client observe::tests::drift_numeric_str_value_matches_arrow_cast
+20:05:28         PASS [   0.009s] (310/879) wyrd-client observe::tests::drift_projects_one_tall_row_per_feature
+20:05:28         PASS [   0.007s] (311/879) wyrd-client observe::tests::drift_refuses_unsupported_inputs
+20:05:28         PASS [   0.011s] (312/879) wyrd-client observe::tests::each_run_is_its_own_invocation
+20:05:29         PASS [   0.852s] (313/879) wyrd-client observe::tests::enqueue_replays_its_key_and_wait_returns_only_a_real_result
+20:05:29         PASS [   0.280s] (314/879) wyrd-client observe::tests::execute_outlives_the_configured_timeout
+20:05:29         PASS [   0.047s] (315/879) wyrd-client observe::tests::execute_pins_files_and_completes_shared_uploads
+20:05:29         PASS [   0.078s] (316/879) wyrd-client observe::tests::failed_startup_may_be_retried
+20:05:29         PASS [   0.044s] (317/879) wyrd-client observe::tests::file_refusals_happen_locally_before_any_request
+20:05:29         PASS [   0.007s] (318/879) wyrd-client observe::tests::flush_drains_only_a_started_writer
+20:05:29         PASS [   0.147s] (319/879) wyrd-client observe::tests::incompatible_fixed_table_fails_startup
+20:05:29         PASS [   0.052s] (320/879) wyrd-client observe::tests::missing_fixed_table_fails_startup
+20:05:29         PASS [   0.013s] (321/879) wyrd-client observe::tests::run_for_card_refuses_an_unknown_alias_without_network_io
+20:05:29         PASS [   0.011s] (322/879) wyrd-client observe::tests::run_for_card_selects_the_initial_view_and_shares_its_invocation
+20:05:29         PASS [   0.010s] (323/879) wyrd-client observe::tests::scoped_views_share_one_invocation_and_keep_their_subjects
+20:05:30         PASS [   0.077s] (324/879) wyrd-client observe::tests::second_startup_is_refused
+20:05:30         PASS [   0.049s] (325/879) wyrd-client observe::tests::several_declared_tables_need_an_explicit_active_table
+20:05:30         PASS [   0.078s] (326/879) wyrd-client observe::tests::shutdown_closes_the_state_permanently
+20:05:30         PASS [   0.045s] (327/879) wyrd-client observe::tests::shutdown_during_start_stays_closed
+20:05:30         PASS [   0.047s] (328/879) wyrd-client observe::tests::shutdown_without_startup_closes_permanently
+20:05:30         PASS [   6.370s] (329/879) wyrd-client bifrost::grpc::tests::held_calls_exhaust_one_transport_budget_then_retain
+20:05:30         PASS [   0.011s] (330/879) wyrd-client observe::tests::unknown_alias_fails_without_network_io
+20:05:30         PASS [   0.009s] (331/879) wyrd-client observe::tests::values_project_onto_named_slots_by_slot_type
+20:05:30         PASS [   0.031s] (332/879) wyrd-client observe::tests::verifier_resolution_preserves_subjects_and_binding_order
+20:05:30         PASS [   0.070s] (333/879) wyrd-client observe::tests::startup_describes_the_fixed_table_once
+20:05:30         PASS [   6.539s] (334/879) wyrd-client bifrost::grpc::tests::blocking_mint_spends_one_transport_budget_then_retains
+20:05:30         PASS [   0.053s] (335/879) wyrd-client observe::tests::write_describes_a_dataset_table_once
+20:05:30         PASS [   6.606s] (336/879) wyrd-client bifrost::grpc::tests::delayed_refresh_spends_one_transport_budget_then_retains
+20:05:30         PASS [   0.051s] (337/879) wyrd-client observe::tests::write_refuses_an_active_system_table
+20:05:30         PASS [   0.070s] (338/879) wyrd-client observe::tests::write_refuses_an_unknown_dataset_table
+20:05:30         PASS [   0.010s] (339/879) wyrd-client saved_login::tests::canonical_origin_is_the_url_origin
+20:05:30         PASS [   0.053s] (340/879) wyrd-client observe::tests::write_refuses_reserved_and_system_tables
+20:05:30         PASS [   0.014s] (341/879) wyrd-client saved_login::tests::logins_live_in_credentials_toml_beside_user_content
+20:05:30         PASS [   0.012s] (342/879) wyrd-client saved_login::tests::selection_picks_the_named_or_newest_login
+20:05:30         PASS [   0.014s] (343/879) wyrd-client saved_login::tests::unsafe_and_corrupt_stores_fail_closed
+20:05:30         PASS [   0.037s] (344/879) wyrd-client state::tests::agent_prompt_rejects_missing_target
+20:05:30         PASS [   0.041s] (345/879) wyrd-client state::tests::agent_prompt_rejects_non_prompt_target
+20:05:30         PASS [   0.023s] (346/879) wyrd-client state::tests::agent_prompt_returns_the_aliased_prompt_card
+20:05:30         PASS [   0.017s] (347/879) wyrd-client state::tests::aliases_are_stably_sorted
+20:05:30         PASS [   0.032s] (348/879) wyrd-client state::tests::agent_with_inline_prompt_is_an_invalid_bundle
+20:05:30         PASS [   0.014s] (349/879) wyrd-client state::tests::aliases_for_same_card_resolve_same_address
+20:05:30         PASS [   0.015s] (350/879) wyrd-client state::tests::artifact_paths_are_absolute_confined_and_verified
+20:05:30         PASS [   0.027s] (351/879) wyrd-client state::tests::duplicate_prompt_aliases_return_same_holder_address
+20:05:30         PASS [   0.022s] (352/879) wyrd-client state::tests::each_typed_accessor_reports_expected_and_actual_kind
+20:05:30         PASS [   0.362s] (353/879) wyrd-client observe::tests::wait_raises_terminal_errors_and_times_out_without_a_result
+20:05:30         PASS [   0.030s] (354/879) wyrd-client state::tests::generic_card_supports_unprojected_kinds
+20:05:30         PASS [   0.027s] (355/879) wyrd-client state::tests::get_returns_the_kind_appropriate_hydrated_card
+20:05:30         PASS [   0.015s] (356/879) wyrd-client state::tests::loads_complete_service_graph_without_network
+20:05:30         PASS [   0.021s] (357/879) wyrd-client state::tests::loads_nested_inline_agent_prompt_durable_reference
+20:05:30         PASS [   0.013s] (358/879) wyrd-client state::tests::rejects_alias_projection_mismatch
+20:05:30         PASS [   0.123s] (359/879) wyrd-client state::tests::configured_service_context_is_immutable
+20:05:30         PASS [   0.023s] (360/879) wyrd-client state::tests::model_and_data_artifacts_remain_external_to_holders
+20:05:30         PASS [   0.016s] (361/879) wyrd-client state::tests::rejects_artifact_digest_mismatch
+20:05:30         PASS [   0.017s] (362/879) wyrd-client state::tests::rejects_artifact_inventory_projection_mismatch
+20:05:30         PASS [   0.021s] (363/879) wyrd-client state::tests::rejects_artifact_size_mismatch
+20:05:30         PASS [   0.464s] (364/879) wyrd-client observe::tests::wait_deadline_bounds_slow_reads_and_starts_no_read_after_expiry
+20:05:30         PASS [   0.018s] (365/879) wyrd-client state::tests::rejects_child_without_uid
+20:05:30         PASS [   0.016s] (366/879) wyrd-client state::tests::rejects_conflicting_alias
+20:05:30         PASS [   0.019s] (367/879) wyrd-client state::tests::rejects_escaping_manifest_path
+20:05:30         PASS [   0.015s] (368/879) wyrd-client state::tests::rejects_external_metadata_symlink
+20:05:30         PASS [   0.015s] (369/879) wyrd-client state::tests::rejects_inconsistent_manifest_counts
+20:05:30         PASS [   0.025s] (370/879) wyrd-client state::tests::rejects_duplicate_exact_card_ref
+20:05:30         PASS [   0.018s] (371/879) wyrd-client state::tests::rejects_manifest_card_identity_mismatch
+20:05:30         PASS [   0.020s] (372/879) wyrd-client state::tests::rejects_missing_manifest_as_unhydrated
+20:05:30         PASS [   0.021s] (373/879) wyrd-client state::tests::rejects_metadata_only_bundle_as_unhydrated
+20:05:30         PASS [   0.027s] (374/879) wyrd-client state::tests::rejects_missing_artifact_payload
+20:05:30         PASS [   0.018s] (375/879) wyrd-client state::tests::rejects_non_file_artifact_payload
+20:05:30         PASS [   0.025s] (376/879) wyrd-client state::tests::rejects_missing_relationship_target
+20:05:30         PASS [   0.024s] (377/879) wyrd-client state::tests::rejects_nested_inline_agent_prompt_sibling_reference
+20:05:30         PASS [   0.019s] (378/879) wyrd-client state::tests::rejects_non_service_root
+20:05:30         PASS [   0.019s] (379/879) wyrd-client state::tests::rejects_relationship_projection_mismatch
+20:05:30         PASS [   0.018s] (380/879) wyrd-client state::tests::rejects_retired_bundle_api_version
+20:05:30         PASS [   0.027s] (381/879) wyrd-client state::tests::rejects_orphaned_card_outside_root_closure
+20:05:30         PASS [   0.022s] (382/879) wyrd-client state::tests::rejects_root_manifest_identity_mismatch
+20:05:30         PASS [   0.016s] (383/879) wyrd-client state::tests::rejects_spec_ref_absent_from_graph
+20:05:30         PASS [   0.019s] (384/879) wyrd-client state::tests::rejects_root_without_uid
+20:05:30         PASS [   0.018s] (385/879) wyrd-client state::tests::rejects_top_level_sibling_reference
+20:05:30         PASS [   0.023s] (386/879) wyrd-client state::tests::rejects_symlinked_artifact_escape
+20:05:30         PASS [   0.014s] (387/879) wyrd-client state::tests::rejects_unsafe_alias
+20:05:30         PASS [   0.013s] (388/879) wyrd-client state::tests::telemetry_flush_failure_settles_with_the_native_drain
+20:05:30         PASS [   0.026s] (389/879) wyrd-client state::tests::rejects_unresolved_nested_path_reference
+20:05:30         PASS [   0.024s] (390/879) wyrd-client state::tests::two_model_aliases_return_distinct_holders
+20:05:30         PASS [   0.011s] (391/879) wyrd-client storage::error::tests::backend_5xx_maps_to_backend_unavailable_catalog_entry
+20:05:30         PASS [   0.022s] (392/879) wyrd-client state::tests::unknown_alias_lists_available_aliases
+20:05:30         PASS [   0.010s] (393/879) wyrd-client storage::error::tests::generic_4xx_maps_to_backend_catalog_entry
+20:05:30         PASS [   0.011s] (394/879) wyrd-client storage::error::tests::precondition_412_maps_to_precondition_failed_catalog_entry
+20:05:30         PASS [   0.012s] (395/879) wyrd-client storage::error::tests::presign_expiry_403_maps_to_presign_expired_catalog_entry
+20:05:30         PASS [   0.009s] (396/879) wyrd-client storage::error::tests::size_mismatch_maps_to_storage_catalog
+20:05:30         PASS [   0.042s] (397/879) wyrd-client state::tests::typed_accessors_return_native_rust_cards
+20:05:30         PASS [   0.014s] (398/879) wyrd-client storage::error::tests::range_416_maps_to_range_not_satisfiable_catalog_entry
+20:05:30         PASS [   0.012s] (399/879) wyrd-client storage::error::tests::structured_wyrd_error_flows_through_from_conversion_unchanged
+20:05:30         PASS [   0.015s] (400/879) wyrd-client storage::error::tests::transport_error_does_not_expose_reqwest_or_url_material
+20:05:30         PASS [   0.015s] (401/879) wyrd-client storage::upload::tests::malformed_dimensions_fail_before_dispatch
+20:05:30         PASS [   0.011s] (402/879) wyrd-client storage::upload::tests::server_completion_is_exposed_without_protocol_matching_at_the_call_site
+20:05:30         PASS [   0.017s] (403/879) wyrd-client storage::upload::tests::progress_preserves_known_and_unknown_totals
+20:05:30         PASS [   0.011s] (404/879) wyrd-client transport::config::tests::https_and_loopback_http_are_accepted
+20:05:31         PASS [   0.019s] (405/879) wyrd-client transport::config::tests::mock_config_rejects_unknown_fields
+20:05:31         PASS [   0.011s] (406/879) wyrd-client transport::config::tests::remote_cleartext_malformed_and_unsupported_targets_are_refused
+20:05:31         PASS [   0.012s] (407/879) wyrd-client transport::config::tests::validate_refuses_each_invalid_field
+20:05:31         PASS [   0.016s] (408/879) wyrd-client transport::config::tests::validate_accepts_defaults_and_boundary_values
+20:05:31         PASS [   0.016s] (409/879) wyrd-client transport::credential::tests::api_key_resolves_when_no_token
+20:05:31         PASS [   0.076s] (410/879) wyrd-client storage::upload::tests::over_range_dimensions_fail_before_request_dispatch
+20:05:31         PASS [   0.015s] (411/879) wyrd-client transport::credential::tests::credentials_toml_floor_resolves_api_key
+20:05:31         PASS [   0.011s] (412/879) wyrd-client transport::credential::tests::explicit_token_tier_resolves_first
+20:05:31         PASS [   0.014s] (413/879) wyrd-client transport::credential::tests::empty_chain_returns_no_credentials
+20:05:31         PASS [   0.014s] (414/879) wyrd-client transport::credential::tests::explicit_credential_routes_by_its_own_prefix
+20:05:31         PASS [   0.085s] (415/879) wyrd-client storage::upload::tests::single_put_declares_the_known_content_length
+20:05:31         PASS [   0.012s] (416/879) wyrd-client transport::credential::tests::explicit_token_wins_over_workload_and_api_key
+20:05:31         PASS [   0.013s] (417/879) wyrd-client transport::credential::tests::is_empty_reflects_chain_state
+20:05:31         PASS [   0.013s] (418/879) wyrd-client transport::credential::tests::first_source_wins_when_multiple_tokens
+20:05:31         PASS [   0.011s] (419/879) wyrd-client transport::credential::tests::workload_token_tier_resolves_before_api_key
+20:05:31         PASS [   0.012s] (420/879) wyrd-client transport::credential::tests::redacted_debug_does_not_leak_secrets
+20:05:31         PASS [   0.018s] (421/879) wyrd-client transport::credential::tests::xdg_config_home_resolves_credentials_file
+20:05:31         PASS [   0.042s] (422/879) wyrd-client transport::grpc::tests::connection_keeps_the_callers_auth_and_message_size
+20:05:31         PASS [   0.035s] (423/879) wyrd-client transport::http::tls_tests::https_client_initializes_provider_standalone
+20:05:31         PASS [   0.014s] (424/879) wyrd-client transport::mock::tests::clone_shares_state
+20:05:31         PASS [   0.011s] (425/879) wyrd-client transport::mock::tests::drain_count_increments_on_each_drain
+20:05:31         PASS [   0.010s] (426/879) wyrd-client transport::mock::tests::drain_records_payload
+20:05:31         PASS [   0.010s] (427/879) wyrd-client transport::mock::tests::fail_on_drain_injects_transport_down
+20:05:31         PASS [   0.071s] (428/879) wyrd-client transport::grpc::tests::invalid_endpoint_fails_as_grpc_transport_down
+20:05:31         PASS [   0.012s] (429/879) wyrd-client transport::mock::tests::fail_on_drain_second_call
+20:05:31         PASS [   0.011s] (430/879) wyrd-client transport::mock::tests::label_matches_config
+20:05:31         PASS [   0.016s] (431/879) wyrd-client transport::trace::tests::no_active_context_sends_none
+20:05:31         PASS [   0.016s] (432/879) wyrd-client transport::trace::tests::producer_span_continues_the_current_trace
+20:05:31         PASS [   0.015s] (433/879) wyrd-client transport::trace::tests::scoped_benchmark_labels_are_sent
+20:05:31         PASS [   0.096s] (434/879) wyrd-client transport::http::tests::serialized_body_backing_is_shared_across_attempts
+20:05:31         PASS [   0.011s] (435/879) wyrd-client transport::trace::tests::scoped_span_opener_is_the_producer
+20:05:31         PASS [   0.018s] (436/879) wyrd-client transport::trace::tests::scoped_caller_context_is_outbound
+20:05:31         PASS [   0.017s] (437/879) wyrd-client transport::trace::tests::scoped_caller_context_is_the_producer
+20:05:31         PASS [   0.012s] (438/879) wyrd-client verify::evidence::tests::source_prefers_arguments_then_variables_then_the_checkout
+20:05:31         PASS [   0.084s] (439/879) wyrd-client::integration cards_transport::server_problem_code_and_status_survive_registry_boundary
+20:05:31         PASS [   0.087s] (440/879) wyrd-client::integration cards_transport::list_uses_typed_query_parameters_and_an_empty_get_body
+20:05:31         PASS [   0.109s] (441/879) wyrd-client::integration cards_transport::client_debug_redacts_constructor_secret
+20:05:31         PASS [   0.025s] (442/879) wyrd-client::integration pg_bifrost_e2e::every_iceberg_column_type::a_type_bifrost_cannot_store_is_refused_when_declared
+20:05:31         PASS [   0.126s] (443/879) wyrd-client::integration cards_transport::uid_delete_uses_kind_qualified_path_and_preserves_idempotence
+20:05:34         PASS [   3.465s] (444/879) wyrd-client::integration pg_auth_e2e_against_fixture::pg_tests::wyrd_client_authenticates_via_wyrd_access_token_header
+20:05:35         PASS [   3.996s] (445/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::blocking_client_registers_writes_and_reads_back
+20:05:36         PASS [   4.774s] (446/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::analytical_sql_over_written_tables
+20:05:36         PASS [   5.166s] (447/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::canonical_error_log_correlates_to_its_span
+20:05:40         PASS [   5.410s] (448/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::canonical_metric_points_aggregate_by_kind
+20:05:40         PASS [   4.157s] (449/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::oracle_query_returns_arrow_batches_and_terminal
+20:05:41         PASS [   5.828s] (450/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::canonical_span_payload_reads_back_for_a_query_reader
+20:05:41         PASS [   5.069s] (451/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::canonical_spans_read_back_as_a_genai_trace
+20:05:41         PASS [   0.021s] (452/879) wyrd-client::integration pg_bifrost_e2e::trace_timeline::invalid_trace_id_fails_locally
+20:05:41         PASS [   0.021s] (453/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::each_unsupported_type_is_refused_when_declared
+20:05:41         PASS [   0.020s] (454/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::model_allowing_extra_keys_is_refused
+20:05:44         PASS [   4.389s] (455/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::typed_sql_projects_rows_and_refuses_a_mismatch
+20:05:44         PASS [   3.526s] (456/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::model_fields_become_variant_struct_and_list_columns
+20:05:44         PASS [   4.322s] (457/879) wyrd-client::integration pg_bifrost_e2e::pg_tests::unified_client_registers_writes_swaps_and_reads_both_tables
+20:05:45         PASS [   4.467s] (458/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::query_results_copy_into_another_table
+20:05:50         PASS [   5.342s] (459/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::undeclared_field_refuses_the_whole_insert
+20:05:52         PASS [   7.062s] (460/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::struct_fields_stay_typed_and_variant_paths_stay_variant
+20:05:52         PASS [   7.498s] (461/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::rows_come_back_as_native_values
+20:05:52         PASS [   0.084s] (462/879) wyrd-client::integration storage_dispatch::download_and_download_verified_stream_bytes_and_check_digest_and_size
+20:05:52         PASS [   0.077s] (463/879) wyrd-client::integration storage_dispatch::façade_preserves_backend_failure_and_download_verification_errors
+20:05:52         PASS [   0.083s] (464/879) wyrd-client::integration storage_dispatch::high_level_upload_dispatches_azure_protocol
+20:05:52         PASS [   0.084s] (465/879) wyrd-client::integration storage_dispatch::façade_rejects_invalid_provider_plans_before_transfer
+20:05:52         PASS [   0.095s] (466/879) wyrd-client::integration storage_dispatch::high_level_upload_dispatches_single_put_and_localfs
+20:05:52         PASS [   0.102s] (467/879) wyrd-client::integration storage_dispatch::high_level_upload_dispatches_s3_and_completes_server_upload
+20:05:52         PASS [   0.081s] (468/879) wyrd-client::integration storage_dispatch::traced_upload_keeps_trace_headers_off_the_presigned_backend
+20:05:52         PASS [   0.021s] (469/879) wyrd-client::integration transport::grpc::grpc_rejects_unknown_fields
+20:05:52         PASS [   0.020s] (470/879) wyrd-client::integration transport::http::http_rejects_unknown_fields
+20:05:52         PASS [   0.020s] (471/879) wyrd-client::integration transport::http::http_validate_rejects_remote_cleartext
+20:05:52         PASS [   0.152s] (472/879) wyrd-client::integration transport::grpc::grpc_connection::https_endpoint_trusts_the_platform_roots
+20:05:52         PASS [   0.139s] (473/879) wyrd-client::integration transport::http::transport_behavior::buffered_calls_keep_failed_decode_and_cancelled_populations
+20:05:52         PASS [   0.203s] (474/879) wyrd-client::integration transport::http::running_query_request_id_and_controls_round_trip
+20:05:52         PASS [   0.094s] (475/879) wyrd-client::integration transport::http::transport_behavior::cross_origin_absolute_url_is_rejected_for_authenticated_requests
+20:05:52         PASS [   0.096s] (476/879) wyrd-client::integration transport::http::transport_behavior::four_oh_one_re_exchanges_api_key_and_retries_with_fresh_token
+20:05:52         PASS [   0.090s] (477/879) wyrd-client::integration transport::http::transport_behavior::json_body_and_request_identity_survive_auth_refresh
+20:05:52         PASS [   0.091s] (478/879) wyrd-client::integration transport::http::transport_behavior::non_idempotent_json_is_not_replayed_after_ambiguous_failure
+20:05:52         PASS [   0.100s] (479/879) wyrd-client::integration transport::http::transport_behavior::problem_json_error_maps_to_wyrd_error
+20:05:52         PASS [   0.145s] (480/879) wyrd-client::integration transport::http::transport_behavior::request_arrow_missing_headers_returns_none
+20:05:52         PASS [   0.127s] (481/879) wyrd-client::integration transport::http::transport_behavior::request_arrow_reads_bytes_and_metadata_headers
+20:05:53         PASS [   0.160s] (482/879) wyrd-client::integration transport::http::transport_behavior::request_external_stream_slow_download_outlives_timeout
+20:05:53         PASS [   0.075s] (483/879) wyrd-client::integration transport::http::transport_behavior::request_json_round_trips_json
+20:05:53         PASS [   2.318s] (484/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::unsupported_type_is_refused_by_sdk_and_server
+20:05:53         PASS [   0.094s] (485/879) wyrd-client::integration transport::http::transport_behavior::request_json_stream_authenticates_and_preserves_body_stream
+20:05:53         PASS [   0.318s] (486/879) wyrd-client::integration transport::http::transport_behavior::request_external_stream_slow_upload_outlives_timeout
+20:05:53         PASS [   0.075s] (487/879) wyrd-client::integration transport::http::transport_behavior::request_json_stream_rejects_unapproved_media_type
+20:05:53         PASS [   0.176s] (488/879) wyrd-client::integration transport::http::transport_behavior::request_json_stream_outlives_ordinary_total_timeout
+20:05:53         PASS [   0.154s] (489/879) wyrd-client::integration transport::http::transport_behavior::request_raw_slow_download_outlives_timeout
+20:05:53         PASS [   0.079s] (490/879) wyrd-client::integration transport::http::transport_behavior::revoke_credential_re_exchanges_once_and_replays
+20:05:53         PASS [   0.080s] (491/879) wyrd-client::integration transport::http::transport_behavior::revoke_credential_stops_after_a_second_refusal
+20:05:53         PASS [   0.060s] (492/879) wyrd-client::integration transport::http::transport_behavior::same_origin_absolute_url_is_accepted_for_authenticated_requests
+20:05:53         PASS [   0.306s] (493/879) wyrd-client::integration transport::http::transport_behavior::request_stream_slow_upload_outlives_timeout
+20:05:53         PASS [   9.039s] (494/879) wyrd-client::integration pg_bifrost_e2e::variant_tables::pg_tests::server_refuses_unstorable_variant_bytes_sent_directly
+20:05:53         PASS [   0.174s] (495/879) wyrd-client::integration transport::http::transport_behavior::submit_idempotent_replays_key_across_retry
+20:05:53         PASS [   0.051s] (496/879) wyrd-client::integration transport::http::transport_behavior::wyrd_access_token_header_is_injected_not_authorization
+20:05:53         PASS [   0.005s] (497/879) wyrd-crypt tests::from_bytes_round_trip_and_redacted_debug
+20:05:53         PASS [   0.004s] (498/879) wyrd-crypt tests::hmac_sha256_matches_rfc_4231
+20:05:53         PASS [   0.004s] (499/879) wyrd-crypt tests::secret_bytes_grow_by_moving_and_redact_debug
+20:05:53         PASS [   0.176s] (500/879) wyrd-client::integration transport::http::transport_behavior::submit_with_idempotency_key_replays_caller_key_across_retry
+20:05:53         PASS [   0.075s] (501/879) wyrd-client::integration transport::http::transport_behavior::wyrd_request_id_is_present_on_every_request
+20:05:54         PASS [   0.426s] (502/879) wyrd-crypt tests::encrypt_decrypt_round_trip
+20:05:54         PASS [   1.034s] (503/879) wyrd-dev-fixtures pg::pg_tests::assertion_pool_clone_close_is_shared
+20:05:54         PASS [   1.152s] (504/879) wyrd-dev-fixtures pg::pg_tests::fixture_smoke
+20:05:54         PASS [   1.182s] (505/879) wyrd-dev-fixtures pg::pg_tests::assertion_pool_supports_repeated_fixture_probes
+20:05:55         PASS [   1.000s] (506/879) wyrd-dev-fixtures pg::pg_tests::start_with_slug_uses_custom_slug
+20:05:55         PASS [   0.013s] (507/879) wyrd-error-derive tests::delegate_metadata_rejects_static_fields
+20:05:55         PASS [   0.006s] (508/879) wyrd-error-derive::wyrd_error codes_enumerate_static_and_delegated_catalog
+20:05:55         PASS [   0.006s] (509/879) wyrd-error-derive::wyrd_error derives_all_error_metadata_accessors
+20:05:55         PASS [   0.006s] (510/879) wyrd-error-derive::wyrd_error from_code_reconstructs_message_details_variants
+20:05:55         PASS [   0.010s] (511/879) wyrd-error-derive::wyrd_error from_code_returns_none_for_unknown_or_unqualified_code
+20:05:55         PASS [   0.005s] (512/879) wyrd-error-derive::wyrd_error from_unit_code_reconstructs_only_fieldless_variants
+20:05:55         PASS [   0.017s] (513/879) wyrd-loader config::tests::config_absent_uses_system_defaults
+20:05:55         PASS [   0.020s] (514/879) wyrd-loader config::tests::config_precedence_is_handled_by_apply_defaults
+20:05:55         PASS [   0.016s] (515/879) wyrd-loader config::tests::config_rejects_name_default
+20:05:55         PASS [   0.012s] (516/879) wyrd-loader diagnose::tests::diagnose_collects_all_in_one_pass_and_emits_stable_json
+20:05:55         PASS [   0.009s] (517/879) wyrd-loader diagnose::tests::diagnostic_schema_exposes_stable_status_and_context
+20:05:55         PASS [   0.018s] (518/879) wyrd-loader extract::tests::docx_extracts_ordered_blocks
+20:05:55         PASS [   0.008s] (519/879) wyrd-loader extract::tests::docx_refuses_impossible_spans
+20:05:55         PASS [   0.017s] (520/879) wyrd-loader extract::tests::empty_values_are_locations
+20:05:55         PASS [   0.033s] (521/879) wyrd-loader extract::tests::limits_refuse_extraction
+20:05:55         PASS [   0.009s] (522/879) wyrd-loader extract::tests::pdf_extracts_pages
+20:05:55         PASS [   0.010s] (523/879) wyrd-loader extract::tests::pptx_extracts_slides
+20:05:55         PASS [   0.008s] (524/879) wyrd-loader extract::tests::text_formats_keep_source
+20:05:55         PASS [   0.010s] (525/879) wyrd-loader extract::tests::units_locate_extracted_text
+20:05:55         PASS [   0.007s] (526/879) wyrd-loader extract::tests::unsupported_and_wrong_formats_are_refused
+20:05:55         PASS [   0.008s] (527/879) wyrd-loader extract::tests::xlsx_extracts_sparse_cells
+20:05:55         PASS [   0.010s] (528/879) wyrd-loader manifest::tests::builds_sorted_manifest_and_excludes_envelope
+20:05:55         PASS [   0.009s] (529/879) wyrd-loader manifest::tests::rejects_symbolic_links_as_artifacts
+20:05:55         PASS [   0.017s] (530/879) wyrd-loader order::tests::order_keeps_same_named_versions_as_distinct_nodes
+20:05:55         PASS [   0.024s] (531/879) wyrd-loader order::tests::order_refuses_mixed_sibling_spellings_of_one_binding_target
+20:05:55         PASS [   0.011s] (532/879) wyrd-loader order::tests::order_rejects_unbound_verifier_peer_with_stable_code
+20:05:55         PASS [   0.010s] (533/879) wyrd-loader order::tests::order_rejects_verifier_service_component_with_stable_code
+20:05:55         PASS [   0.008s] (534/879) wyrd-loader order::tests::order_reuses_shared_graph_and_places_dependencies_first
+20:05:55         PASS [   0.008s] (535/879) wyrd-loader order::tests::order_surfaces_shared_graph_cycle_error
+20:05:55         PASS [   0.021s] (536/879) wyrd-loader parse::tests::flat_card_graph_loads_without_space
+20:05:55         PASS [   0.011s] (537/879) wyrd-loader parse::tests::parse_accepts_multi_doc_yaml
+20:05:55         PASS [   0.007s] (538/879) wyrd-loader parse::tests::parse_collects_every_envelope_violation
+20:05:55         PASS [   0.012s] (539/879) wyrd-loader parse::tests::parse_preserves_source_path
+20:05:55         PASS [   0.009s] (540/879) wyrd-loader parse::tests::parse_rejects_inline_file_symlink_outside_workspace
+20:05:55         PASS [   0.008s] (541/879) wyrd-loader parse::tests::parse_rejects_missing_kind
+20:05:55         PASS [   0.008s] (542/879) wyrd-loader parse::tests::parse_rejects_retired_drift_and_eval_card_kinds
+20:05:55         PASS [   0.011s] (543/879) wyrd-loader path::tests::path_discovery_does_not_follow_symlink_directories
+20:05:55         PASS [   0.007s] (544/879) wyrd-loader path::tests::path_discovery_reports_dangling_yaml_symlink
+20:05:55         PASS [   0.007s] (545/879) wyrd-loader path::tests::path_sandbox_accepts_absolute_with_advisory
+20:05:55         PASS [   0.006s] (546/879) wyrd-loader path::tests::path_sandbox_accepts_valid_relative
+20:05:55         PASS [   0.007s] (547/879) wyrd-loader path::tests::path_sandbox_allows_absolute_target_with_advisory
+20:05:55         PASS [   0.007s] (548/879) wyrd-loader path::tests::path_sandbox_rejects_relative_traversal
+20:05:55         PASS [   0.006s] (549/879) wyrd-loader path::tests::path_sandbox_rejects_symlink_target_outside_root
+20:05:55         PASS [   0.008s] (550/879) wyrd-loader repository::tests::head_commit_reads_detached_loose_packed_and_worktree_heads
+20:05:55         PASS [   0.007s] (551/879) wyrd-loader repository::tests::origin_remote_decodes_quoted_values_and_any_key_case
+20:05:55         PASS [   0.010s] (552/879) wyrd-loader repository::tests::origin_remote_reads_checkouts_and_linked_worktrees
+20:05:55         PASS [   0.016s] (553/879) wyrd-loader resolve::tests::resolve_loads_transitive_path_references_in_discovery_order
+20:05:55         PASS [   0.012s] (554/879) wyrd-loader resolve::tests::resolve_path_rewrites_durable_ref_and_loads_sibling
+20:05:55         PASS [   0.015s] (555/879) wyrd-loader resolve::tests::resolve_rejects_multi_document_path_targets
+20:05:55         PASS [   0.013s] (556/879) wyrd-loader resolve::tests::resolve_reports_path_depth_overflow_without_loading_extra_cards
+20:05:55         PASS [   0.009s] (557/879) wyrd-loader tests::declaration_input_maps_artifact_provenance_without_serializing_paths
+20:05:55         PASS [   0.010s] (558/879) wyrd-loader tests::declaration_input_rejects_artifact_symlink_outside_workspace
+20:05:55         PASS [   0.008s] (559/879) wyrd-loader tests::declaration_input_rejects_missing_and_nonregular_artifacts
+20:05:55         PASS [   0.013s] (560/879) wyrd-loader tests::load_reads_multiple_files_in_deterministic_order
+20:05:55         PASS [   0.009s] (561/879) wyrd-loader tests::load_rejects_authored_reference_uid
+20:05:55         PASS [   0.008s] (562/879) wyrd-loader tests::load_rejects_duplicate_artifact_paths
+20:05:55         PASS [   0.012s] (563/879) wyrd-loader tests::path_and_external_refs_keep_distinct_wire_projections
+20:05:55         PASS [   0.015s] (564/879) wyrd-loader tests::path_to_unversioned_card_becomes_versionless_sibling
+20:05:55         PASS [   0.013s] (565/879) wyrd-loader tests::toml_declares_repository_root_with_only_selected_verifiers
+20:05:55         PASS [   0.014s] (566/879) wyrd-loader tests::toml_infers_repository_from_quoted_or_uppercase_origin
+20:05:55         PASS [   0.013s] (567/879) wyrd-loader tests::toml_overrides_and_explicit_remote_work_outside_a_checkout
+20:05:55         PASS [   0.012s] (568/879) wyrd-loader tests::toml_validates_listed_verifiers_locally
+20:05:55         PASS [   0.015s] (569/879) wyrd-loader tests::toml_without_identity_is_refused
+20:05:55         PASS [   0.013s] (570/879) wyrd-loader upload::tests::uploads_extract_supported_files_before_registration
+20:05:55         PASS [   0.007s] (571/879) wyrd-loader upload::tests::uploads_publish_exactly_the_supplied_files
+20:05:55         PASS [   0.009s] (572/879) wyrd-loader upload::tests::uploads_refuse_invalid_sources_and_reports
+20:05:55         PASS [   0.007s] (573/879) wyrd-loader validate::tests::validate_rejects_duplicate_component_publication_targets
+20:05:55         PASS [   0.023s] (574/879) wyrd-queue batch_builder::batch_builder_tests::a_null_list_item_is_refused_only_for_non_null_items
+20:05:55         PASS [   0.010s] (575/879) wyrd-queue batch_builder::batch_builder_tests::builds_user_columns_plus_correlation_columns
+20:05:55         PASS [   0.009s] (576/879) wyrd-queue batch_builder::batch_builder_tests::each_timestamp_type_keeps_its_own_reading
+20:05:55         PASS [   0.007s] (577/879) wyrd-queue batch_builder::batch_builder_tests::fixed_size_binary_rejects_malformed_and_wrong_width_hex
+20:05:55         PASS [   0.009s] (578/879) wyrd-queue batch_builder::batch_builder_tests::fixed_size_binary_round_trips_hex_trace_and_span_ids
+20:05:55         PASS [   0.007s] (579/879) wyrd-queue batch_builder::batch_builder_tests::invalid_rows_are_refused_with_stable_codes
+20:05:55         PASS [   0.010s] (580/879) wyrd-queue batch_builder::batch_builder_tests::ipc_round_trips
+20:05:55         PASS [   0.008s] (581/879) wyrd-queue batch_builder::batch_builder_tests::map_values_keep_entries_and_nulls
+20:05:55         PASS [   1.217s] (582/879) wyrd-dev-fixtures pg::pg_tests::validate_schema_refuses_drifted_or_unprotected_schemas
+20:05:56         PASS [   0.015s] (583/879) wyrd-queue batch_builder::batch_builder_tests::nested_values_keep_types_nulls_and_precision
+20:05:56         PASS [   0.006s] (584/879) wyrd-queue bounded_arrow::tests::bounded_arrow_checked_complete_simultaneous_peak
+20:05:56         PASS [   0.006s] (585/879) wyrd-queue bounded_arrow::tests::bounded_arrow_material_has_fixed_lengths
+20:05:56         PASS [   0.007s] (586/879) wyrd-queue bounded_arrow::tests::bounded_arrow_overflow_refuses_before_reservation
+20:05:56         PASS [   0.006s] (587/879) wyrd-queue bounded_arrow::tests::bounded_arrow_reservation_refusal_precedes_allocation
+20:05:56         PASS [   0.006s] (588/879) wyrd-queue bounded_arrow::tests::bounded_arrow_transfer_releases_exactly_once
+20:05:56         PASS [   0.006s] (589/879) wyrd-queue error::tests::serialization_failures_map_to_their_bifrost_errors
+20:05:56         PASS [   0.105s] (590/879) wyrd-queue producer::tests::a_thousand_tables_share_one_budget_and_idle_producers_hold_nothing
+20:05:56         PASS [   0.024s] (591/879) wyrd-queue producer::tests::accepted_batch_losses_settle_exactly_once
+20:05:56         PASS [   0.012s] (592/879) wyrd-queue producer::tests::admitted_rows_cannot_take_the_sealing_headroom
+20:05:56         PASS [   0.036s] (593/879) wyrd-queue producer::tests::ambiguous_sends_retry_one_identity_until_acked
+20:05:56         PASS [   0.025s] (594/879) wyrd-queue producer::tests::arrow_batch_enqueue_never_waits_for_publication
+20:05:56         PASS [   0.271s] (595/879) wyrd-queue bounded_arrow::tests::bounded_arrow_cancellation_and_panic_release
+20:05:56         PASS [   0.009s] (596/879) wyrd-queue producer::tests::background_terminal_refusal_is_reported_by_the_next_flush_once
+20:05:56         PASS [   0.028s] (597/879) wyrd-queue producer::tests::arrow_batch_enqueue_seals_nested_columns_through_the_retry_owner
+20:05:56         PASS [   0.009s] (598/879) wyrd-queue producer::tests::bounded_client_bytes_refuse_before_allocation
+20:05:56         PASS [   0.042s] (599/879) wyrd-queue producer::tests::byte_and_linger_triggers_seal_without_a_flush
+20:05:56         PASS [   0.017s] (600/879) wyrd-queue producer::tests::failed_shutdown_keeps_serving_controls_and_retries
+20:05:56         PASS [   0.073s] (601/879) wyrd-queue producer::tests::dropped_handle_keeps_retrying_its_retained_batch
+20:05:56         PASS [   0.008s] (602/879) wyrd-queue producer::tests::invalid_config_is_refused_before_any_task
+20:05:56         PASS [   0.029s] (603/879) wyrd-queue producer::tests::flush_timeout_retains_batch_until_later_ack
+20:05:56         PASS [   0.010s] (604/879) wyrd-queue producer::tests::multi_row_admission_is_all_or_none
+20:05:56         PASS [   0.018s] (605/879) wyrd-queue producer::tests::producer_context_bytes_stay_bounded_through_ambiguous_retry
+20:05:56         PASS [   1.464s] (606/879) wyrd-dev-fixtures pg::pg_tests::validate_schema_shared_login_posture
+20:05:56         PASS [   0.007s] (607/879) wyrd-queue queue::tests::a_held_cutoff_starts_each_retained_batch_once
+20:05:56         PASS [   1.489s] (608/879) wyrd-dev-fixtures pg::pg_tests::validate_schema_refuses_logins_that_defeat_row_security
+20:05:56         PASS [   0.045s] (609/879) wyrd-queue producer::tests::stalled_sends_bound_concurrency_and_grow_the_next_batch
+20:05:56         PASS [   0.008s] (610/879) wyrd-queue queue::tests::an_ambiguous_retry_resends_the_same_producer_contexts
+20:05:56         PASS [   0.009s] (611/879) wyrd-queue queue::tests::oversize_split_preserves_rows
+20:05:56         PASS [   0.011s] (612/879) wyrd-queue queue::tests::arrow_sealing_reserves_the_encoding_overlap_first
+20:05:56         PASS [   0.007s] (613/879) wyrd-queue queue::tests::retained_retry_backoff_is_deterministic_and_capped
+20:05:56         PASS [   0.006s] (614/879) wyrd-queue variant::tests::a_value_moves_into_its_column_without_a_copy
+20:05:56         PASS [   0.007s] (615/879) wyrd-queue queue::tests::seal_keeps_the_first_distinct_producer_contexts_in_order
+20:05:56         PASS [   0.007s] (616/879) wyrd-queue variant::tests::column_encoding_names_the_refused_row
+20:05:56         PASS [   0.010s] (617/879) wyrd-queue variant::tests::column_builder_round_trips_cells
+20:05:56         PASS [   0.009s] (618/879) wyrd-queue variant::tests::in_place_encoding_matches_staged_values_and_rolls_back
+20:05:56         PASS [   0.023s] (619/879) wyrd-queue variant::tests::built_variants_match_full_byte_validation
+20:05:56         PASS [   0.020s] (620/879) wyrd-queue variant::tests::json_depth_is_decided_by_wyrd_at_any_depth
+20:05:56         PASS [   0.008s] (621/879) wyrd-queue variant::tests::json_text_classifies_integers_from_their_tokens
+20:05:56         PASS [   0.029s] (622/879) wyrd-queue variant::tests::json_walk_reads_each_byte_once
+20:05:56         PASS [   0.012s] (623/879) wyrd-queue variant::tests::json_writer_renders_timestamp_tz_in_the_writers_offset
+20:05:56         PASS [   0.177s] (624/879) wyrd-queue producer::tests::prepared_rows_reject_atomically_before_reservation
+20:05:56         PASS [   0.007s] (625/879) wyrd-queue variant::tests::malformed_stored_variant_is_an_error_not_a_panic
+20:05:56         PASS [   0.009s] (626/879) wyrd-queue variant::tests::json_writer_renders_variants_as_values
+20:05:56         PASS [   0.007s] (627/879) wyrd-queue variant::tests::raw_decimals_outside_the_exact_domain_are_refused
+20:05:56         PASS [   0.009s] (628/879) wyrd-queue variant::tests::numeric_range_outranks_depth_in_any_key_order
+20:05:56         PASS [   0.120s] (629/879) wyrd-queue variant::tests::raw_malformed_outranks_depth_in_any_position
+20:05:56         PASS [   0.010s] (630/879) wyrd-queue variant::tests::raw_numbers_outside_the_json_domain_are_refused
+20:05:56         PASS [   0.009s] (631/879) wyrd-queue variant::tests::raw_repeated_field_names_are_refused
+20:05:56         PASS [   0.285s] (632/879) wyrd-queue variant::tests::json_converts_under_the_variant_contract
+20:05:56         PASS [   0.007s] (633/879) wyrd-queue variant::tests::recycled_scan_buffer_keeps_its_allocation
+20:05:56         PASS [   0.108s] (634/879) wyrd-queue variant::tests::raw_shared_field_values_are_refused
+20:05:56         PASS [   0.520s] (635/879) wyrd-queue variant::tests::json_size_outranks_numeric_and_depth
+20:05:57         PASS [   0.021s] (636/879) wyrd-queue variant::tests::typed_values_encode_as_their_json_text
+20:05:57         PASS [   0.209s] (637/879) wyrd-queue variant::tests::renderers_refuse_hostile_stored_variants
+20:05:57         PASS [   0.009s] (638/879) wyrd-queue variant::tests::violation_pointer_escapes_keys_only_when_rendered
+20:05:57         PASS [   0.018s] (639/879) wyrd-runtime builtin_roles::tests::bundles_compile_at_resource_scope
+20:05:57         PASS [   0.009s] (640/879) wyrd-runtime builtin_roles::tests::bundles_hold_their_agreed_boundaries
+20:05:57         PASS [   0.007s] (641/879) wyrd-runtime builtin_roles::tests::role_uuid_is_stable_per_tenant_and_name
+20:05:57         PASS [   0.010s] (642/879) wyrd-runtime builtin_roles::tests::the_agreed_bundles_are_built_in
+20:05:57         PASS [   0.331s] (643/879) wyrd-queue variant::tests::refused_numbers_add_no_size
+20:05:57         PASS [   0.121s] (644/879) wyrd-queue variant::tests::validation_only_matches_owned_validation
+20:05:57         PASS [   0.005s] (645/879) wyrd-runtime outbox::tests::a_heavy_backlog_is_written_in_bounded_slices_in_order
+20:05:57         PASS [   0.005s] (646/879) wyrd-runtime outbox::tests::a_lane_short_of_its_linger_keeps_a_wake_at_its_deadline
+20:05:57         PASS [   0.057s] (647/879) wyrd-runtime outbox::tests::a_failing_tenant_does_not_delay_another_tenant
+20:05:57         PASS [   0.057s] (648/879) wyrd-runtime outbox::tests::a_later_caller_never_takes_capacity_freed_for_the_head
+20:05:57         PASS [   0.162s] (649/879) wyrd-runtime outbox::tests::a_failed_write_is_retried_once_in_order_ahead_of_later_items
+20:05:57         PASS [   0.197s] (650/879) wyrd-runtime outbox::tests::a_panicking_error_display_is_retried_once_in_order_without_loss
+20:05:57         PASS [   0.165s] (651/879) wyrd-runtime outbox::tests::a_panicking_write_is_retried_once_in_order_without_loss
+20:05:57         PASS [   0.013s] (652/879) wyrd-runtime outbox::tests::a_tenants_lanes_write_concurrently_and_each_keeps_order
+20:05:57         PASS [   0.005s] (653/879) wyrd-runtime outbox::tests::admitted_items_charge_process_memory_until_written
+20:05:57         PASS [   0.005s] (654/879) wyrd-runtime outbox::tests::bounded_audit_staging_remains_nonblocking
+20:05:57         PASS [   0.307s] (655/879) wyrd-runtime outbox::tests::a_lingering_lane_batches_trickled_items_and_writes_a_full_batch_at_once
+20:05:57         PASS [   0.005s] (656/879) wyrd-runtime outbox::tests::charged_items_are_taken_over_without_a_second_charge
+20:05:57         PASS [   0.159s] (657/879) wyrd-runtime outbox::tests::a_retry_writes_the_identical_failed_slice_without_later_items
+20:05:57         PASS [   0.005s] (658/879) wyrd-runtime outbox::tests::freeing_a_written_slice_does_not_hold_up_the_next_write
+20:05:57         PASS [   0.005s] (659/879) wyrd-runtime outbox::tests::large_items_shed_on_bytes_before_items
+20:05:57         PASS [   0.006s] (660/879) wyrd-runtime outbox::tests::shed_records_are_aggregated_per_tenant_and_interval
+20:05:57         PASS [   0.206s] (661/879) wyrd-runtime outbox::tests::concurrent_shutdown_releases_reserved_losses_once
+20:05:57         PASS [   0.358s] (662/879) wyrd-runtime outbox::tests::bounded_staging_covers_retrying_and_inflight_work
+20:05:57         PASS [   0.006s] (663/879) wyrd-runtime outbox::tests::shutdown_refuses_items_staged_after_it_begins
+20:05:57         PASS [   0.212s] (664/879) wyrd-runtime outbox::tests::shutdown_counts_items_unwritten_at_the_deadline_as_lost
+20:05:57         PASS [   0.005s] (665/879) wyrd-runtime outbox::tests::waiting_reservations_are_admitted_in_arrival_order
+20:05:57         PASS [   0.005s] (666/879) wyrd-runtime permission::tests::card_objects_are_exactly_the_granted_cards
+20:05:57         PASS [   0.005s] (667/879) wyrd-runtime permission::tests::ceilings_only_restrict_current_grants
+20:05:57         PASS [   0.005s] (668/879) wyrd-runtime permission_check::tests::deny_reason_carries_required_and_principal
+20:05:57         PASS [   0.004s] (669/879) wyrd-runtime permission_check::tests::rbac_allows_match
+20:05:57         PASS [   0.005s] (670/879) wyrd-runtime permission_check::tests::rbac_denies_missing
+20:05:57         PASS [   0.004s] (671/879) wyrd-runtime permission_check::tests::rbac_resolves_through_wildcard
+20:05:57         PASS [   0.005s] (672/879) wyrd-runtime permission_check::tests::verdict_into_result_round_trips
+20:05:57         PASS [   0.005s] (673/879) wyrd-runtime principal::auth_context_tests::permissions_resolve_from_whichever_plane_authenticated
+20:05:57         PASS [   0.005s] (674/879) wyrd-runtime principal::auth_context_tests::platform_context_carries_no_tenant
+20:05:57         PASS [   0.005s] (675/879) wyrd-runtime principal::auth_context_tests::principal_id_is_available_on_both_planes
+20:05:57         PASS [   0.005s] (676/879) wyrd-runtime principal::auth_context_tests::tenant_context_carries_exactly_its_tenant
+20:05:57         PASS [   0.005s] (677/879) wyrd-runtime principal::tests::card_attribution_follows_the_signed_access_state
+20:05:57         PASS [   0.157s] (678/879) wyrd-runtime outbox::tests::shutdown_flushes_items_that_recover_before_the_deadline
+20:05:57         PASS [   0.005s] (679/879) wyrd-runtime principal::tests::principal_id_roundtrips_as_uuid
+20:05:57         PASS [   0.005s] (680/879) wyrd-runtime principal::tests::role_ref_accepts_locked_name_shape
+20:05:57         PASS [   0.005s] (681/879) wyrd-runtime principal::tests::role_ref_rejects_punctuation_and_uppercase
+20:05:57         PASS [   0.006s] (682/879) wyrd-runtime request_context::tests::accepted_authority_keeps_exact_tool_scope
+20:05:57         PASS [   0.006s] (683/879) wyrd-runtime request_context::tests::accepted_authority_round_trips_with_provenance
+20:05:57         PASS [   0.006s] (684/879) wyrd-runtime request_context::tests::debug_redacts_delegation_chain_to_depth
+20:05:57         PASS [   0.005s] (685/879) wyrd-runtime request_context::tests::debug_redacts_idempotency_key
+20:05:57         PASS [   0.006s] (686/879) wyrd-runtime request_context::tests::delegation_chain_default_empty
+20:05:57         PASS [   0.005s] (687/879) wyrd-runtime request_context::tests::delegation_step_carries_self_describing_projection
+20:05:57         PASS [   0.006s] (688/879) wyrd-runtime request_context::tests::delegation_chain_round_trips
+20:05:57         PASS [   0.006s] (689/879) wyrd-runtime request_context::tests::selector_never_rebinds_a_signed_root
+20:05:57         PASS [   0.006s] (690/879) wyrd-runtime resources::lanes::tests::blocking_io_runs_off_the_lane_and_requeues
+20:05:57         PASS [   0.005s] (691/879) wyrd-runtime resources::lanes::tests::dispatched_jobs_wait_for_a_lane_and_keep_it_until_they_return
+20:05:57         PASS [   0.005s] (692/879) wyrd-runtime resources::lanes::tests::cancelled_waiters_return_lanes_exactly_once
+20:05:57         PASS [   0.004s] (693/879) wyrd-runtime resources::lanes::tests::idle_peers_lend_every_lane_and_least_service_goes_next
+20:05:57         PASS [   0.005s] (694/879) wyrd-runtime resources::lanes::tests::idle_time_earns_no_credit
+20:05:57         PASS [   0.004s] (695/879) wyrd-runtime resources::lanes::tests::nested_polls_inherit_and_pending_returns_the_lane
+20:05:57         PASS [   0.005s] (696/879) wyrd-runtime resources::lanes::tests::polled_io_returns_the_lane_for_the_rest_of_the_poll
+20:05:57         PASS [   0.005s] (697/879) wyrd-runtime resources::lanes::tests::running_leases_count_as_service
+20:05:57         PASS [   0.005s] (698/879) wyrd-runtime resources::lanes::tests::spawned_work_inherits_the_parents_lanes
+20:05:57         PASS [   0.005s] (699/879) wyrd-runtime resources::lanes::tests::tenant_service_counts_running_leases_and_rebases_returning_tenants
+20:05:57         PASS [   0.005s] (700/879) wyrd-runtime resources::lanes::tests::tenants_share_their_workload_by_service
+20:05:57         PASS [   0.004s] (701/879) wyrd-runtime resources::tests::attribution_follows_custody_and_counts_shared_buffers_once
+20:05:57         PASS [   0.005s] (702/879) wyrd-runtime resources::tests::release_wakes_a_registered_waiter
+20:05:57         PASS [   0.005s] (703/879) wyrd-runtime resources::tests::process_grants_follow_use_without_double_promises
+20:05:57         PASS [   0.005s] (704/879) wyrd-runtime resources::workload::tests::admission_waits_hold_no_cpu_lane
+20:05:57         PASS [   0.005s] (705/879) wyrd-runtime resources::workload::tests::at_target_workloads_yield_the_largest_cancellable_victim
+20:05:57         PASS [   0.004s] (706/879) wyrd-runtime resources::workload::tests::borrowing_contention_and_recovery_follow_samples
+20:05:57         PASS [   0.005s] (707/879) wyrd-runtime resources::workload::tests::critical_pressure_reclaims_then_cancels_one_victim_per_sample
+20:05:57         PASS [   0.005s] (708/879) wyrd-runtime resources::workload::tests::local_caps_redistribute_and_tenants_share_equally
+20:05:57         PASS [   0.005s] (709/879) wyrd-runtime resources::workload::tests::nested_admissions_join_the_enclosing_operation
+20:05:57         PASS [   0.005s] (710/879) wyrd-runtime resources::workload::tests::paused_admission_starts_after_recovery
+20:05:57         PASS [   0.055s] (711/879) wyrd-runtime resources::lanes::tests::blocking_jobs_wait_for_a_lane_and_nest
+20:05:57         PASS [   0.005s] (712/879) wyrd-runtime resources::workload::tests::untracked_allocator_pressure_pauses_all_growth
+20:05:57         PASS [   0.006s] (713/879) wyrd-semver block::tests::bump_build_rejects_invalid_metadata
+20:05:57         PASS [   0.006s] (714/879) wyrd-semver block::tests::bump_build_adds_metadata
+20:05:57         PASS [   0.004s] (715/879) wyrd-semver block::tests::bump_major_resets_minor_patch
+20:05:57         PASS [   0.008s] (716/879) wyrd-semver block::tests::bump_major_clears_pre_and_build
+20:05:57         PASS [   0.006s] (717/879) wyrd-semver block::tests::bump_minor_clears_pre_and_build
+20:05:57         PASS [   0.005s] (718/879) wyrd-semver block::tests::bump_minor_resets_patch
+20:05:57         PASS [   0.005s] (719/879) wyrd-semver block::tests::bump_patch
+20:05:57         PASS [   0.005s] (720/879) wyrd-semver block::tests::bump_patch_clears_pre_and_build
+20:05:57         PASS [   0.004s] (721/879) wyrd-semver block::tests::bump_pre_adds_prerelease
+20:05:57         PASS [   0.004s] (722/879) wyrd-semver block::tests::bump_pre_rejects_invalid_identifier
+20:05:57         PASS [   0.007s] (723/879) wyrd-semver block::tests::bump_pre_does_not_reset_build
+20:05:57         PASS [   0.008s] (724/879) wyrd-semver block::tests::bump_pre_build_sets_both
+20:05:57         PASS [   0.004s] (725/879) wyrd-semver block::tests::default_is_zero_zero_one
+20:05:57         PASS [   0.007s] (726/879) wyrd-semver block::tests::from_str_parses
+20:05:57         PASS [   0.008s] (727/879) wyrd-semver block::tests::display_round_trip
+20:05:57         PASS [   0.005s] (728/879) wyrd-semver block::tests::from_triple_round_trips_to_block
+20:05:57         PASS [   0.005s] (729/879) wyrd-semver block::tests::from_triple_zero
+20:05:57         PASS [   0.006s] (730/879) wyrd-semver block::tests::is_pin_is_true_for_parsed_block
+20:05:57         PASS [   0.006s] (731/879) wyrd-semver block::tests::parse_accepts_full_triple
+20:05:57         PASS [   0.005s] (732/879) wyrd-semver block::tests::parse_rejects_empty
+20:05:57         PASS [   0.006s] (733/879) wyrd-semver block::tests::parse_rejects_partial
+20:05:57         PASS [   0.005s] (734/879) wyrd-semver block::tests::serde_preserves_the_exact_version_invariant
+20:05:57         PASS [   0.005s] (735/879) wyrd-semver block::tests::sort_versions_orders_lexicographically
+20:05:57         PASS [   0.005s] (736/879) wyrd-semver block::tests::sort_versions_respects_prerelease_precedence
+20:05:57         PASS [   0.006s] (737/879) wyrd-semver bounds::tests::triple_display_canonical_dotted
+20:05:57         PASS [   0.005s] (738/879) wyrd-semver bounds::tests::triple_ord_lexicographic
+20:05:57         PASS [   0.005s] (739/879) wyrd-semver bounds::tests::triple_zero_constant
+20:05:57         PASS [   0.006s] (740/879) wyrd-semver range::tests::default_is_wildcard
+20:05:57         PASS [   0.006s] (741/879) wyrd-semver range::tests::is_loose_partial_bare_major
+20:05:57         PASS [   0.005s] (742/879) wyrd-semver range::tests::is_loose_partial_bare_minor
+20:05:57         PASS [   0.006s] (743/879) wyrd-semver range::tests::is_loose_partial_rejects_comparator_chain
+20:05:57         PASS [   0.005s] (744/879) wyrd-semver range::tests::is_loose_partial_rejects_explicit_caret
+20:05:57         PASS [   0.004s] (745/879) wyrd-semver range::tests::is_loose_partial_rejects_wildcard
+20:05:57         PASS [   0.007s] (746/879) wyrd-semver range::tests::is_loose_partial_rejects_explicit_tilde
+20:05:57         PASS [   0.007s] (747/879) wyrd-semver range::tests::is_loose_partial_rejects_full_triple
+20:05:57         PASS [   0.005s] (748/879) wyrd-semver range::tests::matches_tilde_full
+20:05:57         PASS [   0.006s] (749/879) wyrd-semver range::tests::matches_caret_full
+20:05:57         PASS [   0.006s] (750/879) wyrd-semver range::tests::parse_accepts_short_caret_form
+20:05:57         PASS [   0.005s] (751/879) wyrd-semver range::tests::parse_loose_caret_short
+20:05:57         PASS [   0.006s] (752/879) wyrd-semver range::tests::parse_loose_normalizes_partial_major
+20:05:57         PASS [   0.005s] (753/879) wyrd-semver range::tests::parse_loose_normalizes_partial_minor
+20:05:57         PASS [   0.005s] (754/879) wyrd-semver range::tests::parse_loose_normalizes_star_minor
+20:05:57         PASS [   0.005s] (755/879) wyrd-semver range::tests::parse_loose_passes_through_strict_caret
+20:05:57         PASS [   0.007s] (756/879) wyrd-semver range::tests::parse_loose_passes_through_comparator_chain
+20:05:57         PASS [   0.005s] (757/879) wyrd-semver range::tests::parse_loose_rejects_empty
+20:05:57         PASS [   0.005s] (758/879) wyrd-semver range::tests::parse_loose_tilde_short
+20:05:57         PASS [   0.005s] (759/879) wyrd-semver range::tests::parse_strict_round_trip
+20:05:57         PASS [   0.007s] (760/879) wyrd-semver range::tests::parse_rejects_empty
+20:05:57         PASS [   0.005s] (761/879) wyrd-semver range::tests::to_bounds_caret_partial
+20:05:57         PASS [   0.006s] (762/879) wyrd-semver range::tests::to_bounds_caret_full
+20:05:57         PASS [   0.006s] (763/879) wyrd-semver range::tests::to_bounds_caret_pre_1_minor
+20:05:57         PASS [   0.005s] (764/879) wyrd-semver range::tests::to_bounds_caret_pre_1_patch
+20:05:57         PASS [   0.007s] (765/879) wyrd-semver range::tests::to_bounds_exact_pin
+20:05:57         PASS [   0.005s] (766/879) wyrd-semver range::tests::to_bounds_partial_major
+20:05:57         PASS [   0.005s] (767/879) wyrd-semver range::tests::to_bounds_partial_minor
+20:05:57         PASS [   0.005s] (768/879) wyrd-semver range::tests::to_bounds_rejects_prerelease
+20:05:58         PASS [   0.005s] (769/879) wyrd-semver range::tests::to_bounds_rejects_multi_comparator
+20:05:58         PASS [   0.007s] (770/879) wyrd-semver range::tests::to_bounds_star_minor
+20:05:58         PASS [   0.005s] (771/879) wyrd-semver range::tests::to_bounds_star_patch
+20:05:58         PASS [   0.007s] (772/879) wyrd-semver range::tests::to_bounds_tilde_full
+20:05:58         PASS [   0.005s] (773/879) wyrd-semver range::tests::to_bounds_unbounded
+20:05:58         PASS [   0.005s] (774/879) wyrd-semver spec::tests::deserialize_bare_partial_to_scope
+20:05:58         PASS [   0.005s] (775/879) wyrd-semver spec::tests::deserialize_full_triple_to_pin
+20:05:58         PASS [   0.005s] (776/879) wyrd-semver spec::tests::deserialize_rejects_comparator
+20:05:58         PASS [   0.006s] (777/879) wyrd-semver spec::tests::deserialize_rejects_wildcard
+20:05:58         PASS [   0.005s] (778/879) wyrd-semver spec::tests::from_str_round_trips
+20:05:58         PASS [   0.005s] (779/879) wyrd-semver spec::tests::parse_bare_major_is_scope
+20:05:58         PASS [   0.005s] (780/879) wyrd-semver spec::tests::parse_bare_minor_is_scope
+20:05:58         PASS [   0.005s] (781/879) wyrd-semver spec::tests::parse_full_triple_is_pin
+20:05:58         PASS [   0.005s] (782/879) wyrd-semver spec::tests::parse_rejects_caret
+20:05:58         PASS [   0.005s] (783/879) wyrd-semver spec::tests::parse_rejects_empty
+20:05:58         PASS [   0.007s] (784/879) wyrd-semver spec::tests::parse_rejects_comparator_chain
+20:05:58         PASS [   0.005s] (785/879) wyrd-semver spec::tests::parse_rejects_tilde
+20:05:58         PASS [   0.005s] (786/879) wyrd-semver spec::tests::parse_rejects_wildcard
+20:05:58         PASS [   0.006s] (787/879) wyrd-semver spec::tests::parse_triple_with_prerelease_is_pin
+20:05:58         PASS [   0.005s] (788/879) wyrd-semver spec::tests::serialize_pin_to_string
+20:05:58         PASS [   0.007s] (789/879) wyrd-semver spec::tests::round_trip_pin_through_json
+20:05:58         PASS [   0.005s] (790/879) wyrd-semver spec::tests::serialize_scope_preserves_registerable_form
+20:05:58         PASS [   0.005s] (791/879) wyrd-semver tests::seed_version_is_zero_one_zero
+20:05:58         PASS [   0.010s] (792/879) wyrd-telemetry context::tests::future_version_traceparent_is_read_forward_compatibly
+20:05:58         PASS [   0.006s] (793/879) wyrd-telemetry context::tests::malformed_traceparent_is_ignored
+20:05:58         PASS [   0.012s] (794/879) wyrd-telemetry context::tests::linked_work_continues_its_own_trace_with_the_callers_decision
+20:05:58         PASS [   0.006s] (795/879) wyrd-telemetry context::tests::malformed_tracestate_is_dropped_keeping_the_parent
+20:05:58         PASS [   0.007s] (796/879) wyrd-telemetry context::tests::only_spans_of_a_continued_request_read_a_continued_context
+20:05:58         PASS [   0.006s] (797/879) wyrd-telemetry context::tests::tracestate_whitespace_and_empty_members_normalize
+20:05:58         PASS [   0.007s] (798/879) wyrd-telemetry context::tests::valid_traceparent_is_the_inbound_context
+20:05:58         PASS [   0.006s] (799/879) wyrd-telemetry export::tests::a_sampled_link_records_for_the_tenant
+20:05:58         PASS [   0.008s] (800/879) wyrd-telemetry export::tests::a_sampled_producer_link_routes_the_consumer
+20:05:58         PASS [   0.005s] (801/879) wyrd-telemetry export::tests::catalog_names_only_behavior_spans
+20:05:58         PASS [   0.009s] (802/879) wyrd-telemetry export::tests::an_operation_route_rebinds_only_its_subtree
+20:05:58         PASS [   0.006s] (803/879) wyrd-telemetry export::tests::client_trace_id_does_not_change_the_operator_decision
+20:05:58         PASS [   0.007s] (804/879) wyrd-telemetry export::tests::debug_catalog_span_passes_its_place_to_its_children
+20:05:58         PASS [   0.007s] (805/879) wyrd-telemetry export::tests::each_request_stages_on_the_sink_it_bound
+20:05:58         PASS [   0.005s] (806/879) wyrd-telemetry export::tests::ended_spans_leave_the_registry
+20:05:58         PASS [   0.005s] (807/879) wyrd-telemetry export::tests::operator_filter_admits_only_sampled_spans
+20:05:58         PASS [   0.006s] (808/879) wyrd-telemetry export::tests::remote_parent_rows_combine_operator_and_client_decisions
+20:05:58         PASS [   0.006s] (809/879) wyrd-telemetry export::tests::root_follows_the_operator_policy
+20:05:58         PASS [   0.008s] (810/879) wyrd-telemetry export::tests::sampling_keeps_the_parents_trace_state
+20:05:58         PASS [   0.007s] (811/879) wyrd-telemetry export::tests::sampling_matrix_holds_with_and_without_an_operator
+20:05:58         PASS [   0.007s] (812/879) wyrd-telemetry export::tests::tenant_copy_keeps_ids_and_only_safe_fields
+20:05:58         PASS [   0.005s] (813/879) wyrd-telemetry export::tests::unbound_request_is_operator_only
+20:05:58         PASS [   0.007s] (814/879) wyrd-telemetry export::tests::tenant_filter_drops_detail
+20:05:58         PASS [   0.005s] (815/879) wyrd-telemetry log_writer::tests::a_stalled_stdout_drops_lines_instead_of_blocking
+20:05:58         PASS [   0.006s] (816/879) wyrd-telemetry log_writer::tests::dropping_the_owner_drains_queued_lines
+20:05:58         PASS [   0.006s] (817/879) wyrd-telemetry tests::guard_drop_shuts_down_a_retained_provider
+20:05:58         PASS [   0.008s] (818/879) wyrd-telemetry tests::capture_pipeline_preserves_span_semantics
+20:05:58         PASS [   0.006s] (819/879) wyrd-telemetry tests::operator_sampling_defaults_are_explicit
+20:05:58         PASS [   0.007s] (820/879) wyrd-telemetry tests::production_filters_preserve_tenant_traces
+20:05:58         PASS [   0.006s] (821/879) wyrd-telemetry tests::span_directives_scope_logs_and_operator_spans
+20:05:58         PASS [   0.007s] (822/879) wyrd-tls tests::conflicting_provider_returns_structured_error_in_isolated_process
+20:05:58         PASS [   0.005s] (823/879) wyrd-tls tests::provider_installation_is_idempotent
+20:05:58         PASS [   0.007s] (824/879) wyrd-types schema::schema_tests::array_becomes_list
+20:05:58         PASS [   0.005s] (825/879) wyrd-types schema::schema_tests::arrow_schema_maps_precision_types_verbatim
+20:05:58         PASS [   0.005s] (826/879) wyrd-types schema::schema_tests::arrow_schema_refuses_unrepresentable_types
+20:05:58         PASS [   0.007s] (827/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_keeps_recursive_shape_without_field_ids
+20:05:58         PASS [   0.006s] (828/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_list_round_trip
+20:05:58         PASS [   0.006s] (829/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_nullability_preserved
+20:05:58         PASS [   0.005s] (830/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_scalar_variants_round_trip
+20:05:58         PASS [   0.007s] (831/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_struct_round_trip
+20:05:58         PASS [   0.008s] (832/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_time32_time64_all_units_round_trip
+20:05:58         PASS [   0.007s] (833/879) wyrd-types schema::schema_tests::fieldspec_to_arrow_timestamp_all_time_units_round_trip
+20:05:58         PASS [   0.006s] (834/879) wyrd-types schema::schema_tests::json_scalar_types_map_per_table
+20:05:58         PASS [   0.005s] (835/879) wyrd-types schema::schema_tests::json_schema_to_arrow_equals_compose_path
+20:05:58         PASS [   0.005s] (836/879) wyrd-types schema::schema_tests::map_declarations_round_trip_through_arrow
+20:05:58         PASS [   0.004s] (837/879) wyrd-types schema::schema_tests::nested_object_becomes_struct
+20:05:58         PASS [   0.005s] (838/879) wyrd-types schema::schema_tests::open_nested_and_unsupported_schemas_map_exactly
+20:05:58         PASS [   0.004s] (839/879) wyrd-types schema::schema_tests::optional_anyof_null_is_nullable
+20:05:58         PASS [   0.005s] (840/879) wyrd-types schema::schema_tests::ref_resolves_through_defs
+20:05:58         PASS [   0.004s] (841/879) wyrd-types schema::schema_tests::required_drives_nullability
+20:05:58         PASS [   0.004s] (842/879) wyrd-types timestamp::tests::each_type_parses_its_own_text
+20:05:58         PASS [   0.005s] (843/879) wyrd-types timestamp::tests::arrow_forms_are_recognized
+20:05:58         PASS [   0.004s] (844/879) wyrd-types timestamp::tests::each_type_renders_and_checks_its_text
+20:05:58         PASS [   0.005s] (845/879) wyrd-types timestamp::tests::formats_name_their_timestamp_type
+20:05:58         PASS [   0.004s] (846/879) wyrd-types timestamp::tests::rust_types_declare_their_format
+20:05:58         PASS [   0.005s] (847/879) wyrd-types timestamp::tests::wyrd_values_round_trip_their_text
+20:05:58         PASS [   0.004s] (848/879) wyrd-types variant::tests::variant_extension_requires_empty_metadata
+20:05:58         PASS [   0.007s] (849/879) wyrd-utils codec::tests::gzip_round_trips_bytes
+20:05:58         PASS [   0.006s] (850/879) wyrd-utils codec::tests::zstd_round_trips_bytes
+20:05:58         PASS [   0.005s] (851/879) wyrd-utils config_dir::tests::empty_override_is_skipped
+20:05:58         PASS [   0.004s] (852/879) wyrd-utils config_dir::tests::home_adds_standard_config_components
+20:05:58         PASS [   0.004s] (853/879) wyrd-utils config_dir::tests::wyrd_config_home_is_used_verbatim
+20:05:58         PASS [   0.005s] (854/879) wyrd-utils config_dir::tests::missing_environment_resolves_nothing
+20:05:58         PASS [   0.005s] (855/879) wyrd-utils config_dir::tests::xdg_config_home_adds_wyrd_component
+20:05:58         PASS [   0.005s] (856/879) wyrd-utils fs::tests::copy_manifest_files_preserves_relative_paths
+20:05:58         PASS [   0.107s] (857/879) wyrd-telemetry tests::operator_export_loss_is_observable
+20:05:58         PASS [   0.005s] (858/879) wyrd-utils fs::tests::data_stats_for_file_matches_known_sha256
+20:05:58         PASS [   0.005s] (859/879) wyrd-utils fs::tests::data_stats_for_path_hashes_directory_deterministically
+20:05:58         PASS [   0.006s] (860/879) wyrd-utils fs::tests::require_local_file_rejects_missing_path
+20:05:58         PASS [   0.005s] (861/879) wyrd-utils json::tests::write_json_sorted_is_byte_stable
+20:05:58         PASS [   0.006s] (862/879) wyrd-utils secret::tests::google_service_account_json_does_not_fall_back_past_a_malformed_base64_variable
+20:05:58         PASS [   0.005s] (863/879) wyrd-utils secret::tests::google_service_account_json_prefers_the_decoded_base64_variable
+20:05:58         PASS [   0.044s] (864/879) wyrd-vault tests::reads_latest_version_field_with_supplied_token
+20:05:58         PASS [   0.035s] (865/879) wyrd-vault tests::transit_wraps_and_unwraps_through_the_named_key
+20:05:58         PASS [   0.006s] (866/879) wyrd-version version::tests::bump_major
+20:05:58         PASS [   0.005s] (867/879) wyrd-version version::tests::bump_minor_clears_patch_and_pre
+20:05:58         PASS [   0.091s] (868/879) wyrd-vault tests::maps_outcomes
+20:05:58         PASS [   0.005s] (869/879) wyrd-version version::tests::bump_patch
+20:05:58         PASS [   0.006s] (870/879) wyrd-version version::tests::current_returns_valid_version
+20:05:58         PASS [   0.005s] (871/879) wyrd-version version::tests::invalid_prerelease
+20:05:58         PASS [   0.005s] (872/879) wyrd-version version::tests::parses_basic_semver
+20:05:58         PASS [   0.004s] (873/879) wyrd-version version::tests::rejects_empty_string
+20:05:58         PASS [   0.005s] (874/879) wyrd-version version::tests::rejects_nonsense
+20:05:58         PASS [   0.005s] (875/879) wyrd-version version::tests::round_trip_serde
+20:05:58         PASS [   0.005s] (876/879) wyrd-version version::tests::set_build
+20:05:58         PASS [   0.004s] (877/879) wyrd-version version::tests::set_prerelease
+20:05:58         PASS [   0.165s] (878/879) wyrd-vault tests::egress_is_screened_and_pinned
+20:06:06         PASS [  10.355s] (879/879) wyrd-queue variant::tests::raw_depth_is_bounded_before_full_validation
+20:06:06 ────────────
+20:06:06      Summary [  51.505s] 879 tests run: 879 passed, 231 skipped
+lane test:shared finished 2026-11-25T20:06:07Z exit=0

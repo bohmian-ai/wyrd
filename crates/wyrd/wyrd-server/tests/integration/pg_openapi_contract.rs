@@ -380,18 +380,20 @@ async fn github_connection_operations_publish_their_contract() {
 /// The tenant human-connection administration surface is served with its typed
 /// contract and no secret-bearing or unsupported shape.
 ///
-/// Each of the six operations publishes its route-specific refusals as
-/// problem+json; the redacted view and list shapes expose no secret field; the
-/// input schema offers exactly the three supported client-authentication
-/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
-/// its request body; and activation requires the recovery key.
+/// Each of the six connection operations and the two login-policy operations
+/// publishes its route-specific refusals as problem+json; the redacted view
+/// and list shapes expose no secret field; the policy read carries only its
+/// state, revisions, readiness and warning count; the input schema offers
+/// exactly the three supported client-authentication methods (never
+/// `PrivateKeyJwt`); both PUTs publish their typed request bodies; and
+/// activation requires the recovery key.
 #[tokio::test]
 async fn identity_connection_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
-    let operations: [(&str, &str, &[&str]); 6] = [
+    let operations: [(&str, &str, &[&str]); 8] = [
         ("/v1/identity/oidc/connections", "get", &["403", "503"]),
         (
             "/v1/identity/oidc/candidate",
@@ -418,6 +420,12 @@ async fn identity_connection_operations_publish_their_contract() {
             "delete",
             &["403", "404", "503"],
         ),
+        ("/v1/identity/login-policy", "get", &["403", "503"]),
+        (
+            "/v1/identity/login-policy",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
     ];
     for (path, method, statuses) in operations {
         let operation = &document["paths"][path][method];
@@ -443,7 +451,32 @@ async fn identity_connection_operations_publish_their_contract() {
         "the candidate PUT publishes its typed body although it reads raw bytes"
     );
 
+    assert_eq!(
+        document["paths"]["/v1/identity/login-policy"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/LoginPolicyChange",
+        "the policy PUT publishes its typed body although it reads raw bytes"
+    );
+
     let schemas = &document["components"]["schemas"];
+    // The warning is a count: the policy read names no User, identity or secret.
+    let mut policy_fields: Vec<_> = schemas["LoginPolicyView"]["properties"]
+        .as_object()
+        .expect("LoginPolicyView publishes its properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    policy_fields.sort_unstable();
+    assert_eq!(
+        policy_fields,
+        [
+            "connection",
+            "ready",
+            "require_company_sso",
+            "revision",
+            "users_without_company_identity"
+        ]
+    );
     let view_fields = schemas["HumanConnectionView"]["properties"]
         .as_object()
         .expect("HumanConnectionView publishes its properties");
@@ -603,6 +636,93 @@ async fn tenant_login_operations_publish_their_contract() {
             "{path} client_id is optional: {client_id}"
         );
     }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The principal read projections publish their fields: the caller's own
+/// email and display name on `/me`, every sign-in method, each directory
+/// item's display name, method and scoped Roles, the page's status counts,
+/// the `role` filter, and each Role's description and member count, with the
+/// Role PUT's optional description and its length refusal.
+///
+/// # Panics
+/// Panics when the served document omits one of them.
+#[tokio::test]
+async fn principal_read_projections_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let required = |schema: &str| -> Vec<String> {
+        schemas[schema]["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect()
+    };
+    for (schema, fields, always) in [
+        (
+            "CurrentUserProfile",
+            &["display_name", "email", "authentication"][..],
+            &["authentication"][..],
+        ),
+        (
+            "PrincipalSummary",
+            &["display_name", "authentication", "roles"][..],
+            &["roles"][..],
+        ),
+        ("PrincipalPage", &["counts"][..], &["counts"][..]),
+        (
+            "PrincipalStatusCounts",
+            &["active", "suspended"][..],
+            &["active", "suspended"][..],
+        ),
+        (
+            "RoleView",
+            &["description", "member_count"][..],
+            &["member_count"][..],
+        ),
+        ("PutRoleRequest", &["description"][..], &[][..]),
+    ] {
+        for field in fields {
+            assert!(
+                schemas[schema]["properties"][field].is_object(),
+                "{schema} publishes {field}: {}",
+                schemas[schema]
+            );
+        }
+        let required = required(schema);
+        for field in always {
+            assert!(
+                required.iter().any(|name| name == field),
+                "{schema} requires {field}"
+            );
+        }
+    }
+    assert!(
+        !required("PutRoleRequest").contains(&"description".to_owned()),
+        "a Role description is optional"
+    );
+    assert_eq!(
+        schemas["AccountAuthentication"]["enum"],
+        serde_json::json!(["password", "google", "github", "sso"])
+    );
+    assert!(
+        document["paths"]["/v1/principals"]["get"]["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|parameter| parameter["name"] == "role" && parameter["in"] == "query"),
+        "the directory takes the role filter"
+    );
+    assert!(
+        documented_description(&document, "/v1/access/roles/{role}", "put", 400)
+            .contains("200 characters"),
+        "the Role PUT documents its description limit"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

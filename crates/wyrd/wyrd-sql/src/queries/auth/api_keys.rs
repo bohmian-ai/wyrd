@@ -20,6 +20,9 @@ const REVOKE_API_KEY_SQL: &str = "UPDATE wyrd.auth_api_keys
 /// This helper is idempotent. Re-revoking a revoked key leaves the original
 /// `revoked_at` untouched and returns `Ok(false)`.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
 pub async fn revoke_api_key(
@@ -30,6 +33,7 @@ pub async fn revoke_api_key(
         .bind(api_key_id)
         .execute(&mut **conn.transaction())
         .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }
 

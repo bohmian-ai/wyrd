@@ -6,36 +6,43 @@
  * values, so only these schemas define what a document or intent may carry.
  */
 import { z } from 'zod';
-import type { CardKind, CardRef } from 'wyrd-ai';
+import type { CardKind, CardRef, CardSummary } from 'wyrd-ai';
 
-/** Every Card kind the registry serves, checked against the generated union both ways. */
-const CARD_KINDS = [
+/**
+ * The twelve registrable Card kinds of the architecture kind catalog, in its
+ * order. The generated union still names Policy and Source, which the catalog
+ * removed; every other generated kind must appear here.
+ */
+export const CARD_KINDS = [
   'Data',
   'Model',
+  'Artifact',
   'Experiment',
   'Prompt',
   'Agent',
-  'Verifier',
-  'Service',
-  'Policy',
   'Mcp',
+  'Service',
   'Audit',
-  'Artifact',
+  'Verifier',
   'Trigger',
   'Operator',
-  'Source'
+  'Repository'
 ] as const satisfies readonly CardKind[];
-const everyKind: CardKind extends (typeof CARD_KINDS)[number] ? true : never = true;
+const everyKind: Exclude<CardKind, 'Policy' | 'Source'> extends (typeof CARD_KINDS)[number] ? true : never = true;
 void everyKind;
+
+/** Lifecycle statuses an inventory may filter by; a deleted Card is never listed. */
+export const CARD_STATUSES = ['active', 'pending', 'deprecated', 'failed', 'expired'] as const satisfies readonly CardSummary['status'][];
+
+/** An exact version such as 1.4.2, never a range or "latest". */
+const exactVersion = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'an exact version such as 1.4.2');
 
 /** An exact Card reference: a full version pin, never a range or "latest". */
 export const CardRefSchema = z
   .object({
     kind: z.enum(CARD_KINDS),
     name: z.string().min(1),
-    version: z
-      .string()
-      .regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'an exact version such as 1.4.2'),
+    version: exactVersion,
     uid: z.string().min(1).nullish()
   })
   .strict() satisfies z.ZodType<CardRef>;
@@ -96,6 +103,109 @@ export const CardHeaderInputSchema = z
   })
   .strict();
 
+/** The pages an inventory follows through `cards.list` cursors at most. */
+export const INVENTORY_PAGES = 20;
+
+/** Inventory filters; each maps onto the `cards.list` request field of the same meaning. */
+const inventoryFilters = {
+  /**
+   * One word with no spaces, quotes or operators matches names containing it,
+   * ignoring case; anything else is the metadata query itself (labels.team = "search").
+   */
+  query: z.string().max(4096).optional(),
+  kind: z.enum(CARD_KINDS).optional(),
+  status: z.enum(CARD_STATUSES).optional(),
+  include_prerelease: z.boolean().optional()
+};
+
+/** The input of `CardInventory`: filters and how many server pages to show. */
+export const CardInventoryInputSchema = z
+  .object({ ...inventoryFilters, pages: z.number().int().min(1).max(INVENTORY_PAGES).optional() })
+  .strict();
+
+/** The input of an exact-Card detail component. */
+export const CardDetailInputSchema = z.object({ cardRef: CardRefSchema }).strict();
+
+/** The input of `CardFacts`: one exact Card; `yaml` shows the whole returned Card as YAML instead. */
+export const CardFactsInputSchema = z.object({ cardRef: CardRefSchema, yaml: z.boolean().optional() }).strict();
+
+/** One exact Prompt Card. */
+const promptRef = CardRefSchema.extend({ kind: z.literal('Prompt') });
+
+/** The input of a Prompt component. */
+export const PromptInputSchema = z.object({ cardRef: promptRef }).strict();
+
+/** The input of a Verifier component: one exact Verifier Card. */
+export const VerifierInputSchema = z.object({ cardRef: CardRefSchema.extend({ kind: z.literal('Verifier') }) }).strict();
+
+/** The Show choices of the Repositories index: every row, ready ones, registered ones that start nothing, and repositories with no Card. */
+export const REPOSITORY_SHOWS = ['all', 'ready', 'inactive', 'undeclared'] as const;
+const repositoryFilters = { query: z.string().max(200).optional(), show: z.enum(REPOSITORY_SHOWS).optional() };
+
+/** The input of `RepositoryIndex`: the search text and the Show choice. */
+export const RepositoryIndexInputSchema = z.object(repositoryFilters).strict();
+
+/** The input of `RepositoryPolicy`: one exact Repository Card and which declaration text to show. */
+export const RepositoryPolicyInputSchema = z
+  .object({ cardRef: CardRefSchema.extend({ kind: z.literal('Repository') }), declaration: z.enum(['yaml', 'toml']).optional() })
+  .strict();
+
+/** The input of `RepositoryDeclare`: the provider's stable id of one reachable repository. */
+export const RepositoryDeclareInputSchema = z.object({ repositoryId: z.string().min(1).max(64) }).strict();
+
+/** The input of `GithubIntegration`: the tenant has one connection, so nothing. */
+export const GithubIntegrationInputSchema = z.object({}).strict();
+
+/** One invocation attempt of a step: its fan-out item and repeat iteration, each null when the step has none, and the one-based attempt. */
+export const ProducerSchema = z
+  .object({ item_index: z.number().int().min(0).nullish(), iteration_index: z.number().int().min(0).nullish(), attempt: z.number().int().min(1) })
+  .strict();
+
+/** What an execution view shows beyond the execution itself; every field is shareable selection state. */
+const executionSelection = {
+  /** The selected graph node: `input:`, `step:` or `req:` plus its id; `outputs` for every retained output; `none` for no selection. Absent, a judged execution selects its first failed requirement. */
+  node: z.string().min(1).max(300).optional(),
+  /** The selected invocation attempt of the selected step. */
+  producer: ProducerSchema.optional(),
+  /** The publication of that attempt to read, by its name. */
+  output: z.string().min(1).max(300).optional(),
+  /** Read the completed records (steps, checks, provenance) as well. */
+  details: z.boolean().optional()
+};
+
+/** The input of `VerificationExecution`: one exact execution, its selection, and the page cursors to continue from. */
+export const ExecutionInputSchema = z
+  .object({
+    executionId: z.string().min(1).max(200),
+    ...executionSelection,
+    invocations: z.string().min(1).max(4096).optional(),
+    publications: z.string().min(1).max(4096).optional()
+  })
+  .strict();
+
+/** The input of `VersionDiff`: one exact Prompt and another registered version; absent, the version before it. */
+export const VersionDiffInputSchema = z
+  .object({ cardRef: promptRef, otherVersion: exactVersion.optional() })
+  .strict()
+  .refine((input) => input.otherVersion !== input.cardRef.version, { message: 'must differ from cardRef.version', path: ['otherVersion'] });
+
+/** Open one exact Card version. */
+const openCard = {
+  description: 'Open this exact Card version.',
+  input: z.object({ card_ref: CardRefSchema }).strict(),
+  completion: 'host-navigation'
+} as const;
+
+/** Open the tenant's GitHub connection settings. */
+const openConnection = { description: "Open the tenant's GitHub connection settings.", input: z.object({}).strict(), completion: 'host-navigation' } as const;
+
+/** Show how to declare a reachable repository that has no Card. */
+const declareRepository = {
+  description: 'Show how to declare a Repository Card for this reachable GitHub repository.',
+  input: z.object({ repository_id: z.string().min(1).max(64) }).strict(),
+  completion: 'host-navigation'
+} as const;
+
 /** A bind value: JSON null, boolean, number, or string. */
 const queryParam = z.union([z.null(), z.boolean(), z.number(), z.string()]);
 
@@ -115,7 +225,38 @@ const SPAN_FILTERS = [
 ] as const;
 
 /**
- * The Observe signals and their canonical tables. `traces` lists root spans,
+ * One row per accepted Verifier execution of every origin, as retained: its
+ * input record, the result its latest checkpoint selected (a direct
+ * execution's only one), and its status. A queued execution's `status` is its
+ * newest retained status row (`running`, `retrying`, `waiting`, `pending`,
+ * `completed`, `cancelled`, `timed_out` or `errored`) and `pending` before
+ * any; a status row lost with its process leaves the older one standing. A
+ * direct execution is never queued: `completed` once its result is visible,
+ * else `not recorded`.
+ */
+// Every read of this population binds its range first, so `$1` here is the range start. An execution's
+// states and result are recorded after its input, so the joins read from that start on, with an hour of
+// slack for clocks, and never the tenant's whole history.
+// ponytail: states and results stay unbounded above, since work accepted in the range may end any time later.
+const SINCE = "$1::timestamptz - INTERVAL '1 hour'";
+const EXECUTIONS =
+  '(SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, ' +
+  'i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, ' +
+  'r.result_id, r.verdict, r.ended_at, ' +
+  "CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status " +
+  'FROM bifrost.verification.execution_inputs i ' +
+  // Rows of one instant have no recorded order; the event id only makes the choice repeatable.
+  "LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' " +
+  `AND occurred_at >= ${SINCE} GROUP BY execution_id) q ON q.execution_id = i.execution_id ` +
+  "LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id " +
+  'FROM bifrost.verification.execution_events e ' +
+  `JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= ${SINCE} GROUP BY execution_id) l ` +
+  `ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= ${SINCE}) s ON s.execution_id = i.execution_id ` +
+  `LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= ${SINCE} AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions`;
+
+/**
+ * The Observe signals and their canonical tables, and Verify's `executions`:
+ * one row per accepted Verifier execution, read from {@link EXECUTIONS}. `traces` lists root spans,
  * one row per trace; `spans` lists every span. `filters` are the scalar,
  * non-payload columns a WHERE clause or facet may name; `columns` are a
  * list's defaults and `more` the other columns it may show, such as metric
@@ -154,12 +295,22 @@ export const SIGNALS = {
       'exponential_scale', 'exponential_zero_count', 'exponential_zero_threshold', 'positive_buckets', 'negative_buckets',
       'summary_count', 'summary_sum', 'quantile_values', 'exemplars'
     ]
+  },
+  executions: {
+    table: EXECUTIONS,
+    time: 'recorded_at',
+    columns: ['recorded_at', 'verifier_card_uid', 'subject_name', 'run_id', 'group_id', 'service_name', 'status', 'verdict'],
+    filters: [
+      'status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id', 'origin', 'binding_id', 'subject_kind', 'subject_version',
+      'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id'
+    ],
+    more: ['ended_at']
   }
 } as const;
 
 /** An Observe signal. */
 export type Signal = keyof typeof SIGNALS;
-const SignalSchema = z.enum(['traces', 'spans', 'logs', 'metrics']);
+const SignalSchema = z.enum(['traces', 'spans', 'logs', 'metrics', 'executions']);
 
 /** Columns a list of `signal` may show: its defaults, every filter column, then its other columns. */
 export function signalColumns(signal: Signal): readonly string[] {
@@ -171,7 +322,8 @@ export const TIES: Record<Signal, readonly string[]> = {
   traces: ['trace_id', 'span_id'],
   spans: ['trace_id', 'span_id'],
   logs: ['observed_time_unix_nano', 'wyrd_request_id'],
-  metrics: []
+  metrics: [],
+  executions: ['execution_id']
 };
 
 /** Columns a list of `signal` sorts by on the server: its default and filter columns but its ids. */
@@ -212,6 +364,12 @@ const where = z.array(FilterSchema).max(32);
  */
 const whereSql = z.string().max(8192);
 
+/** Refuse a predicate over `executions`: its rows are derived, so no table validates one. */
+function noPredicate(input: { readonly signal: Signal; readonly where_sql?: string }, context: z.RefinementCtx) {
+  if (input.signal === 'executions' && input.where_sql?.trim())
+    context.addIssue({ code: 'custom', path: ['where_sql'], message: 'executions filter by where clauses only' });
+}
+
 /** Refuse a column the signal does not offer, naming the field. */
 function knownColumns(signal: Signal, names: readonly string[], allowed: readonly string[], path: PropertyKey[], context: z.RefinementCtx) {
   names.forEach((name, index) => {
@@ -234,6 +392,7 @@ export const FacetRailInputSchema = z
   })
   .strict()
   .superRefine((input, context) => {
+    noPredicate(input, context);
     knownColumns(input.signal, input.facets, SIGNALS[input.signal].filters, ['facets'], context);
     knownColumns(input.signal, (input.where ?? []).map((each) => each.column), SIGNALS[input.signal].filters, ['where'], context);
   });
@@ -264,6 +423,7 @@ export const RecordTableInputSchema = z.union([
     })
     .strict()
     .superRefine((input, context) => {
+      noPredicate(input, context);
       const columns = signalColumns(input.signal);
       if (input.sort) knownColumns(input.signal, [input.sort.column], sortColumns(input.signal), ['sort', 'column'], context);
       if (input.after && input.before) context.addIssue({ code: 'custom', path: ['before'], message: 'a page reads after or before one row, not both' });
@@ -333,7 +493,7 @@ const spanRef = z.object({ trace_id: traceId, span_id: spanId.optional() }).stri
 const executedQuery = z.object({ sql: z.string().min(1), params: z.array(queryParam) }).strict();
 
 /** How an action's completion becomes observable. */
-type Completion = 'host-navigation' | 'view-range';
+type Completion = 'host-navigation' | 'view-range' | 'host-action';
 
 /** One action a component emits, with its input schema and completion. */
 interface ActionSpec {
@@ -394,6 +554,168 @@ export const components = {
       }
     }
   },
+  CardInventory: {
+    description:
+      'Every registered Card version cards.list returns, in registration order: kind, name, version, status, uid and update time, ' +
+      'filtered by kind, lifecycle status, prerelease and a name or metadata query (labels., annotations.), paged by server cursor.',
+    input: CardInventoryInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'cards.filter': {
+        description: 'Read the inventory again under these filters, from its first page.',
+        input: z.object(inventoryFilters).strict(),
+        completion: 'host-navigation'
+      },
+      'cards.more': {
+        description: "Show one more page, following the last page's server cursor.",
+        input: z.object({ pages: z.number().int().min(2).max(INVENTORY_PAGES) }).strict(),
+        completion: 'host-navigation'
+      },
+      'card.open': openCard
+    }
+  },
+  CardFacts: {
+    description: "An exact Card's server-managed facts (uid, status, hashes, labels, annotations, origin), or the whole returned Card as YAML.",
+    input: CardFactsInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  RelationshipList: {
+    description: "An exact Card's server-derived relationships: each exact outbound and inbound Card reference.",
+    input: CardDetailInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: { 'card.open': openCard }
+  },
+  ArtifactTable: {
+    description: 'The files registration recorded for one exact Card version: relative path, size, SHA-256 digest and content type.',
+    input: CardDetailInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  PromptMessages: {
+    description:
+      "An exact Prompt as authored: provider, model and response format, then the portable system text and messages, or the native format's body unchanged.",
+    input: PromptInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  PromptVariables: {
+    description: "The text and media variables the server's Prompt compiler derived from an exact Prompt (status.prompt).",
+    input: PromptInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  UsedBy: {
+    description: "The Agents whose spec references an exact Prompt, from its server-derived inbound relationships, with each Agent's execution route.",
+    input: PromptInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: { 'card.open': openCard }
+  },
+  VersionDiff: {
+    description:
+      'The authored differences between two registered versions of one Prompt: provider, model, system text, messages, settings, response format and derived variables.',
+    input: VersionDiffInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'prompt.compare': {
+        description: 'Compare the Prompt with this other registered version.',
+        input: z.object({ other_version: exactVersion }).strict(),
+        completion: 'host-navigation'
+      }
+    }
+  },
+  VerifierDefinition: {
+    description:
+      'An exact Verifier as declared: its description, the read-only graph of its inputs, steps, attached and whole-Verifier requirements with their declared dependencies, and the authored declaration of the selected node. No execution state.',
+    input: VerifierInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  RunsOn: {
+    description:
+      "The Services and Agents whose bindings pin an exact Verifier version, from its server-derived inbound relationships, with each binding's subject and when it runs.",
+    input: VerifierInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: { 'card.open': openCard }
+  },
+  RepositoryIndex: {
+    description:
+      "Repository Cards joined to the GitHub repositories the tenant's connection reaches, by provider repository id: registration, GitHub access and automatic verification as separate facts, with search and a Show choice.",
+    input: RepositoryIndexInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'repository.filter': { description: 'Replace the search text and Show choice.', input: z.object(repositoryFilters).strict(), completion: 'host-navigation' },
+      'card.open': openCard,
+      'repository.declare': declareRepository,
+      'connection.open': openConnection
+    }
+  },
+  RepositoryPolicy: {
+    description:
+      "One exact Repository Card version: whether it is the selected policy, GitHub access, automatic verification, its exact Verifier bindings and its read-only declaration as Card YAML or a wyrd.toml projection.",
+    input: RepositoryPolicyInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'card.version': { description: 'View another exact version of this Repository; selection does not change.', input: z.object({ card_ref: CardRefSchema }).strict(), completion: 'host-navigation' },
+      'card.open': openCard,
+      'repository.declaration': { description: 'Show the declaration as Card YAML or as a wyrd.toml projection.', input: z.object({ declaration: z.enum(['yaml', 'toml']) }).strict(), completion: 'host-navigation' },
+      'connection.open': openConnection
+    }
+  },
+  RepositoryDeclare: {
+    description: 'One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.',
+    input: RepositoryDeclareInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  GithubIntegration: {
+    description:
+      "The tenant's one GitHub App connection: state, installation, App and host, the repositories it reaches beside their Repository Cards, connect, manage access on GitHub, and a confirmed disconnect.",
+    input: GithubIntegrationInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'github.connect': { description: 'Start connecting this tenant to GitHub; the host continues on GitHub.', input: z.object({}).strict(), completion: 'host-action' },
+      'github.disconnect': { description: 'Disconnect this tenant from GitHub, after the reader confirmed.', input: z.object({}).strict(), completion: 'host-action' },
+      'card.open': openCard,
+      'repository.declare': declareRepository
+    }
+  },
+  VerificationExecution: {
+    description:
+      "One exact verification execution: its lifecycle status and verdict, the graph of the Verifier it ran coloured by recorded state, " +
+      'and an inspector for the selected step, requirement, input, session member or retained output. Every part is read and refused on its own.',
+    input: ExecutionInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'execution.select': {
+        description: 'Show this node, invocation attempt, output and details; absent fields clear that part of the selection.',
+        input: z.object(executionSelection).strict(),
+        completion: 'host-navigation'
+      },
+      'execution.page': {
+        description: "Read the page after the one shown, following the server's opaque cursor.",
+        input: z.union([z.object({ invocations: z.string().min(1) }).strict(), z.object({ publications: z.string().min(1) }).strict()]),
+        completion: 'host-navigation'
+      },
+      'execution.open': {
+        description: 'Open another exact execution, such as a session member.',
+        input: z.object({ execution_id: z.string().min(1) }).strict(),
+        completion: 'host-navigation'
+      },
+      'execution.cancel': {
+        description: 'Cancel this execution through the existing cancel operation; the host reports the outcome and reads the status again.',
+        input: z.object({ execution_id: z.string().min(1) }).strict(),
+        completion: 'host-action'
+      },
+      'publication.download': {
+        description: 'Download one retained file of a publication through the host.',
+        input: z.object({ step_id: z.string().min(1), name: z.string().min(1), producer: ProducerSchema, path: z.string().min(1).optional() }).strict(),
+        completion: 'host-navigation'
+      },
+      'record.open': { description: 'Open the exact trace an input names, read with the viewer\'s current permissions.', input: spanRef, completion: 'host-navigation' },
+      'card.open': openCard
+    }
+  },
   StatStrip: {
     description:
       'One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, ' +
@@ -416,14 +738,14 @@ export const components = {
   },
   RecordTable: {
     description:
-      'Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) ' +
+      'Typed rows of one signal (traces as root spans with span and error counts, spans, logs, metric points, or Verifier executions with their retained status and recorded verdict) ' +
       'or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.',
     input: RecordTableInputSchema,
     states: ['populated', 'empty', 'denied', 'error', 'loading', 'live'],
     emits: {
       'record.open': {
-        description: 'Open one trace or span, or one log record by its exact identity.',
-        input: z.union([spanRef, z.object({ log: LogKeySchema }).strict()]),
+        description: 'Open one trace or span, one log record by its exact identity, or one exact Verifier execution.',
+        input: z.union([spanRef, z.object({ log: LogKeySchema }).strict(), z.object({ execution_id: z.string().min(1).max(200) }).strict()]),
         completion: 'host-navigation'
       },
       'record.open_in_query': {
@@ -470,6 +792,24 @@ export type ComponentName = keyof typeof components;
 export type ChartInput = z.infer<typeof ChartInputSchema>;
 /** A validated `CardHeader` input. */
 export type CardHeaderInput = z.infer<typeof CardHeaderInputSchema>;
+/** A validated `CardInventory` input. */
+export type CardInventoryInput = z.infer<typeof CardInventoryInputSchema>;
+/** A validated exact-Card detail input. */
+export type CardDetailInput = z.infer<typeof CardDetailInputSchema>;
+/** A validated `CardFacts` input. */
+export type CardFactsInput = z.infer<typeof CardFactsInputSchema>;
+/** A validated `RepositoryIndex` input. */
+export type RepositoryIndexInput = z.infer<typeof RepositoryIndexInputSchema>;
+/** A validated `RepositoryPolicy` input. */
+export type RepositoryPolicyInput = z.infer<typeof RepositoryPolicyInputSchema>;
+/** A validated `RepositoryDeclare` input. */
+export type RepositoryDeclareInput = z.infer<typeof RepositoryDeclareInputSchema>;
+/** A validated `GithubIntegration` input. */
+export type GithubIntegrationInput = z.infer<typeof GithubIntegrationInputSchema>;
+/** A validated `VerificationExecution` input. */
+export type ExecutionInput = z.infer<typeof ExecutionInputSchema>;
+/** A validated `VersionDiff` input. */
+export type VersionDiffInput = z.infer<typeof VersionDiffInputSchema>;
 /** A view or panel range. */
 export type Range = z.infer<typeof RangeSchema>;
 /** One WHERE clause. */

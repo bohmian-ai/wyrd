@@ -141,7 +141,7 @@ async fn authenticate_browser_session(
             if session.recent {
                 request
                     .extensions_mut()
-                    .insert(crate::auth::browser::RecentHumanLogin);
+                    .insert(crate::auth::browser::RecentHumanLogin(session.anchor));
             }
             request
                 .extensions_mut()
@@ -216,11 +216,14 @@ async fn authenticate_on(
         request.headers(),
         surface,
     ) {
-        Ok(principal) => principal,
+        Ok(bearer) => bearer,
         Err(rejection) => return rejection.into_response(),
     };
     let selected = match workload_uid_header(request.headers()) {
-        Ok(root) => verified.select_root(state, root.as_ref()).await,
+        Ok(root) => match verified.authorize(state).await {
+            Ok(principal) => principal.select_root(state, root.as_ref()).await,
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
     match selected {
@@ -401,7 +404,7 @@ mod pg_tests {
         })
     }
 
-    /// Mint a `wyrd`-audience access token lasting `ttl` for a fresh User
+    /// Mint a `wyrd`-audience access token lasting `ttl` for a fresh live User
     /// principal in `tenant`, signed by the test state's issuing key and
     /// carrying no permissions; a negative `ttl` yields an expired token.
     ///
@@ -413,6 +416,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
         };
+        crate::test_support::admit_accounts(state, tenant, &[principal.id], &[]);
         state
             .auth
             .issuing_key
@@ -421,8 +425,7 @@ mod pg_tests {
             .issue_access_token(
                 wyrd_auth_issue::AccessGrant {
                     principal,
-                    roles: vec![],
-                    permissions: wyrd_runtime::PermissionSet::new(),
+                    permission_ceiling: None,
                     card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
                     workload_uid: None,
                     credential_id: None,

@@ -21,6 +21,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
+use crate::authority::{AuthorityError, TenantAuthority};
 use crate::error::auth_error_to_wyrd;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::WyrdApiKey;
@@ -256,7 +257,8 @@ impl DelegateToken {
     /// transaction back.
     /// The issued token names the subject as principal, the actor as its
     /// outermost `act` with the subject token's earlier actors nested inside,
-    /// and carries the actor's current permissions narrowed to the subject's.
+    /// and signs as its ceiling the exact authority the subject and actor
+    /// currently share.
     /// A store failure commits nothing and serves no token; audit never
     /// refuses or delays the exchange.
     ///
@@ -292,10 +294,42 @@ impl DelegateToken {
             .verify(&actor_token, &tenant)
             .map_err(DelegateError::InvalidActorToken)?;
         let (chain, actor_workload_uid) = delegation_chain(&subject, &actor)?;
+        // The subject token carries identity only: its current authority —
+        // grants bounded by its ceiling, key, and earlier actors — comes from
+        // current state. Issuance resolves the actor the same way and signs
+        // only what both share.
+        let subject_permissions = match TenantAuthority::load(&mut conn).await {
+            Err(AuthorityError::Database(error)) => return Err(DelegateError::Database(error)),
+            Err(AuthorityError::Corrupt { role }) => {
+                Err(DelegateError::Issuance(IssuanceError::RoleCorrupt { role }))
+            }
+            Ok(authority) => match authority.check(subject.principal.id) {
+                Err(AuthorityError::Corrupt { role }) => {
+                    Err(DelegateError::Issuance(IssuanceError::RoleCorrupt { role }))
+                }
+                _ => Ok(()),
+            }
+            .and_then(|()| {
+                authority
+                    .authorize(&subject)
+                    .ok_or(DelegateError::Issuance(IssuanceError::PrincipalInactive))
+                    .and_then(|now| {
+                        now.effective_permissions
+                            .flatten()
+                            .map_err(|error| DelegateError::Issuance(error.into()))
+                    })
+            }),
+        };
+        let subject_permissions = match subject_permissions {
+            Ok(permissions) => permissions,
+            Err(error) => {
+                self.record_refusal(tenant, &subject, &chain, &actor, audience, request_id);
+                return Err(error);
+            }
+        };
         let grant = TenantGrant::Delegation {
             subject: Box::new(TokenPrincipalRef::from(&subject.principal)),
-            subject_roles: subject.principal.roles.clone(),
-            subject_permissions: subject.principal.effective_permissions.clone(),
+            subject_permissions,
             subject_card_access: subject.principal.card_access.clone(),
             subject_workload_uid: subject.principal.workload_uid.clone(),
             actor_workload_uid,
@@ -599,7 +633,8 @@ pub(crate) mod pg_tests {
     use wyrd_sql::queries::cards::get_card_by_ref;
 
     use crate::audit::test_audit::RecordedAudit;
-    use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
+    use wyrd_dev_fixtures::pg::bind_test_permissions;
+    use wyrd_sql::queries::auth::{ApiKeyStatus, SubjectColumns};
 
     use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError};
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
@@ -675,9 +710,10 @@ pub(crate) mod pg_tests {
         }
     }
 
-    /// Mint a `wyrd`-audience token for `principal` carrying `permissions`
-    /// and `card_access`, attributed to `credential_id`, with an optional
-    /// selected `root` and `act`.
+    /// Mint a `wyrd`-audience token for `principal` with `card_access`,
+    /// attributed to `credential_id`, with an optional selected `root` and
+    /// `act`. A nonempty `permissions` is signed as the token's ceiling; an
+    /// empty one signs none, so the principal holds its current grants.
     ///
     /// # Panics
     /// Panics when the test issuing key cannot sign the token.
@@ -693,8 +729,7 @@ pub(crate) mod pg_tests {
             .issue_access_token(
                 AccessGrant {
                     principal,
-                    roles: vec![],
-                    permissions,
+                    permission_ceiling: (!permissions.is_empty()).then_some(permissions),
                     card_access,
                     workload_uid: root,
                     credential_id,
@@ -735,11 +770,15 @@ pub(crate) mod pg_tests {
         }
     }
 
-    /// Mint a rootless unrestricted Service subject token carrying
-    /// `permissions`.
-    fn subject_token(tenant: DataTenantId, permissions: PermissionSet) -> String {
+    /// Mint a rootless unrestricted token for a freshly seeded Service
+    /// subject granted and ceilinged at exactly `permissions`.
+    async fn subject_token(fixture: &PgFixture, permissions: PermissionSet) -> String {
+        let grants: Vec<Permission> = permissions.iter().cloned().collect();
         mint(
-            service_ref(Uuid::new_v4(), tenant),
+            service_ref(
+                seed_subject(fixture, &grants).await,
+                fixture.data_tenant_id(),
+            ),
             permissions,
             None,
             CardAccess::AnyRegistered,
@@ -1517,15 +1556,38 @@ pub(crate) mod pg_tests {
         let root = root_uid(&mut conn, &root_ref).await;
         let id = insert_test_service_account(&mut conn, creator, Some(&service_family(ACTOR_CARD)))
             .await;
-        let role_id = Uuid::new_v4();
-        insert_role(&mut conn, role_id, "delegation_actor", &permissions, false)
+        let permissions: Vec<Permission> =
+            serde_json::from_value(permissions).expect("actor grants decode");
+        bind_test_permissions(&mut conn, service_subject(id), &permissions)
             .await
-            .expect("actor role seeds");
-        grant_role_to_service_account(&mut conn, id, role_id)
-            .await
-            .expect("actor role grants");
+            .expect("actor grants bind");
         conn.commit().await.expect("seed commits");
         SeededActor { id, root, shared }
+    }
+
+    /// The binding subject of Service account `id`.
+    fn service_subject(id: Uuid) -> SubjectColumns {
+        SubjectColumns {
+            service_account_id: Some(id),
+            ..SubjectColumns::default()
+        }
+    }
+
+    /// Seed an active unrestricted Service account bound to `grants` and
+    /// return its id. A subject or earlier actor's authority is its current
+    /// grants bounded by its token's ceiling.
+    ///
+    /// # Panics
+    /// Panics when a seed write or commit fails.
+    async fn seed_subject(fixture: &PgFixture, grants: &[Permission]) -> Uuid {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = insert_test_user(&mut conn, fixture.data_tenant_id()).await;
+        let id = insert_test_service_account(&mut conn, creator, None).await;
+        bind_test_permissions(&mut conn, service_subject(id), grants)
+            .await
+            .expect("subject grants bind");
+        conn.commit().await.expect("seed commits");
+        id
     }
 
     /// Mint the actor's own direct token under `root`. Its permissions claim
@@ -1624,7 +1686,7 @@ pub(crate) mod pg_tests {
         let result = exchange(
             &fixture,
             &audit,
-            subject_token(tenant, PermissionSet::new()),
+            subject_token(&fixture, PermissionSet::new()).await,
             actor_token(Uuid::new_v4(), tenant, &unregistered_uid()),
         )
         .await;
@@ -1652,7 +1714,7 @@ pub(crate) mod pg_tests {
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let actor = seed_actor(&fixture, serde_json::json!([])).await;
-        let subject = subject_token(tenant, PermissionSet::new());
+        let subject = subject_token(&fixture, PermissionSet::new()).await;
         let earlier = Uuid::now_v7();
         let delegated_actor = mint(
             service_ref(actor.id, tenant),
@@ -1747,8 +1809,11 @@ pub(crate) mod pg_tests {
                 table_uid: table,
             })),
         };
-        let subject_id = Uuid::new_v4();
-        let earlier = service_ref(Uuid::new_v4(), tenant);
+        let subject_id = seed_subject(&fixture, &[Permission::wildcard()]).await;
+        let earlier = service_ref(
+            seed_subject(&fixture, &[Permission::wildcard()]).await,
+            tenant,
+        );
         let subject = mint(
             service_ref(subject_id, tenant),
             [
@@ -1794,8 +1859,8 @@ pub(crate) mod pg_tests {
             "earlier actors come first and the new actor is current"
         );
         assert_eq!(
-            delegated.principal.effective_permissions,
-            [Permission::card_read(), table_grant].into_iter().collect(),
+            delegated.permission_ceiling,
+            Some([Permission::card_read(), table_grant].into_iter().collect()),
             "wildcard narrows to the subject's read, schema narrows to the subject's table, \
              and one-sided grants such as the actor's write are dropped"
         );
@@ -1872,7 +1937,7 @@ pub(crate) mod pg_tests {
             let result = exchange(
                 &fixture,
                 &audit,
-                subject_token(tenant, subject_grants.into_iter().collect()),
+                subject_token(&fixture, subject_grants.into_iter().collect()).await,
                 actor_token(actor.id, tenant, &actor.root),
             )
             .await;
@@ -1883,8 +1948,8 @@ pub(crate) mod pg_tests {
                     .verify_on(&exchanged.access_token, &tenant, TokenAudience::Bifrost)
                     .expect("delegated token verifies");
                 assert_eq!(
-                    delegated.principal.effective_permissions,
-                    expected.into_iter().collect(),
+                    delegated.permission_ceiling,
+                    Some(expected.into_iter().collect()),
                     "{actor_grants}"
                 );
             } else {
@@ -1924,8 +1989,8 @@ pub(crate) mod pg_tests {
         .await;
         let verifier = delegate_service(&RecordedAudit::new()).verifier;
         let subject_root = unregistered_uid();
-        let subject_id = Uuid::now_v7();
-        let earlier_id = Uuid::now_v7();
+        let subject_id = seed_subject(&fixture, &[Permission::wildcard()]).await;
+        let earlier_id = seed_subject(&fixture, &[Permission::wildcard()]).await;
         let earlier_root = unregistered_uid();
         let earlier_credential = Uuid::now_v7();
         let reads: PermissionSet = std::iter::once(Permission::card_read()).collect();
@@ -1969,7 +2034,7 @@ pub(crate) mod pg_tests {
             ),
             (
                 "rootless unrestricted subject",
-                subject_token(tenant, reads.clone()),
+                subject_token(&fixture, reads.clone()).await,
                 None,
                 scoped(vec![actor.root.clone(), actor.shared.clone()]),
                 false,
@@ -1994,7 +2059,8 @@ pub(crate) mod pg_tests {
             );
             assert_eq!(principal.credential_id, None, "{label}: no top-level cid");
             assert_eq!(
-                principal.effective_permissions, reads,
+                delegated.permission_ceiling,
+                Some(reads.clone()),
                 "{label}: permissions"
             );
             let current = &delegated
@@ -2085,7 +2151,7 @@ pub(crate) mod pg_tests {
         let error = exchange(
             &fixture,
             &RecordedAudit::new(),
-            subject_token(tenant, reads),
+            subject_token(&fixture, reads).await,
             actor_token(actor.id, tenant, &foreign_root),
         )
         .await

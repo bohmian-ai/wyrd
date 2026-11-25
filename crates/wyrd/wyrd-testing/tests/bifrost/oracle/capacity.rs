@@ -108,14 +108,8 @@ const INTERACTIVE_DEADLINE_MS: i64 = 60_000;
 /// advances execution, so a bound on pulls is a bound on the wait.
 const ANALYTICAL_WARMUP_FRAMES: usize = 4096;
 
-/// Bound on how long one awaited observation may take before it is a failure.
-const OBSERVATION_DEADLINE: Duration = Duration::from_mins(1);
-
 /// Bound on polls waiting for a released query's gauge to settle.
 const PHYSICAL_EVIDENCE_POLLS: usize = 300;
-
-/// Interval between polls for a settled gauge.
-const PHYSICAL_EVIDENCE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A live Analytical query holding its grant does not stop two tenants'
 /// bounded Interactive queries from being admitted and completing at the
@@ -855,7 +849,6 @@ fn fixture_principal(tenant: DataTenantId) -> wyrd_runtime::principal::Principal
         wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
         wyrd_runtime::principal::PrincipalKind::User,
         tenant,
-        Vec::new(),
         wyrd_runtime::PermissionSet::new(),
     )
 }
@@ -1348,20 +1341,25 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     }
 
     let refused = client(server, "memory-refusal-reader").await?;
-    let refusal = drain_query(
-        &wyrd_client::Bifrost::query_only(&refused),
-        &format!(
-            "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
-             FROM bifrost.bifrost.{table} WHERE id > {REFUSAL_WIDE_ROWS_AFTER} ORDER BY wide_key"
-        ),
-    )
-    .await
-    .err()
-    .ok_or("a query against a fully occupied root was not refused")?;
-    if !refusal.contains(QUERY_RESOURCES_EXHAUSTED_CODE) {
-        return Err(
-            format!("refusal carried {refusal} rather than the typed resource code").into(),
-        );
+    let wide = format!(
+        "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
+         FROM bifrost.bifrost.{table} WHERE id > {REFUSAL_WIDE_ROWS_AFTER} ORDER BY wide_key"
+    );
+    // Analysis executes the same governed sort, so it is refused the same way
+    // rather than returning a plan of the failed execution.
+    for sql in [wide.clone(), format!("EXPLAIN ANALYZE {wide}")] {
+        let refusal = drain_query(&wyrd_client::Bifrost::query_only(&refused), &sql)
+            .await
+            .err()
+            .ok_or_else(|| {
+                format!("{sql}: a query against a fully occupied root was not refused")
+            })?;
+        if !refusal.contains(QUERY_RESOURCES_EXHAUSTED_CODE) {
+            return Err(format!(
+                "{sql}: refusal carried {refusal} rather than the typed resource code"
+            )
+            .into());
+        }
     }
 
     server.release_query_memory_hold()?;
@@ -1653,30 +1651,6 @@ async fn wait_ready(server: &WyrdTestServer) -> Result<(), JourneyError> {
         let body = response.text().await?;
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("the server never became ready: {body}").into());
-        }
-        tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
-    }
-}
-
-/// Polls the Oracle's own runtime inspection until `ready` holds.
-///
-/// # Errors
-///
-/// Returns the inspection error, or a timeout naming the last inspection.
-async fn wait_inspection(
-    server: &WyrdTestServer,
-    ready: impl Fn(&wyrd_testing::server::OracleRuntimeInspection) -> bool,
-) -> Result<(), JourneyError> {
-    let deadline = tokio::time::Instant::now() + OBSERVATION_DEADLINE;
-    loop {
-        let inspection = server.oracle_runtime_inspection()?;
-        if ready(&inspection) {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(
-                format!("the Oracle never reached the awaited state: {inspection:?}").into(),
-            );
         }
         tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
     }

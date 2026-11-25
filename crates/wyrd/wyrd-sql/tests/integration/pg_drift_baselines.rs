@@ -33,7 +33,6 @@ fn actor(tenant: DataTenantId) -> Principal {
         PrincipalId::new(Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     )
 }

@@ -7,7 +7,9 @@ mod trusted_issuers;
 mod users;
 mod workload_bindings;
 
-pub use human_connections::{HumanConnectionBinding, HumanConnectionRow, HumanSessionBinding};
+pub use human_connections::{
+    HumanConnectionBinding, HumanConnectionRow, HumanLoginAnchor, HumanSessionBinding,
+};
 pub use refresh_tokens::RefreshTokenRow;
 pub use roles::RoleRow;
 pub use trusted_issuers::TrustedIssuerRow;

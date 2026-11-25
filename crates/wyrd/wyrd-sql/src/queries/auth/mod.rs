@@ -8,17 +8,20 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod authority;
 pub mod browser_sessions;
+pub mod contacts;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod local_passwords;
+pub mod login_policy;
 pub mod login_state;
 /// Discovery of the users and Service or Agent principals a tenant
 /// administrator can assign Roles to.
 pub mod principal_directory;
 pub mod refresh_tokens;
 pub mod revocation;
-pub mod role_assignments;
+pub mod role_bindings;
 pub mod roles;
 pub mod service_accounts;
 pub mod trusted_issuers;
@@ -30,9 +33,17 @@ pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, page_api_key_metadata,
     revoke_api_key,
 };
+pub use authority::{
+    AuthorityApiKey, AuthorityBinding, AuthorityMembership, AuthorityServiceAccount,
+    AuthorityState, authority_state,
+};
 pub use browser_sessions::{
-    BrowserSessionAuthority, LiveBrowserSession, insert_browser_session, live_browser_session,
-    revoke_browser_session,
+    BrowserSessionAuthority, LiveBrowserSession, SocialAnchor, insert_browser_session,
+    live_browser_session, revoke_browser_session,
+};
+pub use contacts::{
+    CONTACT_CHANNEL, VerifiedContact, insert_verified_contact, live_contact,
+    replace_verified_contact, tenant_contacts, verified_contact_for_update,
 };
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,
@@ -48,28 +59,33 @@ pub use human_connections::{
 };
 pub use local_passwords::{
     AttemptScope, InvitationRow, PasswordResetRow, attempt_refusal, consume_invitation,
-    consume_password_reset, insert_invitation, insert_password_reset, record_attempt_failure,
-    revoke_invitation,
+    consume_password_reset, insert_invitation, insert_password_reset, pending_invitations,
+    record_attempt_failure, record_invitation_delivery, reissue_invitation, revoke_invitation,
 };
 pub use login_state::{
-    GithubLoginState, LoginState, bind_github_login_state, consume_github_login_state,
-    consume_login_state, insert_github_login_state, insert_login_state,
+    GithubLoginState, LoginState, SocialLoginState, bind_github_login_state,
+    consume_github_login_state, consume_login_state, consume_social_login_state,
+    insert_github_login_state, insert_login_state, insert_social_login_state,
 };
 pub use principal_directory::{
-    AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,
+    AssignablePrincipalRow, PrincipalFilter, PrincipalStatusCountsRow, assignable_principal,
+    count_assignable_principals, list_assignable_principals,
 };
 pub use refresh_tokens::{
     consume_active_refresh, insert_human_refresh_token, lock_refresh_family, refresh_by_hash,
     refresh_issuance_instant, revoke_refresh, revoke_refresh_chain, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
-pub use role_assignments::{
-    grant_role_to_service_account, grant_role_to_user, list_service_account_roles,
-    list_user_role_assignments, list_user_roles, replace_idp_user_roles,
-    revoke_role_from_service_account, revoke_role_from_user,
+pub use role_bindings::{
+    AUTHORIZATION_CHANNEL, MembershipRow, RoleBindingRow, SubjectColumns,
+    advance_authorization_revision, current_authorization_revision, delete_group,
+    delete_group_membership, delete_role_binding, insert_group, insert_group_membership,
+    insert_role_binding, list_group_memberships, list_groups, list_role_bindings,
+    replace_idp_user_bindings,
 };
 pub use roles::{
-    RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,
+    RoleListRow, RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name,
+    roles_by_name, set_role_description,
 };
 pub use service_accounts::{
     ApiKeyLookupRow, ApiKeyOwner, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
@@ -83,11 +99,14 @@ pub use trusted_issuers::{
     trusted_issuer_by_url, trusted_issuer_exists, trusted_issuers_for_tenant,
     upsert_trusted_issuer,
 };
-pub use user_identities::{upsert_user_identity, user_id_by_identity};
+pub use user_identities::{
+    LinkedIdentity, insert_user_identity, linked_identity, upsert_user_identity,
+    user_id_by_identity,
+};
 pub use users::{
-    LocalCredentialRow, UserRow, delete_user, insert_local_user, insert_user,
-    local_credential_by_username, local_credential_for_update, local_username, set_password_hash,
-    user_by_id,
+    LocalCredentialRow, UserProfileRow, UserRow, delete_user, first_local_user, insert_local_user,
+    insert_user, local_credential_by_username, local_credential_for_update, local_username,
+    refresh_display_name, set_password_hash, user_by_id, user_profile,
 };
 pub use workload_bindings::{
     WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,

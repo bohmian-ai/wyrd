@@ -794,7 +794,7 @@ pub enum QueryParam {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BifrostQueryRequest {
-    /// SELECT-only SQL text.
+    /// One SELECT statement, or one `EXPLAIN [ANALYZE]` of it.
     pub sql: String,
     /// Ordered bind values for the `$1..$n` placeholders in `sql`.
     ///

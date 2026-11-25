@@ -184,6 +184,14 @@
    "w": 1440,
    "h": 1012,
    "title": "Verify grouped by session: the session verdict heads its member runs; session result in the drawer"
+  },
+  "Cards.dc.html": {
+   "expand": "fill",
+   "x": 3040,
+   "y": 3740,
+   "w": 1440,
+   "h": 1000,
+   "title": "Cards: every Card version from cards.list; kind, status and metadata filter; cursor paging"
   }
  },
  "createdOnFiles": {
@@ -289,6 +297,13 @@
    "w": 720,
    "x": 0,
    "y": 6340
+  },
+  "cardslist": {
+   "size": 24,
+   "w": 560,
+   "x": 4560,
+   "y": 3740,
+   "text": "Revision 19, Cards (REQ-008, CardInventory), approved by the caller on 2026-11-06:\n\u2022 Every value comes from cards.list (CardSummary): kind, name, version, status, uid, updated. No description, labels or counts: the summary doesn't carry them.\n\u2022 One row per version, in registry order (created_at). No column sort: the server has none.\n\u2022 Kind lists the 12 registrable kinds.\n\u2022 Filter is the metadata query (labels., annotations., name =~ \u2026); plain text becomes name =~. Kind and Status map to the request's kind and status; default hides deleted. Prerelease maps to include_prerelease.\n\u2022 Load more follows next_cursor; no total.\n\u2022 A row opens its kind's page (Agent, Prompt, Model, Data, Service, Verifier) or the generic Card page.\n\u2022 Empty, empty-tenant, invalid filter and denied states use stable error codes."
   }
  },
  "order": [

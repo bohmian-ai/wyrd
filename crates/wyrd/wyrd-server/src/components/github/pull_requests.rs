@@ -40,22 +40,26 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, CardPermissionScope};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, ExecutionId, RepositoryId};
+use wyrd_spec::github_connection::{
+    GithubPullRequestReviewRequest, GithubPullRequestReviewResponse,
+};
+use wyrd_spec::ids::{CardName, CardUid, ExecutionId, IdempotencyKey, RepositoryId};
 use wyrd_spec::verification::VerificationError;
+use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_spec::verification::execution::{PullRequestActivation, PullRequestRef};
-use wyrd_sql::queries::cards::{repository_family_name, selected_repository};
+use wyrd_sql::queries::cards::{card_scopes, repository_family_name, selected_repository};
 use wyrd_sql::queries::verifier_executions::{
-    Admission, PullRequestAdmission, PullRequestEnd, PullRequestExecution, PullRequestGeneration,
-    PullRequestKey, PullRequestTarget, VerifierExecutionQueue,
+    Admission, Admitted, PullRequestAdmission, PullRequestEnd, PullRequestExecution,
+    PullRequestGeneration, PullRequestKey, PullRequestTarget, VerifierExecutionQueue,
 };
 
 use super::app::{GithubApp, PullRequestBody, unavailable};
 use super::service::{GithubConnections, InstallationAccess};
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::scribe_outbox::ScribeWrite;
+use crate::scribe_outbox::{ScribeWrite, stage_cancelled};
 use crate::state::registry_db_error;
 use crate::verification::authority::{AuthorityRefusal, BackgroundAuthority};
 use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
@@ -63,6 +67,47 @@ use crate::verification::submissions::{AdmissionReply, Queued};
 
 /// Audit operation of a pull-request admission's `verifier:run` check.
 const ADMIT: &str = "verification.pull_request.admit";
+
+/// The audited operation of an explicit fresh-review request.
+const REVIEW: &str = "github_connection.review_pull_request";
+
+/// The audited resource of a review request for PR `number` of
+/// `repository_id`.
+fn review_resource(repository_id: &RepositoryId, number: u64) -> String {
+    format!("pull_request:{repository_id}#{number}")
+}
+
+/// What asks for a PR observation to be decided.
+#[derive(Clone, Copy)]
+enum Admitting<'r> {
+    /// A provider delivery with this id.
+    Delivery(&'r str),
+    /// An explicit fresh-review request by `caller` under `key`.
+    Request {
+        /// The authenticated requester.
+        caller: &'r Caller,
+        /// The request's idempotency key.
+        key: &'r str,
+    },
+}
+
+impl Admitting<'_> {
+    /// The answer when the observation admits nothing for `reason`: no
+    /// work for a delivery, [`WyrdError::GithubPullRequestNotReviewable`]
+    /// for a request.
+    ///
+    /// # Errors
+    /// Returns the refusal for a request.
+    fn nothing<T>(self, reason: &str) -> Result<Option<T>, WyrdError> {
+        match self {
+            Self::Delivery(_) => Ok(None),
+            Self::Request { .. } => Err(WyrdError::GithubPullRequestNotReviewable {
+                message: format!("the pull request cannot be reviewed now: {reason}"),
+                details: serde_json::json!({ "reason": reason }),
+            }),
+        }
+    }
+}
 
 /// How often [`GithubConnections::run_delivery_recovery`] scans the App's
 /// delivery log.
@@ -216,7 +261,7 @@ impl GithubConnections<'_> {
             repository_id: &repository_id,
             number: event.number,
         };
-        let InstallationAccess { token, binding, .. } = match self
+        let access = match self
             .installation_access(tenant, Some(installation), event.repository.id)
             .await
         {
@@ -230,24 +275,160 @@ impl GithubConnections<'_> {
             }
             Err(error) => return Err(error),
         };
+        let admitted = self
+            .admit(app, tenant, key, access, Admitting::Delivery(delivery_id))
+            .await?;
+        Ok(admitted
+            .map(|(_, executions)| executions)
+            .unwrap_or_default())
+    }
+
+    /// Admit a fresh review of one connected pull request by its selected
+    /// Repository's whole `pull_request` binding set, as `caller` requested
+    /// under `key`, and return the accepted generation and every member
+    /// once each is durably admitted or settled.
+    ///
+    /// The caller needs `cards:read`, then `verifier:run` on every selected
+    /// Verifier; members still run under
+    /// the selecting declaration's accountable authority. A distinct key
+    /// admits a new generation even at the PR's unchanged source and
+    /// supersedes the older one. A retry of the same key for the same PR,
+    /// concurrent or after a restart, returns the generation it admitted,
+    /// even after the PR moved on, and never reactivates superseded work.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubRequestInvalid`] for another host or a
+    /// non-numeric repository id, the permission denial,
+    /// [`WyrdError::GithubPullRequestNotReviewable`] for a missing, closed
+    /// or draft PR or a policy binding no pull requests, the connection
+    /// errors of [`Self::installation_access`], and the retryable errors of
+    /// [`Self::pull_request`]. None accepts any work.
+    #[tracing::instrument(skip(self, caller, key), fields(operation = REVIEW, number = request.number))]
+    pub(crate) async fn review_pull_request(
+        &self,
+        caller: &Caller,
+        request: &GithubPullRequestReviewRequest,
+        key: &IdempotencyKey,
+    ) -> Result<GithubPullRequestReviewResponse, WyrdError> {
+        let app = self.app()?;
+        let host = app.settings().host();
+        let invalid = |message: &str| WyrdError::GithubRequestInvalid {
+            message: message.to_owned(),
+            details: serde_json::json!({ "host": host }),
+        };
+        if request.host != host {
+            return Err(invalid(
+                "the request names a host this server is not connected to",
+            ));
+        }
+        let repository = request
+            .repository_id
+            .as_str()
+            .parse::<u64>()
+            .map_err(|_| invalid("repository_id is not a GitHub repository id"))?;
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::card_read(),
+            REVIEW,
+            &review_resource(&request.repository_id, request.number),
+        )?;
+        let tenant = caller.data_tenant_id;
+        let access = self.installation_access(tenant, None, repository).await?;
+        let key_of = PullRequestKey {
+            host: &host,
+            repository_id: &request.repository_id,
+            number: request.number,
+        };
+        let (generation, executions) = self
+            .admit(
+                app,
+                tenant,
+                key_of,
+                access,
+                Admitting::Request {
+                    caller,
+                    key: key.as_str(),
+                },
+            )
+            .await?
+            .ok_or_else(|| WyrdError::internal("an accepted review admitted no generation"))?;
+        Ok(GithubPullRequestReviewResponse {
+            generation,
+            executions,
+        })
+    }
+
+    /// Decide one observation of the PR `key` under its lock, as the
+    /// [module](self) describes, for a provider delivery or an explicit
+    /// review request, and hand the decided generation off.
+    ///
+    /// A delivery replays a current generation that already reviews the
+    /// source and returns `None` when it owes no work. A request first
+    /// replays the generation its key admitted, then never replays a
+    /// source, and refuses, without changing state, every outcome that
+    /// would admit nothing.
+    ///
+    /// # Errors
+    /// The errors of [`Self::pull_request`] and
+    /// [`Self::review_pull_request`].
+    async fn admit(
+        &self,
+        app: &GithubApp,
+        tenant: DataTenantId,
+        key: PullRequestKey<'_>,
+        access: InstallationAccess,
+        admitting: Admitting<'_>,
+    ) -> Result<Option<(Uuid, Vec<ExecutionId>)>, WyrdError> {
+        let InstallationAccess { token, binding, .. } = access;
         let queue = VerifierExecutionQueue::default();
         let mut conn = self.conn(tenant).await?;
         queue
             .lock_pull_request(&mut conn, key)
             .await
             .map_err(registry_db_error)?;
+        if let Admitting::Request {
+            caller,
+            key: request_key,
+        } = admitting
+            && let Some(generation) = queue
+                .requested_pull_request(&mut conn, key, request_key)
+                .await
+                .map_err(registry_db_error)?
+        {
+            let uids: Vec<CardUid> = generation
+                .executions
+                .iter()
+                .map(|execution| execution.verifier_card_uid.clone())
+                .collect();
+            let scopes = card_scopes(&mut conn, &uids).await?;
+            conn.commit().await.map_err(registry_db_error)?;
+            for uid in &uids {
+                self.may_request(caller, scopes.get(uid), key)?;
+            }
+            tracing::info!("the review request replays the generation its key admitted");
+            let executions = self.hand_off(tenant, &generation).await?;
+            return Ok(Some((generation.activation.generation, executions)));
+        }
         let observed_at = queue
             .observe_pull_request(&mut conn)
             .await
             .map_err(registry_db_error)?;
         let current = app
-            .pull_request(&token, event.repository.id, event.number)
+            .pull_request(
+                &token,
+                key.repository_id
+                    .as_str()
+                    .parse()
+                    .map_err(|_| unavailable("the pull request key"))?,
+                key.number,
+            )
             .await?;
         drop(token);
         let Some(current) = current else {
             conn.commit().await.map_err(registry_db_error)?;
             tracing::info!("GitHub no longer shows the pull request; nothing admitted");
-            return Ok(Vec::new());
+            return admitting.nothing("not_found");
         };
         let observed = Observed::of(current)?;
         Self::hold_binding(&mut conn, binding).await?;
@@ -258,57 +439,103 @@ impl GithubConnections<'_> {
         if history.obsolete(observed_at) {
             conn.commit().await.map_err(registry_db_error)?;
             tracing::info!("a newer observation of the pull request already decided it");
-            return Ok(Vec::new());
+            return match admitting {
+                Admitting::Delivery(_) => Ok(None),
+                Admitting::Request { .. } => Err(WyrdError::ServiceUnavailable {
+                    message: "a concurrent observation decided the pull request; retry the request"
+                        .to_owned(),
+                    details: serde_json::json!({}),
+                }),
+            };
         }
         let (base, head, head_repository_id) = match observed {
             Observed::Ended(end) => {
+                if let Admitting::Request { .. } = admitting {
+                    conn.commit().await.map_err(registry_db_error)?;
+                    return admitting.nothing(match end {
+                        PullRequestEnd::Draft => "draft",
+                        PullRequestEnd::Closed | PullRequestEnd::Superseded => "closed",
+                    });
+                }
                 let cancelled = queue
                     .deactivate_pull_request(&mut conn, key, observed_at, end)
                     .await
                     .map_err(registry_db_error)?;
+                let occurred_at = chrono::Utc::now();
                 conn.commit().await.map_err(registry_db_error)?;
                 tracing::info!(
                     ?end,
                     cancelled = cancelled.len(),
                     "pull request deactivated"
                 );
-                return Ok(Vec::new());
+                stage_cancelled(
+                    self.state.bifrost.scribe_outbox(),
+                    tenant,
+                    cancelled,
+                    occurred_at,
+                );
+                return Ok(None);
             }
             Observed::Source(base, head, head_repository_id) => (base, head, head_repository_id),
         };
+        let (delivery_id, request_key, requester) = match admitting {
+            Admitting::Delivery(delivery_id) => (Some(delivery_id.to_owned()), None, None),
+            Admitting::Request { caller, key } => (None, Some(key.to_owned()), Some(caller)),
+        };
         let source = PullRequestActivation {
-            host: host.clone(),
-            repository_id: repository_id.clone(),
-            number: event.number,
+            host: key.host.to_owned(),
+            repository_id: key.repository_id.clone(),
+            number: key.number,
             base,
             head,
             head_repository_id,
-            delivery_id: delivery_id.to_owned(),
+            delivery_id,
+            request_key,
             generation: Uuid::now_v7(),
+            members: Vec::new(),
         };
-        let replay = history
-            .current
-            .as_ref()
-            .is_some_and(|generation| !generation.deactivated && generation.reviews(&source));
+        let mut fenced = Vec::new();
+        let replay = requester.is_none()
+            && history
+                .current
+                .as_ref()
+                .is_some_and(|generation| !generation.deactivated && generation.reviews(&source));
         if !replay {
-            let Some(targets) = self.targets(&mut conn, &repository_id).await? else {
-                let superseded = queue
-                    .deactivate_pull_request(
-                        &mut conn,
-                        key,
-                        observed_at,
-                        PullRequestEnd::Superseded,
-                    )
-                    .await
-                    .map_err(registry_db_error)?;
-                conn.commit().await.map_err(registry_db_error)?;
-                tracing::info!(
-                    superseded = superseded.len(),
-                    "no selected Repository binds this repository's pull requests"
-                );
-                return Ok(Vec::new());
+            let targets = match self.targets(&mut conn, key, requester).await? {
+                Some(targets) => targets,
+                None if requester.is_some() => {
+                    conn.commit().await.map_err(registry_db_error)?;
+                    return admitting.nothing("no_bindings");
+                }
+                None => {
+                    let superseded = queue
+                        .deactivate_pull_request(
+                            &mut conn,
+                            key,
+                            observed_at,
+                            PullRequestEnd::Superseded,
+                        )
+                        .await
+                        .map_err(registry_db_error)?;
+                    let occurred_at = chrono::Utc::now();
+                    conn.commit().await.map_err(registry_db_error)?;
+                    tracing::info!(
+                        superseded = superseded.len(),
+                        "no selected Repository binds this repository's pull requests"
+                    );
+                    stage_cancelled(
+                        self.state.bifrost.scribe_outbox(),
+                        tenant,
+                        superseded,
+                        occurred_at,
+                    );
+                    return Ok(None);
+                }
             };
-            let (reserved, superseded) = queue
+            let Admitted {
+                outcome: (reserved, superseded),
+                cancelled,
+            } = queue
                 .reserve_pull_request(&mut conn, &source, observed_at, &targets)
                 .await
                 .map_err(registry_db_error)?;
@@ -317,17 +544,53 @@ impl GithubConnections<'_> {
                 superseded = superseded.len(),
                 "pull request generation admitted"
             );
+            fenced = superseded;
+            fenced.extend(cancelled);
         }
         let generation = queue
             .lock_pull_request(&mut conn, key)
             .await
             .map_err(registry_db_error)?
             .current;
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        stage_cancelled(
+            self.state.bifrost.scribe_outbox(),
+            tenant,
+            fenced,
+            occurred_at,
+        );
         match generation {
-            Some(generation) => self.hand_off(tenant, &generation).await,
-            None => Ok(Vec::new()),
+            Some(generation) => {
+                let executions = self.hand_off(tenant, &generation).await?;
+                Ok(Some((generation.activation.generation, executions)))
+            }
+            None => Ok(None),
         }
+    }
+
+    /// Decide, and audit, that `caller` may request a review run by
+    /// Verifier `verifier` of PR `key`: `verifier:run` on the Verifier's
+    /// exact registered scope.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationTargetNotFound`] for a Verifier with
+    /// no registered Card, and [`WyrdError::PermissionDeniedRbac`] for the
+    /// denial.
+    fn may_request(
+        &self,
+        caller: &Caller,
+        verifier: Option<&CardPermissionScope>,
+        key: PullRequestKey<'_>,
+    ) -> Result<(), WyrdError> {
+        let verifier = verifier.ok_or_else(unregistered_verifier)?;
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::verifier_run(verifier.clone()),
+            REVIEW,
+            &review_resource(key.repository_id, key.number),
+        )
     }
 
     /// The frozen target of every `pull_request` binding of the Repository
@@ -335,19 +598,23 @@ impl GithubConnections<'_> {
     /// accountable principal; `None` when no Repository is selected or it
     /// binds no pull requests.
     ///
-    /// The principal's current authority is resolved once and `verifier:run`
-    /// is decided, and audited, for each binding's Verifier; a refusal
-    /// becomes that binding's settled error.
+    /// A `requester` of an explicit review must first hold
+    /// [`Self::may_request`] for every binding's Verifier, or nothing is
+    /// admitted. The principal's current authority is then resolved once
+    /// and `verifier:run` is decided, and audited, for each binding's
+    /// Verifier; a refusal becomes that binding's settled error.
     ///
     /// # Errors
-    /// Returns [`WyrdError::ServiceUnavailable`] when the authority cannot be
+    /// Returns the requester's permission denial,
+    /// [`WyrdError::ServiceUnavailable`] when the authority cannot be
     /// decided now, or a registry error.
     async fn targets(
         &self,
         conn: &mut wyrd_sql::TenantConn<'_>,
-        repository_id: &RepositoryId,
+        key: PullRequestKey<'_>,
+        requester: Option<&Caller>,
     ) -> Result<Option<Vec<PullRequestTarget>>, WyrdError> {
-        let Some(name) = repository_family_name(conn, repository_id.as_str()).await? else {
+        let Some(name) = repository_family_name(conn, key.repository_id.as_str()).await? else {
             return Ok(None);
         };
         let name = CardName::new(name).map_err(|error| WyrdError::internal(error.to_string()))?;
@@ -360,6 +627,16 @@ impl GithubConnections<'_> {
             .map_err(registry_db_error)?;
         if bindings.is_empty() {
             return Ok(None);
+        }
+        let uids: Vec<CardUid> = bindings
+            .iter()
+            .map(|binding| binding.verifier_card_uid.clone())
+            .collect();
+        let scopes = card_scopes(conn, &uids).await?;
+        if let Some(caller) = requester {
+            for uid in &uids {
+                self.may_request(caller, scopes.get(uid), key)?;
+            }
         }
         let principal = wyrd_runtime::principal::PrincipalId::new(selected.principal);
         let issuer = self
@@ -395,15 +672,20 @@ impl GithubConnections<'_> {
                                 authority.authority(),
                                 authority.attribution().act_principal_id,
                             );
-                            audit::authorize(
-                                self.state,
-                                &caller,
-                                &Permission::verifier_run(binding.verifier_card_uid.clone()),
-                                ADMIT,
-                                &format!("binding:{}", binding.binding_id),
-                            )
-                            .map(|()| authority.clone())
-                            .map_err(|error| (authority.attribution(), refused(&error)))
+                            scopes
+                                .get(&binding.verifier_card_uid)
+                                .ok_or_else(unregistered_verifier)
+                                .and_then(|scope| {
+                                    audit::authorize(
+                                        self.state,
+                                        &caller,
+                                        &Permission::verifier_run(scope.clone()),
+                                        ADMIT,
+                                        &format!("binding:{}", binding.binding_id),
+                                    )
+                                })
+                                .map(|()| authority.clone())
+                                .map_err(|error| (authority.attribution(), refused(&error)))
                         }
                         Err(error) => Err((Attribution::direct(principal), refused(error))),
                     };
@@ -416,12 +698,21 @@ impl GithubConnections<'_> {
         ))
     }
 
-    /// Stage the input record of every still-reserved execution of
-    /// `generation` and wait until the queue writer activated each.
+    /// Stage the input record of every still-reserved, refused or cancelled
+    /// execution of `generation` and wait until the queue writer activated
+    /// or durably retained each.
+    ///
+    /// A cancelled member may have been superseded before its handoff was
+    /// retained, so a replay of its generation, such as a retried review
+    /// request key, retains it then; its activation is a no-op. An active
+    /// member was activated only after its record was retained, so it is
+    /// not staged again.
     ///
     /// Each record is built from the generation's stored pins and
     /// observation time only, so a replay stages byte-identical rows under
-    /// the same batch identities and Scribe keeps each once.
+    /// the same batch identities and Scribe keeps each once. A refused
+    /// member also stages its `errored` status at the observation time; its
+    /// activation is a no-op, so it never becomes runnable.
     ///
     /// # Errors
     /// Returns [`WyrdError::ServiceUnavailable`] when this process queues no
@@ -435,7 +726,11 @@ impl GithubConnections<'_> {
         let reserved: Vec<&PullRequestExecution> = generation
             .executions
             .iter()
-            .filter(|execution| execution.reserved)
+            .filter(|execution| {
+                execution.reserved
+                    || execution.refused
+                    || execution.status == VerificationExecutionStatus::Cancelled
+            })
             .collect();
         let executions: Vec<ExecutionId> = generation
             .executions
@@ -502,6 +797,19 @@ impl GithubConnections<'_> {
                 },
             );
             replies.push(admitted);
+            if execution.refused {
+                scribe.stage(
+                    tenant,
+                    ScribeWrite::status(
+                        execution.execution_id,
+                        &execution.verifier_card_uid,
+                        &execution.card_uid,
+                        execution.status,
+                        execution.attribution,
+                        generation.observed_at,
+                    ),
+                );
+            }
         }
         for admitted in replies {
             admitted.await.map_err(|_lost| unavailable())?;
@@ -581,6 +889,15 @@ impl GithubConnections<'_> {
                 },
             }
         }
+    }
+}
+
+/// The refusal of a binding or review whose Verifier has no registered Card,
+/// so no exact scope can authorize running it.
+fn unregistered_verifier() -> WyrdError {
+    WyrdError::VerificationTargetNotFound {
+        message: "the bound Verifier has no registered Card in this tenant".to_owned(),
+        details: serde_json::json!({}),
     }
 }
 

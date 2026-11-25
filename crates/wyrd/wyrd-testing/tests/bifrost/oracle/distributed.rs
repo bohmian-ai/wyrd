@@ -2030,6 +2030,215 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
     Ok(())
 }
 
+/// Per-parent verification counts, shaped for [`grouped_counts`].
+const RESULTS_BY_PARENT: &str = "SELECT subject_name AS filter_key, COUNT(*) AS matched \
+     FROM bifrost.verification.results GROUP BY subject_name ORDER BY subject_name";
+
+/// A Viewer bound at one Service family, and another bound at one exact
+/// version of a second Service, each query through the distributed Oracle
+/// only the managed verification records of their own trusted parent.
+///
+/// The administrator declares two Services sharing the `no-refund-promise`
+/// Verifier on a `direct` pod and judges one reply for each, so the records
+/// are the production verification writes, not hand-seeded rows. Every query
+/// enters a query-only pod and must run Analytical with a graph leased on
+/// another pod and a request body crossing the private peer plane. The
+/// administrator sees both parents; each scoped reader sees exactly its
+/// parent's identity and count, and a filter naming the other parent finds no
+/// row and counts zero, as a single server answers.
+///
+/// # Errors
+///
+/// Returns an error when the cluster, declaration, verification, principal
+/// creation, or query fails, when a query does not run on a peer, or when the
+/// visible identities or counts differ.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn scoped_readers_query_only_their_parents_records_across_pods() -> Result<(), JourneyError> {
+    use wyrd_client::Principals;
+    use wyrd_client::principals::{
+        CreateServicePrincipalRequest, PermissionScope, ScopedRoleAssignment,
+    };
+    use wyrd_client::state::{DeclareOptions, WyrdState};
+    use wyrd_spec::auth::CardPermissionScope;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::CardName;
+
+    /// Query-only pod every reader's query enters.
+    const COORDINATOR: usize = 0;
+    /// The `direct` pod that judges replies and retains their records.
+    const PRODUCER: usize = 3;
+    /// Pods other than the coordinator that may run the query's tasks.
+    const PEERS: [usize; 3] = [1, 2, 3];
+    let cluster = PeerCluster::start(&[
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::Direct,
+    ])
+    .await?;
+    let admin_key = cluster
+        .provision_public_api_key("verification-admin")
+        .await?;
+    let producer = public_client(cluster.server(PRODUCER)?, &admin_key)?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let mut states = Vec::new();
+    for path in [
+        root.join("examples/setup-check/support-reply.yaml"),
+        root.join("fixtures/cards/scoped_peer_reads/other-reply.yaml"),
+    ] {
+        let declared = DeclareOptions {
+            client: Some(producer.clone()),
+            ..DeclareOptions::default()
+        };
+        states.push(WyrdState::declare_with(&path, declared).await?);
+    }
+    // Two publications, each holding both parents' records, give the scan two
+    // files that no parent filter can prune by statistics, so every query has
+    // more than one task to place on the query pods.
+    for _ in 0..2 {
+        for state in &states {
+            state
+                .run()
+                .observe()
+                .verify(
+                    "no-refund-promise",
+                    serde_json::json!("Your refund request is approved."),
+                )
+                .await?;
+        }
+        cluster.flush(PRODUCER).await?;
+    }
+    cluster.refresh_snapshots().await?;
+
+    let principals = Principals::connect_with(&producer).await?;
+    let viewer = async |name: &str, scope: CardPermissionScope| -> Result<_, JourneyError> {
+        let created = principals
+            .create_service_principal(&CreateServicePrincipalRequest {
+                name: name.to_owned(),
+                assignments: vec![ScopedRoleAssignment {
+                    role: "viewer".to_owned(),
+                    scope: PermissionScope::Card(scope),
+                }],
+                description: None,
+                workload_restriction: None,
+            })
+            .await?;
+        public_client(
+            cluster.server(COORDINATOR)?,
+            &created.credential.into_secret_string(),
+        )
+    };
+    let family = viewer(
+        "support-reply-viewer",
+        CardPermissionScope::family(CardKind::Service, CardName::new("support-reply")?),
+    )
+    .await?;
+    let exact_ref = states[1].root_ref();
+    let exact = viewer(
+        "other-reply-version-viewer",
+        CardPermissionScope::exact(
+            exact_ref,
+            exact_ref
+                .uid
+                .clone()
+                .ok_or("the declared Service carries no UID")?,
+        ),
+    )
+    .await?;
+    let admin = public_client(cluster.server(COORDINATOR)?, &admin_key)?;
+
+    let everything = peer_counts(&cluster, &PEERS, &admin, RESULTS_BY_PARENT).await?;
+    let names: Vec<&str> = everything.iter().map(|(name, _)| name.as_str()).collect();
+    if names != ["other-reply", "support-reply"] || everything.iter().any(|(_, n)| *n == 0) {
+        return Err(format!("the administrator must see both parents, saw {everything:?}").into());
+    }
+    for (reader, visible, hidden) in [
+        (&family, "support-reply", "other-reply"),
+        (&exact, "other-reply", "support-reply"),
+    ] {
+        let expected: Vec<_> = everything
+            .iter()
+            .filter(|(name, _)| name == visible)
+            .cloned()
+            .collect();
+        let seen = peer_counts(&cluster, &PEERS, reader, RESULTS_BY_PARENT).await?;
+        if seen != expected {
+            return Err(format!("{visible} reader expected {expected:?}, saw {seen:?}").into());
+        }
+        let named = peer_counts(
+            &cluster,
+            &PEERS,
+            reader,
+            &format!(
+                "SELECT subject_name AS filter_key, COUNT(*) AS matched \
+                 FROM bifrost.verification.results WHERE subject_name = '{hidden}' \
+                 GROUP BY subject_name"
+            ),
+        )
+        .await?;
+        if !named.is_empty() {
+            return Err(format!("{visible} reader saw {hidden} rows: {named:?}").into());
+        }
+        let counted = peer_counts(
+            &cluster,
+            &PEERS,
+            reader,
+            &format!(
+                "SELECT '{hidden}' AS filter_key, COUNT(*) AS matched \
+                 FROM bifrost.verification.results WHERE subject_name = '{hidden}'"
+            ),
+        )
+        .await?;
+        if counted != [(hidden.to_owned(), 0)] {
+            return Err(format!("{visible} reader counted {hidden} as {counted:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Runs one grouped count through `client` and requires a peer to execute it.
+///
+/// A task runs on a pod only under a graph lease that pod activated, so a
+/// lease delta on some pod in `peers` attributes the work there; the
+/// process-wide body-poll delta proves it crossed the private peer plane.
+///
+/// # Errors
+///
+/// Returns the [`grouped_counts`] failure, or an error when the query is not
+/// Analytical, no pod in `peers` leased a graph, or no peer body was polled.
+async fn peer_counts(
+    cluster: &PeerCluster,
+    peers: &[usize],
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<Vec<(String, i64)>, JourneyError> {
+    let leases = |cluster: &PeerCluster| {
+        peers
+            .iter()
+            .map(|index| Ok(cluster.graph_leases(*index)?.0))
+            .collect::<Result<Vec<_>, JourneyError>>()
+    };
+    let before = leases(cluster)?;
+    let polls = cluster.peer_body_polls();
+    let (rows, class) = grouped_counts(client, sql.to_owned()).await?;
+    if class != QueryClass::Analytical {
+        return Err(format!("{sql} must run Analytical, ran {class:?}").into());
+    }
+    if leases(cluster)?
+        .iter()
+        .zip(&before)
+        .all(|(after, before)| after <= before)
+    {
+        return Err(format!("{sql} leased a graph on no peer pod").into());
+    }
+    if cluster.peer_body_polls() <= polls {
+        return Err(format!("{sql} crossed no private peer plane").into());
+    }
+    Ok(rows)
+}
+
 /// How long the journey keeps one live Scribe producer paused mid-stream.
 ///
 /// Past the 30-second window the removed tail-fence expiry enforced, so a
@@ -6111,7 +6320,6 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([scoped]),
     );
     // The action permission is tenant-wide, exactly as the public query

@@ -66,10 +66,10 @@ export declare class NativeHeldMemory {
 /**
  * In-process server handle used only by TypeScript integration tests.
  *
- * Journeys steer the server through exactly six test controls, each backed
+ * Journeys steer the server through exactly seven test controls, each backed
  * by the production code path: `flushBifrost`, `waitForBaseline`,
- * `makeBindingDue`, `holdPublications`, and, for contended process memory,
- * `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
+ * `makeBindingDue`, `holdPublications`, `staleConsoleProof`, and, for
+ * contended process memory, `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
  * start, address, or credential the server.
  */
 export declare class NativeWyrdTestServer {
@@ -166,6 +166,26 @@ export declare class NativeWyrdTestServer {
    * Returns a napi error when the harness is closed.
    */
   get tenantSlug(): string
+  /**
+   * Initialize this deployment's platform and return its one root platform
+   * credential, as `wyrd-server init` discloses it to an operator.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the deployment is
+   * already initialized.
+   */
+  initializePlatformRoot(): string
+  /**
+   * Age every platform console session's fresh proof past the shared
+   * five-minute window, so a journey's next destructive console change
+   * asks the operator to confirm it is them. The sessions stay live.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the update fails.
+   */
+  staleConsoleProof(): void
   /**
    * The loopback GitHub App this server is configured against.
    *
@@ -555,6 +575,11 @@ export interface NativeTestServerOptions {
    * journey reaches it quickly; omitted keeps the production deadline.
    */
   verifyTimeoutMs?: number
+  /**
+   * Google's OpenID Connect issuer, so a journey signs in at a local fake
+   * Google; omitted keeps the real provider.
+   */
+  googleIssuer?: string
 }
 
 /**

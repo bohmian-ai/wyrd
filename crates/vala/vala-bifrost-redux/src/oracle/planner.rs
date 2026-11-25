@@ -18,6 +18,20 @@ use super::{
 };
 use crate::catalog::{PinnedSealedTable, TableUid, TenantTableBinding};
 
+/// One validated request's only parse: the statement planning lowers and the
+/// distinct canonical tables it reads.
+///
+/// Only [`OraclePlanner::parse_query`] builds one, so holding it proves the
+/// request passed the query floor. Whoever passes it on keeps it with the
+/// request it was parsed from.
+#[derive(Debug)]
+pub struct ParsedQuery {
+    /// The validated statement.
+    pub(super) statement: DfStatement,
+    /// The statement's distinct canonical table references.
+    pub(super) tables: Vec<TableRef>,
+}
+
 /// Query floor and logical-plan preparation owner.
 ///
 /// Snapshot preparation has no admission bound of its own: concurrent pins
@@ -37,32 +51,12 @@ impl OraclePlanner {
         Self { config }
     }
 
-    /// Validates one non-empty, single-statement `SELECT` request.
-    ///
-    /// Validation already parses the statement, so it returns the distinct
-    /// canonical table references that parse produced.
+    /// Checks one request against the floor that needs no parse: its public
+    /// shape and this planner's SQL byte limit.
     ///
     /// # Errors
-    /// Returns [`BifrostError::QueryInvalidSql`] for floor violations.
-    pub fn validate_query(
-        &self,
-        request: &BifrostQueryRequest,
-    ) -> Result<Vec<TableRef>, BifrostError> {
-        self.validate_statement(request).map(|(_, tables)| tables)
-    }
-
-    /// Validates one request as [`Self::validate_query`] does and also returns
-    /// the parsed statement.
-    ///
-    /// The executing Oracle plans from this statement, so validation and
-    /// planning share one parse.
-    ///
-    /// # Errors
-    /// Returns [`BifrostError::QueryInvalidSql`] for floor violations.
-    pub(super) fn validate_statement(
-        &self,
-        request: &BifrostQueryRequest,
-    ) -> Result<(DfStatement, Vec<TableRef>), BifrostError> {
+    /// Returns [`BifrostError::QueryInvalidSql`] for either violation.
+    pub(super) fn check_floor(&self, request: &BifrostQueryRequest) -> Result<(), BifrostError> {
         request
             .validate()
             .map_err(|error| BifrostError::QueryInvalidSql {
@@ -73,7 +67,53 @@ impl OraclePlanner {
                 detail: "query exceeds configured SQL byte limit".to_owned(),
             });
         }
-        parse_select(&request.sql)
+        Ok(())
+    }
+
+    /// Validates one non-empty, single-statement `SELECT` request and parses
+    /// it once, off the calling async worker.
+    ///
+    /// The parse is synchronous CPU work, so it runs on a blocking worker
+    /// holding one of the process CPU lanes as `tenant`'s Bifrost work. The
+    /// caller waits for that lane here, inside `deadline`, so a blocking
+    /// worker is taken only once a lane is granted. The lane is returned
+    /// before this resolves, ahead of any catalog or storage wait. A parse
+    /// still running at `deadline` cannot be interrupted: the caller gets a
+    /// timeout, and the parse keeps its lane and operation until it returns,
+    /// when its result is dropped. The request travels through the parse and
+    /// back so its SQL is never copied.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryInvalidSql`] for floor violations,
+    /// [`BifrostError::QueryTimeout`] when `deadline` passes first, and
+    /// [`BifrostError::QueryExecutionFailed`] when the parse did not finish.
+    pub async fn parse_query(
+        &self,
+        workloads: &wyrd_runtime::resources::WorkloadManager,
+        tenant: wyrd_spec::DataTenantId,
+        request: BifrostQueryRequest,
+        deadline: Instant,
+    ) -> Result<(BifrostQueryRequest, ParsedQuery), BifrostError> {
+        self.check_floor(&request)?;
+        let operation = workloads.begin(
+            wyrd_runtime::resources::Workload::Bifrost,
+            Some(tenant),
+            None,
+        );
+        let parse = workloads
+            .lanes()
+            .dispatch_blocking(operation.context(), move || {
+                let _operation = operation;
+                let parsed = parse_select(&request.sql);
+                (request, parsed)
+            });
+        let (request, parsed) =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), parse)
+                .await
+                .map_err(|_| BifrostError::QueryTimeout)?
+                .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let (statement, tables) = parsed?;
+        Ok((request, ParsedQuery { statement, tables }))
     }
 
     /// Projects one request's `deadline_ms` to the total budget it runs under.
@@ -285,6 +325,99 @@ mod tests {
     fn empty_cut_is_fully_local() {
         assert!((local_ratio(&[], false).expect("empty remote cut") - 1.0).abs() < f64::EPSILON);
         assert!((local_ratio(&[], true).expect("empty local cut") - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// One query request over `sql`.
+    fn request(sql: &str) -> wyrd_spec::vala::api::BifrostQueryRequest {
+        wyrd_spec::vala::api::BifrostQueryRequest {
+            sql: sql.to_owned(),
+            params: Vec::new(),
+            deadline_ms: None,
+        }
+    }
+
+    /// A parse waits for a CPU lane inside the request deadline, returns its
+    /// lane before it resolves, and hands the request back with its tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a parse runs without a lane, outlives its deadline, keeps
+    /// a lane after resolving, or loses the request or its tables.
+    #[tokio::test]
+    async fn parse_takes_one_lane_inside_the_deadline_and_returns_it() {
+        use std::time::{Duration, Instant};
+        use wyrd_runtime::resources::{ProcessResources, Workload};
+
+        let workloads = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30)
+            .workloads()
+            .clone();
+        let planner = super::OraclePlanner::new(super::OracleConfig::default());
+        let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("test tenant identity");
+        let sql = "SELECT * FROM bifrost.traces.spans";
+
+        let busy = workloads
+            .lanes()
+            .acquire(workloads.begin(Workload::Gateway, None, None).context())
+            .await;
+        let refused = planner
+            .parse_query(
+                &workloads,
+                tenant,
+                request(sql),
+                Instant::now() + Duration::from_millis(20),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(super::BifrostError::QueryTimeout)),
+            "a parse with no lane times out at the deadline: {refused:?}"
+        );
+        assert_eq!(
+            workloads.lanes().waiting(),
+            0,
+            "a timed-out parse stops waiting"
+        );
+        // Floor violations that need no parse are refused without a lane.
+        for invalid in [
+            String::new(),
+            " ".repeat(super::OracleConfig::default().max_sql_bytes + 1),
+        ] {
+            let refused = planner
+                .parse_query(&workloads, tenant, request(&invalid), Instant::now())
+                .await;
+            assert!(matches!(
+                refused,
+                Err(super::BifrostError::QueryInvalidSql { .. })
+            ));
+        }
+        drop(busy);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (returned, parsed) = planner
+            .parse_query(&workloads, tenant, request(sql), deadline)
+            .await
+            .expect("a valid query parses once a lane is free");
+        assert_eq!(returned.sql, sql, "the request comes back unchanged");
+        assert_eq!(
+            parsed.tables.iter().map(TableRef::fqn).collect::<Vec<_>>(),
+            ["bifrost.traces.spans"]
+        );
+        assert_eq!(
+            workloads.lanes().free(),
+            1,
+            "the lane is returned before any IO"
+        );
+        let refused = planner
+            .parse_query(&workloads, tenant, request("UPDATE x SET y = 1"), deadline)
+            .await;
+        assert!(matches!(
+            refused,
+            Err(super::BifrostError::QueryInvalidSql { .. })
+        ));
+        assert_eq!(
+            workloads.lanes().free(),
+            1,
+            "a refused parse returns its lane"
+        );
     }
 
     /// Both canonical hierarchy and quoted dotted-FQN SQL resolve identically.

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
-use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::ids::{CardUid, IdempotencyKey};
 use wyrd_spec::storage::{
     AbortResponse, DownloadInitRequest, IDEMPOTENCY_KEY_HEADER, LocalBlobUploadResponse,
     PartUrlResponse, UploadCompleteRequest, UploadId, UploadInitRequest,
@@ -28,8 +28,8 @@ use wyrd_spec::storage::{
 use wyrd_storage::BackendConfig;
 use wyrd_storage::service::{self, StorageCaller, UploadOwner};
 
-use crate::audit;
 use crate::components::auth::Caller;
+use crate::components::cards::routes::{authorize_card_objects, authorize_card_uid};
 use crate::components::cards::service::card_file;
 use crate::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
@@ -75,8 +75,8 @@ pub fn storage_router(state: &AppState) -> OpenApiRouter<AppState> {
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card write, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write on the Card's family or \
+          version, or the object belongs to another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 409, description = "The upload record conflicts with one already stored \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
@@ -94,12 +94,14 @@ async fn init(
     headers: HeaderMap,
     Json(body): Json<UploadInitRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadInitResponse>, WyrdErrorResponse> {
-    authorize_card_write(
+    authorize_card_uid(
         &state,
         &caller,
+        &Permission::card_write(),
         "storage.upload.init",
-        &format!("card:{}", body.card_uid),
-    )?;
+        &body.card_uid,
+    )
+    .await?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let storage_caller = storage_caller(&caller);
     service::upload_init(
@@ -501,13 +503,20 @@ async fn download_init(
     caller: Caller,
     Json(body): Json<DownloadInitRequest>,
 ) -> Result<Json<wyrd_spec::storage::DownloadInitResponse>, WyrdErrorResponse> {
-    authorize_card_read(
+    let objects = authorize_card_objects(
         &state,
         &caller,
         "storage.download.init",
         &format!("card:{}", body.card_uid),
     )?;
-    let stored = card_file(&state, &caller, &body.card_uid, &body.relative_path).await?;
+    let stored = card_file(
+        &state,
+        &caller,
+        &body.card_uid,
+        &body.relative_path,
+        objects.as_deref(),
+    )
+    .await?;
     service::download_init(&state.storage, &storage_caller(&caller), body, stored)
         .await
         .map(Json)
@@ -579,12 +588,34 @@ async fn download_local_blob(
             details: serde_json::json!({ "field": "path" }),
         })
     })?;
-    authorize_card_read(
+    let objects = authorize_card_objects(
         &state,
         &caller,
         "storage.download.local_blob",
         &format!("object:{path}"),
     )?;
+    if objects.is_some() {
+        // A scoped reader reaches only a completed file of a visible Card;
+        // any other object answers as not found.
+        let hidden = || {
+            WyrdErrorResponse::from(WyrdError::from(WyrdStorageError::ObjectNotFound {
+                storage_path: path.clone(),
+            }))
+        };
+        let (card_uid, relative_path) = path
+            .strip_prefix(&format!("{}/cards/", caller.data_tenant_id))
+            .and_then(|rest| rest.split_once('/'))
+            .ok_or_else(hidden)?;
+        let card_uid = CardUid::new(card_uid).map_err(|_| hidden())?;
+        card_file(
+            &state,
+            &caller,
+            &card_uid,
+            relative_path,
+            objects.as_deref(),
+        )
+        .await?;
+    }
     let (stream, len) = service::download_local_blob(&state.storage, caller.data_tenant_id, path)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -641,7 +672,7 @@ pub(crate) fn extract_idempotency_key(
 ///
 /// The owner is read under the caller's tenant before any decision, so a
 /// foreign or unknown upload is refused as not found. A Card upload needs
-/// `card:write`; a verification File upload needs any `verifier:run` grant,
+/// `cards:write` on its Card's family or exact version; a verification File upload needs any `verifier:run` grant,
 /// the permission that admitted its planning. Either decision is staged on
 /// the audit outbox without waiting for its commit.
 ///
@@ -657,53 +688,22 @@ async fn authorize_upload(
     let (owner, size_bytes) =
         service::upload_owner(state.postgres.wyrd(), &storage_caller(caller), upload_id).await?;
     let resource = format!("upload:{upload_id}");
-    match owner {
-        UploadOwner::Card(_) => authorize_card_write(state, caller, operation, &resource)?,
+    match &owner {
+        UploadOwner::Card(card_uid) => {
+            authorize_card_uid(
+                state,
+                caller,
+                &Permission::card_write(),
+                operation,
+                card_uid,
+            )
+            .await?;
+        }
         UploadOwner::File => {
             VerificationControl::new(state).authorize_evidence(caller, operation, &resource)?;
         }
     }
     Ok((owner, size_bytes))
-}
-
-/// Evaluate and audit the card-write permission for one storage mutation.
-///
-/// The verdict is staged on the process audit outbox before the mutation is
-/// dispatched; the request never waits for the audit commit.
-///
-/// # Errors
-/// Returns the public permission error when the caller lacks `card:write`.
-fn authorize_card_write(
-    state: &AppState,
-    caller: &Caller,
-    operation: &str,
-    resource: &str,
-) -> Result<(), WyrdErrorResponse> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_write(),
-        operation,
-        resource,
-    )
-    .map_err(WyrdErrorResponse::from)
-}
-
-/// Evaluate and audit the card-read permission for one storage read.
-///
-/// A permitted download is the moment a principal is allowed at the artifact
-/// bytes, so its decision row is staged before any plan or stream is produced.
-///
-/// # Errors
-/// Returns the public permission error when the caller lacks `card:read`.
-fn authorize_card_read(
-    state: &AppState,
-    caller: &Caller,
-    operation: &str,
-    resource: &str,
-) -> Result<(), WyrdErrorResponse> {
-    audit::authorize(state, caller, &Permission::card_read(), operation, resource)
-        .map_err(WyrdErrorResponse::from)
 }
 
 /// Convert the authenticated caller into the storage service's tenant context.

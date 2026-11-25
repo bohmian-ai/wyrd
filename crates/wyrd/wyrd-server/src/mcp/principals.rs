@@ -11,6 +11,10 @@
 //! capability it cannot use and an under-scoped agent cannot invoke one by
 //! naming it directly.
 //!
+//! Access administration (an account's access summary, roles, scoped role
+//! bindings and local groups) calls the same HTTP operations, so discovery,
+//! validation, tenant administration and audit are decided once.
+//!
 //! Credential issuance is deliberately absent. A plaintext credential returned
 //! into an agent's context window would be copied into a transcript, a log, and
 //! a model provider's request body in one step — the one place where a
@@ -20,22 +24,29 @@
 use serde_json::Map as JsonMap;
 use std::sync::Arc;
 
+use axum::Json;
+use axum::extract::{Path, Query, State};
 use rmcp::model::{CallToolResult, Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use schemars::SchemaGenerator;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    CredentialListQuery, CredentialListResponse, CredentialRevoked, CurrentUserArgs,
-    CurrentUserProfile, ListCredentialsArgs, PrincipalSummary, RevokeCredentialArgs,
-    SetWorkloadRestrictionArgs,
+    AccessSummary, CreateGroupRequest, CreateRoleBindingRequest, CredentialListQuery,
+    CredentialListResponse, CredentialRevoked, CurrentUserArgs, CurrentUserProfile,
+    DeleteGroupArgs, DeleteRoleArgs, GroupList, GroupMemberArgs, GroupView, ListAccessArgs,
+    ListCredentialsArgs, PrincipalAccessArgs, PrincipalSummary, PutRoleArgs, PutRoleRequest,
+    RevokeCredentialArgs, RoleBindingList, RoleBindingQuery, RoleBindingView, RoleList, RoleView,
+    SetWorkloadRestrictionArgs, UnbindArgs,
 };
 use wyrd_spec::error::WyrdError;
 
 use super::WyrdMcpHandler;
 use crate::components::auth::Caller;
-use crate::http::error::internal_failure;
+use crate::components::principals::access;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 
 /// Wire name of the credential-metadata listing.
 pub(super) const LIST_CREDENTIALS: &str = "principals.list_credentials";
@@ -49,13 +60,98 @@ pub(super) const REVOKE_CREDENTIAL: &str = "principals.revoke_credential";
 /// Wire name of the Service account workload-restriction replacement.
 pub(super) const SET_WORKLOAD_RESTRICTION: &str = "principals.set_workload_restriction";
 
+/// Wire name of one account's access summary.
+pub(super) const ACCESS: &str = "principals.access";
+
+/// Wire name of the role listing.
+pub(super) const LIST_ROLES: &str = "principals.list_roles";
+
+/// Wire name of the custom-role replacement.
+pub(super) const PUT_ROLE: &str = "principals.put_role";
+
+/// Wire name of the custom-role deletion.
+pub(super) const DELETE_ROLE: &str = "principals.delete_role";
+
+/// Wire name of the role-binding listing.
+pub(super) const LIST_BINDINGS: &str = "principals.list_bindings";
+
+/// Wire name of the scoped role binding.
+pub(super) const BIND: &str = "principals.bind";
+
+/// Wire name of the binding removal.
+pub(super) const UNBIND: &str = "principals.unbind";
+
+/// Wire name of the group listing.
+pub(super) const LIST_GROUPS: &str = "principals.list_groups";
+
+/// Wire name of the group creation.
+pub(super) const CREATE_GROUP: &str = "principals.create_group";
+
+/// Wire name of the group deletion.
+pub(super) const DELETE_GROUP: &str = "principals.delete_group";
+
+/// Wire name of the group membership addition.
+pub(super) const ADD_GROUP_MEMBER: &str = "principals.add_group_member";
+
+/// Wire name of the group membership removal.
+pub(super) const REMOVE_GROUP_MEMBER: &str = "principals.remove_group_member";
+
+/// Every access-administration tool [`WyrdMcpHandler::mcp_access`] dispatches.
+pub(super) const ACCESS_TOOLS: [&str; 12] = [
+    ACCESS,
+    LIST_ROLES,
+    PUT_ROLE,
+    DELETE_ROLE,
+    LIST_BINDINGS,
+    BIND,
+    UNBIND,
+    LIST_GROUPS,
+    CREATE_GROUP,
+    DELETE_GROUP,
+    ADD_GROUP_MEMBER,
+    REMOVE_GROUP_MEMBER,
+];
+
 /// The tools every authenticated caller may be shown.
 ///
 /// Read tools are unconditional, which is the MCP contract: an agent can always
 /// discover and observe. Nothing here returns secret material.
 #[must_use]
 pub(super) fn descriptors_unscoped() -> Vec<Tool> {
-    vec![list_credentials_tool(), me_tool()]
+    vec![
+        list_credentials_tool(),
+        me_tool(),
+        tool::<PrincipalAccessArgs, AccessSummary>(
+            ACCESS,
+            "Read an account's access",
+            "Read one User or Service account's current access in this caller's tenant: every \
+             contributing direct, group and identity-provider binding with its role, scope and \
+             source, and the combined scoped permissions. Requires principal administration.",
+            true,
+        ),
+        tool::<ListAccessArgs, RoleList>(
+            LIST_ROLES,
+            "List roles",
+            "List every built-in and custom role of this caller's tenant with its operations. \
+             Takes an empty object. Requires principal administration.",
+            true,
+        ),
+        tool::<RoleBindingQuery, RoleBindingList>(
+            LIST_BINDINGS,
+            "List role bindings",
+            "List this caller's tenant's role bindings, optionally only those of one account \
+             (principal_id), group (group_id) or role. Each names its subject, role, explicit \
+             scope, source and compiled permissions. Requires principal administration.",
+            true,
+        ),
+        tool::<ListAccessArgs, GroupList>(
+            LIST_GROUPS,
+            "List groups",
+            "List every local access group of this caller's tenant with its members. Takes an \
+             empty object. Requires principal administration.",
+            true,
+        ),
+    ]
 }
 
 /// The tools shown only to a caller holding principal administration.
@@ -76,7 +172,72 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
 /// advertised separately; the operation still authorizes and audits it.
 #[must_use]
 pub(super) fn admin_descriptors() -> Vec<Tool> {
-    vec![set_workload_restriction_tool()]
+    vec![
+        set_workload_restriction_tool(),
+        tool::<PutRoleArgs, RoleView>(
+            PUT_ROLE,
+            "Create or replace a custom role",
+            "Create or replace one custom role's operation bundle in this caller's tenant. \
+             Built-in roles are read-only and a bundle is never empty. Every binding of the role \
+             follows the new bundle within about five seconds. Requires tenant administration \
+             (*).",
+            false,
+        ),
+        tool::<DeleteRoleArgs, RoleView>(
+            DELETE_ROLE,
+            "Delete a custom role",
+            "Delete one custom role that no binding references, and return it. Requires tenant \
+             administration (*).",
+            false,
+        ),
+        tool::<CreateRoleBindingRequest, RoleBindingView>(
+            BIND,
+            "Bind a role at a scope",
+            "Bind one role to one account or group at one explicit scope: \"all\", a Card family \
+             {\"card\":{\"family\":{\"kind\":...,\"name\":...}}} covering its future \
+             versions, or one exact version {\"card\":{\"version\":{\"kind\":...,\"name\":...,\
+             \"uid\":...}}}. Idempotent; the grant reaches the subject's existing \
+             credentials within about five seconds, still bounded by every credential ceiling. \
+             Requires tenant administration (*).",
+            false,
+        ),
+        tool::<UnbindArgs, RoleBindingView>(
+            UNBIND,
+            "Remove a role binding",
+            "Remove one directly administered binding and return it. Access another binding \
+             still grants remains; an identity-provider binding changes only through its \
+             provider. Requires tenant administration (*).",
+            false,
+        ),
+        tool::<CreateGroupRequest, GroupView>(
+            CREATE_GROUP,
+            "Create a group",
+            "Create one empty local access group with a tenant-unique name. Requires tenant \
+             administration (*).",
+            false,
+        ),
+        tool::<DeleteGroupArgs, GroupView>(
+            DELETE_GROUP,
+            "Delete a group",
+            "Delete one local group with its memberships and bindings, and return it as it was. \
+             Requires tenant administration (*).",
+            false,
+        ),
+        tool::<GroupMemberArgs, GroupView>(
+            ADD_GROUP_MEMBER,
+            "Add a group member",
+            "Add one User or Service account to a local group; idempotent. Returns the group. \
+             Requires tenant administration (*).",
+            false,
+        ),
+        tool::<GroupMemberArgs, GroupView>(
+            REMOVE_GROUP_MEMBER,
+            "Remove a group member",
+            "Remove one account from a local group; idempotent. Returns the group. Requires \
+             tenant administration (*).",
+            false,
+        ),
+    ]
 }
 
 /// Whether this caller holds tenant administration.
@@ -327,4 +488,103 @@ impl WyrdMcpHandler {
             })?,
         ))
     }
+
+    /// Dispatch one access-administration tool to its HTTP operation, which
+    /// decides, validates and audits it exactly as it does for HTTP.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the arguments are invalid, or the
+    /// operation's own refusal or failure.
+    pub(super) async fn mcp_access(
+        &self,
+        name: &str,
+        caller: Caller,
+        arguments: Option<JsonMap<String, JsonValue>>,
+    ) -> Result<CallToolResult, WyrdError> {
+        let state = || State(self.state.clone());
+        match name {
+            ACCESS => {
+                let args: PrincipalAccessArgs = parse_args(arguments, name)?;
+                project(
+                    access::principal_access(
+                        state(),
+                        caller,
+                        Ok(Path(args.principal_id.as_uuid())),
+                    )
+                    .await,
+                )
+            }
+            LIST_ROLES => {
+                let ListAccessArgs {} = parse_args(Some(arguments.unwrap_or_default()), name)?;
+                project(access::list_access_roles(state(), caller).await)
+            }
+            PUT_ROLE => {
+                let args: PutRoleArgs = parse_args(arguments, name)?;
+                let body = PutRoleRequest {
+                    operations: args.operations,
+                    description: args.description,
+                };
+                project(
+                    access::put_access_role(state(), caller, Ok(Path(args.role)), Ok(Json(body)))
+                        .await,
+                )
+            }
+            DELETE_ROLE => {
+                let args: DeleteRoleArgs = parse_args(arguments, name)?;
+                project(access::delete_access_role(state(), caller, Ok(Path(args.role))).await)
+            }
+            LIST_BINDINGS => {
+                let query: RoleBindingQuery =
+                    parse_args(Some(arguments.unwrap_or_default()), name)?;
+                project(access::list_access_bindings(state(), caller, Ok(Query(query))).await)
+            }
+            BIND => {
+                let request: CreateRoleBindingRequest = parse_args(arguments, name)?;
+                project(access::create_access_binding(state(), caller, Ok(Json(request))).await)
+            }
+            UNBIND => {
+                let args: UnbindArgs = parse_args(arguments, name)?;
+                project(
+                    access::delete_access_binding(state(), caller, Ok(Path(args.binding_id))).await,
+                )
+            }
+            LIST_GROUPS => {
+                let ListAccessArgs {} = parse_args(Some(arguments.unwrap_or_default()), name)?;
+                project(access::list_access_groups(state(), caller).await)
+            }
+            CREATE_GROUP => {
+                let request: CreateGroupRequest = parse_args(arguments, name)?;
+                project(access::create_access_group(state(), caller, Ok(Json(request))).await)
+            }
+            DELETE_GROUP => {
+                let args: DeleteGroupArgs = parse_args(arguments, name)?;
+                project(access::delete_access_group(state(), caller, Ok(Path(args.group_id))).await)
+            }
+            ADD_GROUP_MEMBER | REMOVE_GROUP_MEMBER => {
+                let args: GroupMemberArgs = parse_args(arguments, name)?;
+                let target = Ok(Path((args.group_id, args.principal_id.as_uuid())));
+                project(if name == ADD_GROUP_MEMBER {
+                    access::add_access_group_member(state(), caller, target).await
+                } else {
+                    access::remove_access_group_member(state(), caller, target).await
+                })
+            }
+            _ => Err(WyrdError::internal(format!("{name} is not an access tool"))),
+        }
+    }
+}
+
+/// Project one access operation's answer as structured tool output.
+///
+/// # Errors
+/// Returns the operation's own error, or an internal error when the answer
+/// cannot be serialized.
+fn project<T: Serialize>(
+    answer: Result<Json<T>, WyrdErrorResponse>,
+) -> Result<CallToolResult, WyrdError> {
+    let Json(answer) = answer.map_err(|WyrdErrorResponse(error)| error)?;
+    Ok(CallToolResult::structured(
+        serde_json::to_value(answer)
+            .map_err(|error| internal_failure("access answer could not be projected", &error))?,
+    ))
 }

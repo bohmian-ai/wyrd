@@ -16,9 +16,11 @@ use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer, WorkloadRestricti
 pub struct CreateServicePrincipalRequest {
     /// Operator-facing name, unique within the tenant.
     pub name: String,
-    /// Roles to grant. Narrower than tenant administration, so automation never
-    /// needs the tenant administrative credential.
-    pub roles: Vec<String>,
+    /// Roles to bind, each at an explicit scope. Narrower than tenant
+    /// administration, so automation never needs the tenant administrative
+    /// credential. Empty creates an account with no operation grants.
+    #[serde(default)]
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
     /// Optional description.
     #[serde(default)]
     pub description: Option<String>,
@@ -165,20 +167,29 @@ pub struct CreateUserCredentialRequest {
 }
 
 /// How a User account authenticates.
+///
+/// Read from the account's stored credential and linked identity, never
+/// inferred from its email address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AccountAuthentication {
     /// A Wyrd-owned local username and password.
     Password,
-    /// The tenant's identity provider.
+    /// Google sign-in.
+    Google,
+    /// GitHub sign-in.
+    Github,
+    /// The tenant's company identity provider.
     Sso,
 }
 
 /// Response of `GET /v1/principals/me`: the calling User's safe profile.
 ///
-/// Derived from the verified caller and current User state; never an email,
-/// password verifier, provider subject, session identifier or key secret.
+/// Derived from the verified caller and current User state. It carries the
+/// caller's own email and display name, never another principal's email,
+/// and never a password verifier, provider subject, session identifier or key
+/// secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -194,6 +205,13 @@ pub struct CurrentUserProfile {
     /// Canonical local username; `null` for an SSO-only account.
     #[serde(default)]
     pub username: Option<String>,
+    /// The identity provider's name for the caller, refreshed at each sign-in
+    /// that supplies one; `null` for a password account. Not user-editable.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The caller's own email; `null` when the account has none.
+    #[serde(default)]
+    pub email: Option<String>,
     /// How the account authenticates, independent of this request's credential.
     pub authentication: AccountAuthentication,
     /// Sorted, distinct caller-effective `resource:action` names;
@@ -269,17 +287,27 @@ pub struct CredentialRevoked {
     pub credential_id: Uuid,
 }
 
+/// Most recipients one `POST /v1/principals/users/invitations` accepts.
+pub const INVITATION_RECIPIENTS_MAX: usize = 100;
+
 /// Body of `POST /v1/principals/users/invitations`.
 ///
+/// Each recipient receives a separate invitation with the same assignments.
 /// The issuer's tenant is the invitation's tenant, and its lifetime is a fixed
 /// twenty-four hours; neither is caller-selected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserInvitationRequest {
-    /// Distinct existing tenant Role names the enrolled User receives, such
-    /// as `editor`; nonempty.
-    pub roles: Vec<String>,
+    /// Email addresses to invite, one invitation each; 1 to
+    /// [`INVITATION_RECIPIENTS_MAX`], without repeats. An address names whom
+    /// the invitation is for and where it is emailed; it never selects or
+    /// links an existing User.
+    pub recipients: Vec<String>,
+    /// Roles the enrolled User receives, each at an explicit scope;
+    /// nonempty. Revalidated against the issuer's current authority when
+    /// the invitation is accepted.
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
 }
 
 /// Body of `POST /v1/principals/users`: an administrator creates a local
@@ -293,8 +321,8 @@ pub struct CreateUserRequest {
     /// The User's password, checked against the local password policy.
     #[schemars(with = "String")]
     pub password: SecretBearer,
-    /// Distinct existing tenant Role names the User receives, such as `admin`.
-    pub roles: Vec<String>,
+    /// Roles the User receives, each at an explicit scope; nonempty.
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
 }
 
 /// The local User created by `POST /v1/principals/users`.
@@ -308,36 +336,97 @@ pub struct CreatedUser {
     pub username: String,
 }
 
+/// What became of an invitation's most recent link when Wyrd tried to email it.
+///
+/// `accepted` means the SMTP relay accepted the message, not that it reached
+/// an inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationDelivery {
+    /// Wyrd did not email it: no SMTP relay is configured. The administrator
+    /// delivers the copied link.
+    NotEmailed,
+    /// The SMTP relay accepted the message.
+    Accepted,
+    /// The SMTP relay refused or could not be reached; resend after recovery.
+    Failed,
+}
+
+impl InvitationDelivery {
+    /// The stored and wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEmailed => "not_emailed",
+            Self::Accepted => "accepted",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored label; `None` for any other text.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        [Self::NotEmailed, Self::Accepted, Self::Failed]
+            .into_iter()
+            .find(|delivery| delivery.as_str() == label)
+    }
+}
+
 /// Safe metadata of one enrollment invitation; never its code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UserInvitationView {
-    /// Invitation id, used to revoke it.
+    /// Invitation id, used to resend or revoke it.
     pub id: Uuid,
     /// The tenant's route key.
     pub tenant: crate::ids::TenantSlug,
-    /// Role ids granted at enrollment, ordered by UUID.
-    pub role_ids: Vec<Uuid>,
+    /// The email address the invitation is for.
+    pub recipient: String,
+    /// What became of its most recent link when Wyrd tried to email it.
+    pub delivery: InvitationDelivery,
+    /// Scoped role assignments created at enrollment.
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
     /// Creation time.
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Absolute expiry, twenty-four hours after creation.
+    /// Absolute expiry, twenty-four hours after the current link was issued.
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// A newly issued invitation and its one-time code, returned once.
+/// A newly issued or resent invitation and its link, returned once.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IssuedUserInvitation {
-    /// Invitation metadata.
+    /// Invitation metadata, including what became of emailing this link.
     pub invitation: UserInvitationView,
-    /// The 43-character base64url enrollment code; delivered separately from
-    /// the URL and never recoverable.
+    /// The tenant signup page with the one-time code in its fragment
+    /// (`#invitation=<code>`), so the code reaches no server log or referrer.
+    /// Anyone holding it can enroll once until it expires, is resent or is
+    /// revoked; it is never recoverable.
     #[schemars(with = "String")]
-    pub invitation_code: SecretBearer,
-    /// The fixed tenant signup page; it contains no code.
-    pub signup_url: crate::auth::AbsoluteUrl,
+    pub invitation_link: SecretBearer,
+}
+
+/// Response of `POST /v1/principals/users/invitations`: one entry per
+/// recipient, in request order.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IssuedUserInvitations {
+    /// The issued invitations.
+    pub invitations: Vec<IssuedUserInvitation>,
+}
+
+/// Response of `GET /v1/principals/users/invitations`: the tenant's pending
+/// invitations, oldest first, never their codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UserInvitationList {
+    /// Unexpired, unrevoked and unconsumed invitations.
+    pub invitations: Vec<UserInvitationView>,
 }
 
 /// Safe metadata of one operator-issued password reset; never its code.
@@ -411,53 +500,6 @@ impl RoleSource {
     }
 }
 
-/// One Role a principal holds, and where that assignment came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RoleAssignment {
-    /// Role name.
-    pub role: String,
-    /// Assignment source.
-    pub source: RoleSource,
-}
-
-/// Response of `GET /v1/principals/{principal_id}/roles`.
-///
-/// The principal's effective Roles are the distinct names across every source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct PrincipalRoles {
-    /// Principal the assignments belong to.
-    pub principal_id: PrincipalId,
-    /// Principal kind the server resolved from the id: `user` or `service`.
-    pub kind: PrincipalKindTag,
-    /// Assignments ordered by Role name, then source.
-    pub roles: Vec<RoleAssignment>,
-}
-
-/// Response of `PUT` and `DELETE /v1/principals/{principal_id}/roles/{role}`.
-///
-/// Both writes are idempotent. A change takes effect at the principal's next
-/// token; tokens already issued keep their bounded lifetime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RoleAssignmentChange {
-    /// Principal the assignment belongs to.
-    pub principal_id: PrincipalId,
-    /// Principal kind the server resolved from the id.
-    pub kind: PrincipalKindTag,
-    /// Role the call granted or revoked.
-    pub role: String,
-    /// `true` when this call added or removed the direct assignment, `false`
-    /// when it already held the requested state.
-    pub changed: bool,
-    /// Every assignment after the change, ordered by Role name, then source.
-    pub roles: Vec<RoleAssignment>,
-}
-
 /// Lifecycle status of an assignable principal. Deleted principals are never
 /// listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -484,13 +526,38 @@ pub struct PrincipalSummary {
     /// Email, for users.
     #[serde(default)]
     pub email: Option<String>,
-    /// Account name, for services.
+    /// Account name: a Service's name, or a local User's username; `null`
+    /// for an SSO-only User.
     #[serde(default)]
     pub name: Option<String>,
+    /// A User's provider-sourced display name; `null` for a Service or a
+    /// password User. Label a person by display name, else name, else email.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// How a User signs in; `null` for a Service.
+    #[serde(default)]
+    pub authentication: Option<AccountAuthentication>,
+    /// The distinct Roles the account holds, each at its scope, directly or
+    /// through a Group; ordered by role.
+    pub roles: Vec<crate::auth::ScopedRoleAssignment>,
     /// The account's workload restriction: explicit for a Service, null for a
     /// User.
     #[serde(default)]
     pub workload_restriction: Option<WorkloadRestriction>,
+}
+
+/// How many principals matching a `GET /v1/principals` query are in each
+/// status, across every page.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalStatusCounts {
+    /// Active principals.
+    pub active: u64,
+    /// Suspended principals.
+    pub suspended: u64,
 }
 
 /// Response of `GET /v1/principals`.
@@ -503,6 +570,9 @@ pub struct PrincipalPage {
     /// Cursor for the next page, present only when one may exist.
     #[serde(default)]
     pub next: Option<PrincipalId>,
+    /// Status counts for the query's filters, independent of `limit` and
+    /// `after`.
+    pub counts: PrincipalStatusCounts,
 }
 
 /// Query of `GET /v1/principals`: exact-match filters and keyset paging.
@@ -517,9 +587,13 @@ pub struct PrincipalQuery {
     /// Exact email; matches users only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// Exact account name; matches services only.
+    /// Exact account name: a Service's name or a local User's username.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Role name: principals holding it at any scope, directly or through a
+    /// Group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Page size between 1 and 200; default 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 200))]

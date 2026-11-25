@@ -55,7 +55,7 @@ const FOLLOWS: &str = r#"{"outcome":"passed","reason":"within the policy","citat
 const BREAKS: &str = r#"{"outcome":"failed","reason":"contradicts the policy","citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}"#;
 
 /// The judge's Verdict for an answer containing `UNCITED`: a pass with no
-/// citation, which must not count as one.
+/// citation, which counts as authored.
 const UNCITED: &str = r#"{"outcome":"passed","reason":"trust me","citations":[]}"#;
 
 /// The judge's Verdict for an answer containing `JUDGE-FOREIGN-CITE`: a pass
@@ -68,6 +68,11 @@ const TOOLS: [&str; 3] = ["cards.get", "bifrost.query", "code.run"];
 /// The stable code of a permission denial, carried by every denied tool
 /// call's error.
 const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
+
+/// The stable code of a query the caller may make but whose table no grant
+/// covers: Card read admits the query surface for managed verification rows,
+/// and an ordinary telemetry table still needs its own query grant.
+const QUERY_FORBIDDEN: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
 
 /// The permissions every `tool-review` principal holds: run any Verifier and
 /// invoke the gateway its investigator calls the model through.
@@ -142,7 +147,7 @@ async fn script_investigator(upstream: &MockServer) {
         tool_call(
             "call-query",
             TOOLS[1],
-            &json!({ "sql": "SELECT execution_id FROM bifrost.verification.results LIMIT 1", "max_rows": 1 }),
+            &json!({ "sql": "SELECT name FROM bifrost.traces.spans LIMIT 1", "max_rows": 1 }),
         ),
         tool_call("call-code", TOOLS[2], &json!({ "source": "6 * 7" })),
     ];
@@ -178,7 +183,7 @@ print('escaped the budget')";
 /// The Python a `STALL` investigation runs: one Bifrost query the test
 /// server holds after its schema, so the program waits on it until its
 /// time limit.
-const STALL: &str = "await call_tool('bifrost.query', {'sql': 'SELECT execution_id FROM bifrost.verification.results LIMIT 1', 'max_rows': 1})
+const STALL: &str = "await call_tool('bifrost.query', {'sql': 'SELECT name FROM bifrost.traces.spans LIMIT 1', 'max_rows': 1})
 print('the query returned')";
 
 /// Script investigations whose question starts with `marker` to call only
@@ -636,13 +641,20 @@ impl PolicyDesk {
 
     /// Assert the investigation of `question` finished after calling each of
     /// [`TOOLS`] once, in order, where exactly the `allowed` calls returned
-    /// output and every other call was denied with [`DENIED`] and returned
+    /// output and every other call was denied and returned nothing: a denied
+    /// `bifrost.query` carries `query_denial`, any other [`DENIED`].
     /// nothing. The model's tool turn shows the policy desk's Card only when
     /// the Card read was allowed.
     ///
     /// # Panics
     /// Panics when the step, a call, or the model's tool turn differs.
-    async fn assert_tools(&self, result: &VerificationResult, question: &str, allowed: &[&str]) {
+    async fn assert_tools(
+        &self,
+        result: &VerificationResult,
+        question: &str,
+        allowed: &[&str],
+        query_denial: &str,
+    ) {
         let investigate = step(&self.deployment, result, "investigate").await;
         assert_eq!(investigate.status, StepStatus::Succeeded, "{question}");
         let called: Vec<Value> = investigate
@@ -658,9 +670,13 @@ impl PolicyDesk {
                 assert!(call.returned_bytes > 0, "{question} {tool}");
             } else {
                 assert!(
-                    call.error
-                        .as_deref()
-                        .is_some_and(|error| error.contains(DENIED)),
+                    call.error.as_deref().is_some_and(|error| {
+                        error.contains(if tool == TOOLS[1] {
+                            query_denial
+                        } else {
+                            DENIED
+                        })
+                    }),
                     "{question} {tool}: {call:?}"
                 );
                 assert_eq!(
@@ -689,7 +705,7 @@ impl PolicyDesk {
     /// Assert the `NESTED` investigation `question` made one model-visible
     /// `code.run` call whose nested calls, recorded for `code` in start
     /// order, are `children` as (tool, allowed), each denied one carrying
-    /// [`DENIED`] and returning nothing, and that the model received only
+    /// [`QUERY_FORBIDDEN`] and returning nothing, and that the model received only
     /// the program's `printed` line.
     ///
     /// # Panics
@@ -715,7 +731,7 @@ impl PolicyDesk {
                 assert!(
                     call.error
                         .as_deref()
-                        .is_none_or(|error| error.contains(DENIED)),
+                        .is_none_or(|error| error.contains(QUERY_FORBIDDEN)),
                     "{question}: {call:?}"
                 );
                 (
@@ -891,25 +907,31 @@ async fn judge_verdict_fails_the_agent_check() {
     desk.deployment.shutdown().await;
 }
 
-/// A judge that passes without citing any evidence cannot pass the
-/// requirement or the review.
+/// A judge that passes without citing evidence passes `follows-policy` as
+/// authored, with no citations and the judge's reason; a pass is never
+/// rewritten for lacking one.
 ///
 /// # Panics
-/// Panics when the review is refused or the uncited pass counts.
+/// Panics when the review is refused or the uncited pass is rewritten.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn uncited_judge_verdict_cannot_pass() {
+async fn uncited_judge_verdict_passes_as_authored() {
     let desk = PolicyDesk::start().await;
 
     let result = desk
         .review(review("UNCITED: refunds follow our policy.", 50, None))
         .await;
 
-    assert_ne!(
-        requirement(&result, "follows-policy").outcome,
-        RequirementOutcome::Passed
+    let judged = requirement(&result, "follows-policy");
+    assert_eq!(
+        (
+            judged.outcome,
+            judged.reason.as_str(),
+            judged.citations.len()
+        ),
+        (RequirementOutcome::Passed, "trust me", 0),
+        "{judged:?}"
     );
-    assert_ne!(result.outcome.verdict, VerificationVerdict::Passed);
     desk.deployment.shutdown().await;
 }
 
@@ -1531,25 +1553,33 @@ async fn code_check_fails_with_citations_and_is_inconclusive_otherwise() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn hosted_tools_need_the_tool_and_domain_grants() {
     let desk = PolicyDesk::start().await;
-    let cases: [(&str, &[&str], &[&str]); 3] = [
+    let cases: [(&str, &[&str], &[&str], &str); 3] = [
         (
             "all_tools",
             &["tool:invoke", "cards:read", "bifrost_query:read"],
             &TOOLS,
+            DENIED,
         ),
-        ("no_tool_grant", &["cards:read", "bifrost_query:read"], &[]),
+        (
+            "no_tool_grant",
+            &["cards:read", "bifrost_query:read"],
+            &[],
+            DENIED,
+        ),
         (
             "no_domain_grant",
             &["tool:invoke", "cards:read"],
             &[TOOLS[0], TOOLS[2]],
+            QUERY_FORBIDDEN,
         ),
     ];
 
-    for (name, extra, allowed) in cases {
+    for (name, extra, allowed, query_denial) in cases {
         let permissions = [&VERIFIES[..], extra].concat();
         let key = desk.deployment.scoped_key(name, &permissions).await;
         let result = desk.investigate(desk.deployment.client(&key), name).await;
-        desk.assert_tools(&result, name, allowed).await;
+        desk.assert_tools(&result, name, allowed, query_denial)
+            .await;
     }
     let key = desk
         .deployment
@@ -1558,10 +1588,10 @@ async fn hosted_tools_need_the_tool_and_domain_grants() {
     let result = desk
         .investigate(desk.deployment.client(&key), "card_tool_only")
         .await;
-    desk.assert_tools(&result, "card_tool_only", &[TOOLS[0]])
+    desk.assert_tools(&result, "card_tool_only", &[TOOLS[0]], DENIED)
         .await;
 
-    let denied = format!("query {DENIED} repaired True");
+    let denied = format!("query {QUERY_FORBIDDEN} repaired True");
     let nested = [
         (
             "NESTED all_tools",
@@ -1633,7 +1663,8 @@ async fn delegated_tools_keep_the_narrower_authority() {
 
     let result = desk.investigate(delegated, "delegated").await;
 
-    desk.assert_tools(&result, "delegated", &[TOOLS[0]]).await;
+    desk.assert_tools(&result, "delegated", &[TOOLS[0]], DENIED)
+        .await;
     desk.deployment
         .server()
         .flush_bifrost()
@@ -2189,7 +2220,8 @@ async fn code_mode_failure_releases_session() {
     let recovered = desk
         .investigate(desk.deployment.client(&key), "recovered")
         .await;
-    desk.assert_tools(&recovered, "recovered", &TOOLS).await;
+    desk.assert_tools(&recovered, "recovered", &TOOLS, DENIED)
+        .await;
     desk.deployment.shutdown().await;
 }
 

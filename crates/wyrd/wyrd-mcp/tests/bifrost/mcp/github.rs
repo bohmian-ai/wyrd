@@ -6,7 +6,8 @@
 //! mock, and the agent reads and releases it; no answer carries a token, code
 //! or key. A writer sees the read tool but not the write tools, and is
 //! refused all three when it names them. An agent reads a declared
-//! Repository's served selection and lists the Repository family,
+//! Repository's served selection and lists the Repository family, requests a
+//! fresh review of its pull request,
 //! publishes the deferred evidence a waiting pull request execution needs,
 //! and has another agent approve its pending signoff.
 
@@ -207,7 +208,10 @@ mod pg_tests {
     /// served selection and binding, and `cards.list` filters the family by
     /// the `Repository` kind. A pull request on it admits an execution the
     /// agent finds through the binding, pinned to its base and head, and a
-    /// pushed head cancels it as superseded with its pins kept.
+    /// pushed head cancels it as superseded with its pins kept. The agent
+    /// then requests a fresh review at the unchanged head, whose retry
+    /// returns the same generation, while a viewer is neither offered nor
+    /// granted the request.
     ///
     /// # Errors
     ///
@@ -361,6 +365,82 @@ mod pg_tests {
         assert_eq!(superseded["status"], "cancelled");
         assert_eq!(superseded["error"]["code"], "pull_request_superseded");
         assert_eq!(superseded["pull_request"]["head"]["sha"], "a1");
+
+        let tools = agent.list_all_tools().await?;
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "github_connection.review_pull_request"),
+            "a caller who may run Verifiers is offered the review request"
+        );
+        let review = json!({
+            "host": mock.host(),
+            "repository_id": "2",
+            "number": 7,
+            "idempotency_key": "mcp-review-7-a",
+        });
+        let requested = structured(
+            agent
+                .call_tool(call_with("github_connection.review_pull_request", &review)?)
+                .await?,
+        )?;
+        let members = requested["executions"].clone();
+        assert_eq!(members.as_array().map(Vec::len), Some(1), "{requested}");
+        let fresh = execution(&members[0]).await?;
+        assert_eq!(fresh["status"], "pending");
+        assert_eq!(fresh["pull_request"]["head"]["sha"], "b2");
+        assert_eq!(fresh["pull_request"]["generation"], requested["generation"]);
+        assert_eq!(fresh["pull_request"]["members"], members);
+        assert_eq!(fresh["pull_request"]["request_key"], "mcp-review-7-a");
+        assert_eq!(
+            structured(
+                agent
+                    .call_tool(call_with("github_connection.review_pull_request", &review)?)
+                    .await?,
+            )?,
+            requested,
+            "a retry of the key returns the same generation"
+        );
+        assert_eq!(newest().await?, members[0]);
+
+        let viewer = server
+            .bootstrap_service("mcp-repo-viewer", &["viewer"])
+            .await?;
+        let viewer_key = viewer
+            .api_key()
+            .ok_or("a service bootstraps with a machine key")?
+            .expose_secret()
+            .to_owned();
+        let watcher = ()
+            .serve_with_lifecycle(
+                transport(&server, ResolvedCredential::ApiKey(viewer_key.into()), None)?,
+                discover(),
+            )
+            .await?;
+        let tools = watcher.list_all_tools().await?;
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.name == "github_connection.review_pull_request"),
+            "a viewer is not offered the review request"
+        );
+        let mut other = review.clone();
+        other["idempotency_key"] = json!("mcp-review-7-viewer");
+        let refusal = refused(
+            watcher
+                .call_tool(call_with("github_connection.review_pull_request", &other)?)
+                .await,
+        )?;
+        assert!(
+            refusal.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "{refusal}"
+        );
+        assert_eq!(
+            newest().await?,
+            members[0],
+            "a refused request admits nothing"
+        );
+        watcher.cancel().await?;
         agent.cancel().await?;
         server.shutdown().await?;
         Ok(())
@@ -700,25 +780,41 @@ mod pg_tests {
         viewer.cancel().await?;
 
         let editor = opened.agent("mcp-signoff-editor", "editor").await?;
+        let denied = refused(editor.call_tool(decide(Some("looks fine"))?).await)?;
         assert!(
-            tools(&editor)
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "an editor cannot approve: {denied}"
+        );
+        editor.cancel().await?;
+
+        let approver = opened.agent("mcp-signoff-approver", "approver").await?;
+        assert!(
+            tools(&approver)
                 .await?
                 .iter()
                 .any(|name| name == "verification.decide_approval")
         );
-        let receipt = structured(editor.call_tool(decide(Some("reviewed the diff"))?).await?)?;
+        let receipt = structured(
+            approver
+                .call_tool(decide(Some("reviewed the diff"))?)
+                .await?,
+        )?;
         assert_eq!(receipt["approval_id"], approval);
         assert_eq!(receipt["status"], "approved");
         assert_eq!(receipt["reason"], "reviewed the diff");
         assert!(receipt["actor_id"].is_string() && receipt["decided_at"].is_string());
-        let replayed = structured(editor.call_tool(decide(Some("reviewed the diff"))?).await?)?;
+        let replayed = structured(
+            approver
+                .call_tool(decide(Some("reviewed the diff"))?)
+                .await?,
+        )?;
         assert_eq!(replayed, receipt);
-        let conflict = refused(editor.call_tool(decide(None)?).await)?;
+        let conflict = refused(approver.call_tool(decide(None)?).await)?;
         assert!(
             conflict.contains("WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"),
             "{conflict}"
         );
-        editor.cancel().await?;
+        approver.cancel().await?;
 
         let completed = opened
             .until(|state| state["status"] == "completed" && !state["result"].is_null())

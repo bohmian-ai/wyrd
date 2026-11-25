@@ -23,6 +23,15 @@ use serde_json::{Value, json};
 use wyrd_server::boot::init::InitError;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::principal::within_propagation;
+
+mod company_sso;
+mod console;
+mod contacts;
+mod methods;
+mod resets;
+mod setup;
+mod signup;
 
 /// Wrapping-key lifecycle and stored-secret maintenance journeys.
 mod stored_secrets;
@@ -817,10 +826,11 @@ async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
 ///
 /// This is the whole point of separating credentials from identity: the
 /// principal, its roles, and everything it owns survive the rotation, and the
-/// old credential mints nothing once the operator retires it. A token it
-/// already minted is a self-contained snapshot that lapses at its five-minute
-/// expiry, while the surviving credential exchanges and spends immediately —
-/// no ordering between the two tokens is involved.
+/// old credential mints nothing once the operator retires it. Revocation ends
+/// renewal and does not withdraw a token the credential already minted, which
+/// spends the account's current authority until its five-minute expiry, while
+/// the surviving credential exchanges and spends immediately — no ordering
+/// between the two tokens is involved.
 #[tokio::test]
 async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     let srv = WyrdTestServer::start_in_process()
@@ -835,7 +845,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "ci-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -955,7 +965,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token the revoked credential already minted keeps its snapshot until expiry"
+        "revoking a credential does not withdraw a token it already minted"
     );
     let surviving = tenant_token(&srv, &second)
         .await
@@ -989,7 +999,7 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "ci-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -1192,7 +1202,7 @@ async fn a_revoked_credential_mints_nothing_and_its_token_lapses_at_expiry() {
     assert_eq!(
         cards(&token_a).await,
         StatusCode::OK,
-        "A's existing token keeps its snapshot authority before expiry"
+        "revoking A does not withdraw a token A already minted"
     );
     let token_b = tenant_token(&srv, &second)
         .await
@@ -1228,7 +1238,7 @@ async fn a_credential_cannot_be_revoked_through_another_principal() {
                 tenant_request(
                     Method::POST,
                     "/v1/principals",
-                    Some(json!({ "name": name, "roles": ["viewer"] })),
+                    Some(json!({ "name": name, "assignments": [{ "role": "viewer", "scope": "all" }] })),
                 ),
             )
             .await
@@ -1308,7 +1318,7 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "ci-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -1326,7 +1336,7 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "escalated", "roles": ["admin"] })),
+                Some(json!({ "name": "escalated", "assignments": [{ "role": "admin", "scope": "all" }] })),
             ),
         )
         .await
@@ -1377,13 +1387,24 @@ async fn mount_platform_provider(
     token_response: wiremock::ResponseTemplate,
 ) {
     server.reset().await;
+    mount_platform_discovery(server, key_set, &format!("{}/token", server.uri())).await;
+    mount_platform_token(server, token_response).await;
+}
+
+/// Answer `server`'s discovery, advertising RFC 9207 response issuers and
+/// `token_endpoint`, and its key set with `key_set`.
+async fn mount_platform_discovery(
+    server: &wiremock::MockServer,
+    key_set: wiremock::ResponseTemplate,
+    token_endpoint: &str,
+) {
     let issuer = server.uri();
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(PLATFORM_DISCOVERY))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
+            "token_endpoint": token_endpoint,
             "jwks_uri": format!("{issuer}/jwks"),
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
@@ -1397,7 +1418,6 @@ async fn mount_platform_provider(
         .respond_with(key_set)
         .mount(server)
         .await;
-    mount_platform_token(server, token_response).await;
 }
 
 /// A key set publishing [`PLATFORM_SIGNING_KEY`] under `kid`.
@@ -1445,31 +1465,135 @@ fn platform_token_reply(
     audience: &str,
     kid: &str,
 ) -> wiremock::ResponseTemplate {
+    identity_token_reply(
+        issuer,
+        nonce,
+        audience,
+        kid,
+        "provider-subject-1",
+        "ops@example.com",
+    )
+}
+
+/// A token-endpoint reply as [`platform_token_reply`], for the provider
+/// identity `subject` asserting `email`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn identity_token_reply(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+) -> wiremock::ResponseTemplate {
+    identity_token_reply_with(issuer, nonce, audience, kid, subject, email, true)
+}
+
+/// [`identity_token_reply`] whose `email_verified` claim is `email_verified`.
+fn identity_token_reply_with(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(identity_token_body(
+        issuer,
+        nonce,
+        audience,
+        kid,
+        subject,
+        email,
+        email_verified,
+    ))
+}
+
+/// The token-endpoint body [`identity_token_reply_with`] answers.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn identity_token_body(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> Value {
+    signed_identity_body(
+        kid,
+        &identity_claims(issuer, nonce, audience, subject, email, email_verified),
+    )
+}
+
+/// [`identity_token_reply`] carrying the standard `name` claim when `name`
+/// is given.
+fn identity_token_reply_named(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    name: Option<&str>,
+) -> wiremock::ResponseTemplate {
+    let mut claims = identity_claims(issuer, nonce, audience, subject, email, true);
+    if let Some(name) = name {
+        claims["name"] = json!(name);
+    }
+    signed_identity_reply(kid, &claims)
+}
+
+/// The ID-token claims a provider at `issuer` asserts for `subject`.
+fn identity_claims(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> Value {
     let now = chrono::Utc::now().timestamp();
+    json!({
+        "iss": issuer,
+        "sub": subject,
+        "aud": audience,
+        "exp": now + 3600,
+        "iat": now,
+        "nonce": nonce,
+        "email": email,
+        "email_verified": email_verified,
+    })
+}
+
+/// A token-endpoint reply whose ID token carries `claims`, signed under `kid`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn signed_identity_reply(kid: &str, claims: &Value) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(signed_identity_body(kid, claims))
+}
+
+/// The token-endpoint body whose ID token carries `claims`, signed under `kid`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn signed_identity_body(kid: &str, claims: &Value) -> Value {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     header.kid = Some(kid.to_owned());
     let key = jsonwebtoken::EncodingKey::from_ed_pem(PLATFORM_SIGNING_KEY.as_bytes())
         .expect("test key loads");
-    let id_token = jsonwebtoken::encode(
-        &header,
-        &json!({
-            "iss": issuer,
-            "sub": "provider-subject-1",
-            "aud": audience,
-            "exp": now + 3600,
-            "iat": now,
-            "nonce": nonce,
-            "email": "ops@example.com",
-            "email_verified": true,
-        }),
-        &key,
-    )
-    .expect("token signs");
-    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+    let id_token = jsonwebtoken::encode(&header, claims, &key).expect("token signs");
+    json!({
         "access_token": "provider-access",
         "token_type": "Bearer",
         "id_token": id_token,
-    }))
+    })
 }
 
 /// Begin a platform login and return its state and the nonce the provider
@@ -1950,6 +2074,8 @@ async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_r
     confidential_platform_sign_in(&srv, &provider).await;
     let opened = transit.requests("decrypt").await;
     assert!(opened >= 1, "the sign-in opened the secret through Transit");
+    // The first sign-in start also seals the platform derivation key once.
+    let sealed = transit.requests("encrypt").await;
 
     // 3. The restarted process opens the committed envelope again.
     let srv = Box::pin(srv.restart_bound(WyrdTestServer::builder()))
@@ -1960,7 +2086,11 @@ async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_r
         transit.requests("decrypt").await > opened,
         "the restarted process opened the secret through Transit"
     );
-    assert_eq!(transit.requests("encrypt").await, 1, "nothing was resealed");
+    assert_eq!(
+        transit.requests("encrypt").await,
+        sealed,
+        "nothing was resealed"
+    );
 
     srv.shutdown().await.expect("server shuts down");
 }
@@ -2047,7 +2177,9 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     );
     confidential_platform_sign_in(&srv, &provider).await;
 
-    // A key outage refuses the renewal and changes nothing.
+    // A key outage refuses the renewal and changes nothing. The sign-in
+    // start above sealed the platform derivation key once.
+    let sealed = transit.requests("encrypt").await;
     transit.set_available(false);
     let resp = renew().await.expect("renew route responds");
     transit.set_available(true);
@@ -2058,7 +2190,7 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     );
     assert_eq!(
         transit.requests("encrypt").await,
-        2,
+        sealed,
         "the outage resealed nothing"
     );
     confidential_platform_sign_in(&srv, &provider).await;
@@ -3096,7 +3228,8 @@ async fn an_operator_rotates_the_deployment_root_credential() {
 /// operator reached for it. The journey therefore proves three things a
 /// generated client depends on: the declared kind selects the table, a reason
 /// that looks like a credential is refused rather than persisted, and an
-/// accepted reason is what the audit row carries.
+/// accepted reason is what the audit row carries. A token the principal held
+/// before the revocation is refused as inactive at its next request.
 #[tokio::test]
 async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     let srv = WyrdTestServer::start_in_process()
@@ -3110,7 +3243,7 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "leaked-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "leaked-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3191,15 +3324,29 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .expect("revoke route responds");
     assert_eq!(resp.status(), StatusCode::OK, "the revocation is accepted");
 
+    let cards_status = || async {
+        srv.oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
+            .await
+            .expect("cards route responds")
+            .status()
+    };
+    within_propagation(&StatusCode::UNAUTHORIZED, cards_status).await;
     let resp = srv
         .oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
         .await
         .expect("cards route responds");
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "a token minted before the revocation keeps its snapshot until expiry"
+        StatusCode::UNAUTHORIZED,
+        "a token minted before the revocation spends current authority, and the account is inactive"
     );
+    let problem: Value = serde_json::from_slice(
+        &to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("problem body reads"),
+    )
+    .expect("problem is JSON");
+    assert_eq!(problem["details"]["reason"], "inactive", "{problem}");
     assert_eq!(
         tenant_token(&srv, &credential).await.unwrap_err(),
         StatusCode::BAD_REQUEST,
@@ -3402,7 +3549,7 @@ async fn recovery_is_refused_for_every_state_but_active() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "post-recovery", "roles": ["viewer"] })),
+                Some(json!({ "name": "post-recovery", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3471,7 +3618,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "beta-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "beta-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3567,7 +3714,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "escalated", "roles": ["admin"] })),
+                Some(json!({ "name": "escalated", "assignments": [{ "role": "admin", "scope": "all" }] })),
             ),
         )
         .await
@@ -3679,7 +3826,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     );
 
     // A token minted before the suspension is the interesting one: suspension
-    // governs issuance, and an issued token is a self-contained snapshot.
+    // governs issuance, and an issued token spends its account's current
+    // authority, which suspending the tenant does not withdraw.
     let live_token = tenant_token(&srv, &admin_credential)
         .await
         .expect("the tenant administers before suspension");
@@ -3689,7 +3837,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "before-suspension", "roles": ["viewer"] })),
+                Some(json!({ "name": "before-suspension", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3727,7 +3875,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "during-suspension", "roles": ["viewer"] })),
+                Some(json!({ "name": "during-suspension", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3735,8 +3883,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token minted before the suspension keeps its snapshot authority \
-         until its five-minute expiry; verification reads no tenant state"
+        "a token minted before the suspension keeps its account's current authority \
+         until its five-minute expiry"
     );
 
     // Replaying the same transition changes nothing and says so.
@@ -3767,7 +3915,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "after-resume", "roles": ["viewer"] })),
+                Some(json!({ "name": "after-resume", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3869,9 +4017,9 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
         ),
         (
             "grant",
-            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_service_account_roles
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_role_bindings
              FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-grant')",
-            "DROP TRIGGER fail_stage ON wyrd.auth_service_account_roles",
+            "DROP TRIGGER fail_stage ON wyrd.auth_role_bindings",
         ),
         (
             "credential",
@@ -3974,7 +4122,7 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
         let counts: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM wyrd.auth_service_accounts
                       WHERE data_tenant_id = $1 AND principal_kind <> 'system'),
-                    (SELECT count(*) FROM wyrd.auth_service_account_roles WHERE data_tenant_id = $1),
+                    (SELECT count(*) FROM wyrd.auth_role_bindings WHERE data_tenant_id = $1 AND service_account_id IS NOT NULL),
                     (SELECT count(*) FROM wyrd.auth_api_keys
                       WHERE data_tenant_id = $1 AND revoked_at IS NULL),
                     (SELECT count(*) FROM wyrd.auth_service_accounts
@@ -4510,7 +4658,7 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "unaffected", "roles": ["viewer"] })),
+                Some(json!({ "name": "unaffected", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -4813,6 +4961,16 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "suspending a tenant that does not exist",
         ),
         (
+            platform_request(
+                Method::PUT,
+                &format!("/platform/tenants/{}/status", DataTenantId::SYSTEM_OWNER),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+            StatusCode::NOT_FOUND,
+            "suspending the platform's own wyrd-system tenant",
+        ),
+        (
             platform_post(
                 "/platform/admins",
                 &session,
@@ -4973,7 +5131,9 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "roleless", "roles": ["absent_role"] })),
+                Some(
+                    json!({ "name": "roleless", "assignments": [{ "role": "absent_role", "scope": "all" }] }),
+                ),
             ),
             StatusCode::BAD_REQUEST,
             "creating a principal with a role that does not exist",
@@ -5668,4 +5828,2582 @@ async fn the_benchmark_control_exists_only_in_a_bench_build() {
             assert_eq!(resp.status(), unrouted, "{path} is unrouted");
         }
     }
+}
+
+/// Host every shared social sign-in request names, so callbacks derive from
+/// one public origin.
+const SOCIAL_HOST: &str = "wyrd.test";
+
+/// Build a request at [`SOCIAL_HOST`] carrying `token`, when given.
+fn social_request(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, SOCIAL_HOST);
+    if let Some(token) = token {
+        builder = builder.header(WYRD_ACCESS_TOKEN_HEADER, format!("Bearer {token}"));
+    }
+    match body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+            .expect("request builds"),
+        None => builder.body(Body::empty()).expect("request builds"),
+    }
+}
+
+/// Send `request` and read its status and JSON body (`Null` when not JSON).
+async fn social_call(srv: &WyrdTestServer, request: Request<Body>) -> (StatusCode, Value) {
+    let resp = srv.oneshot(request).await.expect("route responds");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// An operator configures Google beside a tenant's company SSO, tests the
+/// exact stored revision through a real provider sign-in and only then
+/// enables it:
+///   1. with no social configuration the tenant page offers company SSO and
+///      password, no provider and no signup; every provider is unconfigured;
+///   2. storing the client returns the exact registration callback and an
+///      untested revision, never the secret, and the secret is sealed at rest;
+///   3. an untested revision cannot be enabled, and a test of a stale
+///      revision is refused;
+///   4. the test sign-in at the provider marks exactly that revision tested,
+///      and a replayed test return is refused;
+///   5. once enabled, another replica reads the same tested revision and the
+///      tenant page offers Google beside company SSO;
+///   6. a tenant administrator cannot write the shared configuration but
+///      still manages their own connection, a platform session cannot change
+///      tenant settings, and provider setup created no tenant grant.
+#[tokio::test]
+async fn an_operator_configures_and_tests_google_beside_company_sso() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            ..Default::default()
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let mut conn = srv
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn opens");
+    wyrd_dev_fixtures::pg::seed_active_human_connection(&mut conn)
+        .await
+        .expect("company connection seeds");
+    conn.commit().await.expect("seed commits");
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "social-tenant-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let grants_before: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_role_bindings")
+        .fetch_one(&superuser)
+        .await
+        .expect("grants count");
+    let methods = format!("/auth/browser/methods?tenant={slug}");
+
+    // 1. Nothing social is offered before configuration.
+    let (status, offered) =
+        social_call(&srv, social_request(Method::GET, &methods, None, None)).await;
+    assert_eq!(status, StatusCode::OK, "methods list: {offered}");
+    assert_eq!(
+        offered,
+        json!({ "password": true, "company_sso": true, "providers": [], "signup": false, "local_signup": false, "email_discovery": false, "password_reset": false, "email_verification_required": true, "signup_providers": [] }),
+        "password starts enabled, signup disabled, and no social button appears"
+    );
+    let (status, listed) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/platform/social/providers",
+            Some(&session),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "providers list: {listed}");
+    assert_eq!(listed["providers"][0]["provider"], "google");
+    assert_eq!(
+        listed["providers"][0]["state"],
+        Value::Null,
+        "Google is unconfigured"
+    );
+    assert_eq!(listed["providers"][1]["provider"], "github");
+    let (status, settings) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/platform/login-settings",
+            Some(&session),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        settings,
+        json!({ "password_enabled": true, "signup_enabled": false, "signup_workspace_cap": 3,
+            "signup_challenge": null })
+    );
+
+    // 2. Storing the client discloses the callback and never the secret.
+    let secret = "google-client-secret-value";
+    let (status, stored) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(&session),
+            Some(json!({ "client_id": "wyrd-google", "client_secret": secret })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Google configures: {stored}");
+    assert_eq!(
+        stored["callback_url"],
+        "http://wyrd.test/auth/social/google/callback"
+    );
+    assert_eq!(stored["revision"], 1);
+    assert_eq!(stored["state"], "untested");
+    assert!(
+        !stored.to_string().contains(secret),
+        "no secret in a response: {stored}"
+    );
+    let sealed: Vec<u8> = sqlx::query_scalar(
+        "SELECT client_secret_enc FROM platform.social_providers WHERE provider = 'google'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("sealed secret reads");
+    assert!(
+        !sealed
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()),
+        "the client secret is sealed at rest"
+    );
+
+    // 3. Untested and stale revisions are refused.
+    let enable = |revision: u64| {
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google/enabled",
+            Some(&session),
+            Some(json!({ "enabled": true, "expected_revision": revision })),
+        )
+    };
+    let (status, refused) = social_call(&srv, enable(1)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "untested Google cannot be enabled: {refused}"
+    );
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/google/test",
+            Some(&session),
+            Some(json!({ "expected_revision": 2 })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a revision that is not current is not tested"
+    );
+
+    // 4. A real provider sign-in tests exactly revision 1.
+    let (status, begun) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/google/test",
+            Some(&session),
+            Some(json!({ "expected_revision": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test begins: {begun}");
+    let authorization = url::Url::parse(begun["authorization_url"].as_str().expect("url"))
+        .expect("authorization url parses");
+    let query: std::collections::HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    assert_eq!(query["client_id"], "wyrd-google");
+    assert_eq!(
+        query["redirect_uri"],
+        "http://wyrd.test/auth/social/google/callback"
+    );
+    assert_eq!(
+        query["scope"], "openid profile email",
+        "only the agreed Google scopes"
+    );
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        platform_token_reply(&google.uri(), &query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let callback = format!(
+        "/auth/social/google/callback?code=provider-code&state={}&iss={}",
+        query["state"],
+        url::form_urlencoded::byte_serialize(google.uri().as_bytes()).collect::<String>()
+    );
+    let (status, _) = social_call(&srv, social_request(Method::GET, &callback, None, None)).await;
+    assert_eq!(status, StatusCode::OK, "the provider test passes");
+    let (status, _) = social_call(&srv, social_request(Method::GET, &callback, None, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replayed test return is refused"
+    );
+
+    // 5. The tested revision enables and every replica serves it.
+    let (status, enabled) = social_call(&srv, enable(1)).await;
+    assert_eq!(status, StatusCode::OK, "tested Google enables: {enabled}");
+    assert_eq!(enabled["state"], "enabled");
+    let replica = srv
+        .start_replica(WyrdTestServer::builder())
+        .await
+        .expect("replica starts");
+    let (status, listed) = social_call(
+        &replica,
+        social_request(
+            Method::GET,
+            "/platform/social/providers",
+            Some(&session),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "replica lists providers: {listed}");
+    assert_eq!(listed["providers"][0]["revision"], 1);
+    assert_eq!(listed["providers"][0]["state"], "enabled");
+    assert!(
+        !listed.to_string().contains(secret),
+        "no secret in a read: {listed}"
+    );
+    let (_, offered) =
+        social_call(&replica, social_request(Method::GET, &methods, None, None)).await;
+    assert_eq!(
+        offered,
+        json!({ "password": true, "company_sso": true, "providers": ["google"], "signup": false, "local_signup": false, "email_discovery": false, "password_reset": false, "email_verification_required": true, "signup_providers": [] }),
+        "Google is offered beside company SSO"
+    );
+
+    // 6. Each control plane stays on its own side.
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(&admin),
+            Some(json!({ "client_id": "attacker", "client_secret": "attacker" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a tenant admin cannot write shared config"
+    );
+    let (status, connections) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/v1/identity/oidc/connections",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the tenant admin manages their connection: {connections}"
+    );
+    assert!(
+        connections.to_string().contains("Active"),
+        "the company connection is untouched: {connections}"
+    );
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/v1/identity/oidc/candidate",
+            Some(&session),
+            Some(json!({ "issuer_url": "https://idp.example", "client_id": "x" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a platform session cannot change tenant settings"
+    );
+    let grants_after: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_role_bindings")
+        .fetch_one(&superuser)
+        .await
+        .expect("grants count");
+    assert_eq!(
+        grants_after, grants_before,
+        "provider setup creates no tenant grant"
+    );
+}
+
+/// Configure, test and enable the deployment's Google client `wyrd-google`
+/// against the mock `google` through the platform API, leaving `google`
+/// with a working key set.
+///
+/// # Panics
+/// Panics when any platform step is refused.
+async fn enable_google(srv: &WyrdTestServer, session: &str, google: &wiremock::MockServer) {
+    let (status, stored) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(session),
+            Some(json!({ "client_id": "wyrd-google", "client_secret": "google-secret" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Google configures: {stored}");
+    let revision = stored["revision"].as_u64().expect("revision");
+    let (status, begun) = social_call(
+        srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/google/test",
+            Some(session),
+            Some(json!({ "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test begins: {begun}");
+    let query = authorization_query(begun["authorization_url"].as_str().expect("url"));
+    mount_platform_provider(
+        google,
+        platform_key_set("google-key"),
+        platform_token_reply(&google.uri(), &query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (status, _) = social_call(
+        srv,
+        social_request(
+            Method::GET,
+            &social_callback(&query["state"], &google.uri()),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the provider test passes");
+    set_google_enabled(srv, session, revision, true).await;
+}
+
+/// Enable or disable Google revision `revision` through the platform API.
+///
+/// # Panics
+/// Panics when the change is refused.
+async fn set_google_enabled(srv: &WyrdTestServer, session: &str, revision: u64, enabled: bool) {
+    let (status, changed) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google/enabled",
+            Some(session),
+            Some(json!({ "enabled": enabled, "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Google enablement changes: {changed}"
+    );
+}
+
+/// The query parameters of a provider authorization URL.
+///
+/// # Panics
+/// Panics when `url` does not parse.
+fn authorization_query(url: &str) -> std::collections::HashMap<String, String> {
+    url::Url::parse(url)
+        .expect("authorization url parses")
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+/// The Google social callback for `state`, naming `issuer` as RFC 9207 `iss`.
+fn social_callback(state: &str, issuer: &str) -> String {
+    format!(
+        "/auth/social/google/callback?code=provider-code&state={state}&iss={}",
+        url::form_urlencoded::byte_serialize(issuer.as_bytes()).collect::<String>()
+    )
+}
+
+/// One Google sign-in begun from a tenant sign-in page.
+struct BegunSocialLogin {
+    /// The provider state and nonce from the authorization URL.
+    query: std::collections::HashMap<String, String>,
+    /// The `wyrd_login` cookie pair the beginning browser holds.
+    cookie: String,
+    /// That cookie's `Set-Cookie` attributes.
+    set_cookie: String,
+}
+
+/// Begin a Google sign-in for tenant `slug` the way its sign-in page does.
+///
+/// # Panics
+/// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
+async fn begin_google_login(srv: &WyrdTestServer, slug: &str) -> BegunSocialLogin {
+    begin_google(srv, json!({ "tenant": slug, "provider": "google" })).await
+}
+
+/// Begin a Google sign-in with the login request `body`.
+///
+/// # Panics
+/// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
+async fn begin_google(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
+    begin_social(srv, body).await
+}
+
+/// Begin a social sign-in with the login request `body`.
+///
+/// # Panics
+/// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
+async fn begin_social(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
+    begin_social_at(srv, "/auth/browser/login", body).await
+}
+
+/// Begin a social round-trip at `uri` with the request `body`.
+///
+/// # Panics
+/// Panics when it does not begin or sets no `wyrd_login` cookie.
+async fn begin_social_at(srv: &WyrdTestServer, uri: &str, body: Value) -> BegunSocialLogin {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+        .expect("request builds");
+    let resp = srv.oneshot(request).await.expect("login route responds");
+    let status = resp.status();
+    let set_cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("wyrd_login="))
+        .map(str::to_owned);
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "Google sign-in begins: {body}");
+    let set_cookie = set_cookie.expect("the login-transaction cookie is set");
+    BegunSocialLogin {
+        query: authorization_query(body["authorization_url"].as_str().expect("url")),
+        cookie: set_cookie
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_owned(),
+        set_cookie,
+    }
+}
+
+/// Return to the Google callback for `begun` from a browser holding
+/// `cookie`, naming `issuer`; returns the status and `Location`.
+///
+/// # Panics
+/// Panics when the route does not respond.
+async fn finish_google_login(
+    srv: &WyrdTestServer,
+    begun: &BegunSocialLogin,
+    cookie: Option<&str>,
+    issuer: &str,
+) -> (StatusCode, Option<String>) {
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(social_callback(&begun.query["state"], issuer))
+        .header(header::HOST, SOCIAL_HOST);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    let resp = srv
+        .oneshot(builder.body(Body::empty()).expect("request builds"))
+        .await
+        .expect("callback responds");
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (resp.status(), location)
+}
+
+/// Counts of every local record a sign-in could create: Users, linked
+/// identities, browser sessions and role bindings.
+///
+/// # Panics
+/// Panics when a count query fails.
+async fn local_records(pool: &PgPool) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM wyrd.auth_users), \
+                (SELECT count(*) FROM wyrd.auth_user_identities), \
+                (SELECT count(*) FROM wyrd.auth_browser_sessions), \
+                (SELECT count(*) FROM wyrd.auth_role_bindings)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("counts run")
+}
+
+/// Google proves only the sign-in purpose bound before redirecting and
+/// never admits a stranger:
+///   1. a tenant page begins Google with only the agreed scopes and a
+///      login-transaction cookie scoped to the social callbacks;
+///   2. a valid Google identity no tenant User has linked is refused with
+///      account guidance and creates no User, identity, session or grant,
+///      and a replay of the return is refused;
+///   3. an email matching an existing User still selects nothing;
+///   4. a return reaching another browser, naming another issuer, or
+///      carrying a wrong nonce, audience or signature is refused;
+///   5. a Google transaction cannot complete a company sign-in;
+///   6. disabling Google between start and return refuses completion on
+///      every replica, and so does replacing its client;
+///   7. a provider outage refuses; no provider token is retained.
+#[tokio::test]
+async fn google_proves_a_bound_login_without_admitting_a_stranger() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            ..Default::default()
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    enable_google(&srv, &session, &google).await;
+    let issuer = google.uri();
+    let answer = |nonce: &str, audience: &str, kid: &str| {
+        platform_token_reply(&issuer, nonce, audience, kid)
+    };
+    let before = local_records(&superuser).await;
+    let no_account = format!("/t/{slug}/login?login=no_account");
+    let failed = format!("/t/{slug}/login?login=failed");
+
+    // 1. Only the agreed scopes; the cookie reaches only the social callbacks.
+    let begun = begin_google_login(&srv, &slug).await;
+    assert_eq!(begun.query["client_id"], "wyrd-google");
+    assert_eq!(
+        begun.query["redirect_uri"],
+        "http://wyrd.test/auth/social/google/callback"
+    );
+    assert_eq!(begun.query["scope"], "openid profile email");
+    assert!(
+        !begun.query.contains_key("access_type"),
+        "no offline Google access is requested"
+    );
+    assert!(
+        begun.set_cookie.contains("Path=/auth/social"),
+        "the transaction cookie is scoped to the social callbacks: {}",
+        begun.set_cookie
+    );
+
+    // 2. A stranger is refused with guidance and creates nothing.
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (status, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(no_account.as_str()),
+        "account guidance"
+    );
+    assert_eq!(
+        local_records(&superuser).await,
+        before,
+        "a stranger creates nothing"
+    );
+    let (status, _) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replayed return is refused"
+    );
+
+    // 3. A matching email selects no account.
+    sqlx::query(
+        "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status) \
+         VALUES ($1, $2, 'ops@example.com', 'oidc', 'active')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant.as_uuid())
+    .execute(&superuser)
+    .await
+    .expect("same-email User seeds");
+    let before = local_records(&superuser).await;
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (_, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(no_account.as_str()),
+        "email never selects a User"
+    );
+    assert_eq!(local_records(&superuser).await, before);
+
+    // 4. Wrong browser, issuer, nonce, audience and signature are refused.
+    let begun = begin_google_login(&srv, &slug).await;
+    let (_, location) = finish_google_login(&srv, &begun, None, &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "no transaction cookie"
+    );
+    let begun = begin_google_login(&srv, &slug).await;
+    let other = begin_google_login(&srv, &slug).await;
+    let (_, location) = finish_google_login(&srv, &begun, Some(&other.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "another browser's cookie"
+    );
+    let (_, location) =
+        finish_google_login(&srv, &other, Some(&other.cookie), "https://evil.example").await;
+    assert_eq!(location.as_deref(), Some(failed.as_str()), "another issuer");
+    for (nonce, audience, kid, case) in [
+        (None, "wyrd-google", "google-key", "a wrong nonce"),
+        (Some(()), "someone-else", "google-key", "a wrong audience"),
+        (
+            Some(()),
+            "wyrd-google",
+            "unknown-key",
+            "an unknown signing key",
+        ),
+    ] {
+        let begun = begin_google_login(&srv, &slug).await;
+        let nonce = nonce.map_or("other-nonce", |()| begun.query["nonce"].as_str());
+        mount_platform_provider(
+            &google,
+            platform_key_set("google-key"),
+            answer(nonce, audience, kid),
+        )
+        .await;
+        let (_, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+        assert_eq!(
+            location.as_deref(),
+            Some(failed.as_str()),
+            "{case} is refused"
+        );
+    }
+
+    // 5. A Google transaction cannot complete a company sign-in.
+    let begun = begin_google_login(&srv, &slug).await;
+    let company = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/auth/callback?code=provider-code&state={}",
+            begun.query["state"]
+        ))
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::COOKIE, &begun.cookie)
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _) = social_call(&srv, company).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "purpose substitution is refused"
+    );
+
+    // 6. Disabled or replaced between start and return, Google refuses everywhere.
+    let replica = srv
+        .start_replica(WyrdTestServer::builder().with_social_endpoints_for_test(
+            wyrd_server::config::SocialConfig {
+                google_issuer: Some(google.uri()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("replica starts");
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    set_google_enabled(&srv, &session, 1, false).await;
+    let (_, location) = finish_google_login(&replica, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "disabled Google refuses on a replica"
+    );
+    set_google_enabled(&srv, &session, 1, true).await;
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(&session),
+            Some(json!({ "client_id": "wyrd-google", "client_secret": "rotated" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the client is replaced");
+    let (_, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "a replaced client refuses"
+    );
+
+    // 7. Outage refuses, and no provider token is kept anywhere.
+    enable_google(&srv, &session, &google).await;
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_outage(&google, wiremock::ResponseTemplate::new(503)).await;
+    let (status, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an outage refuses as retryable: {location:?}"
+    );
+    assert_eq!(
+        local_records(&superuser).await,
+        before,
+        "no refusal created anything"
+    );
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM wyrd.auth_login_state s WHERE s::text LIKE '%provider-access%') \
+              + (SELECT count(*) FROM platform.social_login_state s WHERE s::text LIKE '%provider-access%')",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("retention check runs");
+    assert_eq!(retained, 0, "no provider token is retained");
+}
+
+/// The repository-managed Mailpit relay: its SMTP `host:port` and HTTP API.
+///
+/// # Panics
+/// Panics when `scripts/postgres/with-test-postgres.sh` did not start it.
+fn mailpit() -> (String, u16, String) {
+    let smtp = env::var("WYRD_TEST_MAILPIT_SMTP")
+        .expect("WYRD_TEST_MAILPIT_SMTP is set by scripts/postgres/with-test-postgres.sh");
+    let api = env::var("WYRD_TEST_MAILPIT_API").expect("WYRD_TEST_MAILPIT_API is set");
+    let (host, port) = smtp.rsplit_once(':').expect("host:port");
+    (host.to_owned(), port.parse().expect("port"), api)
+}
+
+/// Every message Mailpit holds for `recipient`, newest first, as
+/// `(to, from, subject, text)`.
+async fn mail_to(api: &str, recipient: &str) -> Vec<(Vec<String>, String, String, String)> {
+    let http = reqwest::Client::new();
+    let found: Value = http
+        .get(format!("{api}/api/v1/search"))
+        .query(&[("query", format!("to:\"{recipient}\""))])
+        .send()
+        .await
+        .expect("mailpit search")
+        .json()
+        .await
+        .expect("search json");
+    let mut messages = Vec::new();
+    for summary in found["messages"].as_array().expect("messages") {
+        let id = summary["ID"].as_str().expect("message id");
+        let message: Value = http
+            .get(format!("{api}/api/v1/message/{id}"))
+            .send()
+            .await
+            .expect("mailpit message")
+            .json()
+            .await
+            .expect("message json");
+        let to = message["To"]
+            .as_array()
+            .expect("to")
+            .iter()
+            .map(|to| to["Address"].as_str().expect("address").to_owned())
+            .collect();
+        messages.push((
+            to,
+            message["From"]["Address"]
+                .as_str()
+                .expect("from")
+                .to_owned(),
+            message["Subject"].as_str().expect("subject").to_owned(),
+            message["Text"].as_str().expect("text").to_owned(),
+        ));
+    }
+    messages
+}
+
+/// An operator points the deployment at an SMTP relay, and invitations are
+/// emailed after they commit:
+///   1. a tenant administrator can neither read nor change the relay, and
+///      reads never return its password, which is sealed at rest;
+///   2. a test send reaches the relay;
+///   3. each new invitation is emailed separately to its own recipient, from
+///      the configured sender, carrying exactly the returned link, and its
+///      outcome reads `accepted`: relay acceptance, not inbox delivery;
+///   4. a resend emails the replacement link;
+///   5. with the relay down, the link is still returned beside a `failed`
+///      outcome, the invitation stays pending, no User appears, and a resend
+///      after recovery is emailed;
+///   6. a stalled relay holds no tenant transaction: the invitation is
+///      committed and listed while the send is still waiting.
+///
+/// # Panics
+/// Panics when any step's response or the relay's mailbox differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_relays_invitations_through_smtp() {
+    let (host, port, api) = mailpit();
+    let srv = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "mail-tenant-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let relay = |host: &str, port: u16| {
+        json!({
+            "host": host,
+            "port": port,
+            "tls": "none",
+            "username": "relay-user",
+            "password": "relay-password-plaintext",
+            "sender": "invites@wyrd.test",
+        })
+    };
+    let addressed = |name: &str| format!("{name}-{slug}@example.test");
+    let invite = |recipients: Vec<String>| {
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            Some(json!({
+                "recipients": recipients,
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            })),
+        )
+    };
+
+    // 1. The relay is operator-only, and reads never return its password.
+    let (status, unconfigured) = social_call(
+        &srv,
+        social_request(Method::GET, "/platform/mail", Some(&session), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mail read: {unconfigured}");
+    assert_eq!(unconfigured, json!({ "relay": null }), "no relay yet");
+    for (method, body) in [(Method::GET, None), (Method::PUT, Some(relay(&host, port)))] {
+        let (status, refused) = social_call(
+            &srv,
+            social_request(method, "/platform/mail", Some(&admin), body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a tenant administrator cannot reach the relay: {refused}"
+        );
+    }
+    let (status, configured) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay(&host, port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mail configure: {configured}");
+    assert_eq!(
+        configured,
+        json!({ "relay": {
+            "host": host, "port": port, "tls": "none", "username": "relay-user",
+            "password_set": true, "sender": "invites@wyrd.test",
+        } }),
+        "the stored relay reads back without its password"
+    );
+    let sealed: Vec<u8> =
+        sqlx::query_scalar("SELECT smtp_password_enc FROM platform.login_settings")
+            .fetch_one(&superuser)
+            .await
+            .expect("sealed password reads");
+    assert!(
+        !sealed
+            .windows(b"relay-password-plaintext".len())
+            .any(|w| w == b"relay-password-plaintext"),
+        "the relay password is sealed at rest"
+    );
+
+    // 2. A test send reaches the relay.
+    let probe = addressed("probe");
+    let (status, tested) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/mail/test",
+            Some(&session),
+            Some(json!({ "recipient": probe })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test send: {tested}");
+    assert_eq!(tested, json!({ "accepted": true, "error": null }));
+    assert_eq!(
+        mail_to(&api, &probe).await.len(),
+        1,
+        "the test message arrived"
+    );
+
+    // 3. Each invitation is emailed separately with exactly its returned link.
+    let team: Vec<String> = ["ana", "ben", "cy"].iter().map(|n| addressed(n)).collect();
+    let (status, issued) = social_call(&srv, invite(team.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {issued}");
+    for (invitation, recipient) in issued["invitations"]
+        .as_array()
+        .expect("invitations")
+        .iter()
+        .zip(&team)
+    {
+        assert_eq!(invitation["invitation"]["recipient"], recipient.as_str());
+        assert_eq!(
+            invitation["invitation"]["delivery"], "accepted",
+            "the relay accepted it: {invitation}"
+        );
+        let link = invitation["invitation_link"].as_str().expect("link");
+        let mail = mail_to(&api, recipient).await;
+        assert_eq!(mail.len(), 1, "one message per recipient");
+        let (to, from, subject, text) = &mail[0];
+        assert_eq!(
+            to,
+            &vec![recipient.clone()],
+            "addressed to its recipient only"
+        );
+        assert_eq!(from, "invites@wyrd.test");
+        assert!(subject.contains(&slug), "names the workspace: {subject}");
+        assert!(text.contains(link), "carries the returned link: {text}");
+        for other in team.iter().filter(|other| *other != recipient) {
+            assert!(!text.contains(other.as_str()), "names no other recipient");
+        }
+    }
+
+    // 4. A resend emails the replacement link.
+    let first = &issued["invitations"][0];
+    let resend_path = format!(
+        "/v1/principals/users/invitations/{}/resend",
+        first["invitation"]["id"].as_str().expect("id")
+    );
+    let (status, resent) = social_call(
+        &srv,
+        social_request(Method::POST, &resend_path, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resend: {resent}");
+    assert_eq!(resent["invitation"]["delivery"], "accepted");
+    let replacement = resent["invitation_link"].as_str().expect("link");
+    assert_ne!(
+        replacement,
+        first["invitation_link"].as_str().expect("link")
+    );
+    let mail = mail_to(&api, &team[0]).await;
+    assert_eq!(mail.len(), 2, "the resend is a second message");
+    assert!(
+        mail.iter()
+            .any(|(_, _, _, text)| text.contains(replacement))
+    );
+
+    // 5. With the relay down the link still returns, marked failed.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port reserves");
+    let closed_port = closed.local_addr().expect("addr").port();
+    drop(closed);
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay("127.0.0.1", closed_port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relay repoints");
+    let users_before: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_users")
+        .fetch_one(&superuser)
+        .await
+        .expect("users count");
+    let dana = addressed("dana");
+    let (status, failed) = social_call(&srv, invite(vec![dana.clone()])).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {failed}");
+    let failed = &failed["invitations"][0];
+    assert_eq!(failed["invitation"]["delivery"], "failed", "{failed}");
+    assert!(
+        failed["invitation_link"]
+            .as_str()
+            .is_some_and(|link| link.contains("#invitation=")),
+        "the link is still returned to copy"
+    );
+    let (_, pending) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    let listed = pending["invitations"]
+        .as_array()
+        .expect("invitations")
+        .iter()
+        .find(|row| row["recipient"] == dana.as_str())
+        .expect("the failed invitation stays pending");
+    assert_eq!(listed["delivery"], "failed", "its last outcome is listed");
+    let users_after: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_users")
+        .fetch_one(&superuser)
+        .await
+        .expect("users count");
+    assert_eq!(users_after, users_before, "a failed send creates no User");
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay(&host, port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relay recovers");
+    let (status, recovered) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            &format!(
+                "/v1/principals/users/invitations/{}/resend",
+                failed["invitation"]["id"].as_str().expect("id")
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resend after recovery: {recovered}");
+    assert_eq!(recovered["invitation"]["delivery"], "accepted");
+    let mail = mail_to(&api, &dana).await;
+    assert_eq!(mail.len(), 1, "only the recovered resend reached the relay");
+    assert!(
+        mail[0]
+            .3
+            .contains(recovered["invitation_link"].as_str().expect("link"))
+    );
+
+    // 6. A stalled relay holds no tenant transaction.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled relay binds");
+    let stalled_port = stalled.local_addr().expect("addr").port();
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay("127.0.0.1", stalled_port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relay repoints to the stall");
+    let eve = addressed("eve");
+    let ((status, stalled_issue), ()) =
+        tokio::join!(social_call(&srv, invite(vec![eve.clone()])), async {
+            let (socket, _) = stalled.accept().await.expect("the server dials the relay");
+            let (_, pending) = social_call(
+                &srv,
+                social_request(
+                    Method::GET,
+                    "/v1/principals/users/invitations",
+                    Some(&admin),
+                    None,
+                ),
+            )
+            .await;
+            assert!(
+                pending["invitations"]
+                    .as_array()
+                    .expect("invitations")
+                    .iter()
+                    .any(|row| row["recipient"] == eve.as_str()),
+                "the invitation committed before the relay answered"
+            );
+            drop(socket);
+        });
+    assert_eq!(status, StatusCode::CREATED, "invite: {stalled_issue}");
+    assert_eq!(
+        stalled_issue["invitations"][0]["invitation"]["delivery"],
+        "failed"
+    );
+}
+
+/// The session cookie a successful sign-in set for tenant `slug`.
+fn session_cookie(location_and_cookies: &Response<Body>, slug: &str) -> Option<String> {
+    let name = format!("wyrd_session_{slug}=");
+    location_and_cookies
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&name))
+        .and_then(|value| value.split(';').next())
+        .map(str::to_owned)
+}
+
+/// Finish `begun` at the Google callback from its own browser; returns the
+/// status, `Location` and the tenant session cookie pair, when one was set.
+async fn finish_google_session(
+    srv: &WyrdTestServer,
+    begun: &BegunSocialLogin,
+    issuer: &str,
+    slug: &str,
+) -> (StatusCode, Option<String>, Option<String>) {
+    finish_social_session(
+        srv,
+        begun,
+        &social_callback(&begun.query["state"], issuer),
+        slug,
+    )
+    .await
+}
+
+/// Return to the social callback `uri` from `begun`'s own browser; returns
+/// the status, `Location` and the tenant session cookie pair, when one was
+/// set.
+async fn finish_social_session(
+    srv: &WyrdTestServer,
+    begun: &BegunSocialLogin,
+    uri: &str,
+    slug: &str,
+) -> (StatusCode, Option<String>, Option<String>) {
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::COOKIE, &begun.cookie)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("callback responds");
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (resp.status(), location, session_cookie(&resp, slug))
+}
+
+/// Call tenant route `uri` as a browser holding the session `cookie`.
+async fn browser_get(srv: &WyrdTestServer, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    social_call(
+        srv,
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::HOST, SOCIAL_HOST)
+            .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await
+}
+
+/// An invited person opens their link, proves Google and enters with
+/// exactly the invited access, then returns with Google as the same User:
+///   1. beginning Google from the link spends nothing;
+///   2. a Google identity whose email differs from the invited address
+///      enrolls one User, one identity and exactly the invited binding, and
+///      consumes the invitation;
+///   3. the session reaches the invited scope and nothing outside it;
+///   4. after logout the same Google identity signs back in to the same User
+///      and access, adding no record;
+///   5. a spent, revoked, superseded or expired link admits no one and
+///      creates no User, and an identity that already has a User cannot
+///      enroll a second one and spends no link;
+///   6. the identity is a stranger in another tenant until invited there,
+///      then a distinct User, and no session crosses tenants;
+///   7. a suspended User cannot return.
+///
+/// # Panics
+/// Panics when any step's response or stored records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_person_enrolls_with_google_and_returns() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            ..Default::default()
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    enable_google(&srv, &session, &google).await;
+    let issuer = google.uri();
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "google-invite-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let payments = json!({ "card": { "family": { "kind": "Prompt", "name": "payments" } } });
+    let invite = |recipient: &str| {
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            Some(json!({
+                "recipients": [recipient],
+                "assignments": [{ "role": "viewer", "scope": payments }],
+            })),
+        )
+    };
+    let code_of = |issued: &Value| {
+        issued["invitations"][0]["invitation_link"]
+            .as_str()
+            .and_then(|link| link.split_once("#invitation="))
+            .map(|(_, code)| code.to_owned())
+            .expect("the link carries its code")
+    };
+    let pending = || async {
+        let (_, listed) = social_call(
+            &srv,
+            social_request(
+                Method::GET,
+                "/v1/principals/users/invitations",
+                Some(&admin),
+                None,
+            ),
+        )
+        .await;
+        listed["invitations"].as_array().expect("invitations").len()
+    };
+    let answer = |begun: &BegunSocialLogin, subject: &str, email: &str| {
+        identity_token_reply(
+            &issuer,
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            subject,
+            email,
+        )
+    };
+
+    // 1. Beginning Google from the link spends nothing.
+    let (status, issued) = social_call(&srv, invite("ana@example.test")).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {issued}");
+    let code = code_of(&issued);
+    let before = local_records(&superuser).await;
+    let begun = begin_google(
+        &srv,
+        json!({ "tenant": slug, "provider": "google", "invitation_code": code }),
+    )
+    .await;
+    assert_eq!(pending().await, 1, "opening the link spends nothing");
+
+    // 2. A differing Google email enrolls exactly the invited access.
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (status, location, cookie) = finish_google_session(&srv, &begun, &issuer, &slug).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "enrollment: {location:?}");
+    assert_eq!(location.as_deref(), Some(format!("/t/{slug}").as_str()));
+    let cookie = cookie.expect("a tenant session is set");
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "one User and one identity"
+    );
+    let (user,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT user_id FROM wyrd.auth_user_identities WHERE issuer = $1 AND subject = 'google-ana'",
+    )
+    .bind(&issuer)
+    .fetch_one(&superuser)
+    .await
+    .expect("the identity links its User");
+    let bindings: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT r.name, b.scope FROM wyrd.auth_role_bindings b \
+           JOIN wyrd.auth_roles r ON r.id = b.role_id WHERE b.user_id = $1",
+    )
+    .bind(user)
+    .fetch_all(&superuser)
+    .await
+    .expect("bindings read");
+    assert_eq!(bindings, vec![("viewer".to_owned(), payments.clone())]);
+    assert_eq!(pending().await, 0, "the invitation is consumed");
+
+    // 3. The session reaches the invited scope only.
+    let (status, viewed) = browser_get(&srv, "/auth/browser/session", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "session view: {viewed}");
+    assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    assert_eq!(viewed["sessions"][0]["credential"], "social");
+    for name in ["payments", "ledger"] {
+        let mut declare = social_request(
+            Method::POST,
+            "/v1/cards",
+            Some(&admin),
+            Some(json!({ "submissions": [{
+                "apiVersion": "wyrd/v1",
+                "kind": "Prompt",
+                "metadata": { "name": name, "version": "1.0.0" },
+                "spec": {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "hello" }]
+                },
+                "artifacts": []
+            }] })),
+        );
+        declare.headers_mut().insert(
+            "idempotency-key",
+            header::HeaderValue::from_static(if name == "payments" {
+                "declare-p"
+            } else {
+                "declare-l"
+            }),
+        );
+        let (status, body) = social_call(&srv, declare).await;
+        assert_eq!(status, StatusCode::CREATED, "declare {name}: {body}");
+    }
+    let (status, body) = browser_get(&srv, "/v1/cards/Prompt/payments/latest", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the invited scope: {body}");
+    let (status, body) = browser_get(&srv, "/v1/cards/Prompt/ledger/latest", &cookie).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (
+            StatusCode::NOT_FOUND,
+            Some("WYRD_REGISTRY_404_CARD_NOT_FOUND")
+        ),
+        "outside the invited scope a Card is not visible: {body}"
+    );
+
+    // 4. Returning with Google signs in the same User, adding nothing.
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.renamed@gmail.com"),
+    )
+    .await;
+    let records = local_records(&superuser).await;
+    let (status, location, returned) = finish_google_session(&srv, &begun, &issuer, &slug).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "return: {location:?}");
+    let returned = returned.expect("the returning sign-in sets a session");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &returned).await;
+    assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0, after.1, after.3),
+        (records.0, records.1, records.3),
+        "a return adds no User, identity or grant"
+    );
+
+    // 5. Spent, revoked and superseded links, and an owned identity, admit no one.
+    let refused = format!("/t/{slug}/login?login=failed");
+    let enroll_with = |code: String, subject: &'static str| {
+        let srv = &srv;
+        let slug = &slug;
+        let google = &google;
+        let issuer = &issuer;
+        async move {
+            let begun = begin_google(
+                srv,
+                json!({ "tenant": slug, "provider": "google", "invitation_code": code }),
+            )
+            .await;
+            mount_platform_provider(
+                google,
+                platform_key_set("google-key"),
+                identity_token_reply(
+                    issuer,
+                    &begun.query["nonce"],
+                    "wyrd-google",
+                    "google-key",
+                    subject,
+                    "someone@example.test",
+                ),
+            )
+            .await;
+            finish_google_session(srv, &begun, issuer, slug).await
+        }
+    };
+    let before = local_records(&superuser).await;
+    let (_, location, cookie) = enroll_with(code, "google-replay").await;
+    assert_eq!(location.as_deref(), Some(refused.as_str()), "a spent link");
+    assert!(cookie.is_none());
+    let (_, revoked) = social_call(&srv, invite("rev@example.test")).await;
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::DELETE,
+            &format!(
+                "/v1/principals/users/invitations/{}",
+                revoked["invitations"][0]["invitation"]["id"]
+                    .as_str()
+                    .expect("id")
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, location, _) = enroll_with(code_of(&revoked), "google-revoked").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a revoked link"
+    );
+    let (_, superseded) = social_call(&srv, invite("sup@example.test")).await;
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            &format!(
+                "/v1/principals/users/invitations/{}/resend",
+                superseded["invitations"][0]["invitation"]["id"]
+                    .as_str()
+                    .expect("id")
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, location, _) = enroll_with(code_of(&superseded), "google-superseded").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a superseded link"
+    );
+    assert_eq!(
+        local_records(&superuser).await.0,
+        before.0,
+        "no User was created"
+    );
+    let (_, owned) = social_call(&srv, invite("owned@example.test")).await;
+    let live = pending().await;
+    let (_, location, cookie) = enroll_with(code_of(&owned), "google-ana").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("/t/{slug}/login?login=account_exists").as_str()),
+        "an identity with a User is told to sign in"
+    );
+    assert!(cookie.is_none());
+    assert_eq!(
+        pending().await,
+        live,
+        "the owned-identity refusal spends no link"
+    );
+    assert_eq!(local_records(&superuser).await.0, before.0);
+    let (_, expired) = social_call(&srv, invite("late@example.test")).await;
+    sqlx::query(
+        "UPDATE wyrd.auth_user_invitations SET created_at = created_at - interval '25 hours', \
+            expires_at = expires_at - interval '25 hours' WHERE id = $1",
+    )
+    .bind(
+        uuid::Uuid::parse_str(
+            expired["invitations"][0]["invitation"]["id"]
+                .as_str()
+                .expect("id"),
+        )
+        .expect("uuid"),
+    )
+    .execute(&superuser)
+    .await
+    .expect("invitation ages");
+    let (_, location, _) = enroll_with(code_of(&expired), "google-late").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "an expired link"
+    );
+    assert_eq!(
+        local_records(&superuser).await.0,
+        before.0,
+        "no User was created"
+    );
+
+    // 6. The same Google identity is a stranger in another tenant until that
+    //    tenant invites it, and then it is a distinct User there.
+    let beta = srv.seed_tenant("beta").await.expect("tenant seeds");
+    let begun = begin_google_login(&srv, "beta").await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (_, location, cookie) = finish_google_session(&srv, &begun, &issuer, "beta").await;
+    assert_eq!(location.as_deref(), Some("/t/beta/login?login=no_account"));
+    assert!(cookie.is_none(), "an identity is tenant-local");
+    let beta_admin = srv
+        .bootstrap_service_in_tenant(beta, "beta-invite-admin", &["admin"])
+        .await
+        .expect("beta admin bootstraps");
+    let beta_admin = srv
+        .exchange_api_key(beta_admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("beta admin key exchanges");
+    let (status, beta_issued) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&beta_admin),
+            Some(json!({
+                "recipients": ["ana@example.test"],
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "beta invite: {beta_issued}");
+    let begun = begin_google(
+        &srv,
+        json!({ "tenant": "beta", "provider": "google", "invitation_code": code_of(&beta_issued) }),
+    )
+    .await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (_, location, beta_cookie) = finish_google_session(&srv, &begun, &issuer, "beta").await;
+    assert_eq!(location.as_deref(), Some("/t/beta"));
+    let beta_cookie = beta_cookie.expect("a beta session is set");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &beta_cookie).await;
+    let beta_user = viewed["sessions"][0]["principal_id"]
+        .as_str()
+        .expect("principal")
+        .to_owned();
+    assert_ne!(beta_user, user.to_string(), "a distinct User per tenant");
+    let relabeled = returned.replacen(&format!("wyrd_session_{slug}="), "wyrd_session_beta=", 1);
+    let (status, _) = browser_get(&srv, "/auth/browser/session", &relabeled).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "no cross-tenant session use"
+    );
+
+    // 7. A suspended User cannot return.
+    sqlx::query("UPDATE wyrd.auth_users SET status = 'suspended' WHERE id = $1")
+        .bind(user)
+        .execute(&superuser)
+        .await
+        .expect("User suspends");
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (_, location, cookie) = finish_google_session(&srv, &begun, &issuer, &slug).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a suspended User"
+    );
+    assert!(cookie.is_none());
+}
+
+/// GitHub.com's identity namespace, fixed whatever endpoints a test uses.
+const GITHUB_NAMESPACE: &str = "https://github.com";
+
+/// Reset `github` to a GitHub.com stand-in: its token endpoint redeems any
+/// code for `token`, and its user API answers `user` only to that token.
+async fn mount_github(github: &wiremock::MockServer, token: &str, user: Value) {
+    github.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/login/oauth/access_token"))
+        .and(wiremock::matchers::header("accept", "application/json"))
+        .and(wiremock::matchers::body_string_contains("code_verifier="))
+        .and(wiremock::matchers::body_string_contains(
+            "client_secret=github-secret",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": token, "token_type": "bearer", "scope": ""
+        })))
+        .mount(github)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/user"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {token}").as_str(),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(user))
+        .mount(github)
+        .await;
+}
+
+/// The GitHub callback for provider `state`, as GitHub redirects to it.
+fn github_callback(state: &str) -> String {
+    format!("/auth/social/github/callback?code=github-code&state={state}")
+}
+
+/// Configure, test and enable the deployment's GitHub client `wyrd-github`
+/// against the mock `github` through the platform API; returns the enabled
+/// revision.
+///
+/// # Panics
+/// Panics when any platform step is refused.
+async fn enable_github(srv: &WyrdTestServer, session: &str, github: &wiremock::MockServer) -> u64 {
+    let (status, stored) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/github",
+            Some(session),
+            Some(json!({ "client_id": "wyrd-github", "client_secret": "github-secret" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GitHub configures: {stored}");
+    let revision = stored["revision"].as_u64().expect("revision");
+    let (status, begun) = social_call(
+        srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/github/test",
+            Some(session),
+            Some(json!({ "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test begins: {begun}");
+    let query = authorization_query(begun["authorization_url"].as_str().expect("url"));
+    mount_github(
+        github,
+        "gho_operator",
+        json!({ "id": 1, "login": "operator" }),
+    )
+    .await;
+    let (status, tested) = social_call(
+        srv,
+        social_request(Method::GET, &github_callback(&query["state"]), None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the provider test passes: {tested}");
+    let (status, enabled) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/github/enabled",
+            Some(session),
+            Some(json!({ "enabled": true, "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GitHub enables: {enabled}");
+    revision
+}
+
+/// GitHub.com admits an invited person through the same flow as Google,
+/// keyed by GitHub's numeric account ID:
+///   1. the operator configures, tests and enables GitHub;
+///   2. GitHub begins with S256 PKCE and state and requests no scope at all;
+///   3. the invited person enrolls one User under the fixed GitHub.com
+///      namespace and their numeric ID, with exactly the invited binding,
+///      and the session reads the invited Card and not another;
+///   4. after renaming their GitHub login they return to the same User;
+///   5. another account ID with the same login and email is a stranger;
+///   6. a spent link, an owned identity and a provider revision replaced
+///      mid-sign-in admit no one;
+///   7. a failing GitHub token endpoint creates nothing and sets no session.
+///
+/// # Panics
+/// Panics when any step's response or stored records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_person_enrolls_with_github_and_returns() {
+    let github = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: None,
+            github_url: Some(github.uri()),
+            github_api_url: Some(github.uri()),
+            turnstile_siteverify_url: None,
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // 1. The operator enables GitHub through the management journey.
+    let revision = enable_github(&srv, &session, &github).await;
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "github-invite-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let payments = json!({ "card": { "family": { "kind": "Prompt", "name": "payments" } } });
+    let invite = |recipient: &str| {
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            Some(json!({
+                "recipients": [recipient],
+                "assignments": [{ "role": "viewer", "scope": payments }],
+            })),
+        )
+    };
+    let code_of = |issued: &Value| {
+        issued["invitations"][0]["invitation_link"]
+            .as_str()
+            .and_then(|link| link.split_once("#invitation="))
+            .map(|(_, code)| code.to_owned())
+            .expect("the link carries its code")
+    };
+    let sign_in = |code: Option<String>, user: Value| {
+        let srv = &srv;
+        let slug = &slug;
+        let github = &github;
+        async move {
+            let begun = begin_social(
+                srv,
+                json!({ "tenant": slug, "provider": "github", "invitation_code": code }),
+            )
+            .await;
+            mount_github(github, "gho_person", user).await;
+            let finished =
+                finish_social_session(srv, &begun, &github_callback(&begun.query["state"]), slug)
+                    .await;
+            (begun, finished)
+        }
+    };
+
+    // 2 and 3. The invited person enrolls with GitHub.
+    let (status, issued) = social_call(&srv, invite("ana@example.test")).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {issued}");
+    let before = local_records(&superuser).await;
+    let (begun, (status, location, cookie)) = sign_in(
+        Some(code_of(&issued)),
+        json!({ "id": 4242, "login": "ana-gh", "name": "  ", "email": "ana@users.example" }),
+    )
+    .await;
+    assert_eq!(begun.query["client_id"], "wyrd-github");
+    assert_eq!(begun.query["code_challenge_method"], "S256");
+    assert!(begun.query.contains_key("code_challenge") && begun.query.contains_key("state"));
+    assert!(
+        !begun.query.contains_key("scope"),
+        "GitHub is asked for no scope: {:?}",
+        begun.query
+    );
+    assert!(begun.query["redirect_uri"].ends_with("/auth/social/github/callback"));
+    assert_eq!(status, StatusCode::SEE_OTHER, "enrollment: {location:?}");
+    assert_eq!(location.as_deref(), Some(format!("/t/{slug}").as_str()));
+    let cookie = cookie.expect("a tenant session is set");
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "one User and one identity"
+    );
+    let (user,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT user_id FROM wyrd.auth_user_identities WHERE issuer = $1 AND subject = '4242'",
+    )
+    .bind(GITHUB_NAMESPACE)
+    .fetch_one(&superuser)
+    .await
+    .expect("the numeric ID under the GitHub.com namespace links the User");
+    let bindings: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT r.name, b.scope FROM wyrd.auth_role_bindings b \
+           JOIN wyrd.auth_roles r ON r.id = b.role_id WHERE b.user_id = $1",
+    )
+    .bind(user)
+    .fetch_all(&superuser)
+    .await
+    .expect("bindings read");
+    assert_eq!(bindings, vec![("viewer".to_owned(), payments.clone())]);
+    let mut declare = social_request(
+        Method::POST,
+        "/v1/cards",
+        Some(&admin),
+        Some(json!({ "submissions": [{
+            "apiVersion": "wyrd/v1",
+            "kind": "Prompt",
+            "metadata": { "name": "payments", "version": "1.0.0" },
+            "spec": {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hello" }]
+            },
+            "artifacts": []
+        }] })),
+    );
+    declare.headers_mut().insert(
+        "idempotency-key",
+        header::HeaderValue::from_static("declare-github-payments"),
+    );
+    let (status, body) = social_call(&srv, declare).await;
+    assert_eq!(status, StatusCode::CREATED, "declare: {body}");
+    let (status, body) = browser_get(&srv, "/v1/cards/Prompt/payments/latest", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the invited scope: {body}");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &cookie).await;
+    assert_eq!(viewed["sessions"][0]["credential"], "social");
+    // A blank profile name falls back to the login, read back through `/me`
+    // and the directory as a GitHub sign-in.
+    let named = |cookie: String| {
+        let srv = &srv;
+        let admin = &admin;
+        async move {
+            let (status, me) = browser_get(srv, "/v1/principals/me", &cookie).await;
+            assert_eq!(status, StatusCode::OK, "profile reads: {me}");
+            let (_, page) = social_call(
+                srv,
+                social_request(
+                    Method::GET,
+                    "/v1/principals?email=ana@users.example",
+                    Some(admin),
+                    None,
+                ),
+            )
+            .await;
+            let item = &page["principals"][0];
+            assert_eq!(item["authentication"], "github");
+            assert_eq!(item["display_name"], me["display_name"]);
+            assert_eq!(me["authentication"], "github");
+            assert_eq!(me["email"], "ana@users.example");
+            me["display_name"].clone()
+        }
+    };
+    assert_eq!(named(cookie.clone()).await, json!("ana-gh"));
+
+    // 4. A renamed login with the same numeric ID returns to the same User,
+    // whose profile name now replaces the stored one.
+    let records = local_records(&superuser).await;
+    let (_, (status, _, returned)) = sign_in(
+        None,
+        json!({ "id": 4242, "login": "ana-renamed", "name": "Ana Lima", "email": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let returned = returned.expect("the returning sign-in sets a session");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &returned).await;
+    assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    assert_eq!(named(returned.clone()).await, json!("Ana Lima"));
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0, after.1, after.3),
+        (records.0, records.1, records.3),
+        "a return adds no User, identity or grant"
+    );
+
+    // 5. Another numeric ID with the same login and email inherits nothing.
+    let (_, (_, location, cookie)) = sign_in(
+        None,
+        json!({ "id": 9999, "login": "ana-renamed", "email": "ana@users.example" }),
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("/t/{slug}/login?login=no_account").as_str())
+    );
+    assert!(cookie.is_none());
+
+    // 6. A spent link, an owned identity and a replaced revision admit no one.
+    let refused = format!("/t/{slug}/login?login=failed");
+    let (_, (_, location, _)) = sign_in(
+        Some(code_of(&issued)),
+        json!({ "id": 5150, "login": "replayer" }),
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some(refused.as_str()), "a spent link");
+    let (_, owned) = social_call(&srv, invite("owned@example.test")).await;
+    let (_, (_, location, _)) = sign_in(
+        Some(code_of(&owned)),
+        json!({ "id": 4242, "login": "ana-renamed" }),
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("/t/{slug}/login?login=account_exists").as_str()),
+        "an owned identity is told to sign in"
+    );
+    let begun = begin_social(
+        &srv,
+        json!({ "tenant": slug, "provider": "github", "invitation_code": code_of(&owned) }),
+    )
+    .await;
+    let (status, replaced) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/github",
+            Some(&session),
+            Some(json!({ "client_id": "wyrd-github", "client_secret": "github-secret" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GitHub reconfigures: {replaced}");
+    assert!(replaced["revision"].as_u64() > Some(revision));
+    mount_github(
+        &github,
+        "gho_person",
+        json!({ "id": 6060, "login": "late" }),
+    )
+    .await;
+    let (_, location, cookie) =
+        finish_social_session(&srv, &begun, &github_callback(&begun.query["state"]), &slug).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a replaced revision"
+    );
+    assert!(cookie.is_none());
+    assert_eq!(
+        local_records(&superuser).await.0,
+        records.0,
+        "no User was created"
+    );
+
+    // 7. A failing GitHub creates nothing and falls back to nothing.
+    let current = enable_github(&srv, &session, &github).await;
+    assert!(current > revision);
+    let begun = begin_social(
+        &srv,
+        json!({ "tenant": slug, "provider": "github", "invitation_code": code_of(&owned) }),
+    )
+    .await;
+    github.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(502))
+        .mount(&github)
+        .await;
+    let (status, _, cookie) =
+        finish_social_session(&srv, &begun, &github_callback(&begun.query["state"]), &slug).await;
+    assert!(status.is_server_error(), "a provider outage: {status}");
+    assert!(cookie.is_none());
+    assert_eq!(local_records(&superuser).await.0, records.0);
+}
+
+/// Prove `subject` at Google for a workspace signup begun from a fresh
+/// browser; returns that browser's `wyrd_signup` cookie pair.
+///
+/// # Panics
+/// Panics when signup does not begin, or the return is not sent on to the
+/// workspace form with a completion cookie.
+async fn prove_signup(
+    srv: &WyrdTestServer,
+    google: &wiremock::MockServer,
+    subject: &str,
+) -> String {
+    prove_signup_with(srv, google, subject, true).await
+}
+
+/// [`prove_signup`] where Google reports the email `email_verified`.
+///
+/// # Panics
+/// As [`prove_signup`].
+async fn prove_signup_with(
+    srv: &WyrdTestServer,
+    google: &wiremock::MockServer,
+    subject: &str,
+    email_verified: bool,
+) -> String {
+    let begun = begin_social_at(
+        srv,
+        "/auth/signup",
+        json!({ "method": "social", "provider": "google" }),
+    )
+    .await;
+    assert!(
+        begun.set_cookie.contains("Path=/auth/social"),
+        "{}",
+        begun.set_cookie
+    );
+    mount_platform_provider(
+        google,
+        platform_key_set("google-key"),
+        identity_token_reply_with(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            subject,
+            &format!("{subject}@example.test"),
+            email_verified,
+        ),
+    )
+    .await;
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(social_callback(&begun.query["state"], &google.uri()))
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::COOKIE, &begun.cookie)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("callback responds");
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/signup/workspace")
+    );
+    let set_cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("wyrd_signup="))
+        .expect("the completion cookie is set")
+        .to_owned();
+    assert!(set_cookie.contains("Path=/auth/signup"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned()
+}
+
+/// Complete the signup held by `cookie` as workspace `slug` from source
+/// `ip`; returns the status, body and new workspace's session cookie.
+async fn complete_signup(
+    srv: &WyrdTestServer,
+    cookie: &str,
+    slug: &str,
+    ip: [u8; 4],
+) -> (StatusCode, Value, Option<String>) {
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/signup/complete")
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie)
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    ip, 40_000,
+                ))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "slug": slug, "display_name": "Acme" }))
+                        .expect("serializes"),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("completion responds");
+    let status = resp.status();
+    let session = session_cookie(&resp, slug);
+    (status, body_json(resp).await, session)
+}
+
+/// The directory rows named `slug`: status and the attempt that claimed it.
+async fn tenants_named(pool: &PgPool, slug: &str) -> Vec<(uuid::Uuid, String, Option<uuid::Uuid>)> {
+    sqlx::query_as(
+        "SELECT data_tenant_id, status, signup_attempt_id FROM platform.tenants WHERE slug = $1",
+    )
+    .bind(slug)
+    .fetch_all(pool)
+    .await
+    .expect("directory reads")
+}
+
+/// A visitor proves Google, creates a workspace and administers it as an
+/// ordinary tenant User:
+///   1. while signup is off, signup cannot begin;
+///   2. an invalid or existing slug creates nothing and leaves the proof
+///      retryable;
+///   3. a valid slug provisions an active workspace whose builtin roles and
+///      SYSTEM exist, whose one User holds the admin binding through the
+///      proven identity, and whose response carries a tenant session and no
+///      key, platform principal or platform authority; that session invites
+///      a teammate;
+///   4. repeating the completion returns the same tenant without a session
+///      and creates no second one, naming another slug conflicts, and a lost
+///      session response is recovered by returning Google sign-in;
+///   5. racing one proof across two replicas creates exactly one tenant: the
+///      other completion is in progress or returns that tenant without a
+///      session;
+///   6. an interrupted claim resumes only for its own attempt: another
+///      identity cannot adopt it, and it never becomes active without its
+///      administrator;
+///   7. the same account creates a second independent workspace and gains
+///      nothing in the existing one;
+///   8. disabling signup or the provider after proof refuses completion;
+///   9. the shared identity and source windows refuse creation;
+///  10. unavailable admission state refuses creation.
+///
+/// # Panics
+/// Panics when any step's response or stored records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_visitor_creates_a_workspace_with_google() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            ..Default::default()
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let existing = srv.pg_fixture().tenant_slug().to_owned();
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    enable_google(&srv, &session, &google).await;
+    let settings = |signup: bool| {
+        social_request(
+            Method::PUT,
+            "/platform/login-settings",
+            Some(&session),
+            Some(json!({ "password_enabled": true, "signup_enabled": signup })),
+        )
+    };
+    let home = [192, 0, 2, 10];
+
+    // 1. While signup is off, signup cannot begin.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"method":"social","provider":"google"}"#))
+        .expect("request builds");
+    let (status, refused) = social_call(&srv, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(
+        refused["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+        "{refused}"
+    );
+    let (status, changed) = social_call(&srv, settings(true)).await;
+    assert_eq!(status, StatusCode::OK, "signup enables: {changed}");
+
+    // 2. An invalid or existing slug creates nothing; the proof stays usable.
+    let ana = prove_signup(&srv, &google, "google-ana").await;
+    let (status, _, _) = complete_signup(&srv, &ana, "Not A Slug", home).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, taken, _) = complete_signup(&srv, &ana, &existing, home).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{taken}");
+    assert_eq!(tenants_named(&superuser, &existing).await.len(), 1);
+    assert_eq!(
+        tenants_named(&superuser, &existing).await[0].2,
+        None,
+        "an existing tenant is never adopted"
+    );
+
+    // 3. A valid slug provisions a usable workspace administered by its creator.
+    let operators = platform_principals(&superuser).await;
+    let (status, created, cookie) = complete_signup(&srv, &ana, "acme", home).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        created,
+        json!({ "tenant": "acme" }),
+        "no key or platform authority"
+    );
+    let cookie = cookie.expect("the creator's session is set");
+    let rows = tenants_named(&superuser, "acme").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "active");
+    let acme = rows[0].0;
+    let (users, identities, admin_bindings, keys, services, roles, system): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_user_identities \
+                  WHERE data_tenant_id = $1 AND subject = 'google-ana'), \
+                (SELECT count(*) FROM wyrd.auth_role_bindings b \
+                   JOIN wyrd.auth_roles r ON r.id = b.role_id \
+                  WHERE b.data_tenant_id = $1 AND r.name = 'admin' AND b.user_id IS NOT NULL), \
+                (SELECT count(*) FROM wyrd.auth_api_keys WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_service_accounts \
+                  WHERE data_tenant_id = $1 AND principal_kind <> 'system'), \
+                (SELECT count(*) FROM wyrd.auth_roles WHERE data_tenant_id = $1 AND builtin), \
+                (SELECT count(*) FROM wyrd.auth_service_accounts \
+                  WHERE data_tenant_id = $1 AND principal_kind = 'system')",
+    )
+    .bind(acme)
+    .fetch_one(&superuser)
+    .await
+    .expect("tenant records count");
+    assert_eq!((users, identities, admin_bindings), (1, 1, 1));
+    assert_eq!((keys, services), (0, 0), "no bootstrap principal or key");
+    assert!(roles > 0, "builtin roles are seeded");
+    assert_eq!(system, 1, "SYSTEM exists");
+    assert_eq!(
+        platform_principals(&superuser).await,
+        operators,
+        "no platform principal"
+    );
+    let (status, invited) = social_call(
+        &srv,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/principals/users/invitations")
+            .header(header::HOST, SOCIAL_HOST)
+            .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "recipients": ["teammate@example.test"],
+                    "assignments": [{ "role": "viewer", "scope": "all" }],
+                }))
+                .expect("serializes"),
+            ))
+            .expect("request builds"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the creator invites: {invited}"
+    );
+
+    // 4. A replay returns the same workspace and creates nothing; a lost
+    // response is recovered by sign-in.
+    let (status, replay, again) = complete_signup(&srv, &ana, "acme", home).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, json!({ "tenant": "acme" }));
+    assert!(again.is_none(), "a replay opens no session");
+    let (status, _, _) = complete_signup(&srv, &ana, "acme-other", home).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a completed proof creates no other tenant"
+    );
+    assert!(tenants_named(&superuser, "acme-other").await.is_empty());
+    let begun = begin_google_login(&srv, "acme").await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        identity_token_reply(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            "google-ana",
+            "ana@example.test",
+        ),
+    )
+    .await;
+    let (status, location, returned) =
+        finish_google_session(&srv, &begun, &google.uri(), "acme").await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{location:?}");
+    assert_eq!(location.as_deref(), Some("/t/acme"));
+    assert!(returned.is_some(), "the creator signs back in");
+
+    // 5. One proof raced across replicas creates exactly one tenant.
+    let replica = srv
+        .start_replica(WyrdTestServer::builder())
+        .await
+        .expect("replica starts");
+    let bea = prove_signup(&srv, &google, "google-bea").await;
+    let (first, second) = tokio::join!(
+        complete_signup(&srv, &bea, "bea", home),
+        complete_signup(&replica, &bea, "bea", home),
+    );
+    for (status, body, _) in [&first, &second] {
+        assert!(
+            (*status == StatusCode::OK && *body == json!({ "tenant": "bea" }))
+                || (*status == StatusCode::CONFLICT
+                    && body["details"]["reason"] == "signup_in_progress"),
+            "each converges on the one workspace: {first:?} {second:?}"
+        );
+    }
+    assert_eq!(
+        [&first.2, &second.2]
+            .iter()
+            .filter(|cookie| cookie.is_some())
+            .count(),
+        1,
+        "only the creating completion opens a session: {first:?} {second:?}"
+    );
+    let rows = tenants_named(&superuser, "bea").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "active");
+
+    // 6. An interrupted claim resumes only for its own attempt.
+    let cara = prove_signup(&srv, &google, "google-cara").await;
+    let dan = prove_signup(&srv, &google, "google-dan").await;
+    let interrupted = uuid::Uuid::now_v7();
+    sqlx::query(
+        "WITH a AS (UPDATE platform.signup_attempts SET status = 'failed' \
+                     WHERE subject = 'google-cara' RETURNING id) \
+         INSERT INTO platform.tenants \
+             (data_tenant_id, slug, display_name, status, provisioning_failed_reason, \
+              signup_attempt_id, signup_creator_key) \
+         SELECT $1, 'cara', 'Cara', 'failed', 'interrupted', id, \
+                sha256(convert_to('cara', 'UTF8')) FROM a",
+    )
+    .bind(interrupted)
+    .execute(&superuser)
+    .await
+    .expect("an interrupted creation is staged");
+    let (status, adopted, _) = complete_signup(&srv, &dan, "cara", home).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{adopted}");
+    let rows = tenants_named(&superuser, "cara").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "failed", "no active ownerless tenant");
+    let (status, resumed, cookie) = complete_signup(&srv, &cara, "cara", home).await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert!(cookie.is_some());
+    let rows = tenants_named(&superuser, "cara").await;
+    assert_eq!((rows[0].0, rows[0].1.as_str()), (interrupted, "active"));
+
+    // 7. The same account creates a second, independent workspace.
+    let ana_again = prove_signup(&srv, &google, "google-ana").await;
+    let (status, second, _) = complete_signup(&srv, &ana_again, "acme-two", home).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let users: Vec<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM wyrd.auth_user_identities WHERE subject = 'google-ana'",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("identities read");
+    assert_eq!(users.len(), 2, "one User per workspace");
+    assert_ne!(users[0].0, users[1].0);
+    let tenant = srv.data_tenant_id();
+    let elsewhere: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_user_identities WHERE data_tenant_id = $1",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_one(&superuser)
+    .await
+    .expect("identities count");
+    assert_eq!(elsewhere, 0, "no access to an existing workspace");
+
+    // 8. Disabling signup or the provider after proof refuses completion.
+    let eve = prove_signup(&srv, &google, "google-eve").await;
+    let (status, _) = social_call(&srv, settings(false)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, off, _) = complete_signup(&srv, &eve, "eve", home).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{off}");
+    assert_eq!(off["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{off}");
+    let (status, _) = social_call(&srv, settings(true)).await;
+    assert_eq!(status, StatusCode::OK);
+    set_google_enabled(&srv, &session, 1, false).await;
+    let (status, off, _) = complete_signup(&srv, &eve, "eve", home).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{off}");
+    assert_eq!(off["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{off}");
+    assert!(tenants_named(&superuser, "eve").await.is_empty());
+    set_google_enabled(&srv, &session, 1, true).await;
+
+    // 9. The shared identity and source windows refuse creation.
+    let flood = [198, 51, 100, 7];
+    let mut proofs = Vec::new();
+    for subject in [
+        "google-f1",
+        "google-f2",
+        "google-f3",
+        "google-f4",
+        "google-f5",
+    ] {
+        proofs.push(prove_signup(&srv, &google, subject).await);
+    }
+    for proof in &proofs[..4] {
+        for _ in 0..5 {
+            let (status, body, _) = complete_signup(&srv, proof, &existing, flood).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        }
+    }
+    let (status, limited, _) = complete_signup(&replica, &proofs[0], &existing, home).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "identity window: {limited}"
+    );
+    assert_eq!(limited["code"], "WYRD_AUTH_429_SIGNUP_ATTEMPTS");
+    assert!(limited["details"]["retry_after_seconds"].as_u64() > Some(0));
+    let (status, limited, _) = complete_signup(&replica, &proofs[4], "f5", flood).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "source window: {limited}"
+    );
+    assert!(tenants_named(&superuser, "f5").await.is_empty());
+    let (status, admitted, _) = complete_signup(&srv, &proofs[4], "f5", home).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another source is admitted: {admitted}"
+    );
+
+    // 10. Unavailable admission state refuses creation.
+    let gil = prove_signup(&srv, &google, "google-gil").await;
+    sqlx::query("ALTER TABLE platform.signup_admissions RENAME TO signup_admissions_down")
+        .execute(&superuser)
+        .await
+        .expect("admission state goes away");
+    let (status, down, _) = complete_signup(&srv, &gil, "gil", home).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{down}");
+    assert!(tenants_named(&superuser, "gil").await.is_empty());
+    sqlx::query("ALTER TABLE platform.signup_admissions_down RENAME TO signup_admissions")
+        .execute(&superuser)
+        .await
+        .expect("admission state returns");
+    let (status, created, _) = complete_signup(&srv, &gil, "gil", home).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+}
+
+/// How many platform principals exist.
+async fn platform_principals(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM platform.principals")
+        .fetch_one(pool)
+        .await
+        .expect("platform principals count")
 }

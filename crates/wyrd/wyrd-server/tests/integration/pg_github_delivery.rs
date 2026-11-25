@@ -885,17 +885,23 @@ async fn a_permanent_refusal_is_a_visible_failed_outcome() {
     assert!(deployment.mock.reviews(REPOSITORY, PR).is_empty());
 }
 
-/// The public `examples/review-a-pull-request` policy, declared as
-/// published: the pull request is extracted, its Agent's `code_review`
-/// report with one high finding fails the example's requirement, and the
-/// Check concludes `failure` beside one `COMMENT` review whose inline
-/// comment carries the exact suggestion.
+/// The citations the public `examples/review-a-pull-request` requirement
+/// gives every verdict: the reviewed head and the commit it compared from.
+fn example_citations() -> Value {
+    json!([
+        {"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}},
+        {"slot": "pull_request", "locator": {"json_pointer": "/review/comparison_base"}},
+    ])
+}
+
+/// Run the public `examples/review-a-pull-request` policy, declared as
+/// published, on PR [`PR`] at head `a…` whose reviewer answers `report`;
+/// returns the deployment and the execution's delivered Check.
 ///
 /// # Panics
-/// Panics when the example does not declare, or its Check, review or
-/// outcome differs.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
+/// Panics when the example does not declare or its Check is never
+/// delivered.
+async fn review_example(report: &Value) -> (Deployment, Delivered) {
     let example = |file: &str| {
         std::fs::read_to_string(format!(
             "{}/../../../examples/review-a-pull-request/{file}",
@@ -917,18 +923,6 @@ async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
     let head = sha('a');
     deployment.head(&head, &sha('8'), HANDLER_A);
     deployment.compare(&sha('c'), &head, &sha('c'), HANDLER_A, PATCH_A);
-    let line = json!({"path": "src/handler.ts", "commit": head, "start_line": 3, "end_line": 3});
-    let fix = "export const handle = (id: string) => lookupUser(id.trim().toLowerCase());\n";
-    let report = json!({
-        "format": "code_review", "version": 1, "summary": "Ids are trimmed but not normalized.",
-        "coverage": {"complete": true, "limitations": []},
-        "findings": [{"id": "case", "severity": "high", "confidence": "medium",
-                      "title": "Mixed-case ids miss their user",
-                      "explanation": "lookupUser compares lower-case ids.",
-                      "locations": [line], "evidence": [],
-                      "remediation": {"explanation": "Lower-case the id.",
-                                      "suggested_edit": {"location": line, "replacement": fix}}}],
-    });
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_string_contains("Active changes"))
@@ -941,13 +935,137 @@ async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
         .mount(&deployment.model)
         .await;
     deployment.admit(&head, "opened").await;
+    let mut shown = delivered(&deployment, 1).await;
+    let check = shown
+        .remove("wyrd/code-review")
+        .expect("the example's Check");
+    (deployment, check)
+}
 
-    let shown = delivered(&deployment, 1).await;
-    let Delivered { check, served } = &shown["wyrd/code-review"];
-    assert_eq!(served["result"]["outcome"]["verdict"], "failed", "{served}");
+/// The example requirement's verdict, reason and citations from `served`,
+/// the inspection of `check`'s execution, with each
+/// citation's JSON pointer resolved against the execution's retained
+/// `pr` extraction.
+///
+/// # Panics
+/// Panics when the outcome holds no requirement or a citation does not
+/// resolve.
+async fn example_decision(
+    deployment: &Deployment,
+    check: &Value,
+    served: &Value,
+) -> (Value, Value, Vec<Value>) {
+    let requirement = &served["result"]["outcome"]["requirements"][0];
+    assert_eq!(requirement["citations"], example_citations(), "{served}");
+    let execution: Uuid = check["external_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("execution id");
+    let extraction = deployment.extraction(execution).await;
+    let resolved = example_citations()
+        .as_array()
+        .expect("citations")
+        .iter()
+        .map(|citation| {
+            let pointer = citation["locator"]["json_pointer"]
+                .as_str()
+                .expect("pointer");
+            extraction
+                .pointer(pointer)
+                .cloned()
+                .expect("the citation resolves")
+        })
+        .collect();
+    (
+        served["result"]["outcome"]["verdict"].clone(),
+        requirement["reason"].clone(),
+        resolved,
+    )
+}
+
+/// A complete `code_review` report with `findings`.
+fn example_report(complete: bool, findings: &Value) -> Value {
+    json!({
+        "format": "code_review", "version": 1, "summary": "Reviewed.",
+        "coverage": {"complete": complete, "limitations": if complete { json!([]) } else { json!(["Tests were not read."]) }},
+        "findings": findings,
+    })
+}
+
+/// A clean, complete report passes the public example with a `success`
+/// Check, and an incomplete one is `inconclusive` with `action_required`;
+/// each verdict cites the pinned pull request through the extraction's own
+/// `pull_request` slot, resolving to the reviewed head `a…` and the
+/// comparison base `c…` in that execution's retained extraction.
+///
+/// # Panics
+/// Panics when a verdict, Check, citation, or resolved commit differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_review_example_cites_the_pinned_pull_request_it_passes() {
+    for (complete, verdict, conclusion, reason) in [
+        (
+            true,
+            "passed",
+            "success",
+            "The review is complete with no critical or high issues.",
+        ),
+        (
+            false,
+            "inconclusive",
+            "action_required",
+            "The review did not cover the whole change.",
+        ),
+    ] {
+        let (deployment, Delivered { check, served }) =
+            review_example(&example_report(complete, &json!([]))).await;
+        assert_eq!(
+            example_decision(&deployment, &check, &served).await,
+            (
+                json!(verdict),
+                json!(reason),
+                vec![json!(sha('a')), json!(sha('c'))]
+            ),
+            "{served}"
+        );
+        assert_eq!(
+            (&check["head_sha"], &check["conclusion"]),
+            (&json!(sha('a')), &json!(conclusion)),
+            "{check}"
+        );
+        assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
+    }
+}
+
+/// The public example, declared as published: the pull request is
+/// extracted, its Agent's `code_review` report with one high finding fails
+/// the example's requirement, still citing the pinned pull request, and the
+/// Check concludes `failure` beside one `COMMENT` review whose inline
+/// comment carries the exact suggestion.
+///
+/// # Panics
+/// Panics when the example does not declare, or its Check, review,
+/// citations or outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
+    let head = sha('a');
+    let line = json!({"path": "src/handler.ts", "commit": head, "start_line": 3, "end_line": 3});
+    let fix = "export const handle = (id: string) => lookupUser(id.trim().toLowerCase());\n";
+    let findings = json!([{"id": "case", "severity": "high", "confidence": "medium",
+                      "title": "Mixed-case ids miss their user",
+                      "explanation": "lookupUser compares lower-case ids.",
+                      "locations": [line], "evidence": [],
+                      "remediation": {"explanation": "Lower-case the id.",
+                                      "suggested_edit": {"location": line, "replacement": fix}}}]);
+    let (deployment, Delivered { check, served }) =
+        review_example(&example_report(true, &findings)).await;
     assert_eq!(
-        served["result"]["outcome"]["requirements"][0]["reason"],
-        "The review found critical or high issues."
+        example_decision(&deployment, &check, &served).await,
+        (
+            json!("failed"),
+            json!("The review found critical or high issues."),
+            vec![json!(head), json!(sha('c'))]
+        ),
+        "{served}"
     );
     assert_eq!(
         (&check["head_sha"], &check["conclusion"]),
@@ -964,6 +1082,134 @@ async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
         body.contains("[high/medium confidence] Mixed-case ids miss their user (`case`)")
             && body.contains(&format!("```suggestion\n{fix}```")),
         "{body}"
+    );
+}
+
+/// A code requirement judged after an approval resumes the execution cites
+/// the extraction it pinned before waiting, though GitHub now serves head
+/// `b…`: the pinned head still validates and is the one the check reads.
+/// A valid uncited pass is kept, while a pointer the extraction does not
+/// hold and a slot the check does not reach are explicit invalid
+/// citations, never dropped. A Verifier declaring its own `pull_request`
+/// input is refused, so no caller can replace the source.
+///
+/// # Panics
+/// Panics when a requirement outcome or reason differs, the pinned head
+/// moves, or the colliding Verifier is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_check_cites_the_pull_request_it_pinned() {
+    let judged = |id: &str, outcome: &str, citations: &str| {
+        format!(
+            "    - id: {id}\n      statement: {id}\n      check:\n        kind: code\n        entrypoint: judge\n        inputs: {{pr: steps.pr.output.pr, approved: steps.hold.output}}\n        source: {{inline: \"def judge(pr, approved):\\n    return {{'outcome': {outcome}, 'reason': '{id}', 'citations': {citations}}}\\n\"}}\n"
+        )
+    };
+    let head = format!(
+        "'passed' if pr['head']['sha'] == '{}' else 'failed'",
+        sha('a')
+    );
+    let requirements = [
+        judged(
+            "pinned",
+            &head,
+            "[{'slot': 'pull_request', 'locator': {'json_pointer': '/pr/head/sha'}}]",
+        ),
+        judged("uncited", "'passed'", "[]"),
+        judged(
+            "forged",
+            "'passed'",
+            "[{'slot': 'pull_request', 'locator': {'json_pointer': '/pr/forged'}}]",
+        ),
+        judged(
+            "elsewhere",
+            "'passed'",
+            "[{'slot': 'attachment_0', 'locator': {'json_pointer': '/pr'}}]",
+        ),
+    ]
+    .concat();
+    let steps = "    - id: hold\n      depends_on: [pr]\n      action: {kind: approval, message: Judge the review?}\n";
+    let deployment = bound(
+        &[("resumed", verifier("resumed", steps, &requirements))],
+        &[],
+    )
+    .await;
+    let execution = deployment.admit(&sha('a'), "opened").await;
+    let uri = format!("/v1/verification/executions/{execution}");
+    let (_, approval) = waiting_for(&deployment, execution, "hold").await;
+    deployment.serve_b();
+    deployment
+        .post(
+            &format!("{uri}/approvals/{approval}"),
+            &json!({"decision": "approved"}),
+        )
+        .await;
+
+    let shown = delivered(&deployment, 1).await;
+    let Delivered { check, served } = &shown["wyrd/resumed"];
+    let decided: BTreeMap<String, (Value, Value)> = served["result"]["outcome"]["requirements"]
+        .as_array()
+        .expect("requirements")
+        .iter()
+        .map(|requirement| {
+            (
+                requirement["id"].as_str().expect("id").to_owned(),
+                (
+                    requirement["outcome"].clone(),
+                    requirement["reason"].clone(),
+                ),
+            )
+        })
+        .collect();
+    let expected = |outcome: &str, reason: &str| (json!(outcome), json!(reason));
+    assert_eq!(
+        decided,
+        BTreeMap::from([
+            ("pinned".to_owned(), expected("passed", "pinned")),
+            ("uncited".to_owned(), expected("passed", "uncited")),
+            (
+                "forged".to_owned(),
+                expected(
+                    "inconclusive",
+                    "invalid citation: slot pull_request has no location /pr/forged"
+                )
+            ),
+            (
+                "elsewhere".to_owned(),
+                expected(
+                    "inconclusive",
+                    "invalid citation: slot attachment_0 is not evidence this check reaches"
+                )
+            ),
+        ]),
+        "{served}"
+    );
+    assert_eq!(
+        deployment.extraction(execution).await["pr"]["head"]["sha"],
+        json!(sha('a'))
+    );
+    assert_eq!(check["head_sha"], json!(sha('a')), "{check}");
+
+    let colliding = verifier("colliding", "", CHANGES);
+    let (status, refusal) = deployment
+        .declaring(
+            &[
+                ("policy.yaml", &policy(&["colliding"])),
+                ("colliding.yaml", &colliding),
+            ],
+            "colliding",
+            |body| {
+                for submission in body["submissions"].as_array_mut().expect("submissions") {
+                    if submission["kind"] == "Verifier" {
+                        submission["spec"]["inputs"] = json!({"pull_request": {"type": "json"}});
+                    }
+                }
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(
+        (&refusal["code"], &refusal["details"]["rule"]),
+        (&json!("WYRD_SPEC_400_VALIDATION"), &json!("source_slot")),
+        "{refusal}"
     );
 }
 

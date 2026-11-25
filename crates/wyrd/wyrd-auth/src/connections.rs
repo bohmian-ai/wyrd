@@ -42,28 +42,28 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, Attribution, ClaimMappingPayload, ConnectionActivate, ConnectionInput,
     ConnectionTestResponse, ConnectionTester, HumanClientAuth, HumanConnectionState,
-    HumanConnectionView, HumanConnectionsResponse, IssuerUrl, LoginInitiation, PrincipalId,
-    PrincipalKindTag, Sha256Hex,
+    HumanConnectionView, HumanConnectionsResponse, IssuerUrl, LoginInitiation, LoginPolicyChange,
+    LoginPolicyConnection, LoginPolicyView, PrincipalId, Sha256Hex,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+use wyrd_sql::queries::auth::login_policy;
 use wyrd_sql::queries::auth::{
     HumanConnectionWrite, LoginState, deactivate_active_human_connection,
     human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
-    insert_login_state, list_service_account_roles, list_user_roles, live_human_connections,
-    lock_human_connection_slot, promote_tested_human_candidate, remove_human_connection,
-    renew_human_connection_secret, replace_human_candidate, service_account_by_id,
-    stamp_human_candidate_tested, user_by_id,
+    insert_login_state, live_human_connections, lock_human_connection_slot,
+    promote_tested_human_candidate, remove_human_connection, renew_human_connection_secret,
+    replace_human_candidate, stamp_human_candidate_tested,
 };
-use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
-use wyrd_sql::{TenantConn, WyrdPostgres};
+use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow, HumanLoginAnchor};
+use wyrd_sql::{OperatorPool, TenantConn, WyrdPostgres};
 
 use wyrd_runtime::audit::AuditStage;
 
 use crate::audit::{principal_event, principal_kind_tag};
+use crate::authority::TenantAuthority;
 use crate::error::{relying_party_error, store_error};
-use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
-use crate::issuance::resolve_permissions;
+use crate::exchange_api_key::{ExchangeError, verify_api_key};
 use crate::login::LOGIN_STATE_TTL;
 use crate::pg_resolvers::{ClientSecretOwner, IssuerSealError, human_connection_trusted_issuer};
 
@@ -193,6 +193,13 @@ impl HumanConnections {
     #[must_use]
     pub(crate) fn postgres(&self) -> &WyrdPostgres {
         &self.postgres
+    }
+
+    /// The platform store of the operator's login settings, when the
+    /// deployment has a cross-tenant role.
+    #[must_use]
+    pub fn operator_pool(&self) -> Option<OperatorPool> {
+        self.postgres.operator_pool()
     }
 
     /// Read the tenant's Active and Candidate connections as redacted views.
@@ -774,6 +781,164 @@ impl HumanConnections {
         conn.commit().await.map_err(store_error)
     }
 
+    /// What `tenant` contributes to its sign-in methods: whether it has a
+    /// usable Active company connection and whether it requires company SSO.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails or
+    /// the Active connection cannot be opened.
+    pub async fn tenant_login(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<crate::social::TenantLogin, WyrdError> {
+        let company_sso = self.active_connection(tenant).await?.is_some();
+        let mut conn = self.begin(tenant).await?;
+        let requires_company_sso = login_policy::requires_company_sso(&mut conn)
+            .await
+            .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
+        Ok(crate::social::TenantLogin {
+            company_sso,
+            requires_company_sso,
+        })
+    }
+
+    /// Read `tenant`'s login policy for its administrators: the policy and
+    /// its revision, the Active company connection and whether it can sign
+    /// people in, and how many active Users have no identity there.
+    ///
+    /// `decision` is the caller's already-evaluated allowance; it is staged
+    /// before the read.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails and
+    /// [`WyrdError::Internal`] when a stored revision does not decode.
+    pub async fn login_policy(
+        &self,
+        tenant: DataTenantId,
+        decision: &AuditEvent,
+    ) -> Result<LoginPolicyView, WyrdError> {
+        self.audit.stage(tenant, decision.clone());
+        let mut conn = self.begin(tenant).await?;
+        let policy = login_policy::login_policy(&mut conn)
+            .await
+            .map_err(store_error)?;
+        let active = human_connection_in_state(&mut conn, HumanConnectionState::Active.as_str())
+            .await
+            .map_err(store_error)?;
+        let unlinked = match &active {
+            Some(row) => login_policy::users_without_identity(&mut conn, &row.issuer_url).await,
+            None => login_policy::users_without_identity(&mut conn, "").await,
+        }
+        .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
+        let connection = active.as_ref().map(policy_connection).transpose()?;
+        let ready = match active {
+            Some(row) => human_connection_trusted_issuer(tenant, row, self.kms.as_deref())
+                .await
+                .is_ok(),
+            None => false,
+        };
+        Ok(LoginPolicyView {
+            require_company_sso: policy.require_company_sso,
+            revision: u64::try_from(policy.revision).map_err(internal)?,
+            connection,
+            ready,
+            users_without_company_identity: u64::try_from(unlinked).map_err(internal)?,
+        })
+    }
+
+    /// Change `tenant`'s login policy for an administrator whose browser
+    /// session is `proof`: the anchor of a sign-in made within the last five
+    /// minutes, `None` otherwise.
+    ///
+    /// Under the connection slot lock and the policy row lock, `proof` must be
+    /// a company sign-in through exactly the current Active connection, which
+    /// must be the one `change` expects and must open; the policy must still
+    /// be at the expected revision. Only then is the policy written and every
+    /// password and social credential of the tenant ended, in the same
+    /// transaction, whichever way the policy moves: a credential created while
+    /// an earlier change committed cannot outlive this one, and nothing
+    /// revoked returns. A refusal writes nothing. `decision` is the caller's
+    /// allowance, staged when the lock is taken.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::RecentLoginRequired`] when `proof` is missing,
+    /// stale, or not through the current Active connection,
+    /// [`WyrdError::ConnectionConflict`] when the policy or connection
+    /// changed since it was read or no usable Active connection exists, and
+    /// the store errors of [`Self::list`].
+    pub async fn set_login_policy(
+        &self,
+        tenant: DataTenantId,
+        change: LoginPolicyChange,
+        proof: Option<HumanLoginAnchor>,
+        decision: &AuditEvent,
+    ) -> Result<LoginPolicyView, WyrdError> {
+        let mut conn = self.begin_locked(tenant, decision).await?;
+        let policy = login_policy::lock_login_policy(&mut conn)
+            .await
+            .map_err(store_error)?;
+        let active = human_connection_in_state(&mut conn, HumanConnectionState::Active.as_str())
+            .await
+            .map_err(store_error)?;
+        let Some(active) = active else {
+            return commit_refusal(conn, policy_conflict("no_active_connection")).await;
+        };
+        let current = policy_connection(&active)?;
+        let binding = HumanConnectionBinding {
+            connection_id: active.connection_id,
+            connection_revision: active.revision,
+        };
+        if proof != Some(HumanLoginAnchor::Connection(binding)) {
+            return commit_refusal(
+                conn,
+                WyrdError::RecentLoginRequired {
+                    message: "sign in through the company connection within five minutes, \
+                              then confirm the change again"
+                        .to_owned(),
+                    details: json!({ "reason": "company_sign_in_required" }),
+                },
+            )
+            .await;
+        }
+        if Some(current) != change.expected_connection {
+            return commit_refusal(conn, policy_conflict("connection_changed")).await;
+        }
+        if u64::try_from(policy.revision).ok() != Some(change.expected_revision) {
+            return commit_refusal(conn, policy_conflict("policy_changed")).await;
+        }
+        if human_connection_trusted_issuer(tenant, active.clone(), self.kms.as_deref())
+            .await
+            .is_err()
+        {
+            return commit_refusal(conn, policy_conflict("connection_unusable")).await;
+        }
+        let revision = login_policy::set_login_policy(&mut conn, change.require_company_sso)
+            .await
+            .map_err(store_error)?;
+        login_policy::revoke_non_company_credentials(&mut conn)
+            .await
+            .map_err(store_error)?;
+        let unlinked = login_policy::users_without_identity(&mut conn, &active.issuer_url)
+            .await
+            .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
+        tracing::info!(
+            tenant_id = %tenant,
+            require_company_sso = change.require_company_sso,
+            revision,
+            "tenant login policy changed"
+        );
+        Ok(LoginPolicyView {
+            require_company_sso: change.require_company_sso,
+            revision: u64::try_from(revision).map_err(internal)?,
+            connection: Some(current),
+            ready: true,
+            users_without_company_identity: u64::try_from(unlinked).map_err(internal)?,
+        })
+    }
+
     /// Resolve the tenant's Active connection, or `None` when it has none.
     ///
     /// Read durably on every call, so every replica sees activation,
@@ -942,13 +1107,12 @@ pub fn provider_callback(origin: &Url) -> Result<Url, WyrdError> {
 }
 
 /// Whether a test sign-in's tester is still authorized to mark a candidate
-/// tested: an active principal of the RLS tenant whose stored roles grant
+/// tested: an active principal of the RLS tenant whose current bindings grant
 /// `identity_connections:write`.
 ///
-/// A user's roles are its synced grants; a headless principal's are its
-/// service-account grants and its stored kind must still match the recorded
-/// one. A principal that is gone, inactive, or of a kind that holds no tenant
-/// roles is not authorized.
+/// The account's stored kind must still match the recorded one. A principal
+/// that is gone, inactive, or of a kind that holds no tenant bindings is not
+/// authorized.
 ///
 /// # Errors
 /// Returns [`WyrdError::AuthVerifyUnavailable`] when a store read fails,
@@ -958,31 +1122,9 @@ async fn tester_authorized(
     conn: &mut TenantConn<'_>,
     tester: ConnectionTester,
 ) -> Result<bool, WyrdError> {
-    let id = tester.principal_id.as_uuid();
-    let roles = match tester.principal_kind {
-        PrincipalKindTag::User => match user_by_id(conn, id).await.map_err(store_error)? {
-            Some(user) if user.status == "active" => {
-                list_user_roles(conn, id).await.map_err(store_error)?
-            }
-            _ => return Ok(false),
-        },
-        PrincipalKindTag::TenantAdmin | PrincipalKindTag::Service => {
-            match service_account_by_id(conn, id).await.map_err(store_error)? {
-                Some(row) if principal_kind_tag(&row.principal_kind) == tester.principal_kind => {
-                    list_service_account_roles(conn, id)
-                        .await
-                        .map_err(store_error)?
-                }
-                _ => return Ok(false),
-            }
-        }
-        PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System => return Ok(false),
-    };
-    let roles = role_refs(roles).map_err(internal)?;
-    let permissions = resolve_permissions(conn, &roles)
-        .await
-        .map_err(WyrdError::from)?;
-    Ok(permissions.contains(&Permission::identity_connections_write()))
+    let grants =
+        TenantAuthority::current_grants(conn, tester.principal_id, tester.principal_kind).await?;
+    Ok(grants.is_some_and(|grants| grants.contains(&Permission::identity_connections_write())))
 }
 
 /// Verify a recovery API key against this tenant, constant-cost on refusal,
@@ -1021,15 +1163,14 @@ async fn recovery_key_authorizes(
     if row.status != "active" {
         return Ok(false);
     }
-    let roles = list_service_account_roles(conn, row.principal_id)
-        .await
-        .map_err(store_error)?;
-    let roles = role_refs(roles).map_err(internal)?;
-    let permissions = resolve_permissions(conn, &roles)
-        .await
-        .map_err(WyrdError::from)?;
+    let grants = TenantAuthority::current_grants(
+        conn,
+        PrincipalId::new(row.principal_id),
+        principal_kind_tag(&row.principal_kind),
+    )
+    .await?;
     let required = Permission::identity_connections_write();
-    let allowed = permissions.contains(&required);
+    let allowed = grants.is_some_and(|grants| grants.contains(&required));
     let recovery = AuditEvent {
         card_ref: None,
         sub_principal_id: PrincipalId::new(row.principal_id),
@@ -1095,6 +1236,26 @@ fn not_tested_reason(reason: &str, message: &str) -> WyrdError {
 /// Activation without a current stamp.
 fn not_tested(message: &str) -> WyrdError {
     not_tested_reason("test_missing_or_expired", message)
+}
+
+/// The login policy or its connection is not what the change expected.
+fn policy_conflict(reason: &str) -> WyrdError {
+    WyrdError::ConnectionConflict {
+        message: "the login policy or company connection changed; reload and confirm again"
+            .to_owned(),
+        details: json!({ "reason": reason }),
+    }
+}
+
+/// The policy view of an Active connection row.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the stored revision does not decode.
+fn policy_connection(row: &HumanConnectionRow) -> Result<LoginPolicyConnection, WyrdError> {
+    Ok(LoginPolicyConnection {
+        id: row.connection_id,
+        revision: u64::try_from(row.revision).map_err(internal)?,
+    })
 }
 
 /// A revision, state, or recovery-key conflict.

@@ -47,7 +47,180 @@ export function fmtInstant(ms: number): string {
   return `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
+/** How long before `now` an instant was, as a list cell reads it → "now" / "5m ago" / "2h ago" / "12d ago"; a future instant reads "now". */
+export function fmtAgo(ms: number, now = Date.now()): string {
+  const minutes = Math.floor((now - ms) / 60_000);
+  if (minutes < 1) return 'now';
+  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)}h ago`;
+  return `${Math.floor(minutes / (24 * 60))}d ago`;
+}
+
+/** A long id shortened for a list cell, keeping both ends → "01a2f7c1…4be20". */
+export function fmtShortId(id: string): string {
+  return id.length > 15 ? `${id.slice(0, 8)}…${id.slice(-5)}` : id;
+}
+
 /** An exact Card reference in canonical spelling → "Model/ranker@1.4.2", plus "#uid" when one is supplied. */
 export function fmtCardRef(ref: { kind: string; name: string; version: string; uid?: string | null }): string {
   return `${ref.kind}/${ref.name}@${ref.version}${ref.uid ? `#${ref.uid}` : ''}`;
+}
+
+/** Stored bytes → "812 B" / "4.2 KiB" / "1.3 MiB". */
+export function fmtBytes(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/** A string YAML reads back as itself without quotes. */
+const PLAIN_YAML = /^[A-Za-z_/][\w./@+-]*(?: [\w./@+-]+)*$/;
+const YAML_WORDS = /^(?:true|false|yes|no|on|off|null|y|n)$/i;
+
+/** One YAML scalar: plain when unambiguous, else a JSON string (valid YAML double-quoted). */
+function yamlScalar(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value !== 'string') return JSON.stringify(value);
+  return PLAIN_YAML.test(value) && !YAML_WORDS.test(value) ? value : JSON.stringify(value);
+}
+
+/**
+ * JSON-shaped data → block YAML, keys in their returned order. Multi-line
+ * strings use a literal block; every other value round-trips as YAML 1.2.
+ */
+export function fmtYaml(value: unknown, indent = ''): string {
+  const child = `${indent}  `;
+  const nested = (item: unknown) =>
+    item !== null && typeof item === 'object' && Object.keys(item).length > 0;
+  const inline = (item: unknown): string => {
+    if (Array.isArray(item) && item.length === 0) return '[]';
+    if (item !== null && typeof item === 'object' && Object.keys(item).length === 0) return '{}';
+    if (typeof item === 'string' && item.includes('\n') && !/^\s/.test(item))
+      return `|${item.endsWith('\n') ? '' : '-'}\n${item.replace(/\n$/, '').split('\n').map((line) => `${child}${line}`.trimEnd()).join('\n')}`;
+    return yamlScalar(item);
+  };
+  if (Array.isArray(value)) {
+    if (value.length === 0) return `${indent}[]`;
+    return value
+      .map((item) => (nested(item) ? `${indent}- ${fmtYaml(item, child).slice(child.length)}` : `${indent}- ${inline(item)}`))
+      .join('\n');
+  }
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value).filter(([, item]) => item !== undefined);
+    if (entries.length === 0) return `${indent}{}`;
+    return entries
+      .map(([key, item]) => {
+        const label = `${indent}${yamlScalar(key)}:`;
+        return nested(item) ? `${label}\n${fmtYaml(item, child)}` : `${label} ${inline(item)}`;
+      })
+      .join('\n');
+  }
+  return `${indent}${inline(value)}`;
+}
+
+/** One run of JSON, YAML or TOML text and the syntax role it is coloured by. */
+export interface CodeToken {
+  kind: 'key' | 'string' | 'number' | 'literal' | 'punct' | 'comment' | 'text';
+  text: string;
+}
+
+// ponytail: one pattern for both JSON and block YAML as `fmtYaml` writes it; a real parser only if another syntax is shown.
+const CODE =
+  /(?<key>"(?:[^"\\\n]|\\.)*"(?=\s*:)|(?<=^[ \t]*(?:- )*)[A-Za-z_][\w./-]*(?=:(?:\s|$)))|(?<string>"(?:[^"\\\n]|\\.)*"|'[^'\n]*')|(?<number>(?<![\w.@-])-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.@:-]))|(?<literal>\b(?:true|false|null)\b)|(?<punct>[{}[\]]|[:,](?=\s|$)|(?<=^[ \t]*)- )/gm;
+
+// ponytail: the TOML a wyrd.toml uses (comments, tables, keys, basic values); no multi-line strings or dates.
+const TOML =
+  /(?<comment>#.*$)|(?<string>"(?:[^"\\\n]|\\.)*"|'[^'\n]*')|(?<key>[A-Za-z_][\w.-]*(?=\s*=)|(?<=^[ \t]*\[)[\w.-]+(?=\]))|(?<number>(?<![\w.-])-?\d+(?:\.\d+)?(?![\w.-]))|(?<literal>\b(?:true|false)\b)|(?<punct>[{}[\],=])/gm;
+
+/**
+ * JSON or YAML text, or TOML when `toml` is set → runs by syntax role, for
+ * colouring. The runs joined are exactly the text given: nothing is added,
+ * dropped or reordered.
+ */
+export function codeTokens(text: string, toml = false): CodeToken[] {
+  const tokens: CodeToken[] = [];
+  let at = 0;
+  for (const match of text.matchAll(toml ? TOML : CODE)) {
+    if (match.index > at) tokens.push({ kind: 'text', text: text.slice(at, match.index) });
+    const [kind] = Object.entries(match.groups ?? {}).find(([, value]) => value !== undefined) as [CodeToken['kind'], string];
+    tokens.push({ kind, text: match[0] });
+    at = match.index + match[0].length;
+  }
+  if (at < text.length) tokens.push({ kind: 'text', text: text.slice(at) });
+  return tokens;
+}
+
+/** One line of a unified comparison: unchanged, removed, added, or a count of unchanged lines left out. */
+export interface DiffLine {
+  kind: 'same' | 'removed' | 'added' | 'gap';
+  text: string;
+}
+
+/** The most differing line pairs `diffLines` matches: about 500 lines a side. */
+const DIFF_CELLS = 250_000;
+
+/**
+ * Two texts → one unified list of lines: within each change the removed
+ * lines, then the added ones. An absent text has no lines. Unchanged runs
+ * longer than three lines keep one line of context at each end and say how
+ * many lines are left out. Lines shared at the start and end are always
+ * unchanged; a differing middle too long to match line by line comes back
+ * whole, removed then added.
+ */
+export function diffLines(from: string | undefined, to: string | undefined): DiffLine[] {
+  const a = from === undefined ? [] : from.split('\n');
+  const b = to === undefined ? [] : to.split('\n');
+  // Lines shared at the start and end need no matching; only the middle is compared.
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+  let tail = 0;
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1;
+  const endA = a.length - tail;
+  const endB = b.length - tail;
+  // ponytail: quadratic longest-common-subsequence table, so a middle past the bound is not matched; switch to Myers if large texts need line matching.
+  const matched = (endA - head) * (endB - head) <= DIFF_CELLS;
+  const common = matched ? Array.from({ length: endA - head + 1 }, () => new Array<number>(endB - head + 1).fill(0)) : [];
+  if (matched)
+    for (let i = endA - 1; i >= head; i -= 1)
+      for (let j = endB - 1; j >= head; j -= 1)
+        common[i - head][j - head] = a[i] === b[j] ? common[i - head + 1][j - head + 1] + 1 : Math.max(common[i - head + 1][j - head], common[i - head][j - head + 1]);
+
+  const lines: DiffLine[] = [];
+  let same = a.slice(0, head);
+  let removed: string[] = [];
+  let added: string[] = [];
+  const flushSame = () => {
+    if (same.length > 3) lines.push({ kind: 'same', text: same[0] }, { kind: 'gap', text: `${same.length - 2} unchanged lines` }, { kind: 'same', text: same[same.length - 1] });
+    else for (const text of same) lines.push({ kind: 'same', text });
+    same = [];
+  };
+  const flushChange = () => {
+    for (const text of removed) lines.push({ kind: 'removed', text });
+    for (const text of added) lines.push({ kind: 'added', text });
+    removed = [];
+    added = [];
+  };
+  let i = head;
+  let j = head;
+  while (i < endA || j < endB) {
+    if (matched && i < endA && j < endB && a[i] === b[j]) {
+      flushChange();
+      same.push(a[i]);
+      i += 1;
+      j += 1;
+      continue;
+    }
+    flushSame();
+    if (j >= endB || (i < endA && (!matched || common[i - head + 1][j - head] >= common[i - head][j - head + 1]))) removed.push(a[i++]);
+    else added.push(b[j++]);
+  }
+  flushChange();
+  same = same.concat(a.slice(endA));
+  flushSame();
+  return lines;
 }

@@ -645,10 +645,11 @@ fn row(
                 .map_err(|violation| WyrdError::from(violation.into_error("value", 0)))?,
         )
     };
-    let (event_id, execution, verifier) = (
+    let (event_id, execution, verifier, subject) = (
         Uuid::now_v7().to_string(),
         execution_id.to_string(),
         presented.queued.verifier_card_uid.to_string(),
+        presented.queued.card_uid.to_string(),
     );
     let cells = SCHEMA
         .fields()
@@ -660,6 +661,8 @@ fn row(
             "event" => Cell::text(Some(event(presented.status))),
             "status" => Cell::text(status.as_deref()),
             "verifier_card_uid" => Cell::text(Some(verifier.as_str())),
+            // The execution's subject, the row's trusted read parent.
+            "subject_card_uid" => Cell::text(Some(subject.as_str())),
             "reason" => Cell::text(reason.as_deref()),
             "value" => Cell::Variant(value.take()),
             "occurred_at" => Cell::Micros(Some(Utc::now().timestamp_micros())),

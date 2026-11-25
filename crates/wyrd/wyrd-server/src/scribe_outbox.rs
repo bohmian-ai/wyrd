@@ -70,7 +70,7 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
@@ -86,7 +86,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::stage_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
-use vala_bifrost_redux::tables::staged::StagedRow;
+use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::storage::ObjectsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
@@ -97,14 +97,17 @@ use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reserva
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
-use wyrd_spec::ids::{CardUid, GroupId};
+use wyrd_spec::ids::{CardUid, ExecutionId, GroupId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
 use wyrd_spec::vala::{
     ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
 };
+use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::verifier_executions::{GroupActivity, VerifierExecutionQueue};
+use wyrd_sql::queries::verifier_executions::{
+    CancelledExecution, GroupActivity, VerifierExecutionQueue,
+};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Code;
@@ -308,6 +311,21 @@ pub enum ScribeWrite {
         /// for the slice's other frames, and only then; a refused,
         /// unprojectable, or dropped write drops the sender instead.
         acked: Mutex<Option<oneshot::Sender<()>>>,
+    },
+    /// One committed lifecycle transition of a queued execution, staged as
+    /// its `event = 'status'` row of `bifrost.verification.execution_events`
+    /// by [`Self::status`].
+    ///
+    /// Nothing awaits it and it fences nothing: it joins its destination's
+    /// shared frame like any ordinary row, so the status rows of many
+    /// executions write one batch, and a retry resubmits the same row, event
+    /// identity and occurrence time included. `None` when the row could not
+    /// be built, which the sink counts lost.
+    Status {
+        /// The status row.
+        row: Option<StagedRow>,
+        /// The execution's subject and actor, which Scribe stamps on the row.
+        attribution: Attribution,
     },
     /// One first-wins acceptance, staged as its row of `table`: a
     /// subscriber's acceptance of published deferred evidence
@@ -548,7 +566,62 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Row(row.clone()),
             }]),
+            Self::Status { row, attribution } => Ok(vec![Rows {
+                table: ScribeTable::ExecutionEvents,
+                attribution: *attribution,
+                part: Part::Row(row.clone().ok_or("projection")?),
+            }]),
         }
+    }
+
+    /// The status row recording that queued `execution`, run by Verifier
+    /// `verifier` over `subject` for `attribution`, entered `status` at
+    /// `occurred_at`.
+    ///
+    /// Its owner stages it only after the transition's transaction commits.
+    /// The row has `event = 'status'`, `status` as the status serializes, a
+    /// new event id, and `sequence` 0, which orders nothing: a reader takes
+    /// an execution's newest status by `occurred_at`. `subject_card_uid` is the
+    /// execution's subject, its trusted read parent; every other content and
+    /// correlation column is null. A status row is never a checkpoint, so
+    /// state recovery, which reads checkpoint revisions only, never sees it.
+    #[must_use]
+    pub fn status(
+        execution: ExecutionId,
+        verifier: &CardUid,
+        subject: &CardUid,
+        status: VerificationExecutionStatus,
+        attribution: Attribution,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
+        let (event_id, execution) = (Uuid::now_v7().to_string(), execution.to_string());
+        let schema = checkpoint_schema();
+        let cells = schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "event_id" => Cell::text(Some(event_id.as_str())),
+                "execution_id" => Cell::text(Some(execution.as_str())),
+                "sequence" => Cell::Int(Some(0)),
+                "event" => Cell::text(Some("status")),
+                "status" => Cell::text(Some(<&'static str>::from(status))),
+                "verifier_card_uid" => Cell::text(Some(verifier.as_str())),
+                SUBJECT_CARD_UID => Cell::text(Some(subject.as_str())),
+                "value" => Cell::Variant(None),
+                "occurred_at" => Cell::Micros(Some(occurred_at.timestamp_micros())),
+                "item_index" | "iteration_index" | "attempt" | "size_bytes" | "file_count" => {
+                    Cell::Int(None)
+                }
+                // Content, shared dimension, and correlation columns.
+                _ => Cell::text(None::<&str>),
+            })
+            .collect();
+        let row = StagedRow::new(Arc::clone(schema), cells)
+            .inspect_err(|error| {
+                tracing::error!(%error, %execution, "an execution status row cannot be built");
+            })
+            .ok();
+        Self::Status { row, attribution }
     }
 
     /// The grouped source activity this write records: the owner, subject,
@@ -574,7 +647,8 @@ impl ScribeWrite {
             | Self::ServerSpans { .. }
             | Self::Object { .. }
             | Self::ExecutionState { .. }
-            | Self::Fenced { .. } => {
+            | Self::Fenced { .. }
+            | Self::Status { .. } => {
                 return None;
             }
         };
@@ -874,7 +948,6 @@ impl ScribeBatch {
                 PLATFORM_AUDIT_PRINCIPAL,
                 PrincipalKind::User,
                 self.tenant,
-                Vec::new(),
                 PermissionSet::new(),
             ),
             authenticated_tenant: self.tenant,
@@ -2109,7 +2182,10 @@ impl OutboxSink for ScribeSink {
                 execution = checkpoint.execution_id().to_string();
                 Some(execution.as_str())
             }
-            ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
+            ScribeWrite::Status { row: Some(row), .. } => row.text("execution_id"),
+            ScribeWrite::Audit(None)
+            | ScribeWrite::Status { row: None, .. }
+            | ScribeWrite::ServerSpans { .. } => None,
         };
         key.map_or(0, |key| {
             let mut hasher = DefaultHasher::new();
@@ -2124,7 +2200,9 @@ impl OutboxSink for ScribeSink {
     /// [`StagedRow::owned_bytes`].
     fn weight(item: &ScribeWrite) -> usize {
         match item {
-            ScribeWrite::Audit(row) => row.as_ref().map_or(0, StagedRow::owned_bytes),
+            ScribeWrite::Audit(row) | ScribeWrite::Status { row, .. } => {
+                row.as_ref().map_or(0, StagedRow::owned_bytes)
+            }
             ScribeWrite::Capture(capture) => capture.content_bytes(),
             ScribeWrite::Result { payload, .. } => {
                 payload.rows().iter().map(ResultRow::owned_bytes).sum()
@@ -2210,6 +2288,32 @@ impl OutboxSink for ScribeSink {
             }
         }
         Ok(())
+    }
+}
+
+/// Stage the `cancelled` status row of every execution in `cancelled`, which
+/// a committed principal revocation or admission fence settled at
+/// `occurred_at`, without waiting.
+///
+/// The caller stages only after its transaction commits.
+pub(crate) fn stage_cancelled(
+    outbox: &ScribeOutbox,
+    tenant: DataTenantId,
+    cancelled: Vec<CancelledExecution>,
+    occurred_at: DateTime<Utc>,
+) {
+    for execution in cancelled {
+        outbox.stage(
+            tenant,
+            ScribeWrite::status(
+                execution.execution_id,
+                &execution.verifier_card_uid,
+                &execution.card_uid,
+                VerificationExecutionStatus::Cancelled,
+                execution.attribution,
+                occurred_at,
+            ),
+        );
     }
 }
 
@@ -3518,6 +3622,97 @@ mod tests {
             .map(|frame| frame.batch_id)
             .collect::<HashSet<_>>();
         assert_eq!(held, submitted[..2].iter().copied().collect::<HashSet<_>>());
+    }
+
+    /// Proves status rows of several executions travel as one ordinary
+    /// shared execution-events frame, each row keeping its own attribution
+    /// and its status, sequence 0, and occurrence time, and that a refused
+    /// attempt and a redelivery resubmit the identical frame under one batch
+    /// id with the same event identities.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rows split across frames, lose their attribution, or
+    /// change on resubmission.
+    #[tokio::test]
+    async fn status_rows_share_one_frame_and_keep_identity_on_retry() {
+        use wyrd_spec::verification::VerificationExecutionStatus as Status;
+        let scribe = Arc::new(RecordingScribe::default());
+        scribe.refuse_next(ScribeError::IngestBusy {
+            table: ScribeTable::ExecutionEvents.fqn().to_owned(),
+        });
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let tenant = DataTenantId::new_v7();
+        let callers = [background(), background(), background()];
+        let statuses = [Status::Running, Status::Waiting, Status::Cancelled];
+        let at = Utc::now();
+        let slice: Vec<ScribeWrite> = callers
+            .iter()
+            .zip(statuses)
+            .map(|(caller, status)| {
+                ScribeWrite::status(ExecutionId::new_v7(), &uid(), &uid(), status, *caller, at)
+            })
+            .collect();
+        let key = uuid::Uuid::now_v7();
+        assert!(
+            outbox.sink().write(tenant, key, &slice).await.is_err(),
+            "the refused attempt fails the slice"
+        );
+        for _ in 0..2 {
+            outbox
+                .sink()
+                .write(tenant, key, &slice)
+                .await
+                .expect("the retry is written");
+        }
+
+        let submitted = scribe.submitted();
+        assert_eq!(submitted.len(), 3, "one frame per attempt");
+        assert!(submitted.iter().all(|batch| *batch == submitted[0]));
+        let received = scribe.received();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].ipc, received[1].ipc, "the rows are unchanged");
+        let frame = &received[0];
+        assert_eq!(frame.table, ScribeTable::ExecutionEvents.fqn());
+        assert_eq!(frame.rows, 3);
+        assert_eq!(frame.pairs, callers);
+        let batch = StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
+            .expect("the frame opens")
+            .next()
+            .expect("the frame has a batch")
+            .expect("the batch decodes");
+        let text = |name: &str| -> Vec<Option<String>> {
+            let column = arrow::compute::cast(
+                batch.column_by_name(name).expect("the column is present"),
+                &arrow::datatypes::DataType::Utf8,
+            )
+            .expect("the column casts");
+            column
+                .as_string::<i32>()
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect()
+        };
+        assert_eq!(text("event"), vec![Some("status".to_owned()); 3]);
+        assert_eq!(
+            text("status"),
+            ["running", "waiting", "cancelled"].map(|word| Some(word.to_owned()))
+        );
+        assert_eq!(text("sequence"), vec![Some("0".to_owned()); 3]);
+        assert_eq!(text("reason"), vec![None; 3]);
+        assert_eq!(
+            batch.column_by_name("value").expect("value").null_count(),
+            3
+        );
+        let micros = batch
+            .column_by_name("occurred_at")
+            .expect("occurred_at")
+            .as_primitive::<arrow::datatypes::TimestampMicrosecondType>()
+            .values()
+            .to_vec();
+        assert_eq!(micros, vec![at.timestamp_micros(); 3]);
+        let ids = text("event_id");
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 3);
     }
 
     /// Proves a queued result keeps its write identities however it is

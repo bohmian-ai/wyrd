@@ -1518,7 +1518,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::new(),
         );
         let baseline = scribe.memory_snapshot().scribe_total_bytes;
@@ -1593,7 +1592,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::new(),
         );
         Scribe::ingest_frame(
@@ -1647,7 +1645,6 @@ mod tests {
             PLATFORM_AUDIT_PRINCIPAL,
             PrincipalKind::User,
             system,
-            Vec::new(),
             PermissionSet::new(),
         );
         let audit_log = TableRef::new(BifrostNamespace::Audit, "audit_log");
@@ -1667,7 +1664,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 system,
-                Vec::new(),
                 PermissionSet::new(),
             ),
             "x".to_owned(),
@@ -1718,7 +1714,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::new(),
         );
         let make_frame = |value: String| decoded_size_frame(tenant, &principal, value);

@@ -11,7 +11,7 @@
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -20,12 +20,14 @@ use wyrd_auth::connections::HumanConnections;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
-    ConnectionTester, HumanConnectionView, HumanConnectionsResponse,
+    ConnectionTester, HumanConnectionView, HumanConnectionsResponse, LoginPolicyChange,
+    LoginPolicyView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::audit;
+use crate::auth::browser::RecentHumanLogin;
 use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
@@ -33,6 +35,9 @@ use crate::state::AppState;
 
 /// Audit resource naming the caller tenant's connection slot.
 const RESOURCE: &str = "identity:oidc_connection";
+
+/// Audit resource naming the caller tenant's login policy.
+const POLICY_RESOURCE: &str = "identity:login_policy";
 
 /// Build the tenant connection administration routes for the `/v1` group.
 pub fn identity_router() -> OpenApiRouter<AppState> {
@@ -44,6 +49,7 @@ pub fn identity_router() -> OpenApiRouter<AppState> {
         .routes(routes!(deactivate_active))
         .routes(routes!(remove_connection))
         .routes(routes!(renew_connection_encryption))
+        .routes(routes!(read_login_policy, change_login_policy))
 }
 
 /// The deployment's connection owner, built once at boot.
@@ -73,6 +79,26 @@ fn decide(
         &Permission::identity_connections_write(),
         operation,
         RESOURCE,
+    )
+    .map_err(WyrdErrorResponse::from)
+}
+
+/// Evaluate `identity_connections:write` for a login-policy `operation`,
+/// recording a denial.
+///
+/// # Errors
+/// Returns the RBAC denial (already staged for audit).
+fn decide_policy(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+) -> Result<AuditEvent, WyrdErrorResponse> {
+    audit::authorize_recording_denial(
+        state,
+        caller,
+        &Permission::identity_connections_write(),
+        operation,
+        POLICY_RESOURCE,
     )
     .map_err(WyrdErrorResponse::from)
 }
@@ -467,6 +493,114 @@ async fn renew_connection_encryption(
         .map_err(WyrdErrorResponse::from)
 }
 
+/// `GET /v1/identity/login-policy` — whether the caller tenant requires
+/// company SSO, its Active company connection and readiness, and how many
+/// active Users have no identity at that connection.
+///
+/// # Errors
+/// Returns `403` without `identity_connections:write`, and `503` when the
+/// store is unavailable.
+#[utoipa::path(
+    get,
+    path = "/identity/login-policy",
+    responses(
+        (status = 200, description = "The login policy and its account warning; the warning \
+          is a count and names no User", body = LoginPolicyView),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks identity_connections:write \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A stored row did not decode (WYRD_SPEC_500_INTERNAL)",
+         body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Identity"
+)]
+#[tracing::instrument(skip_all, fields(operation = "identity.login_policy.read"))]
+async fn read_login_policy(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<LoginPolicyView>, WyrdErrorResponse> {
+    let decision = decide_policy(&state, &caller, "identity.login_policy.read")?;
+    connections(&state)?
+        .login_policy(caller.data_tenant_id, &decision)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// `PUT /v1/identity/login-policy` — require company SSO, or stop
+/// requiring it, at the revisions the administrator confirmed.
+///
+/// Only a browser session created by a company sign-in through the current
+/// Active connection within the last five minutes proves the change; a
+/// bearer token, API key, recovery session, password or social session does
+/// not. Either change ends every password and social credential of the
+/// tenant; stopping the requirement revives none of them.
+///
+/// # Errors
+/// Returns `403` without `identity_connections:write` or without fresh
+/// company sign-in proof, `409` when the policy or connection changed since
+/// it was read or no usable Active connection exists, and `503` when the
+/// store is unavailable.
+#[utoipa::path(
+    put,
+    path = "/identity/login-policy",
+    request_body = LoginPolicyChange,
+    responses(
+        (status = 200, description = "The policy as changed", body = LoginPolicyView),
+        (status = 400, description = "Invalid body (WYRD_SPEC_400_VALIDATION)",
+         body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks identity_connections:write \
+          (WYRD_PERMISSION_403_DENIED_RBAC), or did not sign in through the current company \
+          connection within five minutes (WYRD_AUTH_403_RECENT_LOGIN_REQUIRED)",
+         body = WyrdProblem),
+        (status = 409, description = "The policy or Active connection changed since it was \
+          read, or no usable Active connection exists; reload and confirm again \
+          (WYRD_AUTH_409_CONNECTION_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
+         body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Identity"
+)]
+#[tracing::instrument(skip_all, fields(operation = "identity.login_policy.change"))]
+async fn change_login_policy(
+    State(state): State<AppState>,
+    caller: Caller,
+    recent: Option<Extension<RecentHumanLogin>>,
+    body: Bytes,
+) -> Result<Json<LoginPolicyView>, WyrdErrorResponse> {
+    let decision = decide_policy(&state, &caller, "identity.login_policy.change")?;
+    let owner = connections(&state)?;
+    let change = match serde_json::from_slice::<LoginPolicyChange>(&body) {
+        Ok(change) => change,
+        Err(error) => {
+            return refuse_after_decision(
+                &state,
+                &caller,
+                decision,
+                WyrdError::Validation {
+                    message: format!("invalid login policy change: {error}"),
+                    details: serde_json::json!({}),
+                },
+            );
+        }
+    };
+    let proof = recent.and_then(|Extension(RecentHumanLogin(anchor))| anchor);
+    owner
+        .set_login_policy(caller.data_tenant_id, change, proof, &decision)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
 #[cfg(test)]
 mod pg_tests {
     use std::sync::Arc;
@@ -479,7 +613,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict, Principal,
-        PrincipalId, PrincipalKind, RoleRef,
+        PrincipalId, PrincipalKind,
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{LoginInitiation, PrincipalKindTag, Sha256Hex};
@@ -614,7 +748,6 @@ mod pg_tests {
                 PrincipalId::new(Uuid::nil()),
                 PrincipalKind::User,
                 tenant,
-                Vec::<RoleRef>::new(),
                 PermissionSet::from_iter([Permission::identity_connections_write()]),
             ),
             request_id: RequestId::now_v7(),

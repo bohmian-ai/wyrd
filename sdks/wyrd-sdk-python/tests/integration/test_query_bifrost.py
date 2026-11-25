@@ -74,6 +74,35 @@ def test_stream_yields_arrow_batches_and_a_terminal(bifrost: Bifrost, query_tabl
     )
 
 
+def test_explain_returns_plans_and_analyze_executes_the_select(
+    bifrost: Bifrost, query_table: str
+) -> None:
+    select = f"SELECT id FROM {query_table} WHERE id >= $1 ORDER BY id"
+
+    def plans(sql: str) -> list[tuple[str, str]]:
+        batches = bifrost.stream(sql, [2])
+        rows = [
+            (kind, plan)
+            for batch in batches
+            for kind, plan in zip(
+                batch.column("plan_type").to_pylist(), batch.column("plan").to_pylist(), strict=True
+            )
+        ]
+        assert batches.terminal is not None and batches.terminal.outcome == "success"
+        return rows
+
+    explained = plans(f"EXPLAIN {select}")
+    analyzed = plans(f"EXPLAIN ANALYZE {select}")
+
+    assert [kind for kind, _ in explained] == ["logical_plan", "physical_plan"]
+    assert query_table in explained[0][1]
+    assert [kind for kind, _ in analyzed] == ["Plan with Metrics"]
+    assert "output_rows=2" in analyzed[0][1]
+    with pytest.raises(WyrdError) as refused:
+        bifrost.sql(f"EXPLAIN DELETE FROM {query_table}")
+    assert refused.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
+
+
 def test_caller_without_bifrost_read_is_refused(
     wyrd_server: WyrdTestServer, query_table: str
 ) -> None:
@@ -83,7 +112,7 @@ def test_caller_without_bifrost_read_is_refused(
 
     with pytest.raises(WyrdError) as refused:
         denied.sql(f"SELECT id FROM {query_table}")
-    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    assert refused.value.code == "WYRD_VALA_403_QUERY_FORBIDDEN"
 
 
 def ids(bifrost: Bifrost, sql: str) -> list[int]:

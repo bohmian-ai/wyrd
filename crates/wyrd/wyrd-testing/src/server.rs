@@ -97,9 +97,9 @@ use wyrd_spec::ids::{BindingId, CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    TrustedIssuerWrite, family_account_id, grant_role_to_service_account, grant_role_to_user,
-    insert_api_key, insert_service_account, insert_trusted_issuer, insert_user,
-    provision_system_principal, revoke_role_from_service_account, revoke_role_from_user,
+    SubjectColumns, TrustedIssuerWrite, advance_authorization_revision, delete_role_binding,
+    family_account_id, insert_api_key, insert_role_binding, insert_service_account,
+    insert_trusted_issuer, insert_user, list_role_bindings, provision_system_principal,
     role_by_name, tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
@@ -535,6 +535,8 @@ pub struct WyrdTestServerBuilder {
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// The loopback GitHub this server's App is configured against.
     github: Option<crate::github::GithubAppMock>,
+    social: Option<wyrd_server::config::SocialConfig>,
+    trusted_ingress: Option<(Vec<String>, String)>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
@@ -701,6 +703,8 @@ impl Default for WyrdTestServerBuilder {
             telemetry: None,
             bind_addrs: None,
             github: None,
+            social: None,
+            trusted_ingress: None,
             peer_tls: None,
             peer_tls_root: None,
             peer_bind: None,
@@ -1056,7 +1060,9 @@ impl WyrdTestServer {
     /// `[kms]` facade from `builder` (this server's `[kms]` unless it names
     /// another), so a journey can prove that durable state written through
     /// one replica is served by another without a restart, and that replicas
-    /// holding different key sets interoperate during rotation.
+    /// holding different key sets interoperate during rotation. Like
+    /// [`Self::start_in_process`], it runs the current-authority propagation
+    /// worker.
     ///
     /// # Errors
     /// Returns an error when the replica fails to start.
@@ -1068,8 +1074,40 @@ impl WyrdTestServer {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
         let storage_root = self.inner.storage_root.clone();
-        on_shared_runtime(move || builder.start_with_resources(fixture, storage, storage_root))
-            .await
+        let replica =
+            on_shared_runtime(move || builder.start_with_resources(fixture, storage, storage_root))
+                .await?;
+        replica.propagate_authority();
+        Ok(replica)
+    }
+
+    /// Start the current-authority propagation and workspace-directory
+    /// workers of an unbound server, leaving its other workers for
+    /// [`Self::bind`].
+    ///
+    /// Current authority and the discovery directory reach an unbound
+    /// server as they reach a bound one, so a test observes access and
+    /// contact changes committed through any replica within their
+    /// propagation bound. Idempotent: each worker leaves the pending set when
+    /// it starts.
+    fn propagate_authority(&self) {
+        let started: Vec<_> = {
+            let mut workers = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (projections, rest) =
+                std::mem::take(&mut *workers)
+                    .into_iter()
+                    .partition(|(name, _)| {
+                        matches!(*name, "authorization_cache" | "workspace_directory")
+                    });
+            *workers = rest;
+            projections
+        };
+        for (_, worker) in started {
+            wyrd_runtime::runtime().spawn(worker);
+        }
     }
 
     /// Start `builder` as a second replica like
@@ -2037,7 +2075,9 @@ impl WyrdTestServer {
     ///
     /// It is the same context the public query service builds, except that its
     /// principal is the fixed [`AUDIT_INSPECTION_PRINCIPAL`], which is what lets
-    /// a retained read exclude the decisions inspection itself commits.
+    /// a retained read exclude the decisions inspection itself commits. It
+    /// reads every parent's managed verification rows, so inspection sees the
+    /// whole tenant's retained evidence.
     ///
     /// # Errors
     /// Returns the tenant invariant error when the principal and tenant disagree.
@@ -2050,8 +2090,10 @@ impl WyrdTestServer {
             PrincipalId::new(AUDIT_INSPECTION_PRINCIPAL),
             wyrd_runtime::PrincipalKind::User,
             tenant,
-            Vec::new(),
-            wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
+            wyrd_runtime::permission::PermissionSet::from_iter([
+                permission.clone(),
+                Permission::executions_read_any(),
+            ]),
         );
         vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
             principal,
@@ -2974,9 +3016,11 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
-    /// Hold process memory so at most `leave` bytes stay free, so a hosted
-    /// Python operation whose retained request bytes do not fit is refused,
-    /// until the returned hold drops.
+    /// Hold process memory as verification work so at most `leave` bytes stay
+    /// free until the returned hold drops: under the contended pressure that
+    /// leaves, a direct hosted Python operation waits for admission, a queued
+    /// one returns to the queue, and retained request bytes that do not fit
+    /// are refused.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime.
@@ -3085,6 +3129,27 @@ impl WyrdTestServer {
             })
     }
 
+    /// Move the last fresh proof of every platform console session ten
+    /// minutes into the past, as if the shared five-minute proof window had
+    /// passed since its sign-in or re-authentication.
+    ///
+    /// Test-support for browser journeys that must reach a destructive
+    /// console change asking for fresh proof without waiting out the window.
+    /// Sessions stay live: only their proof ages, never their idle or
+    /// absolute deadlines.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the update fails.
+    pub async fn stale_platform_console_proof(&self) -> Result<(), WyrdTestServerError> {
+        sqlx::query(
+            "UPDATE platform.browser_sessions SET fresh_at = fresh_at - interval '10 minutes'",
+        )
+        .execute(self.operator_pool().pool())
+        .await
+        .map(drop)
+        .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
+    }
+
     /// Mint the session a registered administrator gets after federated login.
     ///
     /// Stands in for the provider round trip, not for anything the server
@@ -3186,8 +3251,25 @@ impl WyrdTestServer {
         name: &str,
         roles: &[&str],
     ) -> Result<Bootstrap, WyrdTestServerError> {
+        self.bootstrap_user_in_tenant(self.data_tenant_id(), name, roles)
+            .await
+    }
+
+    /// Bootstrap a user principal of `tenant_id` holding provider-sourced
+    /// `roles` through fixture SQL, signed in through the production login
+    /// grant. A role [`Self::seed_role`] seeded binds at its seeded scopes,
+    /// any other tenant-wide.
+    ///
+    /// # Errors
+    /// Returns an error when SQL writes or test JWT minting fail.
+    pub async fn bootstrap_user_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+    ) -> Result<Bootstrap, WyrdTestServerError> {
         let user_id = Uuid::now_v7();
-        let mut conn = self.tenant_conn().await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
         insert_user(
             &mut conn,
             user_id,
@@ -3197,11 +3279,28 @@ impl WyrdTestServer {
         )
         .await
         .map_err(sql)?;
+        // A signed-in User's roles come from its identity provider, each bound
+        // at the scopes it was seeded with; an unknown role is a fixture
+        // error, never silently dropped.
         for role in roles {
-            grant_role(&mut conn, user_id, PrincipalTable::User, role).await?;
+            for (part, scope) in seeded_role_bindings(tenant_id, role) {
+                let role_id = lookup_role_id(&mut conn, &part).await?;
+                insert_role_binding(
+                    &mut conn,
+                    Uuid::now_v7(),
+                    role_id,
+                    subject_columns(user_id, PrincipalTable::User),
+                    &scope,
+                    RoleSource::Idp,
+                )
+                .await
+                .map_err(sql)?;
+            }
         }
-        // Mint through the production login grant so the token carries the
-        // permissions the server itself would sign for these roles.
+        advance_authorization_revision(&mut conn)
+            .await
+            .map_err(sql)?;
+        // Mint through the production login grant, as a signed-in User is.
         let issuer = self
             .inner
             .state
@@ -3244,7 +3343,10 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
         let roles = roles
             .iter()
-            .map(|role| (*role).to_owned())
+            .map(|role| wyrd_spec::auth::ScopedRoleAssignment {
+                role: (*role).to_owned(),
+                scope: wyrd_spec::auth::PermissionScope::All,
+            })
             .collect::<Vec<_>>();
         let mut conn = self.tenant_conn().await?;
         let user_id = wyrd_auth::passwords::create_local_user(&mut conn, name, &verifier, &roles)
@@ -3651,45 +3753,88 @@ impl WyrdTestServer {
         Ok(api_key.secret)
     }
 
-    /// Seed one non-builtin role carrying exactly the requested permissions.
+    /// Seed one non-builtin role bundling exactly the requested operations.
     ///
     /// The builtin roles are coarse — `admin` holds the wildcard and no other
     /// builtin grants `bifrost_query:read` at all — so a case that needs an
-    /// authenticated caller holding one permission and deliberately lacking
+    /// authenticated caller holding one operation and deliberately lacking
     /// another cannot express that with a builtin name. This seeds the role
-    /// the same way tenant seeding does, through the shared upsert, so a
-    /// principal granted it is issued exactly that permission set.
+    /// through the shared upsert and advances the authorization revision.
     ///
-    /// Each permission is stored exactly as it serializes: a typed
-    /// [`Permission`] or a raw JSON document. The raw form lets a journey
-    /// seed a grant the current schema rejects so the server's own issuance
+    /// A role is an operation bundle; a binding supplies the scope. Each
+    /// permission is stored as its `resource` and `action`, and its scope
+    /// becomes a fixture binding: a later bootstrap or [`Self::grant_role`]
+    /// binds the role at the scope its permissions share, so seeding
+    /// `verifier:run` at one Verifier and bootstrapping a principal with that
+    /// role grants exactly that Verifier. Permissions at several scopes are
+    /// also seeded as one part role `{name}_scope{n}` per scope, and granting
+    /// `name` binds every part at its own scope. [`Self::grant_role_at`]
+    /// binds `name`'s whole bundle at any other scope. A raw JSON operation
+    /// lets a journey seed one the current schema rejects so the server's own
     /// decode, not this fixture, refuses it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the permissions cannot be serialized, when the
-    /// name collides with a builtin role, or when the tenant write fails.
+    /// Returns an error when the permissions cannot be serialized, name an
+    /// unparseable scope, the name collides with a builtin role, or the
+    /// tenant write fails.
     pub async fn seed_role<P: serde::Serialize>(
         &self,
         name: &str,
         permissions: &[P],
     ) -> Result<(), WyrdTestServerError> {
-        let payload = serde_json::to_value(permissions)
+        let mut payload = serde_json::to_value(permissions)
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        let mut groups = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
+        for operation in payload.as_array_mut().into_iter().flatten() {
+            let scope = operation
+                .as_object_mut()
+                .and_then(|fields| fields.remove("scope"))
+                .unwrap_or_else(|| serde_json::json!("all"));
+            groups
+                .entry(scope.to_string())
+                .or_default()
+                .push(operation.clone());
+        }
+        let single = groups.len() <= 1;
+        let mut bindings = Vec::with_capacity(groups.len().max(1));
+        let mut roles = vec![(name.to_owned(), payload.clone())];
+        for (index, (scope, operations)) in groups.into_iter().enumerate() {
+            let scope: wyrd_spec::auth::PermissionScope = serde_json::from_str(&scope)
+                .map_err(|error| WyrdTestServerError::Io(format!("role {name}: {error}")))?;
+            let role = if single {
+                name.to_owned()
+            } else {
+                let part = format!("{name}_scope{index}");
+                roles.push((part.clone(), serde_json::Value::Array(operations)));
+                part
+            };
+            bindings.push((role, scope));
+        }
+        if bindings.is_empty() {
+            bindings.push((name.to_owned(), wyrd_spec::auth::PermissionScope::All));
+        }
         let mut conn = self.tenant_conn().await?;
-        wyrd_sql::queries::auth::insert_role(
-            &mut conn,
-            Uuid::new_v5(
-                &wyrd_runtime::builtin_roles::NS_BUILTIN_ROLE,
-                format!("{}:{name}", self.data_tenant_id()).as_bytes(),
-            ),
-            name,
-            &payload,
-            false,
-        )
-        .await
-        .map_err(sql)?;
-        conn.commit().await.map_err(sql)
+        for (role, operations) in &roles {
+            wyrd_sql::queries::auth::insert_role(
+                &mut conn,
+                Uuid::new_v5(
+                    &wyrd_runtime::builtin_roles::NS_BUILTIN_ROLE,
+                    format!("{}:{role}", self.data_tenant_id()).as_bytes(),
+                ),
+                role,
+                operations,
+                false,
+            )
+            .await
+            .map_err(sql)?;
+        }
+        advance_authorization_revision(&mut conn)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        remember_role_bindings(self.data_tenant_id(), name, bindings);
+        Ok(())
     }
 
     /// Deploy `openai/{model}` Chat Completions as the `openai` deployment
@@ -3763,7 +3908,8 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Grant a role to a bootstrapped principal.
+    /// Grant a role to a bootstrapped principal at the scopes it was seeded
+    /// with, tenant-wide for a builtin role.
     ///
     /// # Errors
     /// Returns an error when the role is unknown or SQL fails.
@@ -3772,25 +3918,37 @@ impl WyrdTestServer {
         principal: &Bootstrap,
         role: &str,
     ) -> Result<(), WyrdTestServerError> {
+        let (id, table) = match principal {
+            Bootstrap::User { id, .. } => (id.as_uuid(), PrincipalTable::User),
+            Bootstrap::Machine { id, .. } => (id.as_uuid(), PrincipalTable::ServiceAccount),
+        };
         let mut conn = self.tenant_conn().await?;
-        match principal {
-            Bootstrap::User { id, .. } => {
-                grant_role(&mut conn, id.as_uuid(), PrincipalTable::User, role).await?;
-            }
-            Bootstrap::Machine { id, .. } => {
-                grant_role(
-                    &mut conn,
-                    id.as_uuid(),
-                    PrincipalTable::ServiceAccount,
-                    role,
-                )
-                .await?;
-            }
-        }
+        grant_role(&mut conn, id, table, role).await?;
         conn.commit().await.map_err(sql)
     }
 
-    /// Revoke a role from a bootstrapped principal.
+    /// Bind a role to a bootstrapped principal at `scope`, advancing the
+    /// tenant's authorization revision.
+    ///
+    /// # Errors
+    /// Returns an error when the role is unknown or SQL fails.
+    pub async fn grant_role_at(
+        &self,
+        principal: &Bootstrap,
+        role: &str,
+        scope: &wyrd_spec::auth::PermissionScope,
+    ) -> Result<(), WyrdTestServerError> {
+        let (id, table) = match principal {
+            Bootstrap::User { id, .. } => (id.as_uuid(), PrincipalTable::User),
+            Bootstrap::Machine { id, .. } => (id.as_uuid(), PrincipalTable::ServiceAccount),
+        };
+        let mut conn = self.tenant_conn().await?;
+        bind_role(&mut conn, id, table, role, scope).await?;
+        conn.commit().await.map_err(sql)
+    }
+
+    /// Revoke a role, and every part role it was seeded as, from a
+    /// bootstrapped principal.
     ///
     /// # Errors
     /// Returns an error when the role is unknown or SQL fails.
@@ -3800,19 +3958,26 @@ impl WyrdTestServer {
         role: &str,
     ) -> Result<(), WyrdTestServerError> {
         let mut conn = self.tenant_conn().await?;
-        let role_id = lookup_role_id(&mut conn, role).await?;
-        match principal {
-            Bootstrap::User { id, .. } => {
-                revoke_role_from_user(&mut conn, id.as_uuid(), role_id, RoleSource::Idp)
-                    .await
-                    .map_err(sql)?;
-            }
+        let mut role_ids = vec![lookup_role_id(&mut conn, role).await?];
+        for (part, _) in seeded_role_bindings(self.data_tenant_id(), role) {
+            role_ids.push(lookup_role_id(&mut conn, &part).await?);
+        }
+        let subject = match principal {
+            Bootstrap::User { id, .. } => subject_columns(id.as_uuid(), PrincipalTable::User),
             Bootstrap::Machine { id, .. } => {
-                revoke_role_from_service_account(&mut conn, id.as_uuid(), role_id)
+                subject_columns(id.as_uuid(), PrincipalTable::ServiceAccount)
+            }
+        };
+        for binding in list_role_bindings(&mut conn).await.map_err(sql)? {
+            if role_ids.contains(&binding.role_id) && binding.subject == subject {
+                delete_role_binding(&mut conn, binding.id)
                     .await
                     .map_err(sql)?;
             }
         }
+        advance_authorization_revision(&mut conn)
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)
     }
 
@@ -4208,11 +4373,19 @@ impl WyrdTestServer {
         &self,
         mut req: Request<Body>,
     ) -> Result<Response<Body>, WyrdTestServerError> {
-        req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                0,
-            )));
+        // A request that names its own peer keeps it, so a test can drive a
+        // per-source limit; every other request comes from loopback.
+        if req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .is_none()
+        {
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    0,
+                )));
+        }
         self.inner
             .router
             .clone()
@@ -4689,6 +4862,30 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_github_app_for_test(mut self, mock: &crate::github::GithubAppMock) -> Self {
         self.github = Some(mock.clone());
+        self
+    }
+
+    /// Point the server's shared social sign-in at controlled local providers.
+    ///
+    /// Without it the server talks to the real providers, as in production.
+    #[must_use]
+    pub fn with_social_endpoints_for_test(
+        mut self,
+        social: wyrd_server::config::SocialConfig,
+    ) -> Self {
+        self.social = Some(social);
+        self
+    }
+
+    /// Trust `header` as the client address of requests whose peer is inside
+    /// `proxies` (IP addresses or CIDR blocks), as a deployment behind a
+    /// trusted ingress does.
+    #[must_use]
+    pub fn with_trusted_ingress_for_test(mut self, proxies: &[&str], header: &str) -> Self {
+        self.trusted_ingress = Some((
+            proxies.iter().map(|proxy| (*proxy).to_owned()).collect(),
+            header.to_owned(),
+        ));
         self
     }
 
@@ -5189,6 +5386,8 @@ impl WyrdTestServerBuilder {
     ///
     /// The server is composed on the shared Wyrd runtime, so every background
     /// owner it starts lives on the runtime [`WyrdTestServer`]'s `Drop` drives.
+    /// It runs the current-authority propagation worker, so committed access
+    /// changes reach its cache as they reach a production server's.
     /// Composed on a caller's current-thread runtime, those owners would wait
     /// on a thread the dropping test blocks, and teardown would never settle.
     ///
@@ -5196,7 +5395,9 @@ impl WyrdTestServerBuilder {
     /// Returns an error when database, storage, auth, or router state cannot be
     /// created, or when the composing task panics.
     pub async fn start_in_process(self) -> Result<WyrdTestServer, WyrdTestServerError> {
-        on_shared_runtime(move || self.compose_in_process()).await
+        let server = on_shared_runtime(move || self.compose_in_process()).await?;
+        server.propagate_authority();
+        Ok(server)
     }
 
     /// Composes the in-process server on the calling runtime.
@@ -5476,6 +5677,13 @@ impl WyrdTestServerBuilder {
         }
         if let Some(endpoints) = self.gateway_endpoints {
             config.gateway.endpoints = endpoints;
+        }
+        if let Some(social) = &self.social {
+            config.social = social.clone();
+        }
+        if let Some((proxies, header)) = &self.trusted_ingress {
+            config.http.trusted_ingress.clone_from(proxies);
+            config.http.client_address_header = Some(header.clone());
         }
         if let Some(limits) = self.limits {
             config.limits = wyrd_server::config::LimitsConfig {
@@ -5958,24 +6166,86 @@ enum PrincipalTable {
     ServiceAccount,
 }
 
+/// Bind `role` to a fixture account at the scopes it was seeded with.
 async fn grant_role(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
     table: PrincipalTable,
     role: &str,
 ) -> Result<(), WyrdTestServerError> {
+    for (role, scope) in seeded_role_bindings(conn.data_tenant_id(), role) {
+        bind_role(conn, principal_id, table, &role, &scope).await?;
+    }
+    Ok(())
+}
+
+/// The bindings each role [`WyrdTestServer::seed_role`] seeded in this
+/// process grants: the stored role and scope of each part, keyed by tenant
+/// and role name.
+///
+/// Process-wide so every node of a multi-node harness over one database binds
+/// a seeded role alike. A role not seeded here, such as a builtin, binds
+/// itself tenant-wide.
+static SEEDED_ROLE_BINDINGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(DataTenantId, String), RoleBindings>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The stored role and scope of each binding one seeded role grants.
+type RoleBindings = Vec<(String, wyrd_spec::auth::PermissionScope)>;
+
+/// Record that granting `role` in `tenant` binds `bindings`.
+fn remember_role_bindings(tenant: DataTenantId, role: &str, bindings: RoleBindings) {
+    SEEDED_ROLE_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((tenant, role.to_owned()), bindings);
+}
+
+/// What granting `role` in `tenant` binds: its seeded bindings, else the
+/// role itself tenant-wide.
+fn seeded_role_bindings(tenant: DataTenantId, role: &str) -> RoleBindings {
+    SEEDED_ROLE_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(tenant, role.to_owned()))
+        .cloned()
+        .unwrap_or_else(|| vec![(role.to_owned(), wyrd_spec::auth::PermissionScope::All)])
+}
+
+/// Bind `role` to a fixture account at `scope` and advance the revision.
+async fn bind_role(
+    conn: &mut TenantConn<'_>,
+    principal_id: Uuid,
+    table: PrincipalTable,
+    role: &str,
+    scope: &wyrd_spec::auth::PermissionScope,
+) -> Result<(), WyrdTestServerError> {
     let role_id = lookup_role_id(conn, role).await?;
+    insert_role_binding(
+        conn,
+        Uuid::now_v7(),
+        role_id,
+        subject_columns(principal_id, table),
+        scope,
+        RoleSource::Direct,
+    )
+    .await
+    .map_err(sql)?;
+    advance_authorization_revision(conn).await.map_err(sql)?;
+    Ok(())
+}
+
+/// The binding columns of a fixture account.
+fn subject_columns(principal_id: Uuid, table: PrincipalTable) -> SubjectColumns {
     match table {
-        PrincipalTable::User => grant_role_to_user(conn, principal_id, role_id, RoleSource::Idp)
-            .await
-            .map(|_| ())
-            .map_err(sql),
-        PrincipalTable::ServiceAccount => {
-            grant_role_to_service_account(conn, principal_id, role_id)
-                .await
-                .map(|_| ())
-                .map_err(sql)
-        }
+        PrincipalTable::User => SubjectColumns {
+            user_id: Some(principal_id),
+            ..SubjectColumns::default()
+        },
+        PrincipalTable::ServiceAccount => SubjectColumns {
+            service_account_id: Some(principal_id),
+            ..SubjectColumns::default()
+        },
     }
 }
 
@@ -6505,7 +6775,7 @@ mod tests {
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 23] = [
+    const TYPESCRIPT_SETUP: [&str; 25] = [
         "baseUrl",
         "grpcUrl",
         "token",
@@ -6529,6 +6799,8 @@ mod tests {
         "tenantAdminKey",
         "bootstrapUserKey",
         "seedUserKeys",
+        "initializePlatformRoot",
+        "staleConsoleProof",
     ];
 
     /// Member names declared in the body of `class` in `source`.

@@ -154,7 +154,6 @@ impl VerificationFixture {
                 PrincipalId::new(Uuid::now_v7()),
                 PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 PermissionSet::new(),
             ),
         })
@@ -165,7 +164,7 @@ impl VerificationFixture {
     /// evidence such as traces.
     #[must_use]
     pub fn with_actor_permissions(mut self, permissions: PermissionSet) -> Self {
-        self.actor.effective_permissions = permissions;
+        self.actor.effective_permissions = permissions.into();
         self
     }
 
@@ -320,10 +319,7 @@ impl VerificationFixture {
             }],
         }))
         .map_err(|error| failed(error.to_string()))?;
-        let mut principal = self.actor.clone();
-        principal
-            .effective_permissions
-            .insert(Permission::card_write());
+        let principal = granted(&self.actor, Permission::card_write());
         let caller = Caller {
             data_tenant_id: self.tenant,
             principal,
@@ -644,7 +640,8 @@ impl VerificationFixture {
     ) -> Result<ExecutionId, VerificationFixtureError> {
         let submission = Submission::new(
             self.tenant,
-            AcceptedAuthority::new(&self.actor, &[]),
+            AcceptedAuthority::new(&self.actor, &[])
+                .map_err(|e| VerificationFixtureError::Card(e.to_string()))?,
             VerificationRequest {
                 verifier_card_uid: verifier.clone(),
                 card_uid: subject.clone(),
@@ -695,7 +692,7 @@ impl VerificationFixture {
             )
             .await?;
         conn.commit().await?;
-        match outcomes.as_slice() {
+        match outcomes.outcome.as_slice() {
             [SubmissionOutcome::Accepted] => Ok(submission.execution_id),
             other => Err(VerificationFixtureError::NotEnqueued(format!("{other:?}"))),
         }
@@ -740,10 +737,25 @@ impl VerificationFixture {
         }
         // The accepted authority of a running execution holds `verifier:run`
         // on exactly its Verifier, which File publications are decided on.
-        let mut principal = self.actor.clone();
-        principal
-            .effective_permissions
-            .insert(Permission::verifier_run(claimed.verifier_card_uid.clone()));
+        let scope = {
+            let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+            let scopes = wyrd_sql::queries::cards::card_scopes(
+                &mut conn,
+                std::slice::from_ref(&claimed.verifier_card_uid),
+            )
+            .await
+            .map_err(|e| refused(&e))?;
+            conn.commit().await?;
+            scopes
+                .get(&claimed.verifier_card_uid)
+                .cloned()
+                .ok_or_else(|| {
+                    VerificationFixtureError::Card(
+                        "the claimed Verifier has no registered Card".to_owned(),
+                    )
+                })?
+        };
+        let principal = granted(&self.actor, Permission::verifier_run(scope));
         let caller = Caller {
             data_tenant_id: self.tenant,
             principal,
@@ -1058,4 +1070,13 @@ fn drift_spec(metric: &str, drift: Value) -> Value {
         "inputs": { "samples": { "type": "samples", "features": [metric] } },
         "requirements": [{ "id": "drift", "statement": "The window does not drift.", "check": check }]
     })
+}
+
+/// `principal` with `permission` added to its current grants.
+fn granted(principal: &Principal, permission: Permission) -> Principal {
+    let mut grants = principal.effective_permissions.grants().clone();
+    grants.insert(permission);
+    let mut principal = principal.clone();
+    principal.effective_permissions = grants.into();
+    principal
 }

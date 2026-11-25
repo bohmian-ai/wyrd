@@ -6,11 +6,11 @@ authority, network boundaries, database lifecycle, and safe release contract.
 ## Supported topologies
 
 `wyrd-server` is the only external serving surface. One logical Wyrd server may
-contain multiple replicas and role-targeted pods behind one gateway.
+contain multiple replicas and role-targeted pods behind one ingress.
 
 | Topology | Tenant model | Required properties |
 |---|---|---|
-| Self-hosted | One or more tenants selected by the operator | One logical gateway, durable Postgres, durable object storage, persistent Scribe and Oracle audit volumes, explicit backup and recovery objectives |
+| Self-hosted | One or more tenants selected by the operator | One logical ingress, durable Postgres, durable object storage, persistent Scribe and Oracle audit volumes, explicit backup and recovery objectives |
 | Cloud SaaS | Multi-tenant | Shared serving fleet with full tenant separation in identity, RLS, object paths, encryption, resource admission, audit, telemetry, and generated artifacts |
 | Enterprise cloud | One tenant per deployment | The same server and protocol contracts, isolated storage and keys, and no in-tree commercial feature or compatibility fork |
 
@@ -22,8 +22,8 @@ Replicas may enable a subset of server roles through the canonical target
 configuration. Targeting changes activated subsystems and resource ownership;
 it does not create another public service, protocol, or durable contract.
 
-The gateway owns public addressability, request-size and connection bounds,
-rate-limit integration, and external TLS termination when TLS is not terminated
+The ingress (the load balancer or reverse proxy in front of `wyrd-server`)
+owns public addressability, request-size and connection bounds, rate limiting, and external TLS termination when TLS is not terminated
 by `wyrd-server`. It does not establish tenant identity, reinterpret Wyrd
 errors, retry non-idempotent writes, or buffer an unbounded query stream.
 
@@ -32,7 +32,7 @@ errors, retry non-idempotent writes, or buffer an unbounded query stream.
 - Every external connection uses TLS. Plaintext listeners are confined to
   loopback development or a mutually authenticated, policy-enforced local
   transport boundary.
-- Gateway-to-server transport is authenticated and encrypted. Forwarded client
+- Ingress-to-server transport is authenticated and encrypted. Forwarded client
   identity metadata is advisory; the Wyrd token remains authoritative.
 - Replica-to-replica Bifrost traffic uses mutual TLS from one dedicated
   cluster CA with the fixed `wyrd-peer` identity, and every private operation
@@ -132,6 +132,48 @@ after every writer runs the new configuration, a platform administrator
 repeats the explicit routine or recovery maintenance pass
 (`POST /platform/stored-secrets/maintenance`, `wyrd platform stored-secrets
 maintain`) until it reports nothing remaining.
+
+### Human setup and acquisition configuration
+
+`wyrd-server setup --tenant acme --server URL --admin-username alice` requires a
+hidden password prompt or `--admin-password-stdin`; optional `--admin-email` is
+unverified. Noninteractive callers provide username and secret stdin before a
+claim is made. Passwords never enter argv or configuration dumps. Setup activates
+only a usable named human admin through existing provisioning and retains separate
+automation/recovery credentials. Output includes login URL/username, never password.
+Completed reruns report safe status without duplicate admins/password resets;
+interrupted setup uses existing operator-authorized recovery and cannot activate
+ownerless. Setup/password login and local CLI device approval work without SMTP/IdP.
+
+Private defaults are `password_enabled=true`, `signup_enabled=false`, no relay or
+social credentials. Use existing revisioned platform login-settings and mail
+management to enable acquisition, never another config source or Node secret.
+Local public signup requires password/signup enabled plus configured SMTP; public
+email verification is mandatory, not a bypass setting. Google/GitHub acquisition
+also needs a verified contact (validated provider proof, or bound Wyrd email proof);
+provider proof can permit social creation without SMTP. Returning social login and
+bearer invitation acceptance do not require verified email. Root creation is offered
+only while a method is usable; operator settings explain missing prerequisites.
+
+Configure the existing generic SMTP relay with explicit host, port, TLS mode,
+sender and optional credentials sealed through `WyrdKms`; test-send before use. Prefer validated
+STARTTLS or TLS, plaintext only for an explicitly trusted local relay. No mail
+credentials are bundled. Without SMTP, hide local signup, workspace discovery and
+reset requests while copied invitations, setup, password login, administrator-issued
+reset and CLI device login remain available. Setup/invited contacts require separate
+verification for discovery/recovery. Removing SMTP disables dependent starts, not
+login or valid issued reset-code redemption; signed proofs retain their deadline
+while signup/their method remain enabled. Reset sends are bounded transient work,
+not durable delivery: after a crash the user requests again. Invitations/test-send
+report relay outcomes; public discovery/reset requests conceal account-specific
+outcomes. Discovery returns verified workspace links only and still requires login.
+
+Trusted ingress IP/CIDRs and client-address header are deployment configuration;
+ignore headers from untrusted peers, normalize mapped IPv4, group IPv6 `/64` and
+refuse missing signup source. Preserve revision-5 optional Turnstile settings,
+`WyrdKms`-sealed secret and site key, and per-identity owned-workspace cap (default 3);
+there is no mandatory challenge or deployment-wide cap. Current policy is rechecked
+in Rust, and no new Node credential/encryption configuration is introduced.
 
 ## Browser-session deployment
 
@@ -278,7 +320,12 @@ The official images (`docker/official/{debian,rocky}/Dockerfile`) run
 stops the container. nginx serves HTTP on 8080, proxying the server's routes
 (`/v1`, `/v1beta`, `/auth`, `/platform`, `/mcp`, `/.well-known`,
 `/openapi.json`, `/healthz`, `/readyz`) to the server's loopback listener and
-every other path to the BFF, and gRPC on 50051. Each copies a Linux server
+every other path to the BFF, and gRPC on 50051. Exact `/platform` and
+`/platform/ui` plus its subtree are explicit page/action exceptions to that prefix
+rule, routed to the BFF with exact matches and a `^~ /platform/ui/` prefix
+that takes precedence over the Rust API regex. All other `/platform/*`
+paths, including `/platform/browser/*`, remain Rust-owned; paths are not rewritten
+and no `admin` alias or content-negotiation routing is used. Each copies a Linux server
 bundle and compiles nothing; the image supplies Node.js from the pinned
 official Node image. Release publishes `bohmian/wyrd:<distro>-<arch>-<version>`
 for debian on amd64 and arm64 and rocky on amd64 only, each built on a native
@@ -295,7 +342,7 @@ the reviewed commit and pins that exact build by its immutable local image ID,
 recording the ID and source commit. The first release repeats the same image
 journeys against the published registry digest named in its manifest.
 
-- The gateway and peers reject protocol versions outside their declared
+- The ingress and peers reject protocol versions outside their declared
   compatibility set before payload decoding.
 - Adjacent application versions may overlap only when the release manifest
   proves compatible database, object, wire, and peer contracts.

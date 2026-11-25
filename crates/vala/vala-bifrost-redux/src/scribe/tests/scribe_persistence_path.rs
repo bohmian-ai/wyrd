@@ -85,7 +85,6 @@ fn principal(tenant: DataTenantId) -> Principal {
         PrincipalId::new(Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     )
 }
@@ -1125,7 +1124,6 @@ fn points_frame(
         PrincipalId::new(tenant.as_uuid()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     );
     ScribeIngressFrame {

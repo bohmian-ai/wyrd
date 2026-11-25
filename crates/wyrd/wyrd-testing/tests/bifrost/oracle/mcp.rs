@@ -402,6 +402,17 @@ mod pg_tests {
                 serde_json::json!({"sql": join_sql.clone(), "max_bytes": 1}),
                 "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
             ),
+            // A logical and a physical plan exceed one row.
+            (
+                "explained row ceiling",
+                serde_json::json!({"sql": format!("EXPLAIN {join_sql}"), "max_rows": 1}),
+                "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+            ),
+            (
+                "analyzed byte ceiling",
+                serde_json::json!({"sql": format!("EXPLAIN ANALYZE {join_sql}"), "max_bytes": 1}),
+                "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+            ),
         ] {
             let refusal = problem(client.call_tool(query(arguments)).await?)?;
             if refusal["code"] != serde_json::json!(code) {

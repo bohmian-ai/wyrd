@@ -124,7 +124,7 @@ pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
     OracleQueryParticipant,
 };
-pub use planner::OraclePlanner;
+pub use planner::{OraclePlanner, ParsedQuery};
 pub use query_stream::OracleQueryStream;
 pub use query_stream::QueryStreamLifecycle;
 pub use query_stream::{
@@ -1011,6 +1011,9 @@ struct RetainedPhysicalPlan {
     config: SessionConfig,
     /// The single physical root this query executes.
     root: Arc<dyn ExecutionPlan>,
+    /// Whether the request is `EXPLAIN ANALYZE`: the root is executed and
+    /// returned annotated with its metrics instead of its rows.
+    analyze: bool,
     /// Whether live-stream listing failed for a table before planning.
     live_listing_lost: bool,
 }
@@ -1559,21 +1562,6 @@ impl Oracle {
         self.fragment_dispatcher.as_ref().map(Arc::clone)
     }
 
-    /// Validates the query floor before any asynchronous metadata operation.
-    ///
-    /// Returns the statement's distinct canonical table references, parsed
-    /// once here so no later step of the attempt parses the SQL again.
-    ///
-    /// # Errors
-    /// Returns a stable public query error when the SQL is empty, oversized, or
-    /// contains more than one statement or a non-`SELECT` leading keyword.
-    pub fn validate_query(
-        &self,
-        request: &BifrostQueryRequest,
-    ) -> Result<Vec<TableRef>, BifrostError> {
-        self.planner.validate_query(request)
-    }
-
     /// Returns this node's Analytical follower ingress, when composed.
     ///
     /// The server mounts the upstream worker service behind
@@ -1626,8 +1614,59 @@ impl Oracle {
         request: BifrostQueryRequest,
         absolute_deadline_ms: i64,
     ) -> Result<OracleQueryStream, BifrostError> {
+        let (request, parsed) = self
+            .parse_query(&context, request, absolute_deadline_ms)
+            .await?;
+        self.query_parsed_with_deadline(context, request, parsed, absolute_deadline_ms)
+            .await
+    }
+
+    /// Validates and parses one request on a process CPU lane, off the
+    /// calling async worker, inside its already-captured deadline.
+    ///
+    /// An ingress that selects this Oracle in its own process parses here and
+    /// hands the result to [`Self::query_parsed_with_deadline`], so the
+    /// request is parsed once.
+    ///
+    /// # Errors
+    /// Returns invalid SQL for floor violations and a query timeout when the
+    /// deadline passes first; see [`OraclePlanner::parse_query`].
+    pub async fn parse_query(
+        &self,
+        context: &AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        absolute_deadline_ms: i64,
+    ) -> Result<(BifrostQueryRequest, ParsedQuery), BifrostError> {
+        let deadline = DateTime::from_timestamp_millis(absolute_deadline_ms)
+            .ok_or(BifrostError::QueryTimeout)
+            .and_then(instant_deadline)?;
+        self.planner
+            .parse_query(
+                self.resources.workloads(),
+                context.data_tenant_id,
+                request,
+                deadline,
+            )
+            .await
+    }
+
+    /// Executes a trusted server-internal query from the one parse of its
+    /// request, under the verified ingress deadline.
+    ///
+    /// `parsed` must be the parse of `request`; the caller that parsed it
+    /// keeps the two together.
+    ///
+    /// # Errors
+    /// Returns the same preparation and execution failures as [`Self::query_sql`].
+    pub async fn query_parsed_with_deadline(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        parsed: ParsedQuery,
+        absolute_deadline_ms: i64,
+    ) -> Result<OracleQueryStream, BifrostError> {
         let (roster, planned) = self
-            .prepare_query_attempt(&context, &request, absolute_deadline_ms)
+            .prepare_query_attempt(&context, parsed, absolute_deadline_ms)
             .await?;
         self.run_sql_query(context, request, roster, planned).await
     }
@@ -1697,8 +1736,9 @@ impl Oracle {
         BifrostError,
     > {
         let deadline_ms = self.capture_query_deadline(&request)?;
+        let (request, parsed) = self.parse_query(&context, request, deadline_ms).await?;
         let (roster, prepared) = self
-            .prepare_query_attempt(&context, &request, deadline_ms)
+            .prepare_query_attempt(&context, parsed, deadline_ms)
             .await?;
         let deadline = instant_deadline(roster.deadline())?;
         let ClassifiedAttempt {
@@ -1782,10 +1822,9 @@ impl Oracle {
     async fn prepare_query_attempt(
         &self,
         context: &AuthorizedQueryContext,
-        request: &BifrostQueryRequest,
+        ParsedQuery { statement, tables }: ParsedQuery,
         absolute_deadline_ms: i64,
     ) -> Result<(OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
-        let (statement, tables) = self.planner.validate_statement(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
@@ -2291,7 +2330,12 @@ impl Oracle {
             running_query,
             profile,
         } = input;
-        let RetainedPhysicalPlan { config, root, .. } = retained;
+        let RetainedPhysicalPlan {
+            config,
+            root,
+            analyze,
+            ..
+        } = retained;
         // Process pressure pauses the query before it executes; it then
         // runs as Bifrost work of its tenant on the shared CPU lanes.
         let workloads = self.resources.workloads();
@@ -2315,10 +2359,10 @@ impl Oracle {
                 admitted.retain_root(&root, profile);
                 let task = admitted.execution_task(config)?;
                 let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
-                let schema = root.schema();
+                let schema = Explanation::schema(&root, analyze);
                 let batches = laned_execution(lanes, operation, || {
-                    let batches =
-                        execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
+                    let batches = Explanation::execute(&root, analyze, task)
+                        .map_err(|error| map_datafusion_error(&error))?;
                     Ok(self.audit_tenant_refusal(context, batches))
                 })
                 .await?;
@@ -2355,9 +2399,9 @@ impl Oracle {
             ownership.publish_participants().await?;
         }
         let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
-        let schema = root.schema();
+        let schema = Explanation::schema(&root, analyze);
         let batches = laned_execution(lanes, operation, || {
-            let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
+            let batches = Explanation::execute(&root, analyze, leader.task_ctx())
                 .map_err(|error| map_datafusion_error(&error))?;
             Ok(self.audit_tenant_refusal(context, batches))
         })
@@ -2863,7 +2907,9 @@ impl Oracle {
     /// so a later grant sizes only its memory ceiling. When this node composed
     /// the Analytical owners the build runs through the pinned distributed
     /// planner, which is what lets the root come back as a `DistributedExec`;
-    /// the class is then read from that root alone.
+    /// the class is then read from that root alone. That planner's session is
+    /// installed before the one logical optimizer pass, because its settings
+    /// decide how subqueries are lowered for the physical build.
     ///
     /// Nothing here admits, reserves, publishes, or reads a row. The planning
     /// session is dropped as soon as the root and its config are retained.
@@ -2903,6 +2949,12 @@ impl Oracle {
             .register_cut_providers(&planning, context, cuts)
             .await?;
         providers.done();
+        // The distributed planner's configuration governs how the optimizer
+        // lowers subqueries, so it is installed before the one logical pass.
+        let planning = match self.analytical.as_ref() {
+            Some(handle) => handle.planning_session(&planning, roster.oracles())?,
+            None => planning,
+        };
         let logical_planning = planned.profile.physical_planning.timer();
         let logical = Self::before_deadline(
             deadline,
@@ -2959,13 +3011,8 @@ impl Oracle {
             cap,
             "Oracle sized the query's partitions from its scanned bytes"
         );
-        let oracles = roster.oracles();
         #[cfg(feature = "test-support")]
         record_physical_build(&roster.fingerprint());
-        let planning = match self.analytical.as_ref() {
-            Some(handle) => handle.planning_session(&planning, oracles)?,
-            None => planning,
-        };
         #[cfg(feature = "test-support")]
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
@@ -2977,9 +3024,14 @@ impl Oracle {
             .await?
             .map_err(|error| map_query_planning_error(&error))?;
         physical_planning.done();
+        let explanation = Explanation::of(&planned.statement);
         Ok(Some(RetainedPhysicalPlan {
             config: planning.copied_config(),
-            root,
+            root: match explanation {
+                Some(Explanation::Plan) => Explanation::plan_root(&logical, root.as_ref()),
+                _ => root,
+            },
+            analyze: explanation == Some(Explanation::Analyze),
             live_listing_lost: live.listing_lost,
         }))
     }
@@ -3221,7 +3273,8 @@ impl Oracle {
     /// The optimized plan passes the payload-column gate before it is
     /// returned, so a projection or filter reaching `bifrost.gateway.calls`
     /// payload content without payload-read authority never becomes
-    /// executable.
+    /// executable. Before optimization, [`restrict_verification_rows`]
+    /// limits every managed verification scan to the reader's visible rows.
     async fn plan_logical(
         session: &SessionContext,
         context: &AuthorizedQueryContext,
@@ -3230,9 +3283,10 @@ impl Oracle {
     ) -> Result<datafusion::logical_expr::LogicalPlan, OracleExecutionError> {
         let plan = session
             .state()
-            .statement_to_plan(statement.clone())
+            .statement_to_plan(explained_select(statement).clone())
             .await
             .map_err(|error| map_sql_planning_error(&error))?;
+        let plan = restrict_verification_rows(context, plan)?;
         let frame = session
             .execute_logical_plan(plan)
             .await
@@ -3487,17 +3541,31 @@ fn parse_select(sql: &str) -> Result<(DfStatement, Vec<TableRef>), BifrostError>
         .ok_or_else(|| BifrostError::QueryInvalidSql {
             detail: "exactly one SELECT statement is required".to_owned(),
         })?;
-    if !matches!(&statement, DfStatement::Statement(inner) if matches!(**inner, SqlStatement::Query(_)))
+    if let DfStatement::Explain(explain) = &statement {
+        let options = &explain.options;
+        if options.verbose
+            || options.format.is_some()
+            || options.analyze_level.is_some()
+            || options.analyze_categories.is_some()
+            || options.show_statistics.is_some()
+        {
+            return Err(BifrostError::QueryInvalidSql {
+                detail: "EXPLAIN accepts only the optional ANALYZE keyword".to_owned(),
+            });
+        }
+    }
+    let select = explained_select(&statement);
+    if !matches!(select, DfStatement::Statement(inner) if matches!(**inner, SqlStatement::Query(_)))
     {
         return Err(BifrostError::QueryInvalidSql {
-            detail: "only a single SELECT statement is supported".to_owned(),
+            detail: "only a single SELECT statement, or one EXPLAIN [ANALYZE] of it, is supported"
+                .to_owned(),
         });
     }
-    let (relations, _) = resolve_table_references(&statement, true).map_err(|error| {
-        BifrostError::QueryInvalidSql {
+    let (relations, _) =
+        resolve_table_references(select, true).map_err(|error| BifrostError::QueryInvalidSql {
             detail: format!("table reference error: {error}"),
-        }
-    })?;
+        })?;
     if relations.is_empty() {
         return Err(BifrostError::QueryInvalidSql {
             detail: "query must reference at least one Bifrost table".to_owned(),
@@ -3513,6 +3581,170 @@ fn parse_select(sql: &str) -> Result<(DfStatement, Vec<TableRef>), BifrostError>
         })
         .collect::<Result<_, _>>()
         .map(|tables| (statement, tables))
+}
+
+/// How a validated statement explains its SELECT.
+///
+/// Plain explanation returns the optimized logical plan and the physical root
+/// the SELECT would run, without executing it. Analysis executes that root
+/// through the SELECT's own selected path and returns it with its metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Explanation {
+    /// `EXPLAIN SELECT ...`.
+    Plan,
+    /// `EXPLAIN ANALYZE SELECT ...`.
+    Analyze,
+}
+
+impl Explanation {
+    /// Builds the root a plain explanation executes in place of `root`: one
+    /// row each for the optimized logical plan and the physical root the
+    /// SELECT selected, in `DataFusion`'s `plan_type`/`plan` shape. It reads
+    /// no data.
+    fn plan_root(
+        logical: &datafusion::logical_expr::LogicalPlan,
+        root: &dyn ExecutionPlan,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::common::display::{PlanType, StringifiedPlan, ToStringifiedPlan as _};
+        let physical = redact_locators(
+            &datafusion::physical_plan::displayable(root)
+                .indent(false)
+                .to_string(),
+        );
+        Arc::new(datafusion::physical_plan::explain::ExplainExec::new(
+            datafusion::logical_expr::LogicalPlan::explain_schema(),
+            vec![
+                logical.to_stringified(PlanType::FinalLogicalPlan),
+                StringifiedPlan::new(PlanType::FinalPhysicalPlan, physical),
+            ],
+            false,
+        ))
+    }
+
+    /// Executes the root that answers the request: `root` itself, or, for
+    /// analysis, `root` run to completion and returned as its plan annotated
+    /// with the operator metrics it recorded, object locators redacted.
+    ///
+    /// Analysis wraps the root only after classification and admission, so the
+    /// analyzed SELECT runs on exactly the class and session it selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error the root fails to start with.
+    fn execute(
+        root: &Arc<dyn ExecutionPlan>,
+        analyze: bool,
+        task: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        if !analyze {
+            return execute_stream(Arc::clone(root), task);
+        }
+        let analyzed = execute_stream(
+            Arc::new(
+                datafusion::physical_plan::analyze::AnalyzeExec::builder(
+                    false,
+                    false,
+                    Arc::clone(root),
+                    datafusion::logical_expr::LogicalPlan::explain_schema(),
+                )
+                .build(),
+            ),
+            task,
+        )?;
+        let schema = analyzed.schema();
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema,
+                analyzed.map(|batch| batch.and_then(Self::redact_batch)),
+            ),
+        ))
+    }
+
+    /// Returns the output schema of [`Self::execute`] for `root`.
+    fn schema(root: &Arc<dyn ExecutionPlan>, analyze: bool) -> SchemaRef {
+        if analyze {
+            datafusion::logical_expr::LogicalPlan::explain_schema()
+        } else {
+            root.schema()
+        }
+    }
+
+    /// Redacts the `plan` column of one `plan_type`/`plan` batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the batch is not that shape.
+    fn redact_batch(
+        batch: datafusion::arrow::record_batch::RecordBatch,
+    ) -> datafusion::error::Result<datafusion::arrow::record_batch::RecordBatch> {
+        use datafusion::arrow::array::{Array as _, ArrayRef, StringArray};
+        let plans = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal("plan text".to_owned()))?;
+        let redacted: ArrayRef = Arc::new(
+            (0..plans.len())
+                .map(|row| (!plans.is_null(row)).then(|| redact_locators(plans.value(row))))
+                .collect::<StringArray>(),
+        );
+        Ok(datafusion::arrow::record_batch::RecordBatch::try_new(
+            batch.schema(),
+            vec![Arc::clone(batch.column(0)), redacted],
+        )?)
+    }
+
+    /// Returns the explanation `statement` requests, or `None` for a SELECT.
+    fn of(statement: &DfStatement) -> Option<Self> {
+        match statement {
+            DfStatement::Explain(explain) if explain.options.analyze => Some(Self::Analyze),
+            DfStatement::Explain(_) => Some(Self::Plan),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces every `file_groups={N groups: [...]}` listing in plan text with
+/// `file_groups={N groups}`.
+///
+/// The listing names tenant object keys, which are storage layout rather than
+/// query structure; the group count is what a reader needs. An unterminated
+/// listing drops the rest of the text rather than reveal it.
+fn redact_locators(plan: &str) -> String {
+    const LISTING: &str = "file_groups={";
+    let mut redacted = String::with_capacity(plan.len());
+    let mut rest = plan;
+    while let Some(start) = rest.find(LISTING) {
+        let body = start + LISTING.len();
+        redacted.push_str(&rest[..body]);
+        let tail = &rest[body..];
+        let mut depth = 1_usize;
+        let end = tail.char_indices().find_map(|(index, character)| {
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(index)
+        });
+        let Some(end) = end else {
+            redacted.push('}');
+            return redacted;
+        };
+        redacted.push_str(tail[..end].split(':').next().unwrap_or_default().trim());
+        redacted.push('}');
+        rest = &tail[end + 1..];
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// Returns the SELECT a validated statement reads: itself, or the one it explains.
+fn explained_select(statement: &DfStatement) -> &DfStatement {
+    match statement {
+        DfStatement::Explain(explain) => &explain.statement,
+        select => select,
+    }
 }
 
 /// Computes a stable scrubbed digest from whitespace-normalized SQL or plan text.
@@ -3659,6 +3891,11 @@ pub(super) fn resolved_table_scope(
 /// acceptance, and peer dispatch. One uncovered table denies the query
 /// outright: there is no partial plan and no silently narrowed result.
 ///
+/// A managed `bifrost.verification` table is covered instead by execution
+/// read at any scope: [`restrict_verification_rows`] then keeps only the rows
+/// whose trusted parent that read reaches, so a table grant without it reads
+/// no row and execution read alone reads no other table.
+///
 /// # Errors
 ///
 /// Returns [`BifrostError::QueryForbidden`] for the first resolved table the
@@ -3667,7 +3904,16 @@ pub(super) fn authorize_resolved_tables(
     context: &AuthorizedQueryContext,
     resolved: &[(TenantTableBinding, TableUid)],
 ) -> Result<(), BifrostError> {
+    let parent_reader = context.principal.effective_permissions.covers_operation(
+        &wyrd_runtime::Resource::Executions,
+        &wyrd_runtime::Action::Read,
+    );
     for (binding, table_uid) in resolved {
+        if parent_reader
+            && binding.table_ref.namespace == crate::namespaces::BifrostNamespace::Verification
+        {
+            continue;
+        }
         let required = Permission {
             resource: wyrd_runtime::Resource::BifrostQuery,
             action: wyrd_runtime::Action::Read,
@@ -3683,6 +3929,114 @@ pub(super) fn authorize_resolved_tables(
         }
     }
     Ok(())
+}
+
+/// Limits every scan of a managed `bifrost.verification` table to the rows
+/// whose trusted parent the principal's execution read reaches; Card read at
+/// a scope compiles to execution read at the same scope.
+///
+/// Scribe stamps each verification row's `subject_kind`, `subject_name` and
+/// `subject_card_uid` from the Card registry when the row is accepted, never
+/// from row labels: the subject Card, the Verifier of subjectless direct
+/// work, or the Repository of pull-request work. A row without all three has
+/// no provable parent and is read by nobody. Otherwise tenant-wide execution
+/// read keeps every row, a family grant every version's rows, an exact grant
+/// only its UID's, and no execution read none; a table grant alone never adds
+/// rows.
+///
+/// For a restricted reader each scan, including scans inside views, joins
+/// and subqueries, becomes a filter on the visible parents under a
+/// projection that replaces every column of a row outside them with null,
+/// each masked column keeping its own field, extension type included.
+/// The optimizer may push or reorder user predicates below that filter, but
+/// every user expression still reads the masked columns, so no predicate,
+/// projection or aggregate can evaluate, or fail on, a hidden row's values.
+/// The plan stays native, so peers execute the same masking.
+///
+/// # Errors
+///
+/// Returns the mapped planning error when the plan cannot be rewritten.
+pub(super) fn restrict_verification_rows(
+    context: &AuthorizedQueryContext,
+    plan: datafusion::logical_expr::LogicalPlan,
+) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
+    use crate::tables::DomainTable;
+    use datafusion::common::Column;
+    use datafusion::common::tree_node::Transformed;
+    use datafusion::logical_expr::{Cast, Expr, LogicalPlanBuilder, lit, when};
+    use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
+
+    let objects = context.principal.effective_permissions.card_objects(
+        &wyrd_runtime::Resource::Executions,
+        &wyrd_runtime::Action::Read,
+    );
+    let managed = format!("bifrost.{}.", crate::tables::ResultsTable::NAMESPACE);
+    plan.transform_up_with_subqueries(|node| {
+        let datafusion::logical_expr::LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        if !scan.table_name.to_string().starts_with(&managed) {
+            return Ok(Transformed::no(node));
+        }
+        let table = scan.table_name.clone();
+        let column = |name: &str| Expr::Column(Column::new(Some(table.clone()), name));
+        let known = [SUBJECT_KIND, SUBJECT_NAME, SUBJECT_CARD_UID]
+            .map(|name| column(name).is_not_null())
+            .into_iter()
+            .reduce(Expr::and)
+            .unwrap_or_else(|| lit(false));
+        let Some(objects) = &objects else {
+            return LogicalPlanBuilder::from(node)
+                .filter(known)?
+                .build()
+                .map(Transformed::yes);
+        };
+        let visible = objects
+            .iter()
+            .map(|scope| {
+                let family = column(SUBJECT_KIND)
+                    .eq(lit(scope.kind().wire_name()))
+                    .and(column(SUBJECT_NAME).eq(lit(scope.name().as_str())));
+                match scope {
+                    wyrd_runtime::CardPermissionScope::Family { .. } => family,
+                    wyrd_runtime::CardPermissionScope::Version { uid, .. } => {
+                        family.and(column(SUBJECT_CARD_UID).eq(lit(uid.as_str())))
+                    }
+                }
+            })
+            .reduce(Expr::or)
+            .map_or_else(|| lit(false), |visible| known.and(visible));
+        let masked = scan
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                // A CASE drops its column's field metadata. The cast to the
+                // column's own field restores it on the expression itself, so
+                // an extension-typed column such as a Variant still resolves
+                // its functions once the optimizer and the physical planner
+                // discard the alias; the alias keeps it on the output schema.
+                when(visible.clone(), column(field.name()))
+                    .end()
+                    .map(|expr| {
+                        let masked = Arc::new(field.as_ref().clone().with_nullable(true));
+                        Expr::Cast(Cast::new_from_field(Box::new(expr), masked))
+                            .alias_qualified_with_metadata(
+                                Some(table.clone()),
+                                field.name(),
+                                Some(field.metadata().into()),
+                            )
+                    })
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
+        LogicalPlanBuilder::from(node)
+            .filter(visible.clone())?
+            .project(masked)?
+            .build()
+            .map(Transformed::yes)
+    })
+    .map(|transformed| transformed.data)
+    .map_err(|error| map_datafusion_error(&error))
 }
 
 /// Refuses a plan reaching `bifrost.gateway.calls` payload content without the
@@ -4396,7 +4750,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the fixture principal cannot form a context.
-    fn payload_context(permissions: &[Permission]) -> AuthorizedQueryContext {
+    pub(super) fn payload_context(permissions: &[Permission]) -> AuthorizedQueryContext {
         let tenant = DataTenantId::new_v7();
         let mut effective_permissions = wyrd_runtime::PermissionSet::default();
         for permission in permissions {
@@ -4407,7 +4761,6 @@ mod tests {
                 wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
                 wyrd_runtime::PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 effective_permissions,
             ),
             tenant,
@@ -4595,7 +4948,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the query is not one valid Bifrost `SELECT`.
-    fn statement(sql: &str) -> DfStatement {
+    pub(super) fn statement(sql: &str) -> DfStatement {
         parse_select(sql).expect("test query validates").0
     }
 
@@ -4839,6 +5192,327 @@ mod tests {
             ),
             Err(BifrostError::QueryForbidden)
         ));
+    }
+
+    /// Proves execution read at any scope admits the managed verification
+    /// tables and no other table, while a table grant still admits only its
+    /// own table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a table is admitted or refused against these grants.
+    #[test]
+    fn execution_read_admits_only_managed_verification_tables() {
+        use crate::namespaces::BifrostNamespace;
+        use wyrd_runtime::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let tenant = DataTenantId::new_v7();
+        let resolved = |namespace, name: &str| {
+            let binding = TenantTableBinding::resolve((tenant, TableRef::new(namespace, name)))
+                .expect("tenant table binding");
+            vec![(binding, TableUid::from_bytes([7; 16]))]
+        };
+        let context = |permissions: &[Permission]| {
+            let mut context = payload_context(permissions);
+            context.principal.tenant_id = tenant;
+            context.data_tenant_id = tenant;
+            context
+        };
+        let family = context(
+            &[Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(
+                    CardKind::Repository,
+                    CardName::new("payments").expect("name"),
+                ),
+            ))],
+        );
+        let results = resolved(BifrostNamespace::Verification, "results");
+        let logs = resolved(BifrostNamespace::Logs, "records");
+        authorize_resolved_tables(&family, &results)
+            .expect("execution read admits the verification table");
+        assert!(matches!(
+            authorize_resolved_tables(&family, &logs),
+            Err(BifrostError::QueryForbidden)
+        ));
+        let table = context(&[Permission::bifrost_query_read()]);
+        authorize_resolved_tables(&table, &logs).expect("the query grant admits its table");
+        authorize_resolved_tables(&table, &results)
+            .expect("the query grant admits the table, whose rows stay filtered");
+        assert!(matches!(
+            authorize_resolved_tables(&context(&[]), &results),
+            Err(BifrostError::QueryForbidden)
+        ));
+    }
+
+    /// A session whose `bifrost.verification.results` and `.evidence` hold
+    /// one row under each of two Repository families, `payments` and
+    /// `other`, plus one row with no trusted parent. Each row's `detail` is a
+    /// Variant document naming its own head commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture tables cannot be built.
+    /// Field metadata the fixture's `result_id` carries, standing in for the
+    /// extension tag a Variant column needs to decode.
+    const VARIANT_TAG: (&str, &str) = ("ARROW:extension:name", "arrow.parquet.variant");
+
+    /// A restricted reader's masked columns keep their field metadata, so an
+    /// extension-typed column such as a Variant still decodes.
+    ///
+    /// # Panics
+    /// Panics when the plan fails or drops the column's metadata.
+    #[tokio::test]
+    async fn masked_verification_columns_keep_their_metadata() {
+        use wyrd_runtime::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let family = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(
+                    CardKind::Repository,
+                    CardName::new("payments").expect("name"),
+                ),
+            )),
+        ]);
+        let session = verification_session();
+        let plan = Oracle::plan_logical(
+            &session,
+            &family,
+            &statement("SELECT result_id FROM bifrost.verification.results"),
+            &[],
+        )
+        .await
+        .expect("plan builds");
+        let field = plan.schema().field(0);
+        assert_eq!(
+            field.metadata().get(VARIANT_TAG.0).map(String::as_str),
+            Some(VARIANT_TAG.1),
+            "{field:?}"
+        );
+    }
+
+    pub(super) fn verification_session() -> SessionContext {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::catalog::{
+            CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+        };
+        use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
+
+        let documents: datafusion::arrow::array::ArrayRef = Arc::new(StringArray::from(vec![
+            r#"{"head":{"sha":"a1"}}"#,
+            r#"{"head":{"sha":"a2"}}"#,
+            r#"{"head":{"sha":"a3"}}"#,
+        ]));
+        let detail: datafusion::arrow::array::ArrayRef =
+            parquet_variant_compute::json_to_variant(&documents)
+                .expect("fixture documents encode")
+                .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("result_id", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::from([(
+                    VARIANT_TAG.0.to_owned(),
+                    VARIANT_TAG.1.to_owned(),
+                )]),
+            ),
+            Field::new(SUBJECT_KIND, DataType::Utf8, true),
+            Field::new(SUBJECT_NAME, DataType::Utf8, true),
+            Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
+            Field::new("detail", detail.data_type().clone(), true).with_metadata(
+                wyrd_types::variant::variant_field("detail", true)
+                    .metadata()
+                    .clone(),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["p1", "o1", "u1"])),
+                Arc::new(StringArray::from(vec![
+                    Some("Repository"),
+                    Some("Repository"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("payments"),
+                    Some("other"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("01927b4c-0000-7000-8000-000000000001"),
+                    Some("01927b4c-0000-7000-8000-000000000002"),
+                    None,
+                ])),
+                detail,
+            ],
+        )
+        .expect("fixture batch builds");
+        let provider = MemorySchemaProvider::new();
+        for name in ["results", "evidence"] {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![batch.clone()]],
+            )
+            .expect("fixture table builds");
+            provider
+                .register_table(name.to_owned(), Arc::new(table))
+                .expect("table registers");
+        }
+        let catalog = MemoryCatalogProvider::new();
+        catalog
+            .register_schema("verification", Arc::new(provider))
+            .expect("schema registers");
+        let session = SessionContext::new();
+        session.register_catalog("bifrost", Arc::new(catalog));
+        session
+    }
+
+    /// Proves managed verification rows are filtered by the reader's
+    /// execution read before any user expression: a `payments` family reader
+    /// sees and counts only payments rows through direct scans, predicates
+    /// naming the other family, joins, subqueries and aggregation; an
+    /// exact-version reader sees only its UID; a reader without execution read
+    /// sees nothing even with the table grant; tenant-wide read sees every
+    /// row with a known parent. A predicate that would fail on a hidden row's
+    /// values never sees them, so it cannot reveal the row by failing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any query returns a row outside the reader's visibility.
+    #[tokio::test]
+    async fn verification_rows_are_filtered_by_the_readers_card_scope() {
+        use datafusion::arrow::array::{Array, AsArray};
+        use wyrd_runtime::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::{CardName, CardUid};
+
+        let payments = || CardName::new("payments").expect("name");
+        let family = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(CardKind::Repository, payments()),
+            )),
+        ]);
+        let exact = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::version(
+                    CardKind::Repository,
+                    payments(),
+                    CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid"),
+                ),
+            )),
+        ]);
+        let table_only = payload_context(&[Permission::bifrost_query_read()]);
+        let tenant_wide = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any(),
+        ]);
+        let session = verification_session();
+        let rows = |context: AuthorizedQueryContext, sql: &'static str| {
+            let session = &session;
+            async move {
+                let plan = Oracle::plan_logical(session, &context, &statement(sql), &[])
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql} plans: {error}"));
+                let batches = session
+                    .execute_logical_plan(plan)
+                    .await
+                    .expect("plan executes")
+                    .collect()
+                    .await
+                    .expect("plan collects");
+                let mut values = Vec::new();
+                for batch in &batches {
+                    let column = batch.column(0);
+                    for index in 0..column.len() {
+                        values.push(match column.as_string_opt::<i32>() {
+                            Some(text) => text.value(index).to_owned(),
+                            None => column
+                                .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                                .value(index)
+                                .to_string(),
+                        });
+                    }
+                }
+                values.sort();
+                values
+            }
+        };
+
+        for (sql, expected) in [
+            (
+                "SELECT result_id FROM bifrost.verification.results",
+                vec!["p1"],
+            ),
+            (
+                "SELECT result_id FROM bifrost.verification.results WHERE subject_name = 'other'",
+                vec![],
+            ),
+            (
+                "SELECT count(*) FROM bifrost.verification.results",
+                vec!["1"],
+            ),
+            (
+                "SELECT r.result_id FROM bifrost.verification.results r \
+                 JOIN bifrost.verification.evidence e ON r.result_id = e.result_id",
+                vec!["p1"],
+            ),
+            (
+                "SELECT result_id FROM bifrost.verification.results WHERE result_id IN \
+                 (SELECT result_id FROM bifrost.verification.evidence)",
+                vec!["p1"],
+            ),
+            (
+                "WITH all_rows AS (SELECT * FROM bifrost.verification.evidence) \
+                 SELECT result_id FROM all_rows",
+                vec!["p1"],
+            ),
+            (
+                "SELECT result_id FROM bifrost.verification.results WHERE \
+                 CAST(CASE WHEN subject_name = 'other' THEN 'hidden' ELSE '1' END AS BIGINT) = 1",
+                vec!["p1"],
+            ),
+        ] {
+            assert_eq!(rows(family.clone(), sql).await, expected, "{sql}");
+        }
+        // A Variant read by key plans and executes over the masked column,
+        // directly, under a table alias and inside a joined subquery.
+        for sql in [
+            "SELECT detail -> 'head' ->> 'sha' FROM bifrost.verification.results",
+            "SELECT r.detail -> 'head' ->> 'sha' FROM bifrost.verification.results r",
+            "SELECT variant_get_text(detail -> 'head', 'sha') FROM bifrost.verification.results",
+            "SELECT s.sha FROM bifrost.verification.results r LEFT JOIN \
+             (SELECT e.result_id, e.detail -> 'head' ->> 'sha' AS sha \
+             FROM bifrost.verification.evidence e) s ON s.result_id = r.result_id",
+        ] {
+            assert_eq!(rows(family.clone(), sql).await, vec!["a1"], "{sql}");
+        }
+        assert_eq!(
+            rows(exact, "SELECT result_id FROM bifrost.verification.results").await,
+            vec!["p1"]
+        );
+        assert_eq!(
+            rows(
+                table_only,
+                "SELECT count(*) FROM bifrost.verification.results"
+            )
+            .await,
+            vec!["0"]
+        );
+        assert_eq!(
+            rows(
+                tenant_wide,
+                "SELECT result_id FROM bifrost.verification.results"
+            )
+            .await,
+            vec!["o1", "p1"]
+        );
     }
 
     /// Builds one Bifrost table scope for the supplied schema and UID.
@@ -5335,8 +6009,80 @@ mod tests {
                 params: Vec::new(),
                 deadline_ms: None,
             };
-            assert!(planner.validate_query(&request).is_err());
+            assert!(
+                planner
+                    .check_floor(&request)
+                    .and_then(|()| parse_select(&request.sql))
+                    .is_err()
+            );
         }
+    }
+
+    /// One plain or analyzed explanation of one SELECT is accepted with the
+    /// SELECT's own tables, and every other explanation is invalid SQL.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an explained SELECT is refused, its tables differ from the
+    /// SELECT's, or an unsupported explanation is accepted or refused with
+    /// another error.
+    #[test]
+    fn query_floor_accepts_one_explained_select() {
+        let select = "WITH recent AS (SELECT * FROM bifrost.bifrost.spans) \
+                      SELECT * FROM recent JOIN bifrost.bifrost.observations o ON true \
+                      WHERE o.name = $1";
+        let (_, expected) = parse_select(select).expect("SELECT validates");
+        for (sql, mode) in [
+            (format!("EXPLAIN {select}"), Some(Explanation::Plan)),
+            (
+                format!("explain analyze {select}"),
+                Some(Explanation::Analyze),
+            ),
+            (select.to_owned(), None),
+        ] {
+            let (statement, tables) = parse_select(&sql).unwrap_or_else(|error| {
+                panic!("{sql} must validate: {error}");
+            });
+            assert_eq!(tables, expected, "{sql} reads the SELECT's tables");
+            assert_eq!(Explanation::of(&statement), mode, "{sql}");
+        }
+        for sql in [
+            "EXPLAIN VERBOSE SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN ANALYZE VERBOSE SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN FORMAT TREE SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN EXPLAIN SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN UPDATE bifrost.bifrost.spans SET name = 'x'",
+            "EXPLAIN DELETE FROM bifrost.bifrost.spans",
+            "EXPLAIN CREATE TABLE bifrost.bifrost.t (n INT)",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN SELECT * FROM bifrost.bifrost.spans; SELECT 1",
+        ] {
+            assert!(
+                matches!(parse_select(sql), Err(BifrostError::QueryInvalidSql { .. })),
+                "{sql} must be invalid SQL"
+            );
+        }
+    }
+
+    /// Plan text keeps each file listing's group count and drops its object keys.
+    #[test]
+    fn explained_plans_redact_object_locators() {
+        let plan = "DataSourceExec: file_groups={2 groups: [[tenants/t/a.parquet], \
+                    [tenants/t/b.parquet:0..10]]}, projection=[id]\n  \
+                    DataSourceExec: file_groups={1 group: [[tenants/t/c.parquet]]}";
+        assert_eq!(
+            redact_locators(plan),
+            "DataSourceExec: file_groups={2 groups}, projection=[id]\n  \
+             DataSourceExec: file_groups={1 group}"
+        );
+        assert_eq!(
+            redact_locators("x file_groups={1 group: [[tenants/t/c"),
+            "x file_groups={}"
+        );
+        assert_eq!(
+            redact_locators("ProjectionExec: expr=[id]"),
+            "ProjectionExec: expr=[id]"
+        );
     }
 
     /// The SQL parser accepts a complete query and extracts its canonical tables.
@@ -5360,6 +6106,104 @@ mod tests {
                 "bifrost.bifrost.spans".to_owned(),
             ]
         );
+    }
+
+    /// Validates `sql` once on each of a run of small thread stacks.
+    ///
+    /// The parser grows its stack only at guarded functions, so whether an
+    /// unguarded stretch overruns depends on how much stack is left when it
+    /// starts. Stepping the stack size moves that offset across the parser's
+    /// whole guard margin; each run parses, resolves the statement's tables and
+    /// drops it on the small stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread cannot start or its validation panics. A stack
+    /// overrun ends the test process instead.
+    fn validate_on_constrained_stacks(sql: &str) -> Vec<Result<Vec<String>, BifrostError>> {
+        const KIB: usize = 1024;
+        (192 * KIB..=448 * KIB)
+            .step_by(4 * KIB)
+            .map(|stack| {
+                let sql = sql.to_owned();
+                std::thread::Builder::new()
+                    .stack_size(stack)
+                    .spawn(move || {
+                        parse_select(&sql)
+                            .map(|(_, tables)| tables.iter().map(TableRef::fqn).collect())
+                    })
+                    .expect("parser thread starts")
+                    .join()
+                    .expect("validation returns instead of panicking")
+            })
+            .collect()
+    }
+
+    /// `depth` SELECTs, each reading the one inside it as a derived table.
+    fn nested_derived_tables(depth: usize) -> String {
+        (0..depth).fold(
+            "SELECT n FROM bifrost.bifrost.spans".to_owned(),
+            |inner, level| format!("SELECT n FROM ({inner}) AS t{level}"),
+        )
+    }
+
+    /// The Verify discovery query that once overran the parser's stack
+    /// validates on every constrained stack and reads its three tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any stack size refuses the query or resolves other tables.
+    #[test]
+    fn nested_verify_discovery_query_validates_on_constrained_stacks() {
+        for tables in validate_on_constrained_stacks(include_str!("verify_discovery_nested.sql")) {
+            assert_eq!(
+                tables.expect("the discovery query validates"),
+                [
+                    "bifrost.verification.execution_events",
+                    "bifrost.verification.execution_inputs",
+                    "bifrost.verification.results",
+                ]
+            );
+        }
+    }
+
+    /// Derived tables and parenthesized joins nested below the parser's
+    /// recursion limit validate on every constrained stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any stack size refuses either query.
+    #[test]
+    fn nested_derived_tables_and_joins_validate_on_constrained_stacks() {
+        let joins = (0..12).fold("bifrost.bifrost.spans s".to_owned(), |inner, level| {
+            format!("({inner} JOIN bifrost.bifrost.observations o{level} ON true)")
+        });
+        for sql in [nested_derived_tables(12), format!("SELECT 1 FROM {joins}")] {
+            for tables in validate_on_constrained_stacks(&sql) {
+                tables.unwrap_or_else(|error| panic!("{sql} must validate: {error}"));
+            }
+        }
+    }
+
+    /// Nesting past the parser's recursion limit, and malformed SQL, are
+    /// refused as invalid SQL on every constrained stack; neither ends the
+    /// process.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any stack size accepts either query or refuses it with
+    /// another error.
+    #[test]
+    fn over_nested_and_malformed_sql_are_refused_on_constrained_stacks() {
+        let malformed = format!("{} WHERE", nested_derived_tables(12));
+        for sql in [nested_derived_tables(200), malformed] {
+            for refusal in validate_on_constrained_stacks(&sql) {
+                assert!(
+                    matches!(refusal, Err(BifrostError::QueryInvalidSql { .. })),
+                    "{sql} must be invalid SQL, got {refusal:?}"
+                );
+            }
+        }
     }
 
     /// Late execution failure produces one closed failed terminal carrying

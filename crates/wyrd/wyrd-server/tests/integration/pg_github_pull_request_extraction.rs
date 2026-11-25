@@ -79,7 +79,7 @@ pub(super) fn sha(ch: char) -> String {
 }
 
 /// Git blob id of `bytes`.
-fn blob(bytes: &[u8]) -> String {
+pub(super) fn blob(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
     hasher.update(bytes);
@@ -90,7 +90,7 @@ fn blob(bytes: &[u8]) -> String {
 ///
 /// # Panics
 /// Panics if building or compressing the archive fails.
-fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+pub(super) fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     for (path, bytes) in files {
         let mut header = tar::Header::new_gnu();
@@ -168,7 +168,10 @@ impl Deployment {
             .await
             .expect("the tool role seeds");
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("pull-request-editor", &["editor", MODEL_ROLE, TOOL_ROLE])
+            .bootstrap_user(
+                "pull-request-editor",
+                &["editor", "approver", MODEL_ROLE, TOOL_ROLE],
+            )
             .await
             .expect("editor bootstraps")
         else {
@@ -235,13 +238,32 @@ impl Deployment {
     /// # Panics
     /// Panics when the declaration is refused.
     async fn declare(&self, cards: &[(&str, &str)], key: &str) {
+        let (status, body) = self.declaring(cards, key, |_| {}).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// Submit `cards`, whose `policy.yaml` is the Repository, under
+    /// idempotency `key` with its request body changed by `edit`, as a
+    /// client skipping its own validation would, returning the answer's
+    /// status and JSON body.
+    ///
+    /// # Panics
+    /// Panics when the files do not build a declaration or the answer is
+    /// not JSON.
+    pub(super) async fn declaring(
+        &self,
+        cards: &[(&str, &str)],
+        key: &str,
+        edit: impl FnOnce(&mut Value),
+    ) -> (StatusCode, Value) {
         let dir = tempfile::tempdir().expect("checkout creates");
         for (name, contents) in cards {
             std::fs::write(dir.path().join(name), contents).expect("card file writes");
         }
         let input = build_declaration_input(load(&dir.path().join("policy.yaml")).expect("loads"))
             .expect("declaration input builds");
-        let body = serde_json::to_value(input.to_declare_card_request()).expect("serializes");
+        let mut body = serde_json::to_value(input.to_declare_card_request()).expect("serializes");
+        edit(&mut body);
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/cards")
@@ -254,7 +276,14 @@ impl Deployment {
             .oneshot_authenticated(&self.jwt, request)
             .await
             .expect("declaration responds");
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 22)
+            .await
+            .expect("body reads");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// Serve `acme/policy` with `main` at commit `c…` (tree `7…`).
@@ -447,7 +476,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the details are not served or hold no `pr` step.
-    async fn extraction(&self, execution: Uuid) -> Value {
+    pub(super) async fn extraction(&self, execution: Uuid) -> Value {
         let details = self
             .get(&format!("/v1/verification/executions/{execution}/details"))
             .await;

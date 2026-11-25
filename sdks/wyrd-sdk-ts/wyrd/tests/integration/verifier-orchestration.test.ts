@@ -503,7 +503,7 @@ type Speculated = {
  * work; a `null` comparison blocks it; a decision known before the extra
  * review is eligible makes no call. The consolidator only ever reads the
  * recorded disposition and receives the account only when it was admitted,
- * while a caller holding only `verifier:read` still inspects the retained
+ * while a caller holding only `executions:read` still inspects the retained
  * excluded account, leaving its disposition unchanged. Each race is ordered by
  * holding upstream answers until the invocation listing or the upstream shows
  * the other side settled or arrived, never by elapsed time.
@@ -571,7 +571,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
       return prompt.includes(marker) && prompt.includes(question);
     });
   const reader = WyrdClient.connect({
-    credential: server.scopedApiKey("speculation_reader", [{ resource: "verifier", action: "read", scope: "all" }]),
+    credential: server.scopedApiKey("speculation_reader", [{ resource: "executions", action: "read", scope: "all" }]),
   });
   const extra = async (id: string): Promise<string[]> =>
     (await publications(id))
@@ -655,7 +655,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
       const execution = await verify.Execution.connect(result.execution_id, { client: reader });
       expect(
         await execution.publication("extra", "account", { attempt: 1 }),
-        `${question}: a verifier:read grant inspects the retained account`,
+        `${question}: an executions:read grant inspects the retained account`,
       ).toMatchObject({ kind: "json", value: { extra: true } });
       expect(await extra(result.execution_id), `${question}: inspection leaves the disposition unchanged`).toEqual(
         retained,

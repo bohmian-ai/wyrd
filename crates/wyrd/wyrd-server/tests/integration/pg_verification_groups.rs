@@ -1014,7 +1014,8 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
             let outcome = queue
                 .accept_grouped(&mut claimer, &admission)
                 .await
-                .expect("admits");
+                .expect("admits")
+                .outcome;
             assert!(
                 matches!(outcome, EnqueueOutcome::Enqueued(_)),
                 "{outcome:?}"
@@ -1227,7 +1228,7 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         .expect("Bifrost flushes");
     let mut conn = support.conn().await;
     sqlx::query(
-        "DELETE FROM wyrd.auth_service_account_roles
+        "DELETE FROM wyrd.auth_role_bindings
           WHERE service_account_id = (
                 SELECT p.id FROM wyrd.auth_service_accounts p
                   JOIN wyrd.cards c ON p.restriction_kind = c.kind AND p.restriction_name = c.name
@@ -1237,6 +1238,9 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     .execute(&mut **conn.transaction())
     .await
     .expect("the owner loses its roles");
+    wyrd_sql::queries::auth::advance_authorization_revision(&mut conn)
+        .await
+        .expect("the revocation advances the revision");
     conn.commit().await.expect("the revocation commits");
     support.make_due().await;
     let handed = batched.group_pass(&stop).await.expect("the pass runs");

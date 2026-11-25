@@ -214,3 +214,44 @@ def test_pull_requests_admit_pinned_executions_and_supersede_them(
     assert mock.deliver(server.base_url, "pull_request", payload) == 202
     closed = verify.Execution(pushed["execution_id"], admin).status()
     assert (closed["status"], closed["error"]["code"]) == ("cancelled", "pull_request_closed")
+
+
+def test_a_review_request_admits_a_new_generation_and_replays_by_key(
+    admin: WyrdClient, mock: GithubAppMock, tmp_path: Path
+) -> None:
+    Cards(admin).declare_from_path(policy(checkout(mock, "acme/api", tmp_path / "api"), "minimal"))
+    github = GithubConnection(admin)
+    mock.set_pull_request(1, 8, "b1", "a1")
+
+    def review(key: str, number: int = 8) -> dict:
+        return dict(
+            github.review_pull_request(
+                host=mock.host, repository_id="1", number=number, idempotency_key=key
+            )
+        )
+
+    first = review("python-review-a")
+    [member] = first["executions"]
+    pins = verify.Execution(member, admin).status()["pull_request"]
+    assert (pins["generation"], pins["members"], pins["request_key"]) == (
+        first["generation"],
+        [member],
+        "python-review-a",
+    )
+    assert "delivery_id" not in pins
+    assert review("python-review-a") == first
+
+    second = review("python-review-b")
+    assert second["generation"] != first["generation"]
+    superseded = verify.Execution(member, admin).status()
+    assert (superseded["status"], superseded["error"]["code"]) == (
+        "cancelled",
+        "pull_request_superseded",
+    )
+    assert review("python-review-a") == first
+
+    mock.set_pull_request(1, 9, "b1", "a1", open=False)
+    with pytest.raises(WyrdError) as closed:
+        review("python-review-closed", number=9)
+    assert closed.value.code == "WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE"
+    assert closed.value.details["reason"] == "closed"

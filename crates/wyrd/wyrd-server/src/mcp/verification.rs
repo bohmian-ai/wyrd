@@ -163,8 +163,9 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
              request execution also carries github_delivery: its Check and review delivery \
              outcome (pending, delivered, skipped or failed) and safe reason, separate from \
              the verdict. A just-enqueued execution may briefly be not found, and a completed one may \
-             briefly lack its result; poll again. Requires verifier:read on the execution's \
-             Verifier.",
+             briefly lack its result; poll again. \
+             Requires executions:read on the execution's trusted parent: the subject Card, the \
+             Repository for pull request work, or the Verifier for subjectless direct work.",
             true,
         ),
         tool::<PageArgs, InvocationPage>(
@@ -174,8 +175,9 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
              step, item, iteration, and attempt, its progress (started, an action status, or a \
              requirement outcome) and reason, plus the execution status and history \
              projection counts. Pass next_cursor back as cursor to continue the same listing; \
-             limit defaults to 50, at most 200. Requires verifier:read on the execution's \
-             Verifier.",
+             limit defaults to 50, at most 200. \
+             Requires executions:read on the execution's trusted parent: the subject Card, the \
+             Repository for pull request work, or the Verifier for subjectless direct work.",
             true,
         ),
         tool::<PageArgs, PublicationPage>(
@@ -184,7 +186,9 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
             "Page a queued execution's publications in acceptance order: name, kind, and the \
              exact producer attempt, without content. Pass next_cursor back as cursor to \
              continue; limit defaults to 50, at most 200. Read one with \
-             verification.get_publication. Requires verifier:read on the execution's Verifier.",
+             verification.get_publication. \
+             Requires executions:read on the execution's trusted parent: the subject Card, the \
+             Repository for pull request work, or the Verifier for subjectless direct work.",
             true,
         ),
         tool::<PublicationArgs, Publication>(
@@ -193,7 +197,8 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
             "Read one publication of an exact producer attempt (step_id, attempt, and the \
              item_index and iteration_index a listing gives; omit them for null) with its JSON \
              value or its file or directory manifest. path is refused here. Requires \
-             verifier:read on the execution's Verifier.",
+             executions:read on the execution's trusted parent: the subject Card, the \
+             Repository for pull request work, or the Verifier for subjectless direct work.",
             true,
         ),
         tool::<PublicationArgs, DownloadInitResponse>(
@@ -203,7 +208,9 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
              producer attempt: omit path for a file publication, or pass a file path its \
              directory manifest lists. Fetch get_url before ttl_secs elapses and check the \
              size and base64 SHA-256. A JSON publication is read with \
-             verification.get_publication. Requires verifier:read on the execution's Verifier.",
+             verification.get_publication. \
+             Requires executions:read on the execution's trusted parent: the subject Card, the \
+             Repository for pull request work, or the Verifier for subjectless direct work.",
             true,
         ),
         tool::<GetExecutionArgs, VerificationDetails>(
@@ -213,7 +220,8 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
              check and provenance, every step with its tool calls, and the pinned evidence \
              declarations, beside the same judgments as its result. Not found until the \
              complete records are visible, and when they are unknown or no longer readable. \
-             Requires verifier:read on the execution's Verifier.",
+             Requires executions:read on the execution's trusted parent: the subject Card, the \
+             Repository for pull request work, or the Verifier for subjectless direct work.",
             true,
         ),
     ]
@@ -297,7 +305,8 @@ pub(super) fn approve_descriptors() -> Vec<Tool> {
          only once the decision is durable, and the same execution continues. Repeating \
          the same decision and reason replays the receipt; any other decision, a decision \
          by someone else, or one after the execution ended or expired is refused (409 \
-         approval not pending). Requires verifier:approve on the execution's Verifier.",
+         approval not pending). Requires verifier:approve on the execution's Verifier and \
+         executions:read on its trusted parent.",
         false,
     )]
 }
@@ -425,7 +434,8 @@ impl WyrdMcpHandler {
     ///
     /// # Errors
     /// Returns a Wyrd error when the arguments are invalid, the caller lacks
-    /// `verifier:read` on the execution's Verifier, complete details are not visible, or a read fails.
+    /// `executions:read` on the execution's trusted parent, complete details are
+    /// not visible, or a read fails.
     pub(super) async fn mcp_get_execution_details(
         &self,
         caller: Caller,

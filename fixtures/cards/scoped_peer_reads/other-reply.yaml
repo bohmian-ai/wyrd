@@ -1,0 +1,10 @@
+# A second Service family beside the quickstart's support-reply, verified by
+# the same Verifier, so a scoped reader can be shown only one parent's records.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: other-reply
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./no-refund-promise.yaml

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
 import { expect, test } from 'vitest';
-import { problem, safeProblem } from './problem';
+import { problem, safeProblem, upstreamProblem } from './problem';
 
 const source = readFileSync(
   new URL('../../../../../../wyrd-spec/src/error.rs', import.meta.url),
@@ -13,6 +13,8 @@ test('every BFF problem preserves the canonical Rust derive metadata', () => {
     'unauthenticated',
     'expired',
     'denied',
+    'methodUnavailable',
+    'signInAttempts',
     'internal',
     'upstream'
   ] as const) {
@@ -52,4 +54,16 @@ test('a throttled password attempt keeps only its positive whole retry wait', ()
     expect(safeProblem({ ...throttled, details: { retry_after_seconds: wait } })).toEqual(problem('passwordAttempts'));
   }
   expect(safeProblem({ ...problem('validation'), details: { retry_after_seconds: 840 } })).toEqual(problem('validation'));
+});
+
+test('a disabled sign-in method keeps its own refusal rather than becoming a permission denial', async () => {
+  const refused = await upstreamProblem(
+    new Response(
+      JSON.stringify({ code: 'WYRD_AUTH_403_METHOD_UNAVAILABLE', status: 403, detail: 'secret', details: { reason: 'x' } }),
+      { status: 403 }
+    )
+  );
+  expect(refused.code).toBe('WYRD_AUTH_403_METHOD_UNAVAILABLE');
+  expect(refused.status).toBe(403);
+  expect(refused.details).toEqual({});
 });

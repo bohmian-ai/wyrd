@@ -33,9 +33,9 @@ use vala_verify::blocks::{
     PromptCardResolver, ToolSession, VerificationEngine,
 };
 use vala_verify::{TraceSource, TraceUnavailable};
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::card::agent::{BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, Check};
-use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::TaskId;
@@ -86,9 +86,9 @@ pub struct Execution<'a> {
     /// The accepted authority every Card, evidence, query, tool, and model
     /// call is authorized and audited as.
     pub caller: &'a Caller,
-    /// The executing Verifier, whose `verifier:run` authorizes loading its
-    /// Agent and Prompt definitions.
-    pub verifier: &'a CardUid,
+    /// The executing Verifier's exact scope, whose `verifier:run` authorizes
+    /// loading its Agent and Prompt definitions.
+    pub verifier: &'a CardPermissionScope,
     /// Per-requirement or per-step Agent route overrides.
     pub routes: &'a BTreeMap<TaskId, ExecutionRoute>,
     /// The Card and application Run model calls are attributed to.
@@ -276,9 +276,9 @@ struct ExecutionBinding {
     state: AppState,
     /// The accepted caller every one of them is authorized and audited as.
     caller: Caller,
-    /// The executing Verifier, whose `verifier:run` authorizes loading its
-    /// Agent and Prompt definitions.
-    verifier: CardUid,
+    /// The executing Verifier's exact scope, whose `verifier:run` authorizes
+    /// loading its Agent and Prompt definitions.
+    verifier: CardPermissionScope,
     /// The Card and application Run model calls are attributed to.
     subject: GatewayCallContext,
     /// Per-requirement or per-step Agent route overrides.
@@ -883,7 +883,11 @@ mod pg_tests {
         let state = runtime.block_on(test_state());
         let caller = test_caller([]);
         let routes = BTreeMap::new();
-        let uid = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+        let uid = CardPermissionScope::version(
+            wyrd_spec::envelope::CardKind::Verifier,
+            wyrd_spec::ids::CardName::new("allocation").expect("name"),
+            wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"),
+        );
         let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
         let verifier = |spec: Value| -> Arc<VerifierSpec> {
             Arc::new(serde_json::from_value(spec).expect("Verifier"))

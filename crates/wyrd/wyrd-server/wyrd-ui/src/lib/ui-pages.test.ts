@@ -1,7 +1,10 @@
 import { expect, test } from 'vitest';
 import {
+  loadExecutionDiscovery,
+  NAMED_VERIFIERS,
   loadFacetRail,
   loadMetric,
+  loadMetricKeys,
   loadMetricNames,
   METRIC_GROUP_KEYS,
   METRIC_NAMES,
@@ -58,13 +61,17 @@ test('observe signal planning and interactions', async () => {
   expect(logs.calls).toHaveLength(2);
 
   // Facets and the strip read the same normalized predicate; trace roots find it on any span of the trace.
+  // Panels of one refresh share its context, so the predicate is validated once for all of them.
   const spans = recording(normalizing('http_response_status_code = 404'));
-  await loadFacetRail({ signal: 'traces', facets: ['name', 'service_name'], where_sql: 'http_response_status_code=404' }, { executor: spans.executor, range: RANGE });
-  await loadStatStrip({ stats: ['traces', 'errors'], where_sql: 'http_response_status_code=404' }, { executor: spans.executor, range: RANGE });
-  const roots = await loadRecordTable({ signal: 'traces', where_sql: 'http_response_status_code=404' }, { executor: spans.executor, range: RANGE });
+  const refresh = { executor: spans.executor, range: RANGE };
+  await Promise.all([
+    loadFacetRail({ signal: 'traces', facets: ['name', 'service_name'], where_sql: 'http_response_status_code=404' }, refresh),
+    loadStatStrip({ stats: ['traces', 'errors'], where_sql: 'http_response_status_code=404' }, refresh)
+  ]);
+  const roots = await loadRecordTable({ signal: 'traces', where_sql: 'http_response_status_code=404' }, refresh);
   const queries = spans.calls.filter((call) => call.op === 'bifrost.query');
-  expect(spans.calls.filter((call) => call.op === 'bifrost.validate_predicate')).toHaveLength(3);
-  expect(queries).toHaveLength(2 + 4 + 1);
+  expect(spans.calls.filter((call) => call.op === 'bifrost.validate_predicate')).toHaveLength(1);
+  expect(queries).toHaveLength(1 + 2 + 1);
   for (const call of queries) expect(call.op === 'bifrost.query' && call.sql).toContain('(http_response_status_code = 404)');
   expect(roots.executed?.sql).toContain('parent_span_id IS NULL AND trace_id IN (SELECT trace_id FROM bifrost.traces.spans WHERE');
 
@@ -76,9 +83,10 @@ test('observe signal planning and interactions', async () => {
   );
   expect(timeline.calls[0]).toMatchObject({ op: 'bifrost.validate_predicate', namespace: 'bifrost.logs', name: 'records' });
   const logReads = timeline.calls.filter((call) => call.op === 'bifrost.query');
-  expect(logReads).toHaveLength(4);
+  // Both stats count the same records, so one read answers them; errors are that read's FILTER.
+  expect(logReads).toHaveLength(1);
   for (const call of logReads) expect(call.op === 'bifrost.query' && call.sql).toMatch(/FROM bifrost\.logs\.records WHERE .*severity_text = \$\d.*\(body_text LIKE '%refund%'\)/);
-  expect(logReads.filter((call) => call.op === 'bifrost.query' && call.sql.includes('severity_number >= 17'))).toHaveLength(2);
+  expect(logReads[0].op === 'bifrost.query' && logReads[0].sql).toContain('count(*) AS s0, count(*) FILTER (WHERE severity_number >= 17) AS s1, count(*) FILTER (WHERE severity_number >= 17) AS m1 FROM');
   expect(validatePanel('StatStrip', { stats: ['logs', 'spans'], where: [{ column: 'severity_text', value: 'ERROR' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('StatStrip', { stats: ['logs'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ detail: expect.stringContaining('name is not a logs column') });
 
@@ -333,10 +341,18 @@ test('the metric rail searches names on the server and reads at most one past it
 test('group keys are offered from at most 100 of the metric series index rows', async () => {
   const sets = { columns: ['attributes', 'resource', 'scope'].map((name) => ({ name, data_type: 'Utf8', nullable: true })), rows: [['{"http.route":"/a","code":200}', '{"host.name":"h"}', null], ['{"http.route":"/b"}', 'not json', '[1]']], terminal: EMPTY.terminal };
   const { executor, calls } = recording((request) => ({ ok: true, value: request.op === 'bifrost.query' && request.sql.includes('LIMIT 100') ? sets : EMPTY }) as never);
-  const loaded = await loadMetric({ metric: 'm' }, { executor, range: RANGE });
-  const sample = calls.find((call) => call.op === 'bifrost.query' && call.sql.includes('LIMIT 100'));
+  const sampled = (call: (typeof calls)[number]) => call.op === 'bifrost.query' && call.sql.includes('LIMIT 100');
+  // Drawing a metric never samples its keys; the picker asks for them when the reader opens it.
+  await loadMetric({ metric: 'm' }, { executor, range: RANGE });
+  expect(calls.filter(sampled)).toEqual([]);
+  const offered = await loadMetricKeys({ metric: 'm' }, { executor, range: RANGE });
+  const [sample] = calls.filter(sampled);
+  expect(calls.filter(sampled)).toHaveLength(1);
   expect(sample?.op === 'bifrost.query' && sample.sql).toContain("FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz AND metric_name = $3");
-  expect(loaded.keys).toEqual([...METRIC_GROUP_KEYS, 'attributes.code', 'attributes.http.route', 'resource.host.name']);
+  expect(offered).toEqual({ state: 'populated', data: [...METRIC_GROUP_KEYS, 'attributes.code', 'attributes.http.route', 'resource.host.name'] });
+  // A failed sample offers the promoted columns alone; any key can still be typed.
+  const failing = recording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: { code: 'WYRD_VALA_500_QUERY_FAILED', title: 'Query failed', status: 500 } } : { ok: true, value: EMPTY }) as never);
+  expect(await loadMetricKeys({ metric: 'm' }, { executor: failing.executor, range: RANGE })).toEqual({ state: 'populated', data: METRIC_GROUP_KEYS });
 });
 
 test('histogram percentiles interpolate inside the bucket holding the rank', () => {
@@ -478,4 +494,936 @@ test('every histogram series apart is labelled from the series index, plotted id
     ['{"service.name":"a"}', 0.5],
     ['{"service.name":"b"}', 1]
   ]);
+});
+
+import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
+import { vi } from 'vitest';
+import { goto, invalidate, invalidateAll } from '$app/navigation';
+import { EXECUTIONS, fixtureExecutor, PROMPT, SERVICE, stateExecutors, VERIFIER, VERIFIER_UIDS, verifiers } from '$lib/ui-fixtures';
+import { readExecution, writeExecution } from '$lib/verify-host';
+import { load as loadExecutionPage } from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.server';
+import ExecutionPage from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.svelte';
+import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
+import CardDetail from '../routes/t/[tenantKey]/cards/detail/+page.svelte';
+import { load as loadVerify } from '../routes/t/[tenantKey]/verify/+page.server';
+import VerifyPage from '../routes/t/[tenantKey]/verify/+page.svelte';
+import { load as loadObserve } from '../routes/t/[tenantKey]/observe/+layout.server';
+
+// The page's reads run through the fixture executor here; the real BFF path is the integration journey's.
+const host = vi.hoisted(() => ({ executor: undefined as Executor | undefined }));
+vi.mock('wyrd-ai-ui/node', () => ({ nodeExecutor: () => host.executor }));
+vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}), invalidate: vi.fn(async () => {}), invalidateAll: vi.fn(async () => {}) }));
+
+test('a Card page reads its Card once and lists its versions once, whichever panels its tab shows', async () => {
+  const requests: WireRequest[] = [];
+  host.executor = { run: (batch, signal) => (requests.push(...batch), fixtureExecutor.run(batch, signal)) };
+  const open = async (ref: { kind: string; name: string; version: string }) => {
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/cards/detail?${new URLSearchParams(ref)}`);
+    await loadCardDetail({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url) } as never);
+    const own = (request: WireRequest) => 'card_ref' in request && request.card_ref.name === ref.name && request.card_ref.version === ref.version;
+    return {
+      cardReads: requests.filter((request) => request.op === 'cards.get_by_ref' && own(request)).length,
+      versionListings: requests.filter((request) => request.op === 'cards.list' && request.name === ref.name).length
+    };
+  };
+  for (const ref of [SERVICE, PROMPT, { kind: 'Verifier', name: 'ticket-policy', version: '1.1.0' }]) {
+    expect(await open(ref), `${ref.kind} ${ref.name}@${ref.version}`).toEqual({ cardReads: 1, versionListings: 1 });
+  }
+});
+
+test('an exact Verifier Card page shows its definition, versions and where it runs', async () => {
+  const requests: WireRequest[] = [];
+  const through = (executor: Executor): Executor => ({ run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) });
+  const open = async (search: string, executor = fixtureExecutor) => {
+    host.executor = through(executor);
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/cards/detail${search}`);
+    const data = await loadCardDetail({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url) } as never);
+    return render(CardDetail, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+  };
+
+  // The exact version: header, Graph/Files/YAML tabs, description, graph, where it runs, relationships and metadata.
+  const page = await open('?kind=Verifier&name=ticket-policy&version=1.1.0');
+  await waitFor(() => expect(page.container.querySelector('[data-node="step:classify"]')).toBeInTheDocument());
+  expect(page.getByRole('heading', { level: 2, name: 'ticket-policy' })).toBeInTheDocument();
+  expect(page.container).toHaveTextContent('Verifier / ticket-policy@1.1.0');
+  const tabs = within(page.getByRole('navigation', { name: 'ticket-policy sections' }));
+  expect(tabs.getAllByRole('button').map((tab) => tab.textContent)).toEqual(['Graph', 'Files', 'YAML']);
+  expect(tabs.getByRole('button', { name: 'Graph' })).toHaveAttribute('aria-current', 'page');
+  expect(page.container).toHaveTextContent('A support ticket follows the refund policy.');
+  expect(page.container.querySelectorAll('[data-node]')).toHaveLength(9);
+  expect(page.getByRole('region', { name: 'Runs on' })).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
+  expect(page.getByRole('region', { name: 'Relationships' })).toBeInTheDocument();
+  // The newest version carries no older-version note; Results in Verify opens the list filtered to this exact Verifier version.
+  expect(page.queryByText(/You are viewing/)).toBeNull();
+  expect(page.getByRole('link', { name: 'Results in Verify' })).toHaveAttribute(
+    'href',
+    `/t/acme/verify?${new URLSearchParams({ where: JSON.stringify([{ column: 'verifier_card_uid', value: verifiers['ticket-policy@1.1.0'].metadata.uid }]) })}`
+  );
+  // Only exact Card reads: the header gates the rest, and nothing reads executions or telemetry.
+  expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['cards.get_by_ref', 'cards.list']));
+  expect(requests.filter((request) => request.op === 'cards.get_by_ref').every((request) => 'version' in request.card_ref && /^\d/.test(request.card_ref.version))).toBe(true);
+
+  // Version navigation is exact and read-only: choosing a version navigates to that version's URL.
+  await fireEvent.change(page.getByRole('combobox'), { target: { value: '1.0.0' } });
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.0.0', expect.anything());
+  await fireEvent.click(tabs.getByRole('button', { name: 'YAML' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.1.0&tab=yaml', expect.anything());
+  // Opening a binding owner follows its exact reference.
+  await fireEvent.click(within(page.getByRole('region', { name: 'Runs on' })).getByRole('button', { name: `${SERVICE.name}@${SERVICE.version}` }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Service&name=support-api&version=1.0.0', expect.anything());
+  page.unmount();
+
+  // An older version says that viewing changes nothing, draws its own graph, and has no binding.
+  const older = await open('?kind=Verifier&name=ticket-policy&version=1.0.0');
+  await waitFor(() => expect(older.container.querySelector('[data-node="req:has-answer"]')).toBeInTheDocument());
+  expect(older.getByText(/You are viewing/)).toHaveTextContent('You are viewing 1.0.0; the newest registered version is 1.1.0. Viewing a version changes nothing: each binding pins the exact version it runs.');
+  expect(older.container.querySelectorAll('[data-node]')).toHaveLength(2);
+  expect(older.getByRole('region', { name: 'Runs on' })).toHaveTextContent('No binding runs this exact version.');
+  older.unmount();
+
+  // The YAML tab shows the Card as returned and loads no graph.
+  const yaml = await open('?kind=Verifier&name=ticket-policy&version=1.1.0&tab=yaml');
+  expect(yaml.container.querySelector('pre')?.textContent).toContain('description: A support ticket follows the refund policy.');
+  expect(yaml.container.querySelector('pre')?.textContent).toContain(`name: ${verifiers['ticket-policy@1.1.0'].metadata.name}`);
+  expect(yaml.container.querySelector('[data-node]')).toBeNull();
+  yaml.unmount();
+
+  // A denied or missing Card shows only that outcome: no dependent read, no graph, no stale definition.
+  const denied = await open('?kind=Verifier&name=ticket-policy&version=1.1.0', stateExecutors.denied);
+  expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
+  expect(denied.container.querySelector('[data-node]')).toBeNull();
+  expect(requests).toEqual([{ op: 'cards.get_by_ref', card_ref: VERIFIER }]);
+  denied.unmount();
+  const missing = await open('?kind=Verifier&name=ticket-policy&version=9.9.9');
+  expect(missing.container).toHaveTextContent('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  expect(missing.container.querySelector('[data-node]')).toBeNull();
+  expect(requests).toHaveLength(1);
+});
+
+test('an exact execution page keeps its selection in the URL and cancels once through the host', async () => {
+  const requests: WireRequest[] = [];
+  const open = async (path: string, executor: Executor = fixtureExecutor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/verify/executions/${path}`);
+    const executionId = url.pathname.split('/').pop() as string;
+    const data = await loadExecutionPage({ locals: { browserSession: { client: () => ({}), api: vi.fn() } }, params: { tenantKey: 'acme', executionId }, url, request: new Request(url) } as never);
+    return render(ExecutionPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+  };
+  const here = '/t/acme/verify/executions/exec_settled';
+
+  // The URL round-trips the exact selection: node, nullable item and iteration, one-based attempt, output, details and cursors.
+  const selection = { node: 'step:polish', producer: { item_index: 2, iteration_index: null, attempt: 3 }, output: 'draft v2/notes.md', details: true, invocations: 'c+1/=', publications: 'c 2' };
+  const search = writeExecution(selection);
+  expect(search).toBe('?node=step%3Apolish&item=2&attempt=3&output=draft+v2%2Fnotes.md&details=1&invocations=c%2B1%2F%3D&publications=c+2');
+  expect(readExecution('exec_1', new URLSearchParams(search))).toEqual({ executionId: 'exec_1', ...selection });
+  // A repeat iteration is part of the producer: it round-trips, and the page reads the output of that exact iteration.
+  const repeated = { node: 'step:score', producer: { item_index: null, iteration_index: 1, attempt: 2 }, output: 'units' };
+  expect(writeExecution(repeated)).toBe('?node=step%3Ascore&iteration=1&attempt=2&output=units');
+  expect(readExecution('exec_1', new URLSearchParams(writeExecution(repeated)))).toEqual({ executionId: 'exec_1', ...repeated });
+  const iterated = await open(`exec_settled${writeExecution(repeated)}`);
+  expect(requests.find((request) => request.op === 'verification.get_publication')).toEqual({ op: 'verification.get_publication', execution_id: 'exec_settled', step_id: 'score', name: 'units', attempt: 2, item_index: null, iteration_index: 1 });
+  iterated.unmount();
+  expect(readExecution('exec_1', new URLSearchParams())).toEqual({ executionId: 'exec_1' });
+  expect(writeExecution({})).toBe('');
+
+  // Opening the exact URL shows that execution with the URL's attempt and output selected; no list is read to get there.
+  const page = await open('exec_settled?node=step%3Ascore&attempt=2&output=units');
+  await waitFor(() => expect(page.container.querySelector('[data-node="step:score"]')).toHaveAttribute('aria-pressed', 'true'));
+  expect(page.container).toHaveTextContent('Verify/Executions/exec_settled');
+  expect(page.container.querySelector('[data-producer]')).toHaveAttribute('data-producer', 'attempt 2');
+  expect(page.container.querySelector('[data-preview="units"] pre')?.textContent).toBe('{\n  "units": 3\n}');
+  expect(requests.find((request) => request.op === 'verification.get_publication')).toEqual({ op: 'verification.get_publication', execution_id: 'exec_settled', step_id: 'score', name: 'units', attempt: 2, item_index: null, iteration_index: null });
+  expect(requests.some((request) => request.op === 'cards.list')).toBe(false);
+
+  // Every selection is a navigation to its own URL; opening a member, the Verifier or a file follows exact identities.
+  await fireEvent.click(within(page.getByRole('radiogroup', { name: 'Invocations of score' })).getByRole('radio', { name: /attempt 1/ }));
+  expect(goto).toHaveBeenLastCalledWith(`${here}?node=step%3Ascore&attempt=1`, { keepFocus: true, noScroll: true });
+  await fireEvent.click(page.container.querySelector('[data-node="req:policy-followed"]') as Element);
+  expect(goto).toHaveBeenLastCalledWith(`${here}?node=req%3Apolicy-followed`, expect.anything());
+  await fireEvent.click(page.getByRole('button', { name: 'Load completed details' }));
+  expect(goto).toHaveBeenLastCalledWith(`${here}?node=req%3Apolicy-followed&details=1`, expect.anything());
+  await fireEvent.click(page.getByRole('button', { name: 'ticket-policy@1.1.0' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.1.0&uid=card_verifier_ticket-policy_1.1.0', expect.anything());
+
+  // Refresh rereads in place; Copy link copies the address that holds the selection.
+  await fireEvent.click(page.getByRole('button', { name: 'Refresh' }));
+  expect(invalidateAll).toHaveBeenCalledTimes(1);
+  const writeText = vi.fn(async () => {});
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+  await fireEvent.click(page.getByRole('button', { name: /Copy link/ }));
+  expect(writeText).toHaveBeenCalledWith(window.location.href);
+  await waitFor(() => expect(page.container).toHaveTextContent('Link copied'));
+  page.unmount();
+
+  // An older navigation finishing does not clear the newer one's pending state, and the newer selection stays shown.
+  const settle: (() => void)[] = [];
+  vi.mocked(goto).mockImplementation(() => new Promise<void>((resolve) => settle.push(resolve)));
+  const racing = await open('exec_settled?node=step%3Ascore');
+  await waitFor(() => expect(racing.container.querySelector('[data-node="step:score"]')).toBeInTheDocument());
+  await fireEvent.click(racing.container.querySelector('[data-node="step:classify"]') as Element);
+  await fireEvent.click(racing.container.querySelector('[data-node="step:summarise"]') as Element);
+  settle[0]();
+  await new Promise((resolve) => setTimeout(resolve));
+  expect(racing.container.querySelector('[data-node="step:summarise"]')).toHaveAttribute('aria-pressed', 'true');
+  expect(racing.getByRole('region', { name: 'Step summarise' })).toBeInTheDocument();
+  // Until its own answer arrives, the newer selection shows no output body that was read for another one.
+  expect(racing.container.querySelector('[data-preview]')).toBeNull();
+  settle[1]();
+  vi.mocked(goto).mockImplementation(async () => {});
+  racing.unmount();
+
+  // Session members and downloads leave through exact URLs.
+  const session = await open('exec_session?node=input%3Aoutcomes');
+  await fireEvent.click(await session.findByRole('button', { name: 'exec_m2' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify/executions/exec_m2', { keepFocus: true, noScroll: false });
+  session.unmount();
+  const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+  const files = await open('exec_settled?node=step%3Asummarise&attempt=1&output=tree');
+  await fireEvent.click(within(await files.findByRole('region', { name: 'Files of tree' })).getAllByRole('button', { name: 'Download' })[1]);
+  expect(opened).toHaveBeenLastCalledWith(`${here}/download?step=summarise&name=tree&attempt=1&path=nested%2Fb.md`, '_self');
+  opened.mockRestore();
+  files.unmount();
+
+  // Cancel is one host request: pending disables the control, the answer is the recorded status, and status is read back.
+  const answers: ((response: Response) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve) => answers.push(resolve)));
+  vi.mocked(invalidateAll).mockClear();
+  const running = await open('exec_running');
+  const cancel = () => running.getByRole('button', { name: /Cancel execution/ });
+  await fireEvent.click(cancel());
+  await waitFor(() => expect(cancel()).toBeDisabled());
+  await fireEvent.click(cancel());
+  expect(fetched.mock.calls).toEqual([['/t/acme/verify/executions/exec_running/cancel', { method: 'POST' }]]);
+  expect(invalidateAll).not.toHaveBeenCalled();
+  // A completion that won the race answers its own terminal status; the page reports that, not "cancelled".
+  answers[0](Response.json({ execution_id: 'exec_running', status: 'completed' }));
+  await waitFor(() => expect(running.container).toHaveTextContent('Recorded status: completed'));
+  expect(invalidateAll).toHaveBeenCalledTimes(1);
+  // A refused cancel is shown as denied with the server's code, and the readable execution stays.
+  await fireEvent.click(cancel());
+  answers[1](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(running.container).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(running.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
+  expect(invalidateAll).toHaveBeenCalledTimes(2);
+  fetched.mockRestore();
+  running.unmount();
+
+  // An unknown execution shows the server's problem and nothing else; a malformed selection is refused before any read.
+  const unknown = await open('exec_nowhere?node=step%3Ascore&attempt=1&output=units');
+  expect(unknown.container).toHaveTextContent('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  expect(unknown.container.querySelector('[data-node], [data-execution-status]')).toBeNull();
+  expect(unknown.container.textContent).not.toMatch(/running/i);
+  expect(requests).toEqual([{ op: 'verification.get_execution', execution_id: 'exec_nowhere' }]);
+  unknown.unmount();
+  const malformed = await open('exec_settled?attempt=0');
+  expect(malformed.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  expect(requests).toEqual([]);
+  const refused = await open('exec_settled', stateExecutors.denied);
+  expect(refused.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
+  expect(requests).toHaveLength(1);
+});
+
+test('executions list, facets and charts read one population in bounded shared queries', async () => {
+  const where = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: null }];
+  const context = () => {
+    const recorded = recording(() => ({ ok: true, value: EMPTY }) as never);
+    return { ...recorded, context: { executor: recorded.executor, range: RANGE } };
+  };
+  const sql = (request: WireRequest) => (request as { sql: string }).sql;
+
+  // One row per accepted execution: the input record, its latest recorded state and the result that state selected.
+  const list = context();
+  const table = await loadRecordTable({ signal: 'executions', where }, list.context);
+  expect(list.calls).toHaveLength(1);
+  const population = sql(list.calls[0]).slice(sql(list.calls[0]).indexOf(' FROM ('), sql(list.calls[0]).lastIndexOf(' ORDER BY '));
+  expect(population).toContain('FROM bifrost.verification.execution_inputs i');
+  // A queued execution's status is its newest retained status row, and pending before any; equal times fall to the event id.
+  expect(population).toContain("last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status'");
+  expect(population).toContain("ELSE coalesce(q.status, 'pending') END AS status");
+  // A direct execution is never queued: complete once its result is visible, else nothing is recorded.
+  expect(population).toContain("WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END");
+  // Only checkpoint rows name the selected result; status and delivery rows carry no state.
+  expect(population.match(/event = 'checkpoint'/g)).toHaveLength(2);
+  // The selected result is the recorded one, or a direct execution's only one; never the latest row.
+  expect(population).toContain("(i.origin = 'direct' OR r.result_id = s.result_id)");
+  // States and results are read from the range start on, never the tenant's whole history.
+  expect(population.match(/(occurred_at|ended_at) >= \$1::timestamptz - INTERVAL '1 hour'/g)).toHaveLength(4);
+  expect(population).toContain('WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz AND status = $3 AND verdict IS NULL');
+  expect(table.executed?.params).toEqual([RANGE.from, RANGE.to, 'completed']);
+  expect(sql(list.calls[0])).toMatch(/ORDER BY recorded_at DESC, execution_id ASC LIMIT 51$/);
+  // Each row carries its exact identities and correlations, shown or not: the subject Card, the selected result, the binding and the Workload.
+  expect(sql(list.calls[0])).toMatch(/^SELECT .*, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid FROM /);
+  expect(table.result).toMatchObject({ state: 'empty', reason: 'No execution matches these filters in this window.' });
+
+  // Facets and both charts read that same population and WHERE in one aggregate; Verifiers are ranked by the server.
+  const column = (name: string, data_type = 'Utf8') => ({ name, data_type, nullable: true });
+  const discovered = recording(() => ({
+    ok: true,
+    value: {
+      columns: [column('facet', 'Int64'), column('f0'), column('f1'), column('f2'), column('at', 'Timestamp(ns, "+00:00")'), column('verdict'), column('verifier'), column('place', 'UInt64'), column('verifiers', 'UInt64'), column('n', 'Int64')],
+      rows: [
+        [0, 'completed', null, null, null, null, null, null, null, 4],
+        [1, null, null, null, null, null, null, null, null, 4],
+        [2, null, null, 'v1', null, null, null, null, null, 3],
+        [3, null, null, null, 'T1', 'no verdict', null, null, null, 4],
+        [4, null, null, null, 'T1', null, 'v1', 1, 5, 3],
+        [4, null, null, null, 'T1', null, 'v2', 2, 5, 1],
+        [4, null, null, null, 'T1', null, 'v3', 3, 5, 1],
+        [4, null, null, null, 'T1', null, null, null, 5, 2]
+      ],
+      terminal: { outcome: 'success', row_count: 8, warnings: [] }
+    } as never
+  }));
+  const drawn = await loadExecutionDiscovery({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'], where }, { executor: discovered.executor, range: RANGE });
+  expect(discovered.calls).toHaveLength(1);
+  const combined = sql(discovered.calls[0]);
+  expect(combined).toContain(population.replace(/\$3/g, '$4'));
+  expect(combined).toContain('GROUP BY GROUPING SETS ((status), (verdict), (verifier_card_uid), (at, verdict_series), (at, verifier))');
+  // Each stage is a named sibling that reads the one before it, so the read nests no deeper than the population.
+  expect(combined).toMatch(
+    /^WITH population AS \(SELECT .+\), grouped AS \(SELECT .+ FROM population GROUP BY .+\), ranked AS \(SELECT .+ FROM grouped\), placed AS \(SELECT .+ FROM ranked\), counted AS \(SELECT .+ FROM placed\), kept AS \(SELECT .+ FROM counted WHERE .+\) SELECT .+ FROM kept GROUP BY /
+  );
+  // No verdict is its own neutral series, never a verdict; the Verifier chart keys each of its three largest Verifiers by UID and counts the rest together.
+  expect(combined).toContain("coalesce(verdict, 'no verdict') AS verdict_series");
+  expect(combined).toContain('dense_rank() OVER (PARTITION BY facet ORDER BY total DESC, verifier) AS place');
+  expect(combined).toContain(`CASE WHEN facet = 4 AND place <= ${NAMED_VERIFIERS} THEN verifier END AS verifier`);
+  expect((discovered.calls[0] as Extract<WireRequest, { op: 'bifrost.query' }>).params).toEqual([RANGE.from, RANGE.to, '15 minutes', 'completed']);
+  expect(drawn.facets.result).toMatchObject({
+    state: 'populated',
+    data: { facets: [{ column: 'status', values: { rows: [['completed', 4]] } }, { column: 'verdict', values: { rows: [[null, 4]] } }, { column: 'verifier_card_uid', values: { rows: [['v1', 3]] } }] }
+  });
+  expect(drawn.charts.verdicts.input).toMatchObject({ type: 'timeseries', x: 'at', y: ['executions'], series: 'verdict', range: RANGE });
+  expect(drawn.charts.verdicts.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 'no verdict', 4]] } });
+  expect(drawn.charts.verifiers.input).toMatchObject({ series: 'verifier' });
+  // Each chart keeps its own portable SQL for a Chart panel or Query; the dashboard records the one read it executed.
+  expect(drawn.charts.verdicts.input.sql).toContain("coalesce(verdict, 'no verdict') AS verdict, count(*) AS executions");
+  expect(drawn.charts.verifiers.input.sql).toContain('verifier_card_uid AS verifier, count(*) AS executions');
+  expect(drawn.charts.verdicts.executed?.sql).toBe(combined);
+  expect(drawn.charts.verifiers.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 'v1', 3], ['T1', 'v2', 1], ['T1', 'v3', 1], ['T1', null, 2]] } });
+  expect(drawn.charts.verifierSeries).toEqual({ top: ['v1', 'v2', 'v3'], more: 2 });
+
+  // A page cursor compares the recorded instant as a timestamp; a predicate is refused, because no table validates it.
+  expect(listQuery({ signal: 'executions', after: ['2026-10-20T01:00:00Z', 'e1'] }, RANGE).sql).toContain(
+    '(recorded_at < $3::timestamptz OR (recorded_at = $3::timestamptz AND (execution_id > $4)))'
+  );
+  expect(validatePanel('RecordTable', { signal: 'executions', where_sql: 'status = 1' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('FacetRail', { signal: 'executions', facets: ['status'], where_sql: 'status = 1' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('RecordTable', { signal: 'executions', where: [{ column: 'inputs', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+});
+
+test('the Verify dashboard reads one population and keeps its investigation in the URL', async () => {
+  const requests: WireRequest[] = [];
+  const open = async (search: string, executor: Executor = fixtureExecutor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/verify${search}`);
+    const data = await loadVerify({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {} } as never);
+    return render(VerifyPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+  };
+  const search = (state: Record<string, unknown>) => `?${new URLSearchParams(Object.entries(state).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)]))}`;
+  const queries = () => requests.filter((request) => request.op === 'bifrost.query') as Extract<WireRequest, { op: 'bifrost.query' }>[];
+
+  // The dashboard: two charts, counted facets and the execution rows, with Verifiers named from one bounded Card list.
+  const page = await open('');
+  await waitFor(() => expect(page.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  expect(page.getByRole('region', { name: 'Executions' })).toHaveTextContent('no verdict');
+  // Each chart states its total; the Verifier chart names its largest Verifiers by name.
+  expect(page.getByRole('region', { name: 'By Verifier' })).toHaveTextContent('By Verifier 14 ticket-policylatency-drift');
+  const rail = within(page.getByRole('navigation', { name: 'Filter executions' }));
+  expect(rail.getByRole('button', { name: /no recorded verdict/ })).toHaveTextContent('2');
+  expect(rail.getByRole('button', { name: /latency-drift@1.0.0/ })).toHaveTextContent('2');
+  // The rail counts the facets of the approved design, in its order.
+  expect(rail.getAllByRole('heading').map((heading) => heading.textContent?.trim())).toEqual(['Status', 'Verdict', 'Verifier', 'Service', 'Card', 'Run', 'Session']);
+  // A Verifier value links to its exact definition.
+  expect(rail.getByRole('link', { name: 'Open Verifier latency-drift@1.0.0' })).toHaveAttribute('href', '/t/acme/cards/detail?kind=Verifier&name=latency-drift&version=1.0.0');
+  const table = within(page.getByRole('region', { name: 'executions rows' }));
+  expect(table.getAllByRole('row')).toHaveLength(8);
+  expect(table.getAllByText('ticket-policy')).toHaveLength(5);
+  expect(page.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent('select facet values to filter');
+  // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
+  expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));
+  expect(requests.filter((request) => request.op === 'cards.list')).toEqual([{ op: 'cards.list', kind: 'Verifier', limit: 200 }]);
+  expect(queries()).toHaveLength(2);
+  expect(queries().every((query) => query.sql.includes(') AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz'))).toBe(true);
+  expect(new Set(queries().map((query) => JSON.stringify(query.params?.slice(0, 2)))).size).toBe(1);
+
+  // A facet value, a brush, grouping, Live and paging are navigations: the URL holds the investigation.
+  await fireEvent.click(rail.getByRole('button', { name: /failed/ }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [{ column: 'verdict', value: 'failed' }] })}`, { keepFocus: true, noScroll: true });
+  // Group by is a row of choices with the current one pressed, beside the total the status facet counts.
+  const groups = within(page.getByRole('group', { name: 'Group by' }));
+  expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['run', 'false'], ['Card', 'false'], ['Service', 'false'], ['session', 'false']]);
+  expect(page.getByText('7 executions')).toBeInTheDocument();
+  // The list says how many of them it shows and has no more to ask for.
+  expect(page.getByText('Showing 7 of 7 · newest first')).toBeInTheDocument();
+  await fireEvent.click(groups.getByRole('button', { name: 'session' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?group=group_id', expect.anything());
+  // Live is off until asked for, and says so.
+  await fireEvent.click(page.getByRole('button', { name: 'Paused' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?live=1', expect.anything());
+  for (const title of ['Executions', 'By Verifier']) {
+    const plot = page.getByRole('region', { name: title }).querySelector('svg.plot') as SVGSVGElement;
+    plot.getBoundingClientRect = () => ({ left: 0, width: 600, top: 0, height: 56, right: 600, bottom: 56, x: 0, y: 0, toJSON: () => ({}) });
+    await fireEvent.pointerDown(plot, { clientX: 100, pointerId: 1 });
+    await fireEvent.pointerMove(plot, { clientX: 400, pointerId: 1 });
+    await fireEvent.pointerUp(plot, { clientX: 400, pointerId: 1 });
+    const brushed = new URL(`http://ui.test${vi.mocked(goto).mock.lastCall?.[0]}`).searchParams;
+    expect(Date.parse(brushed.get('to') as string)).toBeGreaterThan(Date.parse(brushed.get('from') as string));
+  }
+  // A row opens its exact execution page as an ordinary navigation, so Back returns to this URL and scroll position.
+  await fireEvent.click(table.getAllByRole('row')[1]);
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify/executions/exec_failed');
+  page.unmount();
+
+  // Status and verdict combine: the WHERE projection names both, and rows, facets and both charts bind the same clauses.
+  const where = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: 'failed' }];
+  const filtered = await open(search({ where, from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'service_name' }));
+  await waitFor(() => expect(filtered.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  expect(filtered.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent(`status = 'completed' AND verdict = 'failed'`);
+  expect(queries()).toHaveLength(2);
+  expect(queries().every((query) => query.sql.includes('status = $') && query.sql.includes('verdict = $') && query.params?.includes('completed') && query.params?.includes('failed'))).toBe(true);
+  expect(queries().every((query) => query.params?.[0] === '2026-10-20T10:00:00.000Z' && query.params?.[1] === '2026-10-20T12:00:00.000Z')).toBe(true);
+  // Reset zoom returns to the preset; Clear drops the filters; both keep the grouping.
+  await fireEvent.click(filtered.getByRole('button', { name: 'Reset zoom' }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where, group: 'service_name' })}`, expect.anything());
+  expect(filtered.getByRole('link', { name: 'Clear' })).toHaveAttribute('href', `/t/acme/verify${search({ from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'service_name' })}`);
+  filtered.unmount();
+  // The list reads as many rows as the URL asks for. Another value adds a clause and the changed list starts from its first rows; a pressed value removes its own clause.
+  const longer = await open(`${search({ where })}&shown=100`);
+  await waitFor(() => expect(longer.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  expect(queries().filter((query) => / LIMIT 10[01]$/.test(query.sql))).toHaveLength(1);
+  const pressed = within(longer.getByRole('navigation', { name: 'Filter executions' }));
+  await fireEvent.click(pressed.getByRole('button', { name: /cancelled/ }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [...where, { column: 'status', value: 'cancelled' }] })}`, expect.anything());
+  await fireEvent.click(pressed.getByRole('button', { name: /failed/ }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [where[0]] })}`, expect.anything());
+  longer.unmount();
+  // The footer names the order the reader chose, not a fixed one.
+  const sorted = await open('?sort=status:asc');
+  await waitFor(() => expect(sorted.getByText('Showing 7 of 7 · by Status ↑')).toBeInTheDocument());
+  sorted.unmount();
+
+  // An incompatible combination is an empty list, said plainly; a refusal is shown as the refusal, never as empty.
+  const empty = await open(search({ where: [{ column: 'status', value: 'cancelled' }, { column: 'verdict', value: 'passed' }] }), stateExecutors.empty);
+  await waitFor(() => expect(empty.container).toHaveTextContent('No execution matches these filters in this window.'));
+  empty.unmount();
+  const denied = await open('', stateExecutors.denied);
+  await waitFor(() => expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN'));
+  expect(denied.container).not.toHaveTextContent('No execution matches');
+  // The refusals end the load: the one batch of independent reads, and nothing after it.
+  expect(requests).toHaveLength(3);
+  denied.unmount();
+  // A malformed range or an unknown filter column issues no read.
+  for (const bad of ['?from=yesterday&to=today', search({ where: [{ column: 'secret', value: 1 }] })]) {
+    const refused = await open(bad);
+    expect(refused.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+    expect(requests).toEqual([]);
+    refused.unmount();
+  }
+});
+
+import { readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
+import { load as loadRepositories } from '../routes/t/[tenantKey]/repositories/+page.server';
+import { load as loadAccount } from '../routes/t/[tenantKey]/settings/account/+page.server';
+import { browserSessions, type LoginMethods } from '$lib/server/auth/browser-sessions';
+import type { RepositoryIndexProps } from 'wyrd-ai-ui/loaders';
+import RepositoriesPage from '../routes/t/[tenantKey]/repositories/+page.svelte';
+import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[name]/+page.server';
+import RepositoryPage from '../routes/t/[tenantKey]/repositories/[name]/+page.svelte';
+import { load as loadUndeclared } from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.server';
+import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.svelte';
+import { load as loadGithub } from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.server';
+import GithubPage from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.svelte';
+import { load as loadSecrets } from '../routes/t/[tenantKey]/settings/(admin)/secrets/+page.server';
+import StoredSecretsPage from '../routes/platform/ui/secrets/+page.svelte';
+import { connectionExecutor } from '$lib/ui-fixtures';
+import { EventEmitter } from 'node:events';
+import { GET as getObserveSupport } from '../routes/t/[tenantKey]/observe/support/+server';
+import { GET as getVerifySupport } from '../routes/t/[tenantKey]/verify/support/+server';
+
+/** The supporting reads of Observe and Verify: facets, overview, timeline, discovery charts and Card names. */
+const supporting = (request: WireRequest) => request.op === 'cards.list' || (request.op === 'bifrost.query' && /GROUPING SETS|grouping\(at\)/.test(request.sql));
+/** One request as this tenant's browser session, over `socket` when one is given. */
+const asSession = (path: string, more: Record<string, unknown> = {}) => {
+  const url = new URL(`http://ui.test/t/acme/${path}`);
+  return { locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {}, ...more } as never;
+};
+/** A fixed window, so two reads of one population bind the same bounds. */
+const WINDOW = '&from=2026-10-20T00%3A00%3A00.000Z&to=2026-10-21T00%3A00%3A00.000Z';
+
+test('a client navigation reads only its list, and support reads the population whatever the list shows', async () => {
+  const requests: WireRequest[] = [];
+  host.executor = { run: (batch, signal) => (requests.push(...batch), fixtureExecutor.run(batch, signal)) };
+  // Paging, sorting, grouping and shown columns rerun the list and no supporting read.
+  for (const [load, path, section] of [
+    [loadVerify, `verify?sort=status:asc&shown=100&group=run_id${WINDOW}`, 'verify'],
+    [loadObserve, `observe?sort=name:asc&group=name${WINDOW}`, 'observe']
+  ] as const) {
+    requests.length = 0;
+    const data = (await (load as (event: never) => Promise<unknown>)(asSession(path, { isDataRequest: true }))) as Record<string, { list: { result: { state: string } }; support?: unknown }>;
+    expect(data[section].list.result.state).not.toBe('error');
+    expect(data[section].support).toBeUndefined();
+    expect(requests.filter(supporting)).toEqual([]);
+    expect(requests.length).toBeGreaterThan(0);
+  }
+
+  // The support routes read the population only: list choices change nothing they read or answer.
+  const read = async (handler: (event: never) => Response | Promise<Response>, path: string) => {
+    requests.length = 0;
+    const response = await handler(asSession(path));
+    return { status: response.status, body: await response.json(), requests: [...requests] };
+  };
+  for (const [handler, path, list] of [
+    [getVerifySupport, 'verify/support?', `&sort=status:asc&shown=100&group=run_id&live=1`],
+    [getObserveSupport, 'observe/support?', `&sort=name:asc&columns=${encodeURIComponent('["name"]')}&group=name&live=1&trace=${'a'.repeat(32)}`]
+  ] as const) {
+    const whole = await read(handler, `${path}${WINDOW.slice(1)}`);
+    expect(whole.status).toBe(200);
+    expect(whole.body.facets.result.state).toBe('populated');
+    expect(whole.requests.some(supporting)).toBe(true);
+    expect(whole.requests.some((request) => request.op === 'bifrost.query' && !supporting(request))).toBe(false);
+    expect(await read(handler, `${path}${WINDOW.slice(1)}${list}`)).toEqual(whole);
+    // A refused population is answered with its stable problem and reads nothing.
+    const refused = await read(handler, `${path}where=${encodeURIComponent(JSON.stringify([{ column: 'secret', value: 1 }]))}${WINDOW}`);
+    expect(refused).toMatchObject({ status: 400, body: { code: 'WYRD_SPEC_400_VALIDATION' }, requests: [] });
+  }
+
+  // The first HTML still carries every section.
+  const first = (await loadVerify(asSession('verify', { isDataRequest: false }))) as unknown as { verify: { support: { facets: { result: { state: string } } } } };
+  expect(first.verify.support.facets.result.state).toBe('populated');
+});
+
+test('each Observe request validates its custom predicate once before reading, and a refused one reads nothing', async () => {
+  const requests: WireRequest[] = [];
+  let refusal: WireResult | undefined;
+  host.executor = {
+    run: (batch, signal) => {
+      requests.push(...batch);
+      if (!batch.some((request) => request.op === 'bifrost.validate_predicate')) return fixtureExecutor.run(batch, signal);
+      return Promise.resolve(batch.map(() => refusal ?? { ok: true, value: { expression: 'duration_ms > 5' } })) as never;
+    }
+  };
+  const custom = `signal=traces&where_sql=${encodeURIComponent('duration_ms>5')}${WINDOW}`;
+  const ops = () => requests.map((request) => request.op);
+  const refresh = async () => {
+    requests.length = 0;
+    const data = (await loadObserve(asSession(`observe?${custom}`, { isDataRequest: true }))) as unknown as { observe: { list: { result: { state: string } } } };
+    const list = { state: data.observe.list.result.state, ops: ops() };
+    requests.length = 0;
+    const response = await getObserveSupport(asSession(`observe/support?${custom}`));
+    return { list, support: { status: response.status, body: await response.json(), ops: ops() } };
+  };
+
+  // A client refresh is two host requests; each validates the predicate once, first, then reads under it.
+  const valid = await refresh();
+  expect(valid.list.state).not.toBe('error');
+  expect(valid.list.ops[0]).toBe('bifrost.validate_predicate');
+  expect(valid.list.ops.filter((op) => op === 'bifrost.validate_predicate')).toHaveLength(1);
+  expect(valid.support.status).toBe(200);
+  expect(valid.support.ops[0]).toBe('bifrost.validate_predicate');
+  expect(valid.support.ops.filter((op) => op === 'bifrost.validate_predicate')).toHaveLength(1);
+  expect(valid.support.ops.length).toBeGreaterThan(1);
+
+  // A refused or denied predicate stops both requests at the validation, with no dependent read.
+  for (const [code, status, state] of [
+    ['WYRD_VALA_400_QUERY_INVALID_SQL', 400, 'error'],
+    ['WYRD_VALA_403_QUERY_FORBIDDEN', 403, 'denied']
+  ] as const) {
+    refusal = { ok: false, problem: { code, title: code, status } };
+    const refused = await refresh();
+    expect(refused.list).toEqual({ state, ops: ['bifrost.validate_predicate'] });
+    expect(refused.support.ops).toEqual(['bifrost.validate_predicate']);
+    expect(refused.support.body.facets.result).toMatchObject({ state, problem: { code } });
+  }
+});
+
+test('a support read stops its upstream reads when the browser closes the connection, and leaves the connection as it found it', async () => {
+  const signals: AbortSignal[] = [];
+  host.executor = {
+    run: async (batch, signal) => {
+      if (!batch.some(supporting)) return fixtureExecutor.run(batch, signal);
+      if (signal) signals.push(signal);
+      return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+    }
+  };
+  for (const [handler, path] of [
+    [getVerifySupport, 'verify/support'],
+    [getObserveSupport, 'observe/support']
+  ] as const) {
+    signals.length = 0;
+    const socket = new EventEmitter();
+    const read = handler(asSession(path, { platform: { req: { socket } } }));
+    await vi.waitFor(() => expect(signals.length).toBeGreaterThan(0));
+    expect(signals.some((signal) => signal.aborted)).toBe(false);
+    socket.emit('close');
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    await expect(read).rejects.toBeDefined();
+    expect(socket.listenerCount('close')).toBe(0);
+  }
+  // A completed read stops listening, so a kept-alive connection gathers no listeners.
+  host.executor = fixtureExecutor;
+  const socket = new EventEmitter();
+  expect((await getVerifySupport(asSession('verify/support', { platform: { req: { socket } } }))).status).toBe(200);
+  expect(socket.listenerCount('close')).toBe(0);
+});
+
+test('Live starts no refresh until the last refresh has read its support, and stops when the page goes', async () => {
+  host.executor = fixtureExecutor;
+  const data = await loadVerify(asSession('verify?live=1', { isDataRequest: false }));
+  const body = JSON.stringify((data as unknown as { verify: { support: unknown } }).verify.support);
+  const answers: ((response: Response) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve) => answers.push(resolve)));
+  vi.mocked(invalidate).mockReset().mockResolvedValue(undefined);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+  try {
+    const page = render(VerifyPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+    // The list refreshed at once; its support is still being read across three more tick opportunities.
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith('wyrd:verify');
+    expect(fetched).toHaveBeenCalledTimes(1);
+    const [href, init] = fetched.mock.calls[0] as [string, RequestInit];
+    expect(href).toMatch(/^\/t\/acme\/verify\/support\?/);
+    expect(new URL(href, 'http://ui.test').searchParams.get('live')).toBeNull();
+    expect(init.signal?.aborted).toBe(false);
+
+    // A failed support read settles the refresh: the list stays, the failure is said, and the next tick runs.
+    answers[0](new Response(JSON.stringify(wyrdProblem('upstream', 'connection reset')), { status: 502, headers: { 'content-type': 'application/problem+json' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(page.getByRole('region', { name: 'executions rows' })).toBeInTheDocument();
+    expect(page.container).toHaveTextContent('connection reset');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(fetched).toHaveBeenCalledTimes(2);
+
+    // A successful one does too, and shows what it read.
+    answers[1](new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(page.container).not.toHaveTextContent('connection reset');
+    expect(page.getByRole('region', { name: 'By Verifier' })).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(invalidate).toHaveBeenCalledTimes(3);
+
+    // Leaving cancels the read in flight, and no tick follows.
+    page.unmount();
+    expect((fetched.mock.calls[2][1] as RequestInit).signal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(invalidate).toHaveBeenCalledTimes(3);
+  } finally {
+    vi.useRealTimers();
+    fetched.mockRestore();
+  }
+});
+
+test('the Repositories index lists its Cards without waiting for the GitHub connection', async () => {
+  let connected = false;
+  const listedBefore: boolean[] = [];
+  host.executor = {
+    run: async (batch, signal) => {
+      if (batch.some((request) => request.op === 'cards.list')) listedBefore.push(!connected);
+      const answers = await fixtureExecutor.run(batch, signal);
+      if (batch.some((request) => request.op === 'github.get_connection')) await new Promise((settle) => setTimeout(settle, 10)).then(() => (connected = true));
+      return answers;
+    }
+  };
+  const url = new URL('http://ui.test/t/acme/repositories');
+  const data = (await loadRepositories({ locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme' }, url, request: new Request(url) } as never)) as { index: RepositoryIndexProps };
+
+  expect(data.index.result.state).toBe('populated');
+  expect(listedBefore[0]).toBe(true);
+});
+
+test('the Repositories workspace keeps its index state, opens exact versions and leads to the connection', async () => {
+  const requests: WireRequest[] = [];
+  const tenant = { key: 'acme', name: 'Acme' };
+  const event = (path: string, params: object, executor: Executor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/${path}`);
+    return { locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme', ...params }, url, request: new Request(url) } as never;
+  };
+  const index = async (search = '', executor: Executor = fixtureExecutor) => render(RepositoriesPage, { data: { ...(await loadRepositories(event(`repositories${search}`, {}, executor))), tenant } } as never);
+  const detail = async (rest: string, executor: Executor = fixtureExecutor) =>
+    render(RepositoryPage, { data: { ...(await loadRepository(event(`repositories/${rest}`, { name: decodeURIComponent(rest.split('?')[0]) }, executor))), tenant } } as never);
+  const undeclared = async (rest: string) =>
+    render(UndeclaredPage, { data: { ...(await loadUndeclared(event(`repositories/github/${rest}`, { repositoryId: rest.split('?')[0] }, fixtureExecutor))), tenant } } as never);
+  vi.mocked(goto).mockClear();
+
+  // The index URL round-trips search and Show; an unknown Show is refused before any read.
+  expect(writeIndex({ query: 'pay', show: 'ready' })).toBe('?q=pay&show=ready');
+  expect(readIndex(new URLSearchParams('?q=pay&show=ready'))).toEqual({ query: 'pay', show: 'ready' });
+  expect(writeIndex({})).toBe('');
+  const refused = await index('?show=paused');
+  expect(refused.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  expect(requests).toEqual([]);
+  refused.unmount();
+
+  // Rows open the exact version and carry the index state, so the way back restores it.
+  const filtered = await index('?q=acme&show=ready');
+  expect(filtered.getByRole('heading', { level: 1, name: 'Repositories' })).toBeInTheDocument();
+  expect(filtered.container).toHaveTextContent('1 of 4 shown');
+  await fireEvent.click(filtered.getByRole('button', { name: 'payments-api' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api?version=1.4.0&back=%3Fq%3Dacme%26show%3Dready');
+  await fireEvent.click(within(filtered.getByRole('group', { name: 'Show' })).getByRole('button', { name: 'No Card' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories?q=acme&show=undeclared', { keepFocus: true, noScroll: true });
+  await fireEvent.click(filtered.getByRole('button', { name: 'GitHub connection' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/settings/integrations/github');
+  filtered.unmount();
+  const all = await index();
+  await fireEvent.click(all.getByRole('button', { name: 'acme/web-checkout' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/github/741660215');
+  all.unmount();
+
+  // The detail: policy and access first, then this Repository's executions from the shared Verify population.
+  expect(repositoryHref('/t/acme', { kind: 'Repository', name: 'a b', version: '1.0.0' }, { declaration: 'toml', back: '?q=x' })).toBe('/t/acme/repositories/a%20b?version=1.0.0&declaration=toml&back=%3Fq%3Dx');
+  const page = await detail('payments-api?version=1.3.0&back=%3Fq%3Dacme%26show%3Dready');
+  expect(page.getByRole('link', { name: 'Repositories' })).toHaveAttribute('href', '/t/acme/repositories?q=acme&show=ready');
+  expect(page.container).toHaveTextContent('not selected · viewing only');
+  const where = [{ column: 'subject_kind', value: 'Repository' }, { column: 'subject_name', value: 'payments-api' }];
+  const activity = requests.filter((request) => request.op === 'bifrost.query') as Extract<WireRequest, { op: 'bifrost.query' }>[];
+  expect(activity).toHaveLength(1);
+  expect(activity[0].sql).toContain('subject_kind = $3 AND subject_name = $4');
+  expect(activity[0].params?.slice(2)).toEqual(['Repository', 'payments-api']);
+  // Activity is one list read: no execution's status or detail is read per row.
+  expect(requests.some((request) => request.op.startsWith('verification.'))).toBe(false);
+  expect(page.getByRole('link', { name: 'View all in Verify' })).toHaveAttribute('href', `/t/acme/verify?${new URLSearchParams({ last: '30d', where: JSON.stringify(where) })}`);
+  await fireEvent.change(page.getByRole('combobox', { name: 'Card version' }), { target: { value: '1.4.0' } });
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api?version=1.4.0&back=%3Fq%3Dacme%26show%3Dready', { keepFocus: true, noScroll: true });
+  await fireEvent.click(page.getByRole('tab', { name: 'wyrd.toml' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api?version=1.3.0&declaration=toml&back=%3Fq%3Dacme%26show%3Dready', { keepFocus: true, noScroll: true });
+  await fireEvent.click(page.getByRole('button', { name: 'Verifier definition' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=pr-review&version=1.3.0');
+  await fireEvent.click(page.getByRole('button', { name: 'Manage connection' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/settings/integrations/github');
+  page.unmount();
+
+  // A refused activity read leaves policy and access readable.
+  const noActivity = await detail('payments-api?version=1.4.0', {
+    run: (batch, signal) => (batch[0].op === 'bifrost.query' ? stateExecutors.denied.run(batch, signal) : fixtureExecutor.run(batch, signal))
+  });
+  expect(noActivity.container).toHaveTextContent('✓ selected');
+  expect(noActivity.getByRole('region', { name: 'Verification activity' })).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
+  noActivity.unmount();
+
+  // The URL names one exact version; without it, or for an unknown Card, nothing else is read or shown.
+  for (const rest of ['payments-api', 'payments-api?version=latest']) {
+    const invalid = await detail(rest);
+    expect(invalid.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+    expect(requests).toEqual([]);
+    invalid.unmount();
+  }
+  const unknown = await detail('nowhere?version=1.0.0');
+  expect(unknown.container).toHaveTextContent('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  expect(requests).toEqual([{ op: 'cards.get_by_ref', card_ref: { kind: 'Repository', name: 'nowhere', version: '1.0.0' } }]);
+  expect(unknown.queryByRole('region', { name: 'Verification activity' })).toBeNull();
+  unknown.unmount();
+
+  // A reachable repository with no Card explains how to declare it; a foreign id names nothing.
+  const declare = await undeclared('741660215?back=%3Fshow%3Dundeclared');
+  expect(declare.getByRole('link', { name: 'Repositories' })).toHaveAttribute('href', '/t/acme/repositories?show=undeclared');
+  expect(declare.container).toHaveTextContent('wyrd declare wyrd.toml');
+  declare.unmount();
+  const foreign = await undeclared('999');
+  expect(foreign.container).toHaveTextContent('WYRD_SPEC_404_NOT_FOUND');
+  expect(foreign.container.textContent).not.toMatch(/acme\/\w/);
+});
+
+test('account settings reads the profile and the own key page at once, for the session principal', async () => {
+  const requested: string[] = [];
+  let profiled = false;
+  vi.spyOn(browserSessions, 'methods').mockResolvedValueOnce({ email_discovery: true } as LoginMethods);
+  const browserSession = {
+    principalId: 'p-1',
+    tenantKey: 'acme',
+    api: async (_method: string, path: string) => {
+      requested.push(`${path} (profile answered: ${profiled})`);
+      if (path !== '/principals/me') return Response.json({ items: [], next_cursor: null });
+      await new Promise((settle) => setTimeout(settle, 10));
+      profiled = true;
+      return Response.json({ principal_id: 'p-1' });
+    }
+  };
+  const url = new URL('http://ui.test/t/acme/settings/account?after=k-9');
+  const data = await loadAccount({ locals: { browserSession }, url } as never);
+
+  expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, recovery: true, problem: null });
+  expect(requested).toEqual(['/principals/me (profile answered: false)', '/principals/p-1/credentials?limit=50&cursor=k-9 (profile answered: false)']);
+});
+
+test('Secrets lists each owner on its own: a refused owner is its problem, never an empty success', async () => {
+  const refused = { type: 'about:blank', title: 'Permission denied', status: 403, code: 'WYRD_PERMISSION_403_DENIED_RBAC', remediation: 'Ask an administrator.' };
+  const answers: Record<string, unknown> = {
+    '/admin/gateway/provider-credentials': [
+      { name: 'openai-prod', provider: 'openai', source: 'managed_secret', state: 'active', rotated_at: '2026-11-01T00:00:00Z', revoked_at: null, created_at: '2026-10-01T00:00:00Z', updated_at: '2026-11-01T00:00:00Z' },
+      { name: 'openai-old', provider: 'openai', source: 'managed_secret', state: 'revoked', rotated_at: null, revoked_at: '2026-10-02T00:00:00Z', created_at: '2026-10-01T00:00:00Z', updated_at: '2026-10-02T00:00:00Z' }
+    ],
+    '/identity/oidc/connections': { active: { id: 'c-1', state: 'Active', issuer: 'https://idp.example.test/realm', client_id: 'wyrd', client_auth: 'SecretBasic' }, candidate: null, callback_url: null },
+    '/admin/trusted-issuers': [{ issuer: 'https://ci.example.test', client_id: 'ci', client_auth: 'Public' }]
+  };
+  const browserSession = {
+    api: async (_method: string, path: string) =>
+      path in answers ? Response.json(answers[path]) : new Response(JSON.stringify(refused), { status: 403, headers: { 'content-type': 'application/problem+json' } })
+  };
+  const data = (await loadSecrets({ locals: { browserSession } } as never)) as { secrets: { name: string; state: string; revoke: boolean }[]; problems: { owner: string; problem: { status: number } }[] };
+
+  expect(data.secrets.map(({ name, state, revoke }) => [name, state, revoke])).toEqual([
+    ['openai-prod', 'active', true],
+    ['openai-old', 'revoked', false],
+    ['idp.example.test', 'active', false]
+  ]);
+  // Operator connections refused: named, not shown as none. A public issuer holds no secret.
+  expect(data.problems).toMatchObject([{ owner: 'operator', problem: { status: 403 } }]);
+});
+
+test('Settings connects and disconnects GitHub once through the host and reads state back', async () => {
+  const tenant = { key: 'acme', name: 'Acme' };
+  const open = async (executor: Executor) => {
+    host.executor = executor;
+    const url = new URL('http://ui.test/t/acme/settings/integrations/github');
+    return render(GithubPage, { data: { ...(await loadGithub({ locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme' }, url, request: new Request(url) } as never)), tenant } } as never);
+  };
+  const here = '/t/acme/settings/integrations/github';
+  const answers: ((response: Response) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve) => answers.push(resolve)));
+  const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+  vi.mocked(invalidateAll).mockClear();
+
+  // Connect asks the host for the authorization URL once, then leaves for GitHub in the same tab.
+  const start = await open(connectionExecutor({ state: 'not_connected' }));
+  expect(start.getByRole('heading', { level: 1, name: 'GitHub' })).toBeInTheDocument();
+  const connect = () => start.getByRole('button', { name: 'Connect GitHub' });
+  await fireEvent.click(connect());
+  await waitFor(() => expect(connect()).toBeDisabled());
+  await fireEvent.click(connect());
+  expect(fetched.mock.calls).toEqual([[`${here}/connection`, { method: 'POST' }]]);
+  answers[0](Response.json({ authorization_url: 'https://github.com/apps/wyrd-verify/installations/new?state=s1' }));
+  await waitFor(() => expect(opened).toHaveBeenCalledWith('https://github.com/apps/wyrd-verify/installations/new?state=s1', '_self'));
+  start.unmount();
+  // A refused connect stays on the page with the server's code.
+  const refusedStart = await open(connectionExecutor({ state: 'not_connected' }));
+  await fireEvent.click(refusedStart.getByRole('button', { name: 'Connect GitHub' }));
+  answers[1](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(refusedStart.container).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(opened).toHaveBeenCalledTimes(1);
+  refusedStart.unmount();
+
+  // Disconnect is one confirmed host request; the page then reads the connection back.
+  fetched.mockClear();
+  vi.mocked(invalidateAll).mockClear();
+  const connected = await open(fixtureExecutor);
+  const dialog = connected.container.querySelector('dialog') as HTMLDialogElement;
+  dialog.showModal = vi.fn();
+  const confirm = async () => {
+    await fireEvent.click(connected.getByRole('button', { name: 'Disconnect' }));
+    dialog.returnValue = 'confirm';
+    await fireEvent(dialog, new Event('close'));
+  };
+  await confirm();
+  await waitFor(() => expect(connected.getByRole('button', { name: 'Disconnect' })).toBeDisabled());
+  expect(fetched.mock.calls).toEqual([[`${here}/connection`, { method: 'DELETE' }]]);
+  expect(invalidateAll).not.toHaveBeenCalled();
+  answers[2](Response.json({ host: 'github.com', app: { id: 4242, slug: 'wyrd-verify' }, state: 'not_connected', repositories: [] }));
+  await waitFor(() => expect(invalidateAll).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(connected.getByRole('button', { name: 'Disconnect' })).toBeEnabled());
+  // A refusal is shown with its code and the connection stays as the server reports it.
+  await confirm();
+  answers[3](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(connected.container).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(connected.container).toHaveTextContent('Connected');
+  connected.unmount();
+
+  // Denied, and an App that is not configured, show the problem and no action or Card read.
+  const calls: WireRequest[] = [];
+  const noApp = await open({ run: (batch) => (calls.push(...batch), Promise.resolve(batch.map(() => ({ ok: false, problem: { code: 'WYRD_GITHUB_503_NOT_CONFIGURED', title: 'GitHub App not configured', status: 503 } }))) as never) });
+  expect(noApp.container).toHaveTextContent('WYRD_GITHUB_503_NOT_CONFIGURED');
+  expect(noApp.queryByRole('button')).toBeNull();
+  expect(calls).toEqual([{ op: 'github.get_connection' }]);
+  fetched.mockRestore();
+  opened.mockRestore();
+});
+
+import WorkspacePage from '../routes/signup/workspace/+page.svelte';
+
+test('the workspace page renders the configured Turnstile challenge and sends its token', async () => {
+  const posted: Record<string, unknown>[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (path: string, init?: RequestInit) => {
+    if (path === '/auth/signup/proof') return Response.json({ method: 'google' });
+    posted.push(JSON.parse(String(init?.body)));
+    return Response.json({ status: 403, code: 'WYRD_AUTH_403_SIGNUP_CHALLENGE', title: 'Forbidden', remediation: '' }, { status: 403 });
+  }));
+  // A stub of Cloudflare's widget: each render or reset solves the challenge with the next token.
+  type Options = { sitekey: string; action: string; callback: (token: string) => void };
+  const widgets: { element: Element; options: Options }[] = [];
+  const reset = vi.fn();
+  const remove = vi.fn();
+  let issued = 0;
+  const solve = () => {
+    issued += 1;
+    widgets[0].options.callback(`tok-${issued}`);
+  };
+  vi.stubGlobal('turnstile', {
+    render(element: Element, options: Options) {
+      widgets.push({ element, options });
+      solve();
+      return 'widget-1';
+    },
+    reset(id: string) {
+      reset(id);
+      solve();
+    },
+    remove
+  });
+  try {
+    const page = render(WorkspacePage, { data: { mail: true, problem: null, challenge: '0x4AAA-site' } } as never);
+    await page.findByLabelText('Workspace name');
+    await waitFor(() => expect(widgets).toHaveLength(1));
+    expect(widgets[0].options).toMatchObject({ sitekey: '0x4AAA-site', action: 'signup' });
+    expect(page.getByTestId('turnstile')).toContainElement(widgets[0].element as HTMLElement);
+    await fireEvent.input(page.getByLabelText('Workspace name'), { target: { value: 'Acme Research' } });
+    await fireEvent.click(page.getByRole('button', { name: 'Create workspace' }));
+    await page.findByText('Complete the challenge below, then create the workspace again.');
+    expect(posted[0]).toMatchObject({ slug: 'acme-research', challenge_token: 'tok-1' });
+    // A Siteverify token is single-use, so a refused attempt asks for a fresh one.
+    expect(reset).toHaveBeenCalledWith('widget-1');
+    await fireEvent.click(page.getByRole('button', { name: 'Create workspace' }));
+    await waitFor(() => expect(posted[1]).toMatchObject({ challenge_token: 'tok-2' }));
+    page.unmount();
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('widget-1'));
+
+    // Without a configured challenge there is no widget and no token.
+    widgets.length = 0;
+    posted.length = 0;
+    const plain = render(WorkspacePage, { data: { mail: true, problem: null, challenge: null } } as never);
+    await fireEvent.input(await plain.findByLabelText('Workspace name'), { target: { value: 'Acme Research' } });
+    await fireEvent.click(plain.getByRole('button', { name: 'Create workspace' }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).not.toHaveProperty('challenge_token');
+    expect(plain.queryByTestId('turnstile')).toBeNull();
+    expect(widgets).toHaveLength(0);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+import SignupPage from '../routes/signup/+page.svelte';
+
+test('a refused provider proof has no code to show, so the problem shows none', () => {
+  const page = render(SignupPage, { data: { signup: true, local: true, providers: ['google'], failed: true, problem: null } } as never);
+  const problem = page.getByRole('alert');
+  expect(problem).toHaveTextContent('Sign-in was not confirmed');
+  expect(problem.querySelector('code')).toBeNull();
+});
+
+test('a maintenance run that leaves failures lists them in a named, keyboard-reachable scroll region', () => {
+  const report = { current: 3, changed: 1, remaining: 1, bounded: false, failures: [{ store: 'operator_connections', data_tenant_id: 'tenant-a', owner: 'ops-slack', reason: 'key_unavailable' }] };
+  const page = render(StoredSecretsPage, {
+    props: { data: {}, form: { report } } as never,
+    context: new Map([['console-reauth', { guard: () => async () => undefined }]])
+  });
+  const region = page.getByRole('region', { name: 'Rotation failures' });
+  expect(region).toHaveAttribute('tabindex', '0');
+  expect(within(region).getByRole('table')).toHaveTextContent('key_unavailable');
 });

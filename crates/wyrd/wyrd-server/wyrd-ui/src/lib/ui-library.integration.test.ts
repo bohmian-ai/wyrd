@@ -1,18 +1,40 @@
 /**
- * TASK-003 and TASK-004 live proof. The built `ui://wyrd/view` HTML runs in the ext-apps
+ * TASK-003, TASK-004 and TASK-005 live proof. The built `ui://wyrd/view` HTML runs in the ext-apps
  * AppBridge test host; every other read goes to a real Wyrd server started by
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import type { Cookies } from '@sveltejs/kit';
+import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
+import { StatStrip, TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
 import { z } from 'zod';
-import { Bifrost, Cards, TableConfig, WyrdClient } from 'wyrd-ai';
+import { Bifrost, Cards, Gateway, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
+import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
 import {
+  CardRefSchema,
+  loadArtifactTable,
+  loadCardFacts,
   loadCardHeader,
+  loadCardInventory,
+  loadExecution,
+  loadExecutionDiscovery,
+  loadGithubIntegration,
+  loadPromptMessages,
+  loadPromptVariables,
+  loadRelationshipList,
+  loadRepositoryDeclare,
+  loadRepositoryIndex,
+  loadRepositoryPolicy,
+  loadRunsOn,
+  loadUsedBy,
+  loadVerifierDefinition,
+  loadVersionDiff,
   loadChart,
   loadFacetRail,
   loadMetric,
@@ -23,16 +45,26 @@ import {
   spanTree,
   type ChartInput,
   type Executor,
-  type WireRequest
+  type QueryResult,
+  type WireRequest,
+  bucketFor,
+  executionDiscoveryQuery,
+  facetsQuery,
+  statQueries,
+  traceOverviewReads
 } from 'wyrd-ai-ui/loaders';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
-import { card, observeAnswer, registered, series, summary, timeseries } from '$lib/ui-fixtures';
-import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
+import { AGENT, PROMPT, agent as agentCard, card, inventory, notFound, observeAnswer, prompts, registered, series, summary, timeseries } from '$lib/ui-fixtures';
+import { declarePolicy, exportOtlp, nanos, seedPopulated, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
-import { declared, fixture, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
+import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
+import { AGREES, assistantTest, judgeReply, toolCall, toolTurn } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
+import { configureGateway } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/local-development';
+import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
 import { POST as loadExamplePanel } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { dashboard } from '../../../../../../examples/ui-app/src/panels';
@@ -47,7 +79,7 @@ const ARTIFACT = 'packages/ui/dist/wyrd-view.html';
  * `tools/call` with `answer`, deliver `doc` as the tool result, and return
  * the iframe's document and the tool calls it made.
  */
-async function appBridgeView(doc: unknown, answer: (name: string, args: Record<string, unknown>) => object) {
+async function appBridgeView(doc: unknown, answer: (name: string, args: Record<string, unknown>) => object | Promise<object>) {
   const iframe = document.createElement('iframe');
   document.body.append(iframe);
   const view = iframe.contentWindow as Window & typeof globalThis;
@@ -59,8 +91,8 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
     void setTimeout(() => target.dispatchEvent(new target.MessageEvent('message', { data, source })));
   view.postMessage = deliver(view, host);
   // jsdom has no ResizeObserver; ext-apps observes the body to report its size.
-  // Its windows also lack structuredClone, which every real host provides.
-  Object.assign(view, { ResizeObserver: class { observe() {} disconnect() {} }, structuredClone });
+  // Its windows also lack structuredClone and matchMedia, which every real host provides.
+  Object.assign(view, { ResizeObserver: class { observe() {} disconnect() {} }, structuredClone, matchMedia: window.matchMedia });
   // ext-apps traces every message at debug level on both sides.
   for (const each of [view.console, console]) vi.spyOn(each, 'debug').mockImplementation(() => {});
   host.postMessage = deliver(host, view);
@@ -69,7 +101,9 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
   bridge.oncalltool = async (params) => {
     const args = (params.arguments ?? {}) as Record<string, unknown>;
     calls.push({ name: params.name, arguments: args });
-    return { content: [], structuredContent: answer(params.name, args) as Record<string, unknown> };
+    // An answer that is already a whole tool result (it has `content`) is relayed as is, so a tool's refusal reaches the page as one.
+    const answered = (await answer(params.name, args)) as Record<string, unknown>;
+    return Array.isArray(answered.content) ? (answered as never) : { content: [], structuredContent: answered };
   };
   const initialized = new Promise<void>((resolve) => (bridge.oninitialized = () => resolve()));
   await bridge.connect(new PostMessageTransport(view, view));
@@ -95,6 +129,8 @@ const LATENCY_CHART: ChartInput = {
   series: 'model'
 };
 const DENIED = 'WYRD_PERMISSION_403_DENIED_RBAC';
+/** A Bifrost query over tables the principal's grants do not cover. */
+const QUERY_FORBIDDEN = 'WYRD_VALA_403_QUERY_FORBIDDEN';
 
 /** Register the latency table as `client` and publish three rows inside {@link RANGE}. */
 async function seedLatency(server: { flushBifrost(): void }, client?: WyrdClient) {
@@ -132,14 +168,18 @@ function jar(): Cookies {
   } as Cookies;
 }
 
+/** A declared Card as the exact reference a component input takes. */
+const exact = (ref: DeclaredRef) => ({ ...CardRefSchema.parse(ref), uid: ref.uid });
+type Exact = ReturnType<typeof exact>;
+
 /** The fixture tenant's Cards and latency table, seeded once per file. */
-const test = serverTest().extend<{ seeded: { model: DeclaredRef; foreign: DeclaredRef } }>({
+const test = serverTest().extend<{ seeded: { model: Exact; foreign: Exact } }>({
   seeded: [
     async ({ server }, use) => {
       await seedLatency(server);
       const cards = await Cards.connect();
-      const model = declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-model.yaml')));
-      const foreign = declared(await cards.declareFromPath(fixture('cards/latency_baseline/latency-baseline.yaml')));
+      const model = exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-model.yaml'))));
+      const foreign = exact(declared(await cards.declareFromPath(fixture('cards/latency_baseline/latency-baseline.yaml'))));
       // The custom app example shows the support desk Service.
       await cards.declareFromPath(fixture('cards/declare_and_pull/support-desk.yaml'));
       await use({ model, foreign });
@@ -211,7 +251,7 @@ test('TASK-003: Identical authorized reads', async ({ server, seeded }) => {
     const request: WireRequest = { op: 'bifrost.query', sql: LATENCY_CHART.sql, params: [RANGE.from, RANGE.to] };
     const [[direct], [tool]] = await Promise.all([nodeExecutor(reader).run([request]), readerMcp.executor.run([request])]);
     expect(tool).toEqual(direct);
-    expect(direct).toMatchObject({ ok: false, problem: { code: DENIED } });
+    expect(direct).toMatchObject({ ok: false, problem: { code: QUERY_FORBIDDEN } });
   } finally {
     await readerMcp.close();
   }
@@ -240,7 +280,8 @@ test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) =
   expect(app.document.querySelector('h2')?.textContent).toBe('Ranker');
   expect(app.document.querySelector('[data-panel="header"]')?.textContent).toContain(registered.metadata.name);
   expect(app.document.querySelector('[data-panel="invalid"]')?.textContent).toContain('WYRD_SPEC_400_VALIDATION');
-  expect(app.calls.map((call) => call.name).sort()).toEqual(['bifrost.query', 'cards.get', 'cards.list']);
+  // The header's version list may settle after the chart draws.
+  await vi.waitFor(() => expect(app.calls.map((call) => call.name).sort()).toEqual(['bifrost.query', 'cards.get', 'cards.list']));
   expect(app.calls.find((call) => call.name === 'bifrost.query')?.arguments).toEqual({
     sql: timeseries.sql,
     params: ['2026-10-19T00:00:00Z', '2026-10-19T12:00:00Z']
@@ -255,7 +296,7 @@ test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) =
   expect(populated.executed).toEqual({ sql: LATENCY_CHART.sql, params: [RANGE.from, RANGE.to] });
   expect((await loadChart(LATENCY_CHART, { ...node, range: BEFORE })).result).toMatchObject({ state: 'empty' });
   const cardReader = { executor: nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_chart_denied', ['cards:read']) })) };
-  expect((await loadChart(LATENCY_CHART, { ...cardReader, range: RANGE })).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect((await loadChart(LATENCY_CHART, { ...cardReader, range: RANGE })).result).toMatchObject({ state: 'denied', problem: { code: QUERY_FORBIDDEN } });
   const header = await loadCardHeader({ cardRef: seeded.model }, node);
   expect(header.result).toMatchObject({
     state: 'populated',
@@ -353,7 +394,7 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
       expect((await loadFacetRail({ signal: 'traces', facets: ['service_name'] }, context)).result).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [['ui-agent', 1]] } }] } });
       // Spans filter by a bound WHERE; the waterfall reads the exact trace with nanosecond starts.
       const errors = await loadRecordTable({ signal: 'spans', where: [{ column: 'status_code', value: 2 }] }, context);
-      expect(errors.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'execute_tool search', 'ui-agent', 100_000_000, 2, 1, TRACE, 'b9c7c989f97918e1']] } } });
+      expect(errors.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'execute_tool search', 'ui-agent', 100_000_000, 2, TRACE, 'b9c7c989f97918e1', '53995c3f42cd8ad8']] } } });
       const waterfall = await loadTraceWaterfall({ traceId: TRACE }, context);
       expect(waterfall.result.state === 'populated' && spanTree(waterfall.result.data).map((span) => [span.name, span.depth, span.startMs])).toEqual([
         ['invoke_agent support', 0, 0],
@@ -404,7 +445,7 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
     loadFacetRail({ signal: 'traces', facets: ['service_name'] }, cardReader),
     loadStatStrip({ stats: ['traces'] }, cardReader)
   ]))
-    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: QUERY_FORBIDDEN } });
 
   // T4: the built HTML renders Observe panels through host tools/call alone.
   const doc = {
@@ -421,6 +462,216 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
   expect(app.document.querySelector('[data-panel="list"]')?.textContent).toContain('invoke_agent support');
   expect(app.calls.map((call) => call.name)).toEqual(['bifrost.query', 'bifrost.query', 'bifrost.query']);
   expect(app.calls.find((call) => String(call.arguments.sql).includes("trace_id = decode($1, 'hex')"))?.arguments).toMatchObject({ params: [TRACE], max_rows: 10_000 });
+});
+
+/** One analytical read as the UI issues it. */
+type Read = { readonly sql: string; readonly params: readonly unknown[] };
+
+/** The audited original read `id`, test-only reference SQL, rebound to the fixture's range and `bucket`. */
+function originalRead(id: string, bucket: string, range: { from: string; to: string } = RANGE): Read {
+  const audit = JSON.parse(readFileSync(join(process.cwd(), '../../../../changes/active/verification-workflow-ui/design/query-audit/queries.json'), 'utf8')) as { queries: (Read & { id: string })[] };
+  const found = audit.queries.find((each) => each.id === id);
+  if (!found) throw new Error(`no audited query ${id}`);
+  const rest = found.params.slice(2).map((param, index) => (index === 0 && /^\d+ \w+$/.test(String(param)) ? bucket : param));
+  return { sql: found.sql, params: [range.from, range.to, ...rest] };
+}
+
+/** Run a page's reads together, as the page does, timing the batch from submission to its last terminal. */
+async function readAll(executor: Executor, reads: readonly Read[]): Promise<{ elapsed: number; values: QueryResult[] }> {
+  const started = performance.now();
+  const results = await executor.run(reads.map((read) => ({ op: 'bifrost.query', sql: read.sql, params: [...read.params] }) as WireRequest));
+  const elapsed = performance.now() - started;
+  return {
+    elapsed,
+    values: results.map((result, index) => {
+      if (!result.ok) throw new Error(`${reads[index].sql}: ${JSON.stringify(result.problem)}`);
+      return result.value as QueryResult;
+    })
+  };
+}
+
+/**
+ * The executed work of `reads`, one `EXPLAIN ANALYZE` at a time: scan operators,
+ * the rows they emitted, summed operator `elapsed_compute` and spills. Missing
+ * metrics count nothing; summed compute is not wall time.
+ */
+async function executedWork(executor: Executor, reads: readonly Read[]) {
+  const work = { statements: reads.length, scans: 0, scanned: 0, compute_ms: 0, spills: 0 };
+  const MS: Record<string, number> = { ns: 1e-6, µs: 1e-3, us: 1e-3, ms: 1, s: 1e3 };
+  for (const read of reads) {
+    const { values } = await readAll(executor, [{ sql: `EXPLAIN ANALYZE ${read.sql}`, params: read.params }]);
+    for (const line of values[0].rows.flatMap((row) => String(row[1]).split('\n'))) {
+      const count = (name: string) => Number(line.match(new RegExp(`${name}=([0-9.]+)`))?.[1] ?? 0);
+      const timed = line.match(/elapsed_compute=([0-9.]+)(ns|µs|us|ms|s)/);
+      if (/(DataSource|Scan|Memtable|Parquet)\w*Exec/.test(line)) {
+        work.scans += 1;
+        work.scanned += count('output_rows');
+      }
+      if (timed) work.compute_ms += Number(timed[1]) * MS[timed[2]];
+      work.spills += count('spill_count');
+    }
+  }
+  return { ...work, compute_ms: Math.round(work.compute_ms * 1000) / 1000 };
+}
+
+/** The value and its counts for facet `index` of a grouping-set facet read over `facets` columns. */
+const facetRows = (result: QueryResult, index: number, facets: number, counts = 1) =>
+  result.rows.filter((row) => Number(row[0]) === index).map((row) => [row[1 + index], ...row.slice(1 + facets, 1 + facets + counts)]);
+
+/** Add bundle comparisons to the diagnostic report, kept only where the run names a file. */
+function recordDiagnostics(bundles: Record<string, unknown>) {
+  const path = process.env.WYRD_QUERY_DIAGNOSTICS;
+  if (!path) return;
+  const kept = existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>) : {};
+  writeFileSync(path, JSON.stringify({ ...kept, ...bundles }, null, 2));
+}
+
+/** Rows as sorted JSON, compared as a multiset. */
+const multiset = (rows: readonly (readonly unknown[])[]) => rows.map((row) => JSON.stringify(row)).sort();
+
+/** The bucket (`whole` 0) or range (`whole` 1) rows of a grouping-set read, keeping `names`. */
+const wholeRows = (result: QueryResult, whole: number, names: readonly string[]) =>
+  result.rows.filter((row) => Number(row[0]) === whole).map((row) => names.map((name) => row[result.columns.findIndex((column) => column.name === name)]));
+
+test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE compares their work', async ({ server }) => {
+  const key = server.bootstrapServiceInTenant(server.seedTenant('ui-consolidated'), ['admin'], 'ui-consolidated-admin');
+  await seedSignals(server, key, { trace: '4bf92f3577b34da6a3ce929d0e0e4736', service: 'ui-agent' });
+  await seedPopulated(server, key);
+  const run = nodeExecutor(WyrdClient.connect({ credential: key }));
+  const bucket = '15 minutes';
+  const original = (id: string) => originalRead(id, bucket);
+  const report: Record<string, unknown> = {};
+
+  // Traces overview and facets: five plus five reads were one overview pair plus one facet read.
+  const facetColumns = ['service_name', 'name', 'status_code', 'http_response_status_code', 'gen_ai_operation_name'];
+  const traceOriginal = [...['trace-spans', 'trace-errors', 'trace-duration', 'trace-totals', 'trace-durations'].map(original), ...facetColumns.map((column) => original(`trace-facet-${column}`))];
+  const overview = traceOverviewReads({}, RANGE, bucket);
+  const traceNew = [overview.spans, overview.roots, facetsQuery({ signal: 'traces', facets: facetColumns }, RANGE)];
+  const [before, after] = [await readAll(run, traceOriginal), await readAll(run, traceNew)];
+  expect(multiset(wholeRows(after.values[0], 0, ['at', 'spans']))).toEqual(multiset(before.values[0].rows));
+  expect(multiset(wholeRows(after.values[0], 0, ['at', 'errors']))).toEqual(multiset(before.values[1].rows));
+  expect(multiset(wholeRows(after.values[1], 0, ['at', 'p95', 'p50']))).toEqual(multiset(before.values[2].rows));
+  expect([...wholeRows(after.values[0], 1, ['spans', 'traces', 'error_traces', 'span_p95_ms'])[0], ...wholeRows(after.values[1], 1, ['p95', 'p50'])[0]]).toEqual([...before.values[3].rows[0], ...before.values[4].rows[0]]);
+  // Independent fixture facts: seventeen spans of fifteen traces, one span an error.
+  expect(before.values[3].rows[0].slice(0, 3)).toEqual([17, 15, 1]);
+  facetColumns.forEach((_, index) => {
+    expect(multiset(facetRows(after.values[2], index, facetColumns.length)), facetColumns[index]).toEqual(multiset(before.values[5 + index].rows));
+  });
+  // Each facet keeps its own first ten values plus the eleventh, by trace count then value; an empty value ranks by its count.
+  const ten = (prefix: string, from = 0) => Array.from({ length: 10 }, (_, n) => [`${prefix}-${String(n + from).padStart(2, '0')}`, 1]);
+  const [services, names, , statuses, operations] = facetColumns.map((_, index) => facetRows(after.values[2], index, facetColumns.length));
+  expect(services).toEqual([['svc-00', 2], ...ten('svc', 1)]);
+  expect(names).toEqual([['chat ranker', 1], ['execute_tool search', 1], ['invoke_agent support', 1], ...ten('op').slice(0, 8)]);
+  expect(statuses).toEqual([[null, 2], ...Array.from({ length: 10 }, (_, n) => [200 + n, 1])]);
+  expect(operations).toEqual([[null, 3], ...ten('gen')]);
+  report.traces = { original: { ...(await executedWork(run, traceOriginal)), elapsed_ms: Math.round(before.elapsed) }, consolidated: { ...(await executedWork(run, traceNew)), elapsed_ms: Math.round(after.elapsed) } };
+
+  // Logs facets: four reads were one.
+  const logColumns = ['severity_text', 'service_name', 'event_name', 'exception_type'];
+  const logOriginal = logColumns.map((column) => original(`logs-facet-${column}`));
+  const logNew = [facetsQuery({ signal: 'logs', facets: logColumns }, RANGE)];
+  const [logBefore, logAfter] = [await readAll(run, logOriginal), await readAll(run, logNew)];
+  logColumns.forEach((_, index) => {
+    // Severity also carries its number.
+    expect(multiset(facetRows(logAfter.values[0], index, logColumns.length, index === 0 ? 2 : 1)), logColumns[index]).toEqual(multiset(logBefore.values[index].rows));
+  });
+  const [severities, logServices, events, exceptions] = logColumns.map((_, index) => facetRows(logAfter.values[0], index, logColumns.length, index === 0 ? 2 : 1));
+  expect(severities).toEqual([['INFO', 14, 9], ['ERROR', 1, 17]]);
+  expect(logServices).toEqual([['svc-00', 2], ...ten('svc', 1)]);
+  expect(events).toEqual([[null, 2], ...ten('event')]);
+  expect(exceptions).toEqual([[null, 2], ...ten('Err')]);
+  report.logs = { original: { ...(await executedWork(run, logOriginal)), elapsed_ms: Math.round(logBefore.elapsed) }, consolidated: { ...(await executedWork(run, logNew)), elapsed_ms: Math.round(logAfter.elapsed) } };
+
+  // The stat strip: a total and a bucket read per stat were one read per population.
+  const stats = ['traces', 'spans', 'errors', 'duration_p95', 'invocations', 'logs', 'log_errors', 'tokens', 'calls', 'cost'] as const;
+  const statOriginal = stats.flatMap((stat) => [original(`stat-${stat}-total`), original(`stat-${stat}-buckets`)]);
+  const statNew = statQueries({ stats: [...stats] }, RANGE, bucket);
+  const [statBefore, statAfter] = [await readAll(run, statOriginal), await readAll(run, statNew)];
+  stats.forEach((stat, index) => {
+    const at = statNew.findIndex((plan) => plan.stats.includes(index));
+    const currency = stat === 'cost' ? ['currency'] : [];
+    expect(multiset(wholeRows(statAfter.values[at], 1, [`s${index}`, ...currency])), `${stat} total`).toEqual(multiset(statBefore.values[index * 2].rows));
+  });
+  // Every stat's loaded series is its original bucket read: the error stats record one bucket, the counts two.
+  const loaded = await loadStatStrip({ stats: [...stats] }, { executor: run, range: RANGE });
+  expect(loaded.result.state, JSON.stringify(loaded.result)).toBe('populated');
+  const strip = loaded.result.state === 'populated' ? loaded.result.data.stats : [];
+  const loadedOriginal = await readAll(run, stats.map((stat) => originalRead(`stat-${stat}-buckets`, bucketFor(RANGE))));
+  stats.forEach((stat, index) => expect(strip[index].series.rows, `${stat} buckets`).toEqual(loadedOriginal.values[index].rows));
+  expect(strip.map(({ series }) => series.rows.length)).toEqual([2, 2, 1, 2, 1, 2, 1, 0, 0, 0]);
+  // One recorded error bucket draws no trend line; the counts over both buckets draw one.
+  const view = render(StatStrip, loaded);
+  for (const [label, line] of [['Error spans', false], ['Error logs', false], ['Agent invocations', false], ['Spans', true], ['Log records', true]] as const)
+    expect(view.getByRole('img', { name: `${label} per bucket` }).querySelector('polyline') !== null, label).toBe(line);
+  view.unmount();
+  report.statstrip = { original: { ...(await executedWork(run, statOriginal)), elapsed_ms: Math.round(statBefore.elapsed) }, consolidated: { ...(await executedWork(run, statNew)), elapsed_ms: Math.round(statAfter.elapsed) } };
+  // The plan comparison is diagnostic evidence, kept only where the run names a file.
+  recordDiagnostics(report);
+});
+
+/** A gateway whose upstream reports five input and three output tokens, except for `gpt-4o-nano`, which reports no usage. */
+const metered = serverTest({
+  perTest: true,
+  provider: ({ body }) => {
+    const reply = judgeReply('ok');
+    if (!body.includes('gpt-4o-nano')) return reply;
+    const { usage: _, ...unmetered } = reply.body as Record<string, unknown>;
+    return { ...reply, body: unmetered };
+  }
+});
+
+metered('gateway usage stats count tokens apart from calls and never add currencies', async ({ server }) => {
+  const client = WyrdClient.connect();
+  await configureGateway(client);
+  const gateway = await Gateway.connect({ client });
+  await gateway.putCapturePolicy({ mode: 'metadata', payload_fields: [] });
+  const priced = (model: string, currency: string, input: string, output: string) => ({
+    model: { deployment: 'openai', model },
+    version: `${model}-v1`,
+    currency,
+    effective_at: '2020-01-01T00:00:00Z',
+    active: true,
+    rates: [
+      { dimension: 'input_tokens', unit: '1m_tokens', price: input },
+      { dimension: 'output_tokens', unit: '1m_tokens', price: output }
+    ]
+  });
+  const call = async (model: string) => {
+    const answered = await client.httpAuth(`${server.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: `openai/${model}`, messages: [{ role: 'user', content: 'hi' }] })
+    });
+    expect(answered.status, await answered.clone().text()).toBe(200);
+  };
+  // Active pricing has one currency at a time: one EUR call, then, repriced in USD, two USD calls and one unpriced call reporting no tokens.
+  const govern = (pricing: ReturnType<typeof priced>[]) => gateway.putGovernancePolicy({ limits: [], budgets: [], unknown_cost: 'allow_unpriced', pricing });
+  await govern([priced('gpt-4o-mini', 'EUR', '1', '4')]);
+  await call('gpt-4o-mini');
+  await govern([priced('gpt-4o', 'USD', '2', '8')]);
+  for (const model of ['gpt-4o', 'gpt-4o', 'gpt-4o-nano']) await call(model);
+  server.flushBifrost();
+  const hour = 3_600_000;
+  const now = Math.floor(Date.now() / hour) * hour;
+  const range = { from: new Date(now - hour).toISOString(), to: new Date(now + 2 * hour).toISOString() };
+  const run = nodeExecutor(client);
+  const stats = ['tokens', 'calls', 'cost'] as const;
+  const loaded = await loadStatStrip({ stats: [...stats] }, { executor: run, range });
+  expect(loaded.result.state, JSON.stringify(loaded.result)).toBe('populated');
+  const strip = loaded.result.state === 'populated' ? loaded.result.data.stats : [];
+  // Independent facts: eight tokens for each of three metered calls; four calls; 2·5 + 8·3 per million USD twice, 1·5 + 4·3 per million EUR once.
+  expect(strip.map(({ total }) => total.rows.map((row) => row.map(String)))).toEqual([[['24']], [['4']], [['0.000017', 'EUR'], ['0.000068', 'USD']]]);
+  // Totals and buckets equal the original per-stat reads.
+  const original = await readAll(run, stats.flatMap((stat) => [originalRead(`stat-${stat}-total`, bucketFor(range), range), originalRead(`stat-${stat}-buckets`, bucketFor(range), range)]));
+  stats.forEach((stat, index) => {
+    expect(multiset(strip[index].total.rows), `${stat} total`).toEqual(multiset(original.values[index * 2].rows));
+    // The original orders buckets by time alone, so currencies within one bucket compare as a multiset.
+    expect(multiset(strip[index].series.rows), `${stat} buckets`).toEqual(multiset(original.values[index * 2 + 1].rows));
+  });
+  // The strip shows each currency's own amount, never their sum.
+  const view = render(StatStrip, loaded);
+  expect([...view.container.querySelectorAll('.value')].map((each) => each.textContent)).toEqual(['24', '4', '0.000017 EUR', '0.000068 USD']);
+  view.unmount();
 });
 
 test('TASK-004: Metric windows count every recorded value', async ({ server }) => {
@@ -519,4 +770,1422 @@ test('TASK-004: Metric windows count every recorded value', async ({ server }) =
       .map(([resource, , value]) => [JSON.parse(String(resource))['service.name'], value])
       .sort()
   ).toEqual([['api', 0.5], ['worker', 1.5]]);
+});
+
+test('card and prompt components use authorized host reads and actions', async ({ server, seeded }) => {
+  const cards = await Cards.connect();
+  const ui = (name: string) => fixture(`cards/ui_cards/${name}`);
+  /** A declared Prompt as the exact Prompt reference its components take. */
+  const asPrompt = (ref: Exact) => ({ ...ref, kind: 'Prompt' as const });
+  const older = asPrompt(exact(declared(await cards.declareFromPath(ui('support-reply-1.0.0.yaml')))));
+  const prompt = asPrompt(exact(declared(await cards.declareFromPath(ui('support-reply-1.1.0.yaml')))));
+  const agent = exact(declared(await cards.declareFromPath(ui('reply-agent.yaml'))));
+  const native = asPrompt(exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/native-prompt.yaml')))));
+  // Another tenant registers a Prompt of its own; this tenant never sees it.
+  const tenant = 'ui-cards-foreign';
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant(tenant), ['admin'], 'ui-cards-admin');
+  const foreignCards = await Cards.connect({ client: WyrdClient.connect({ credential: foreignKey }) });
+  const theirs = exact(declared(await foreignCards.declareFromPath(fixture('cards/gateway_inference/ask-prompt.yaml'))));
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // Inventory: one row per version, filtered by kind, name and label; the other tenant's Card never lists.
+      const prompts = await loadCardInventory({ kind: 'Prompt' }, context);
+      expect(prompts.result.state, surface).toBe('populated');
+      const uids = prompts.result.state === 'populated' ? prompts.result.data.items.map((item) => item.card_uid) : [];
+      expect(uids).toEqual(expect.arrayContaining([older.uid, prompt.uid, native.uid]));
+      expect(uids).not.toContain(theirs.uid);
+      const named = await loadCardInventory({ query: 'SUPPORT-reply' }, context);
+      expect(named.result.state === 'populated' && named.result.data.items.map((item) => item.version).sort()).toEqual(['1.0.0', '1.1.0']);
+      const labelled = await loadCardInventory({ query: 'labels.team = "support"', kind: 'Prompt' }, context);
+      expect(labelled.result.state === 'populated' && labelled.result.data.items.map((item) => item.card_uid).sort()).toEqual([older.uid, prompt.uid].sort());
+      expect((await loadCardInventory({ query: 'ask-prompt' }, context)).result).toMatchObject({ state: 'empty', reason: 'No Card version matches these filters.' });
+      expect((await loadCardInventory({ query: 'name = = "x"' }, context)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+
+      // Exact detail: facts, relationships in both directions and the registered files.
+      expect((await loadCardFacts({ cardRef: agent }, context)).result).toMatchObject({ state: 'populated', data: { metadata: { uid: agent.uid } } });
+      expect((await loadRelationshipList({ cardRef: agent }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { outbound: [{ ref: { kind: 'Prompt', name: 'support-reply', version: '1.1.0', uid: prompt.uid } }] }
+      });
+      expect((await loadRelationshipList({ cardRef: prompt }, context)).result).toMatchObject({ state: 'populated', data: { inbound: [{ ref: { uid: agent.uid } }] } });
+      expect((await loadCardFacts({ cardRef: { ...prompt, version: '9.9.9', uid: undefined } }, context)).result).toMatchObject({
+        state: 'error',
+        problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' }
+      });
+      expect((await loadCardFacts({ cardRef: theirs }, context)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' } });
+      const files = await loadArtifactTable({ cardRef: seeded.model }, context);
+      if (surface === 'node') {
+        expect(files.result).toMatchObject({ state: 'populated', data: [{ relative_path: 'support-model.bin' }] });
+        expect((await loadArtifactTable({ cardRef: agent }, context)).result).toMatchObject({ state: 'empty' });
+      } else {
+        // The MCP server has no file-listing tool yet; the panel shows its refusal.
+        expect(files.result.state, JSON.stringify(files.result)).toBe('error');
+      }
+
+      // Prompt: authored forms kept, server-derived variables, its Agent and a comparison.
+      expect((await loadPromptMessages({ cardRef: prompt }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { system: 'You answer support tickets.\nCite the policy section you rely on.', response_format: 'verdict' }
+      });
+      expect((await loadPromptMessages({ cardRef: native }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { format: 'chat_completion', body: { seed: 123, future_knob: { enabled: true } } }
+      });
+      expect((await loadPromptMessages({ cardRef: agent }, context)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+      expect((await loadPromptVariables({ cardRef: prompt }, context)).result).toEqual({
+        state: 'populated',
+        data: [
+          { name: 'ticket', kind: 'text' },
+          { name: 'tone', kind: 'text' }
+        ]
+      });
+      expect((await loadUsedBy({ cardRef: prompt }, context)).result).toMatchObject({
+        state: 'populated',
+        data: [{ ref: { uid: agent.uid }, agent: { state: 'populated', data: { route: { kind: 'native' }, services: [] } } }]
+      });
+      expect((await loadUsedBy({ cardRef: older }, context)).result).toMatchObject({ state: 'empty' });
+      const diff = await loadVersionDiff({ cardRef: prompt }, context);
+      expect(diff.result.state === 'populated' && [diff.result.data.other, diff.result.data.changes.map((change) => change.field)]).toEqual([
+        '1.0.0',
+        ['system', 'messages[0]', 'response_format', 'variables']
+      ]);
+      expect((await loadVersionDiff({ cardRef: older, otherVersion: '1.1.0' }, context)).result).toMatchObject({ state: 'populated', data: { other: '1.1.0' } });
+      expect((await loadVersionDiff({ cardRef: native }, context)).result).toMatchObject({ state: 'empty', reason: 'Only version 1.0.0 is registered.' });
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal without card permission sees each component denied and no dependent read.
+  const runs: WireRequest[][] = [];
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_cards_denied', ['bifrost_query:read']) }));
+  // Each loader stands alone here: a page's panels share one context, and with it one read of each Card.
+  const denied = (): { executor: Executor } => ({ executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } });
+  for (const loaded of await Promise.all([
+    loadCardInventory({}, denied()),
+    loadCardFacts({ cardRef: agent }, denied()),
+    loadRelationshipList({ cardRef: agent }, denied()),
+    loadArtifactTable({ cardRef: seeded.model }, denied()),
+    loadPromptMessages({ cardRef: prompt }, denied()),
+    loadPromptVariables({ cardRef: prompt }, denied()),
+    loadUsedBy({ cardRef: prompt }, denied()),
+    loadVersionDiff({ cardRef: prompt }, denied())
+  ]))
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect(runs.every((requests) => requests.length === 1)).toBe(true);
+  expect(runs).toHaveLength(8);
+
+  // BFF: the other tenant's browser session lists its own Prompt and never this tenant's.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+  const cookies = jar();
+  await browserSessions.signInWithApiKey(tenant, foreignKey, url, cookies);
+  const browserSession = await browserSessions.read(tenant, url, cookies);
+  const bff = async (body: unknown) => {
+    const response = await loadPanel({
+      locals: { browserSession },
+      request: new Request(url, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } })
+    } as never);
+    const text = await response.text();
+    expect(text).not.toContain(foreignKey);
+    return JSON.parse(text) as { result: { state: string; data?: { items: { card_uid: string }[] } } };
+  };
+  const listed = await bff({ component: 'CardInventory', input: {}, range: RANGE });
+  const visible = listed.result.data?.items.map((item) => item.card_uid) ?? [];
+  expect(visible).toContain(theirs.uid);
+  for (const ours of [older, prompt, agent, native, seeded.model]) expect(visible).not.toContain(ours.uid);
+  expect(await bff({ component: 'PromptMessages', input: { cardRef: prompt }, range: RANGE })).toMatchObject({
+    result: { state: 'error', problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' } }
+  });
+
+  // T4: the built HTML renders Card and Prompt panels through host tools/call alone.
+  const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range: RANGE,
+    panels: [
+      { id: 'cards', component: 'CardInventory', input: { kind: 'Prompt' } },
+      { id: 'messages', component: 'PromptMessages', input: { cardRef: PROMPT } },
+      { id: 'used', component: 'UsedBy', input: { cardRef: PROMPT } }
+    ]
+  };
+  const app = await appBridgeView(doc, (name, args) => {
+    if (name === 'cards.list') return { items: inventory.filter((item) => (item as { kind: string }).kind === 'Prompt'), next_cursor: null };
+    if (name === 'cards.get') return { card: (args.card_ref as { name: string }).name === AGENT.name ? agentCard : prompts['1.1.0'] };
+    return notFound;
+  });
+  await vi.waitFor(() => expect(app.document.querySelector('[data-panel="used"]')?.textContent).toContain(AGENT.name));
+  expect(app.document.querySelector('[data-panel="cards"]')?.textContent).toContain(PROMPT.name);
+  expect(app.document.querySelector('[data-panel="messages"]')?.textContent).toContain('{{ticket}}');
+  expect(app.calls.map((call) => call.name).sort()).toEqual(['cards.get', 'cards.get', 'cards.get', 'cards.list']);
+  expect(app.calls.find((call) => call.name === 'cards.list')?.arguments).toMatchObject({ kind: 'Prompt', limit: 50 });
+});
+
+test('an exact Verifier definition and where it runs load through every authorized host', async ({ server, seeded: _seeded }) => {
+  const cards = await Cards.connect();
+  // A Service bound to a three-step Verifier, a component-bound Verifier and a drift Verifier nothing binds.
+  const receipt = await cards.declareFromPath(fixture('cards/verifier_building_blocks/policy-desk.yaml'));
+  const desk = exact(declared(receipt));
+  const review = exact(declared(receipt, 'policy-review'));
+  const promise = exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-desk.yaml')), 'no-refund-promise'));
+  const drift = exact(declared(await cards.declareFromPath(fixture('cards/mcp_investigation/drift-verifier.yaml'))));
+  const tenant = 'ui-verifier-foreign';
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant(tenant), ['admin'], 'ui-verifier-admin');
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // The declared graph: every input, step and requirement, and the dependencies its references name.
+      const definition = await loadVerifierDefinition({ cardRef: review }, context);
+      if (definition.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(definition.result)}`);
+      const { graph, spec } = definition.result.data;
+      expect(spec.description).toBe('A support answer follows its refund policy and was looked up, not guessed.');
+      expect(graph.inputs.map((input) => [input.id, input.kind])).toEqual([['answer', 'json'], ['policy', 'media'], ['trace', 'trace']]);
+      expect(graph.steps.map((step) => [step.id, step.kind, step.needs, step.requirements.map((each) => each.id)])).toEqual([
+        ['policy-text', 'extract', [], ['policy-has-text']],
+        ['refund-rules', 'agent', ['policy-text'], ['limit-found']],
+        ['answer-facts', 'code', ['refund-rules'], []]
+      ]);
+      expect(graph.requirements.map((each) => each.id)).toEqual(['refund-within-limit', 'policy-looked-up', 'answer-drafted-after-lookup', 'lookup-read-refunds', 'follows-policy', 'names-the-policy']);
+      expect(graph.edges).toHaveLength(13);
+      expect(graph.edges).toEqual(
+        expect.arrayContaining([
+          { source: 'input:policy', target: 'step:policy-text' },
+          { source: 'step:answer-facts', target: 'req:refund-within-limit', label: 'within_limit' },
+          { source: 'input:trace', target: 'req:policy-looked-up' },
+          { source: 'step:policy-text', target: 'step:refund-rules', label: 'outline' },
+          { source: 'step:refund-rules', target: 'req:follows-policy', label: 'rules' }
+        ])
+      );
+      // Drift-shaped: one samples input judged by one whole-Verifier requirement.
+      expect((await loadVerifierDefinition({ cardRef: drift }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { graph: { inputs: [{ id: 'latency', kind: 'samples' }], steps: [], requirements: [{ kind: 'drift' }], edges: [{ source: 'input:latency', target: 'req:latency-under-threshold' }] } }
+      });
+
+      // Where it runs: the Service itself, one component of another Service, and nothing.
+      expect((await loadRunsOn({ cardRef: review }, context)).result).toMatchObject({
+        state: 'populated',
+        data: [{ ref: { kind: 'Service', name: 'policy-desk', uid: desk.uid }, bindings: { state: 'populated', data: [{ when: 'explicit invocation only' }] } }]
+      });
+      expect((await loadRunsOn({ cardRef: promise }, context)).result).toMatchObject({
+        state: 'populated',
+        data: [{ ref: { kind: 'Service', name: 'support-desk' }, bindings: { state: 'populated', data: [{ subject: 'agent', when: 'explicit invocation only' }] } }]
+      });
+      expect((await loadRunsOn({ cardRef: drift }, context)).result).toMatchObject({ state: 'empty', reason: 'No binding runs this exact version.' });
+
+      // A missing version and a Card of another kind are refused, never replaced by another version.
+      for (const load of [loadVerifierDefinition, loadRunsOn]) {
+        expect((await load({ cardRef: { ...review, version: '9.9.9', uid: undefined } }, context)).result).toMatchObject({
+          state: 'error',
+          problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' }
+        });
+        expect((await load({ cardRef: desk }, context)).result).toMatchObject({
+          state: 'error',
+          problem: { code: 'WYRD_SPEC_400_VALIDATION', detail: 'policy-desk@1.0.0 is a Service Card, not a Verifier' }
+        });
+      }
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal without card permission sees both denied after one read each.
+  const runs: WireRequest[][] = [];
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_verifier_denied', ['bifrost_query:read']) }));
+  const denied = (): { executor: Executor } => ({ executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } });
+  for (const loaded of [await loadVerifierDefinition({ cardRef: review }, denied()), await loadRunsOn({ cardRef: review }, denied())])
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect(runs.map((requests) => requests.length)).toEqual([1, 1]);
+
+  // BFF: another tenant's browser session cannot read this tenant's Verifier.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+  const cookies = jar();
+  await browserSessions.signInWithApiKey(tenant, foreignKey, url, cookies);
+  const browserSession = await browserSessions.read(tenant, url, cookies);
+  for (const component of ['VerifierDefinition', 'RunsOn']) {
+    const response = await loadPanel({
+      locals: { browserSession },
+      request: new Request(url, { method: 'POST', body: JSON.stringify({ component, input: { cardRef: review }, range: RANGE }), headers: { 'content-type': 'application/json' } })
+    } as never);
+    expect(await response.json(), component).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' } } });
+  }
+
+  // Custom app: its server loads the same props with WYRD_API_KEY and never returns the key.
+  for (const component of ['VerifierDefinition', 'RunsOn']) {
+    const response = await loadExamplePanel({
+      request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component, input: { cardRef: review }, range: RANGE }) })
+    } as never);
+    const text = await response.text();
+    expect(text).not.toContain(server.apiKey);
+    expect(JSON.parse(text), component).toMatchObject({ result: { state: 'populated' } });
+  }
+
+  // The built HTML draws the registered declaration and its binding through host tools/call alone.
+  const [verifier, service] = await nodeExecutor(client).run([
+    { op: 'cards.get_by_ref', card_ref: review },
+    { op: 'cards.get_by_ref', card_ref: desk }
+  ]);
+  if (!verifier.ok || !service.ok) throw new Error('the registered Cards did not read back');
+  const app = await appBridgeView(
+    {
+      version: 'wyrd.view/v1',
+      catalogId: 'wyrd.ui/v1',
+      range: RANGE,
+      panels: [
+        { id: 'definition', component: 'VerifierDefinition', input: { cardRef: review } },
+        { id: 'runs', component: 'RunsOn', input: { cardRef: review } }
+      ]
+    },
+    (name, args) => (name === 'cards.get' ? { card: (args.card_ref as { kind: string }).kind === 'Service' ? service.value : verifier.value } : notFound)
+  );
+  await vi.waitFor(() => expect(app.document.querySelector('[data-panel="runs"]')?.textContent).toContain('policy-desk'));
+  const drawn = app.document.querySelector('[data-panel="definition"]') as Element;
+  await vi.waitFor(() => expect(drawn.querySelector('[data-node]')).not.toBeNull());
+  expect([...drawn.querySelectorAll('[data-node]')].map((node) => node.getAttribute('data-node'))).toEqual(
+    expect.arrayContaining(['input:policy', 'step:refund-rules', 'req:limit-found', 'req:follows-policy'])
+  );
+  expect(drawn.querySelectorAll('[data-edge]')).toHaveLength(13);
+  // Both panels read the Verifier; the view issues that identical read once, then the owner's.
+  expect(app.calls.map((call) => call.name)).toEqual(['cards.get', 'cards.get', 'cards.get']);
+});
+
+/** The populated data of one execution load, or its refusal as a failure. */
+function data(loaded: Awaited<ReturnType<typeof loadExecution>>, surface: string) {
+  if (loaded.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(loaded.result)}`);
+  return loaded.result.data;
+}
+
+test('an unfinished execution shows recorded progress and retained outputs through every authorized host, and cancels once', async ({ server, seeded: _seeded }) => {
+  const { executionId, verifier } = server.holdPublications('ui-held');
+  server.flushBifrost();
+  const attempt = { item_index: null, iteration_index: null, attempt: 1 };
+  const tree = { executionId, node: 'step:draft', producer: attempt, output: 'tree' };
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // Running, with no result: the Verifier it ran is found by its recorded UID, never by name.
+      const open = data(await loadExecution({ executionId, node: 'outputs', details: true }, context), surface);
+      expect([open.status.status, open.status.result], surface).toEqual(['running', undefined]);
+      expect(open.definition, surface).toMatchObject({ state: 'populated', data: { ref: { kind: 'Verifier', uid: verifier }, graph: { requirements: [{ kind: 'drift' }] } } });
+      expect(open.publications?.state === 'populated' && open.publications.data.items.map((item) => [item.producer.step_id, item.name, item.kind]), surface).toEqual([
+        ['review', 'verdict', 'json'],
+        ['review', 'nothing', 'json'],
+        ['draft', 'report', 'file'],
+        ['draft', 'tree', 'directory']
+      ]);
+      expect(open.invocations?.state, surface).toBe('populated');
+      // No result yet: completed details are not read and say why.
+      expect(open.details, surface).toEqual({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' });
+      expect(open.publication, surface).toBeUndefined();
+
+      // One exact intermediate publication of one producer attempt, and a recorded null kept apart from no output.
+      const selected = data(await loadExecution(tree, context), surface);
+      expect(selected.publication, surface).toMatchObject({
+        state: 'populated',
+        data: { name: 'tree', kind: 'directory', producer: { step_id: 'draft', attempt: 1 }, manifest: { files: [{ path: 'a.md' }, { path: 'nested/b.md' }], directories: ['nested'] } }
+      });
+      expect(data(await loadExecution({ ...tree, node: 'step:review', output: 'nothing' }, context), surface).publication, surface).toMatchObject({ state: 'populated', data: { kind: 'json', value: null } });
+      // A retained text file previews as text where the host can read file content; an MCP host has no such tool and says so, keeping the manifest.
+      const report = data(await loadExecution({ ...tree, output: 'report' }, context), surface);
+      expect(report.publication, surface).toMatchObject({ state: 'populated', data: { kind: 'file', manifest: { files: [{ path: 'report', size_bytes: 9 }] } } });
+      if (surface === 'node') expect(report.text, surface).toEqual({ state: 'populated', data: { text: '# Report\n', truncated: false } });
+      else expect(report.text?.state, surface).toBe('error');
+      // Another attempt and an unknown output are refusals of that part only.
+      for (const missing of [{ ...tree, producer: { ...attempt, attempt: 2 } }, { ...tree, output: 'absent' }]) {
+        const loaded = data(await loadExecution(missing, context), surface);
+        expect(loaded.publication, surface).toMatchObject({ state: 'error', problem: { status: 404 } });
+        expect(loaded.publications?.state, surface).toBe('populated');
+      }
+      // An execution that does not exist ends the load at its first read.
+      expect((await loadExecution({ executionId: '0192f0a0-0000-7000-8000-000000000000' }, context)).result, surface).toMatchObject({
+        state: 'error',
+        problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' }
+      });
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal that may query but not read executions is denied after one read; nothing dependent is asked.
+  const runs: WireRequest[][] = [];
+  const restrictedKey = server.scopedApiKey('ui_execution_denied', ['bifrost_query:read']);
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: restrictedKey }));
+  const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
+  expect((await loadExecution(tree, denied)).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect(runs.map((requests) => requests.map((request) => request.op))).toEqual([['verification.get_execution']]);
+
+  // BFF: this tenant's browser session loads the same props; another tenant's finds no such execution.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const session = async (tenant: string, key: string) => {
+    const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+    const cookies = jar();
+    await browserSessions.signInWithApiKey(tenant, key, url, cookies);
+    return { url, browserSession: await browserSessions.read(tenant, url, cookies) };
+  };
+  const panel = async ({ url, browserSession }: Awaited<ReturnType<typeof session>>) =>
+    (
+      await loadPanel({
+        locals: { browserSession },
+        request: new Request(url, { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }), headers: { 'content-type': 'application/json' } })
+      } as never)
+    ).json();
+  const own = await session('test-tenant-1', server.apiKey);
+  const viewer = await session('test-tenant-1', server.bootstrapService(['viewer'], 'ui-execution-viewer'));
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant('ui-execution-foreign'), ['admin'], 'ui-execution-admin');
+  const foreign = await session('ui-execution-foreign', foreignKey);
+  expect(await panel(own)).toMatchObject({
+    result: { state: 'populated', data: { status: { status: 'running' }, definition: { state: 'populated', data: { ref: { uid: verifier } } }, publication: { state: 'populated', data: { kind: 'directory' } } } }
+  });
+  expect(await panel(foreign)).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
+
+  // The host download leaves as an attachment the browser may not sniff; another tenant's session gets the server's refusal.
+  const event = (from: Awaited<ReturnType<typeof session>>, path: string) =>
+    ({ locals: { browserSession: from.browserSession }, params: { tenantKey: 'test-tenant-1', executionId }, url: new URL(`http://ui.test/x/${path}`) }) as never;
+  const file = await downloadPublication(event(own, 'download?step=draft&name=tree&attempt=1&path=nested/b.md'));
+  expect([file.status, file.headers.get('content-type'), file.headers.get('content-disposition'), file.headers.get('x-content-type-options'), await file.text()]).toEqual([
+    200,
+    'application/octet-stream',
+    "attachment; filename*=UTF-8''b.md",
+    'nosniff',
+    'beta'
+  ]);
+  expect((await downloadPublication(event(foreign, 'download?step=draft&name=report&attempt=1'))).status).toBe(404);
+  // A JSON value is not a file: the existing operation refuses it and the host relays that.
+  expect((await downloadPublication(event(own, 'download?step=review&name=verdict&attempt=1'))).status).toBe(400);
+
+  // Cancel: a viewer and another tenant are refused and the execution keeps running; the owner's cancel is recorded once and a repeat keeps it.
+  expect(await (await cancelExecution(event(viewer, 'cancel'))).json()).toMatchObject({ code: DENIED, status: 403 });
+  expect(await (await cancelExecution(event(foreign, 'cancel'))).json()).toMatchObject({ code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', status: 404 });
+  expect(await panel(own)).toMatchObject({ result: { data: { status: { status: 'running' } } } });
+  for (const _ of [1, 2]) expect(await (await cancelExecution(event(own, 'cancel'))).json()).toEqual({ execution_id: executionId, status: 'cancelled' });
+
+  // Custom app, after settlement: the same execution, cancelled with no result, still lists what it retained.
+  const response = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  const text = await response.text();
+  expect(text).not.toContain(server.apiKey);
+  const settled = JSON.parse(text) as Awaited<ReturnType<typeof loadExecution>>;
+  expect(settled).toMatchObject({ result: { state: 'populated', data: { status: { status: 'cancelled' }, publication: { state: 'populated', data: { kind: 'directory' } } } } });
+  expect(data(settled, 'app').publications).toMatchObject({ state: 'populated', data: { items: [{}, {}, {}, {}] } });
+  // Recorded progress stays readable after the cancel, through Node and the custom app alike.
+  const afterCancel = data(await loadExecution({ executionId }, { executor: nodeExecutor(client) }), 'node after cancel');
+  expect(afterCancel.invocations?.state).toBe('populated');
+  expect(data(settled, 'app').invocations).toEqual(afterCancel.invocations);
+
+  // An execution the app's credential cannot find is the server's refusal, not an empty panel.
+  const missing = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: { executionId: '0192f0a0-0000-7000-8000-000000000000' }, range: RANGE }) })
+  } as never);
+  expect(await missing.json()).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
+
+  // Run as another tenant's key, the app finds no such execution.
+  vi.stubEnv('WYRD_API_KEY', foreignKey);
+  const other = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  vi.stubEnv('WYRD_API_KEY', server.apiKey);
+  expect(await other.json()).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
+
+  // The built HTML draws that execution through host tools/call alone, each answered by the real MCP server.
+  const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: client.httpAuth }));
+  try {
+    const app = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] },
+      async (name, args) => ((await host.callTool({ name, arguments: args })).structuredContent ?? {}) as object
+    );
+    const drawn = () => app.document.querySelector('[data-panel="execution"]') as Element;
+    await vi.waitFor(() => expect(drawn().querySelector('[data-execution-status]')?.getAttribute('data-execution-status')).toBe('cancelled'));
+    await vi.waitFor(() => expect(drawn().querySelector('[data-node]')).not.toBeNull());
+    expect(drawn().querySelector('[data-preview]')?.textContent).toContain('nested/b.md');
+    expect(drawn().textContent).not.toMatch(/passed|failed/);
+    expect(new Set(app.calls.map((call) => call.name))).toEqual(
+      new Set(['verification.get_execution', 'bifrost.query', 'cards.get', 'verification.list_invocations', 'verification.list_publications', 'verification.get_publication'])
+    );
+    // The same artifact shows the MCP server's refusal of an unknown execution and asks for nothing else.
+    const refusing = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: { executionId: '0192f0a0-0000-7000-8000-000000000000' } }] },
+      async (name, args) => (await host.callTool({ name, arguments: args })) as object
+    );
+    await vi.waitFor(() => expect(refusing.document.querySelector('[data-panel="execution"]')?.textContent).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND'));
+    expect(refusing.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
+  } finally {
+    await host.close();
+  }
+
+  // Answered by the MCP server as another tenant, the artifact shows that refusal for the real execution and reads nothing further.
+  const outsider = new Client({ name: 'wyrd-ui-artifact-outsider', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await outsider.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: WyrdClient.connect({ credential: foreignKey }).httpAuth }));
+  try {
+    const refused = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] },
+      async (name, args) => (await outsider.callTool({ name, arguments: args })) as object
+    );
+    await vi.waitFor(() => expect(refused.document.querySelector('[data-panel="execution"]')?.textContent).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND'));
+    expect(refused.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
+  } finally {
+    await outsider.close();
+  }
+
+  // The restricted principal is refused the same way through the remaining hosts: denied, never empty, and nothing asked after the one read.
+  const refusal = { result: { state: 'denied', problem: { code: DENIED } } };
+  expect(await panel(await session('test-tenant-1', restrictedKey))).toMatchObject(refusal);
+  vi.stubEnv('WYRD_API_KEY', restrictedKey);
+  const appDenied = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  vi.stubEnv('WYRD_API_KEY', server.apiKey);
+  expect(await appDenied.json()).toMatchObject(refusal);
+  const restricted = new Client({ name: 'wyrd-ui-artifact-restricted', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await restricted.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: WyrdClient.connect({ credential: restrictedKey }).httpAuth }));
+  try {
+    const asked: string[][] = [];
+    const tools = mcpExecutor({ callServerTool: (params, options) => restricted.callTool(params, options) });
+    const counted: Executor = { run: ((requests, signal) => (asked.push(requests.map((request) => request.op)), tools.run(requests, signal))) as Executor['run'] };
+    expect(await loadExecution(tree, { executor: counted })).toMatchObject(refusal);
+    expect(asked).toEqual([['verification.get_execution']]);
+    const drawn = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] },
+      async (name, args) => (await restricted.callTool({ name, arguments: args })) as object
+    );
+    await vi.waitFor(() => expect(drawn.document.querySelector('[data-panel="execution"]')?.textContent).toContain(DENIED));
+    expect(drawn.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
+  } finally {
+    await restricted.close();
+  }
+
+  // A server that cannot be reached is a problem through every host: never an empty panel, never recorded state.
+  const DOWN = 'http://127.0.0.1:9';
+  const unreachable = (surface: string, loaded: unknown) => {
+    expect(loaded, surface).toMatchObject({ result: { state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } } });
+    // Unreachable is not "no such execution".
+    expect(JSON.stringify(loaded), surface).not.toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  };
+  unreachable('node', await loadExecution(tree, { executor: nodeExecutor(WyrdClient.connect({ serverUrl: DOWN, credential: server.apiKey })) }));
+  const gone = await mcpOver(server.baseUrl, client);
+  await gone.close();
+  unreachable('mcp', await loadExecution(tree, { executor: gone.executor }));
+  env.WYRD_SERVER_URL = DOWN;
+  unreachable('bff', await panel(own));
+  env.WYRD_SERVER_URL = server.baseUrl;
+  vi.stubEnv('WYRD_SERVER_URL', DOWN);
+  const appDown = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  vi.stubEnv('WYRD_SERVER_URL', server.baseUrl);
+  unreachable('app', await appDown.json());
+  const dark = await appBridgeView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] }, async () => {
+    throw new Error('the host cannot reach its server');
+  });
+  await vi.waitFor(() => expect(dark.document.querySelector('[data-panel="execution"]')?.textContent).toMatch(/WYRD_[A-Z0-9_]+/));
+  expect(dark.document.querySelector('[data-panel="execution"]')?.textContent).not.toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  expect(dark.document.querySelector('[data-execution-status]')).toBeNull();
+});
+
+/** A fresh server that runs Verifiers, with the assistant Service registered. */
+const judged = assistantTest({ perTest: true });
+
+judged('a judged execution shows its judgments, accepted inputs, completed details, drift and session through the Node and MCP hosts', async ({ server, assistant, state }) => {
+  const cards = await Cards.connect();
+  const token = await WyrdClient.connect().accessToken();
+  /** The one binding of `owner` whose status carries `field`: a schedule or a session end. */
+  const bindingWith = async (owner: Exact, field: string) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as Record<string, unknown>)[field]) return id;
+    }
+    throw new Error(`${owner.name} has no binding with ${field}`);
+  };
+  const submit = async (verifier: string, answer: string) => {
+    const submitted = await state.run('agent').observe.submit(verifier, { answer });
+    if (submitted.kind !== 'queued') throw new Error(`${verifier} queues an execution`);
+    await submitted.execution.wait({ timeoutMs: 60_000 });
+    return submitted.execution.id;
+  };
+  // Two Run executions: a failed assertion and a judged answer that cites its input.
+  const refused = await submit('answer-check', 'no');
+  const agreed = await submit('answer-judged', 'yes');
+
+  // A scheduled drift window far from its fitted baseline.
+  const latency = (await cards.get({ kind: 'Verifier', name: 'latency-drift', version: '1.0.0' })).metadata.uid as string;
+  server.waitForBaseline(latency, 90_000);
+  await state.startBifrost();
+  const model = state.run('model');
+  for (let sample = 0; sample < 100; sample += 1) await model.observe.submit('latency-drift', { latency: 99 });
+  await state.shutdown();
+  server.flushBifrost();
+  const schedule = await bindingWith(exact(assistant.service), 'next_run_at');
+  server.makeBindingDue(schedule);
+  const drifted = (await scheduledResult(server, schedule, 90_000)).execution_id;
+
+  // A session: three turns of one conversation, judged together when it ends.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-session-'));
+  await cards.pull(support.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: support.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  const conversation = desk.run('agent');
+  for (const turn of [1, 2, 3]) await conversation.observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-conversation' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await bindingWith(exact(declared(support)), 'group_end'), 90_000);
+  server.flushBifrost();
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // A failed execution opens on its first failed requirement, with the judgment the server recorded.
+      const failed = await loadExecution({ executionId: refused, details: true }, context);
+      expect(failed.input.node, surface).toBe('req:says-yes');
+      const open = data(failed, surface);
+      expect(open.status, surface).toMatchObject({
+        status: 'completed',
+        result: { verifier: { name: 'answer-check', uid: assistant.answerCheck.uid }, outcome: { verdict: 'failed', requirements: [{ id: 'says-yes', outcome: 'failed', reason: 'operator Equals returned false', actual: 'no' }] } }
+      });
+      expect(open.definition, surface).toMatchObject({ state: 'populated', data: { ref: { uid: assistant.answerCheck.uid }, graph: { edges: [{ source: 'input:answer', target: 'req:says-yes' }] } } });
+      // A Verifier without steps whose result is recorded reads no progress; outputs are read only when opened.
+      expect([open.invocations, open.publications], surface).toEqual([undefined, undefined]);
+      expect(data(await loadExecution({ executionId: refused, node: 'outputs' }, context), surface).publications, surface).toMatchObject({ state: 'populated', data: { items: [] } });
+      expect(open.details, surface).toMatchObject({ state: 'populated', data: { execution_id: refused, outcome: { requirements: [{ id: 'says-yes' }] } } });
+      // Details are read only when asked for; the accepted input is read for its selected node only.
+      const input = data(await loadExecution({ executionId: refused, node: 'input:answer' }, context), surface);
+      expect([input.details, input.inputs], surface).toEqual([undefined, { state: 'populated', data: { kind: 'json', value: 'no' } }]);
+      expect(open.inputs, surface).toBeUndefined();
+
+      // A judged requirement keeps its reason and the citation into the input it judged.
+      const cited = data(await loadExecution({ executionId: agreed, node: 'req:agrees' }, context), surface);
+      expect(cited.status.result?.outcome, surface).toMatchObject({
+        verdict: 'passed',
+        requirements: [{ id: 'agrees', outcome: 'passed', reason: 'it agrees', citations: [{ slot: 'answer', locator: { json_pointer: '' } }] }]
+      });
+
+      // Drift: the report of this execution, with its binding's retained history ending at this window.
+      const drift = data(await loadExecution({ executionId: drifted }, context), surface);
+      expect(drift.status.result, surface).toMatchObject({ verifier: { name: 'latency-drift' }, outcome: { verdict: 'failed', requirements: [{ id: 'latency-stable', outcome: 'failed' }] } });
+      expect(drift.status.result?.outcome.requirements[0]?.detail?.drift.features.latency?.score ?? 0, surface).toBeGreaterThan(0.25);
+      const history = drift.drift?.state === 'populated' ? drift.drift.data.history : [];
+      expect(history.map((point) => point.execution_id), surface).toEqual([drifted]);
+      expect(history[0]?.scores.latency ?? 0, surface).toBeGreaterThan(0.25);
+      expect(drift.drift?.state === 'populated' && drift.drift.data.window_end, surface).toEqual(expect.any(String));
+      // A requirement that is not drift reads no drift history.
+      expect(open.drift, surface).toBeUndefined();
+
+      // Session: the group execution names its owner and its members, each read as its own exact execution.
+      const group = data(await loadExecution({ executionId: session.execution_id, node: 'input:turns' }, context), surface);
+      expect(group.status, surface).toMatchObject({ group_id: 'ui-conversation', owner_card_uid: declared(support).uid, result: { outcome: { verdict: 'passed' } } });
+      expect(group.members?.map((member) => [member.execution_id, member.status?.state === 'populated' && member.status.data.status]), surface).toEqual(
+        (session.group?.sources.turns.execution_ids ?? []).map((id) => [id, 'completed'])
+      );
+      expect(group.members, surface).toHaveLength(3);
+      expect(group.inputs, surface).toBeUndefined();
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // Cancel after completion: the terminal state wins, and the judged result stays readable.
+  const late = await client.httpAuth(`${server.baseUrl}/v1/verification/executions/${refused}/cancel`, { method: 'POST' });
+  expect([late.status, await late.json()]).toEqual([200, { execution_id: refused, status: 'completed' }]);
+  expect(data(await loadExecution({ executionId: refused }, { executor: nodeExecutor(client) }), 'late').status.result?.outcome.verdict).toBe('failed');
+
+  // A turn observed after the session was judged joins no recorded membership: the judged execution keeps its three pinned members and verdict.
+  const later = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await later.startBifrost();
+  await later.run('agent').observe.verify('turn-check', { turn: 4, answer: 'answer 4' }, { positional: true, group_id: 'ui-conversation' });
+  await later.shutdown();
+  server.flushBifrost();
+  const pinned = data(await loadExecution({ executionId: session.execution_id, node: 'input:turns' }, { executor: nodeExecutor(client) }), 'later turn');
+  expect(pinned.members?.map((member) => member.execution_id)).toEqual(session.group?.sources.turns.execution_ids);
+  expect(pinned.status.result?.outcome.verdict).toBe('passed');
+
+  // A second drift window of the same binding: its history holds both windows, oldest first, ending at the viewed one; the first window's own history is unchanged.
+  const sampler = WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential: assistant.key }) });
+  await sampler.startBifrost();
+  for (let sample = 0; sample < 100; sample += 1) await sampler.run('model').observe.submit('latency-drift', { latency: 99 });
+  await sampler.shutdown();
+  server.flushBifrost();
+  server.makeBindingDue(schedule);
+  const windows = async () => {
+    server.flushBifrost();
+    const [read] = await nodeExecutor(client).run([{ op: 'bifrost.query', sql: 'SELECT execution_id FROM bifrost.verification.results WHERE binding_id = $1 ORDER BY ended_at', params: [schedule], max_rows: 10 }]);
+    return read.ok ? read.value.rows.map(([id]) => String(id)) : [];
+  };
+  await vi.waitFor(async () => expect(await windows()).toHaveLength(2), { timeout: 90_000, interval: 1_000 });
+  const [, second] = await windows();
+  for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', (await mcpOver(server.baseUrl, client)).executor]] as const) {
+    const points = async (executionId: string) => {
+      const loaded = data(await loadExecution({ executionId }, { executor }), surface).drift;
+      return loaded?.state === 'populated' ? loaded.data.history.map((point) => point.execution_id) : [];
+    };
+    expect(await points(second), surface).toEqual([drifted, second]);
+    expect(await points(drifted), surface).toEqual([drifted]);
+  }
+
+  // Another tenant reads none of them, by ID alone, through either host.
+  const outsider = WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') });
+  // A principal that may read executions only: the recorded judgments and the retained inputs load, and the Verifier's definition, a separate Card read, is denied.
+  const limited = WyrdClient.connect({ credential: server.scopedApiKey('ui_judged_narrow', ['executions:read']) });
+  const [foreignMcp, narrowMcp] = [await mcpOver(server.baseUrl, outsider), await mcpOver(server.baseUrl, limited)];
+  try {
+    for (const [surface, foreign, narrow] of [['node', nodeExecutor(outsider), nodeExecutor(limited)], ['mcp', foreignMcp.executor, narrowMcp.executor]] as const) {
+      for (const executionId of [refused, drifted, session.execution_id])
+        expect((await loadExecution({ executionId }, { executor: foreign })).result, surface).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+      const partial = data(await loadExecution({ executionId: refused, node: 'input:answer' }, { executor: narrow }), surface);
+      expect(partial.status.result?.outcome.verdict, surface).toBe('failed');
+      expect(partial.invocations, surface).toBeUndefined();
+      expect([partial.definition, partial.inputs], surface).toMatchObject([
+        { state: 'denied', problem: { code: DENIED } },
+        { state: 'populated', data: { kind: 'json', value: 'no' } }
+      ]);
+    }
+  } finally {
+    await foreignMcp.close();
+    await narrowMcp.close();
+  }
+});
+
+judged('Verify lists executions with and without a recorded result as one authorized population through every host', async ({ server, assistant, state }) => {
+  const cards = await Cards.connect();
+  const client = WyrdClient.connect();
+  const token = await client.accessToken();
+  const bindingWith = async (owner: Exact, field: string) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as Record<string, unknown>)[field]) return id;
+    }
+    throw new Error(`${owner.name} has no binding with ${field}`);
+  };
+  const submit = async (verifier: string, answer: string) => {
+    const submitted = await state.run('agent').observe.submit(verifier, { answer });
+    if (submitted.kind !== 'queued') throw new Error(`${verifier} queues an execution`);
+    await submitted.execution.wait({ timeoutMs: 60_000 });
+    return submitted.execution.id;
+  };
+  // Ordinary Run executions: one failed, one passed.
+  const refused = await submit('answer-check', 'no');
+  const agreed = await submit('answer-judged', 'yes');
+  // Drift: one scheduled window far from its fitted baseline.
+  const latency = (await cards.get({ kind: 'Verifier', name: 'latency-drift', version: '1.0.0' })).metadata.uid as string;
+  server.waitForBaseline(latency, 90_000);
+  await state.startBifrost();
+  for (let sample = 0; sample < 100; sample += 1) await state.run('model').observe.submit('latency-drift', { latency: 99 });
+  await state.shutdown();
+  server.flushBifrost();
+  const schedule = await bindingWith(exact(assistant.service), 'next_run_at');
+  server.makeBindingDue(schedule);
+  const drifted = (await scheduledResult(server, schedule, 90_000)).execution_id;
+  // A session: three direct turns of one conversation, then the group execution that judges them together.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-'));
+  await cards.pull(support.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: support.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  for (const turn of [1, 2, 3]) await desk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-verify-conversation' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await bindingWith(exact(declared(support)), 'group_end'), 90_000);
+  const turns = session.group?.sources.turns.execution_ids ?? [];
+  // A hosted Verifier, whose step can be held waiting for memory, and one execution cancelled while held.
+  const capacity = await cards.declareFromPath(fixture('cards/verification_capacity/capacity-desk.yaml'));
+  const capacityBundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-capacity-'));
+  await cards.pull(capacity.root, capacityBundle);
+  const capacityRoot = declared(capacity);
+  const counter = WyrdState.fromPath(capacityBundle, { client: WyrdClient.connect({ credential: (await runtimeAccount({ kind: 'Service', name: capacityRoot.name })).key, workloadUid: capacityRoot.uid }) });
+  await counter.startBifrost();
+  const stopped = server.holdPublications('ui-verify-stopped').executionId;
+  expect((await client.httpAuth(`${server.baseUrl}/v1/verification/executions/${stopped}/cancel`, { method: 'POST' })).status).toBe(200);
+  server.flushBifrost();
+
+  const range = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() };
+  const named = (read: QueryResult) => read.rows.map((row) => Object.fromEntries(read.columns.map((column, at) => [column.name, row[at]])));
+  const total = (read: QueryResult) => read.rows.reduce((sum, row) => sum + Number(row[row.length - 1]), 0);
+  /** One page of the list as named rows, or the reason it is empty. */
+  const page = async (input: Record<string, unknown>, executor: Executor) => {
+    const loaded = await loadRecordTable({ signal: 'executions', ...input } as never, { executor, range });
+    if (loaded.result.state === 'empty') return { rows: [], older: undefined, reason: loaded.result.reason };
+    if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+    return { rows: named(loaded.result.data.rows), older: loaded.result.data.page?.older, reason: undefined };
+  };
+  /** Every row of the list, read three at a time. */
+  const all = async (input: Record<string, unknown>, executor: Executor) => {
+    const rows: Record<string, unknown>[] = [];
+    for (let read = await page({ ...input, limit: 3 }, executor); ; read = await page({ ...input, limit: 3, after: read.older }, executor)) {
+      rows.push(...read.rows);
+      if (!read.older) return rows;
+    }
+  };
+  const facets = async (where: readonly object[], executor: Executor) => {
+    const loaded = await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'], where } as never, { executor, range });
+    if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+    return loaded.result.data.facets.map((facet) => facet.values);
+  };
+
+  // The Verify discovery read runs over the same population: its facets and both charts count every listed execution.
+  const discovered = await loadExecutionDiscovery({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'] }, { executor: nodeExecutor(client), range });
+  const listed = await all({}, nodeExecutor(client));
+  if (discovered.facets.result.state !== 'populated') throw new Error(JSON.stringify(discovered.facets.result));
+  expect(discovered.facets.result.data.facets.map((facet) => total(facet.values))).toEqual(Array(3).fill(listed.length));
+  expect(discovered.facets.result.data.facets.map((facet) => facet.values.rows)).toEqual((await facets([], nodeExecutor(client))).map((values) => values.rows));
+  for (const chart of [discovered.charts.verdicts, discovered.charts.verifiers]) {
+    if (chart.result.state !== 'populated') throw new Error(JSON.stringify(chart.result));
+    expect(total(chart.result.data)).toBe(listed.length);
+  }
+  const verifierCount = new Set(listed.map((each) => each.verifier_card_uid)).size;
+  expect([discovered.charts.verifierSeries.top.length, discovered.charts.verifierSeries.more]).toEqual([Math.min(3, verifierCount), Math.max(0, verifierCount - 3)]);
+
+  // The discovery read returns what the original seven facet and two chart reads did; EXPLAIN ANALYZE compares their work.
+  const discoveryColumns = ['status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id'];
+  const discovery = executionDiscoveryQuery({ signal: 'executions', facets: discoveryColumns }, range);
+  const discoveryBucket = String(discovery.params.find((param) => /^\d+ \w+$/.test(String(param))));
+  const verifyOriginal = [...discoveryColumns.map((column) => `verify-facet-${column}`), 'verify-chart-verdict', 'verify-chart-verifier'].map((id) => originalRead(id, discoveryBucket, range));
+  const [verifyBefore, verifyAfter] = [await readAll(nodeExecutor(client), verifyOriginal), await readAll(nodeExecutor(client), [discovery])];
+  const of = (facet: number, names: readonly string[]) =>
+    verifyAfter.values[0].rows.filter((row) => Number(row[0]) === facet).map((row) => names.map((name) => row[verifyAfter.values[0].columns.findIndex((column) => column.name === name)]));
+  discoveryColumns.forEach((column, index) => expect(multiset(of(index, [`f${index}`, 'n'])), column).toEqual(multiset(verifyBefore.values[index].rows)));
+  expect(multiset(of(7, ['at', 'verdict', 'n']))).toEqual(multiset(verifyBefore.values[7].rows));
+  // The top three Verifiers keep their rows; the rest fold into one row per bucket.
+  const kept = of(8, ['at', 'verifier', 'n']).filter((row) => row[1] !== null);
+  const folded = new Map(of(8, ['at', 'verifier', 'n']).filter((row) => row[1] === null).map((row) => [String(row[0]), Number(row[2])]));
+  const namedUids = new Set(kept.map((row) => row[1]));
+  expect(multiset(kept)).toEqual(multiset(verifyBefore.values[8].rows.filter((row) => namedUids.has(row[1]))));
+  const others = new Map<string, number>();
+  for (const row of verifyBefore.values[8].rows.filter((each) => !namedUids.has(each[1]))) others.set(String(row[0]), (others.get(String(row[0])) ?? 0) + Number(row[2]));
+  expect(folded).toEqual(others);
+  recordDiagnostics({
+    verify: {
+      original: { ...(await executedWork(nodeExecutor(client), verifyOriginal)), elapsed_ms: Math.round(verifyBefore.elapsed) },
+      consolidated: { ...(await executedWork(nodeExecutor(client), [discovery])), elapsed_ms: Math.round(verifyAfter.elapsed) }
+    }
+  });
+
+  // Unfinished work: under contended memory each claim returns a queued execution to the queue, so it is listed once, unfinished,
+  // with no verdict.
+  const memory = server.occupyHostedMemory(64 << 20);
+  const claimed = await counter.run('agent').observe.submit('adds-one', { answer: 2 });
+  if (claimed.kind !== 'queued') throw new Error('adds-one queues an execution');
+  const running = claimed.execution.id;
+  server.flushBifrost();
+  const unfinished = (await all({}, nodeExecutor(client))).filter((row) => row.execution_id === running);
+  expect(unfinished.map((row) => row.verdict)).toEqual([null]);
+  expect(['queued', 'pending']).toContain(unfinished[0].status);
+  // Given memory it finishes, and the list follows its newest recorded status.
+  memory.release();
+  await claimed.execution.wait({ timeoutMs: 60_000 });
+  await counter.shutdown();
+  server.flushBifrost();
+
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, direct] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const ops: string[] = [];
+      const executor: Executor = { run: (requests, signal) => (ops.push(...requests.map((request) => request.op)), direct.run(requests, signal)) };
+      // Every accepted execution is one row, whatever its origin, exactly once across pages.
+      const rows = await all({}, executor);
+      const ids = rows.map((row) => row.execution_id);
+      expect(new Set(ids).size, surface).toBe(ids.length);
+      expect(ids, surface).toEqual(expect.arrayContaining([refused, agreed, drifted, session.execution_id, ...turns, running, stopped]));
+      const row = (id: string) => rows.find((each) => each.execution_id === id) as Record<string, unknown>;
+      // Status and verdict are separate recorded facts, with the exact Verifier and the recorded correlations.
+      expect(row(refused), surface).toMatchObject({ status: 'completed', verdict: 'failed', verifier_card_uid: assistant.answerCheck.uid, group_id: null });
+      expect(row(agreed), surface).toMatchObject({ status: 'completed', verdict: 'passed' });
+      expect(row(drifted), surface).toMatchObject({ status: 'completed', verdict: 'failed', verifier_card_uid: latency, run_id: null });
+      expect(row(session.execution_id), surface).toMatchObject({ status: 'completed', verdict: 'passed', group_id: 'ui-verify-conversation' });
+      expect(turns.map((id) => [row(id).status, row(id).verdict, row(id).group_id]), surface).toEqual(turns.map(() => ['completed', 'passed', 'ui-verify-conversation']));
+      expect(row(refused).run_id, surface).toEqual(expect.any(String));
+      // The execution that was running is now completed with its verdict; the one cancelled while held has its recorded status and no verdict.
+      expect([row(running).status, row(running).verdict], surface).toEqual(['completed', 'passed']);
+      expect([row(stopped).status, row(stopped).verdict], surface).toEqual(['cancelled', null]);
+      // Every queued row agrees with the execution's own exact read.
+      for (const id of [refused, agreed, drifted, session.execution_id, running]) {
+        const [live] = await direct.run([{ op: 'verification.get_execution', execution_id: id }]);
+        expect(live.ok && [live.value.status, live.value.result?.outcome.verdict, live.value.result?.verifier.uid], surface).toEqual([row(id).status, row(id).verdict, row(id).verifier_card_uid]);
+        // The row also carries the exact subject Card and the identity of its selected result.
+        expect(live.ok && live.value.result?.subject.uid, surface).toBe(row(id).subject_card_uid);
+        expect(row(id).result_id, surface).toEqual(expect.any(String));
+      }
+      const [cancelled] = await direct.run([{ op: 'verification.get_execution', execution_id: stopped }]);
+      expect(cancelled.ok && cancelled.value.status, surface).toBe('cancelled');
+
+      // Facets and both charts count the same population the pages hold.
+      const [statuses, verdicts, verifiers] = await facets([], executor);
+      const { charts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'] }, { executor, range });
+      if (charts.verdicts.result.state !== 'populated' || charts.verifiers.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(charts)}`);
+      expect([total(statuses), total(verdicts), total(verifiers), total(charts.verdicts.result.data), total(charts.verifiers.result.data)], surface).toEqual(Array(5).fill(rows.length));
+      const count = (read: QueryResult, value: unknown) => Number(read.rows.find((each) => each[0] === value)?.[1] ?? 0);
+      for (const status of ['completed', 'running', 'cancelled', 'pending', 'not recorded']) expect(count(statuses, status), `${surface} ${status}`).toBe(rows.filter((each) => each.status === status).length);
+      for (const verdict of ['passed', 'failed', null]) expect(count(verdicts, verdict), `${surface} ${verdict}`).toBe(rows.filter((each) => each.verdict === verdict).length);
+      // No recorded verdict is its own neutral chart series, never a verdict.
+      expect(named(charts.verdicts.result.data).filter((each) => each.verdict === 'no verdict').reduce((sum, each) => sum + Number(each.executions), 0), surface).toBe(count(verdicts, null));
+
+      // Status and verdict combine across pages, and the facets under the same clauses count the same rows.
+      const failed = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: 'failed' }];
+      const failures = await all({ where: failed }, executor);
+      expect(failures.map((each) => each.execution_id).sort(), surface).toEqual(rows.filter((each) => each.verdict === 'failed').map((each) => each.execution_id).sort());
+      expect((await facets(failed, executor)).map(total), surface).toEqual(Array(3).fill(failures.length));
+      // One exact Verifier, by its recorded UID; a session; no recorded verdict.
+      expect((await all({ where: [{ column: 'verifier_card_uid', value: assistant.answerCheck.uid }] }, executor)).map((each) => each.execution_id), surface).toEqual([refused]);
+      expect((await all({ where: [{ column: 'group_id', value: 'ui-verify-conversation' }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([session.execution_id, ...turns].sort());
+      expect((await all({ where: [{ column: 'verdict', value: null }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([stopped]);
+      // An incompatible combination is empty, and says so.
+      expect(await page({ where: [{ column: 'status', value: 'cancelled' }, { column: 'verdict', value: 'passed' }] }, executor), surface).toMatchObject({ rows: [], reason: 'No execution matches these filters in this window.' });
+      // An earlier range holds nothing.
+      expect((await loadRecordTable({ signal: 'executions' }, { executor, range: BEFORE })).result.state, surface).toBe('empty');
+      // Bounded shared queries only: no execution's status or details was read to build the list, counts or charts.
+      expect(new Set(ops), surface).toEqual(new Set(['bifrost.query']));
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // Another tenant sees no row, count or chart bucket; a principal without the query permission is refused, never shown an empty list.
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant('ui-verify-foreign'), ['admin'], 'ui-verify-admin');
+  const outsider = { executor: nodeExecutor(WyrdClient.connect({ credential: foreignKey })), range };
+  expect((await loadRecordTable({ signal: 'executions' }, outsider)).result.state).toBe('empty');
+  expect((await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict'] }, outsider)).result.state).toBe('empty');
+  const { charts: foreignCharts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, outsider);
+  expect([foreignCharts.verdicts.result.state, foreignCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
+  // `verifier:read` alone opens exact executions but grants no discovery read: every panel is denied whole.
+  const narrowKey = server.scopedApiKey('ui_verify_narrow', ['verifier:read']);
+  const narrowNode = nodeExecutor(WyrdClient.connect({ credential: narrowKey }));
+  let narrowBatches = 0;
+  const countingExecutor: Executor = {
+    run(requests, signal) {
+      narrowBatches += 1;
+      return narrowNode.run(requests, signal);
+    }
+  };
+  const narrow = { executor: countingExecutor, range };
+  const { charts: refusedCharts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, narrow);
+  for (const loaded of [await loadRecordTable({ signal: 'executions' }, narrow), await loadFacetRail({ signal: 'executions', facets: ['status'] }, narrow), refusedCharts.verdicts, refusedCharts.verifiers])
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  // The list, the facets and the two charts together sent one batch each, and nothing was read after a refusal.
+  expect(narrowBatches).toBe(3);
+
+  // BFF and custom app: the same rows for this tenant's session, nothing for another tenant's.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const failedBody = JSON.stringify({ component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: 'failed' }] }, range });
+  const app = async (body = failedBody) => JSON.parse(await (await loadExamplePanel({ request: new Request('http://app.test/view/load', { method: 'POST', body }) } as never)).text());
+  const signedIn = async (tenant: string, credential: string) => {
+    const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+    const cookies = jar();
+    await browserSessions.signInWithApiKey(tenant, credential, url, cookies);
+    return { url, browserSession: await browserSessions.read(tenant, url, cookies) };
+  };
+  const bff = async ({ url, browserSession }: Awaited<ReturnType<typeof signedIn>>, body = failedBody) =>
+    (await loadPanel({ locals: { browserSession }, request: new Request(url, { method: 'POST', body, headers: { 'content-type': 'application/json' } }) } as never)).json();
+  const own = await signedIn('test-tenant-1', server.apiKey);
+  const failedIds = [refused, drifted].sort();
+  const idsOf = (loaded: { result: { state: string; data?: { rows: QueryResult } } }) => (loaded.result.state === 'populated' && loaded.result.data ? named(loaded.result.data.rows).map((each) => each.execution_id).sort() : loaded.result.state);
+  expect(idsOf(await bff(own))).toEqual(failedIds);
+  expect(idsOf(await bff(await signedIn('ui-verify-foreign', foreignKey)))).toBe('empty');
+  const answered = await app();
+  expect(JSON.stringify(answered)).not.toContain(server.apiKey);
+  expect(idsOf(answered)).toEqual(failedIds);
+
+  // Each chart is a plain Chart panel over the same population: the BFF and the custom app count every execution the pages hold.
+  const { charts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, { executor: nodeExecutor(client), range });
+  const everything = (await all({}, nodeExecutor(client))).length;
+  for (const chart of [charts.verdicts, charts.verifiers]) {
+    const chartBody = JSON.stringify({ component: 'Chart', input: chart.input, range });
+    for (const loaded of [await bff(own, chartBody), await app(chartBody)]) {
+      expect(loaded.result.state, JSON.stringify(loaded.result)).toBe('populated');
+      expect(total(loaded.result.data)).toBe(everything);
+    }
+  }
+
+  // The refusal and the other tenant's empty list read the same through MCP, the BFF and the custom app.
+  const refusal = { result: { state: 'denied', problem: { code: DENIED } } };
+  const [narrowMcp, foreignMcp] = [await mcpOver(server.baseUrl, WyrdClient.connect({ credential: narrowKey })), await mcpOver(server.baseUrl, WyrdClient.connect({ credential: foreignKey }))];
+  try {
+    expect(await loadRecordTable({ signal: 'executions' }, { executor: narrowMcp.executor, range })).toMatchObject(refusal);
+    expect((await loadRecordTable({ signal: 'executions' }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
+    expect((await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict'] }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
+    const { charts: foreignMcpCharts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, { executor: foreignMcp.executor, range });
+    expect([foreignMcpCharts.verdicts.result.state, foreignMcpCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
+  } finally {
+    await narrowMcp.close();
+    await foreignMcp.close();
+  }
+  expect(await bff(await signedIn('test-tenant-1', narrowKey))).toMatchObject(refusal);
+  vi.stubEnv('WYRD_API_KEY', narrowKey);
+  const appDenied = await app();
+  vi.stubEnv('WYRD_API_KEY', foreignKey);
+  const appForeign = await app();
+  vi.stubEnv('WYRD_API_KEY', server.apiKey);
+  expect(appDenied).toMatchObject(refusal);
+  expect(idsOf(appForeign)).toBe('empty');
+
+  // The built HTML draws the list and its facets through host tools/call alone, each answered by the real MCP server.
+  const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: client.httpAuth }));
+  const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range,
+    panels: [
+      { id: 'list', component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: null }] } },
+      { id: 'facets', component: 'FacetRail', input: { signal: 'executions', facets: ['status', 'verdict'] } },
+      { id: 'verdicts', component: 'Chart', input: charts.verdicts.input }
+    ]
+  };
+  try {
+    const built = await appBridgeView(doc, async (name, args) => ((await host.callTool({ name, arguments: args })).structuredContent ?? {}) as object);
+    const list = () => built.document.querySelector('[data-panel="list"]') as Element;
+    await vi.waitFor(() => expect(list().querySelectorAll('tbody tr')).toHaveLength(1));
+    expect(list().textContent).toContain('cancelled');
+    expect(list().textContent).toContain('none');
+    expect(list().textContent).not.toMatch(/passed|failed/);
+    await vi.waitFor(() => expect(built.document.querySelector('[data-panel="facets"]')?.textContent).toContain('completed'));
+    await vi.waitFor(() => expect(built.document.querySelector('[data-panel="verdicts"] .legend')?.textContent).toContain('no verdict'));
+    expect(new Set(built.calls.map((call) => call.name))).toEqual(new Set(['bifrost.query']));
+  } finally {
+    await host.close();
+  }
+  // The same built HTML behind another principal's host: a refusal is shown as a refusal, another tenant's list as empty.
+  const artifactList = async (credential: string) => {
+    const as = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+    await as.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: WyrdClient.connect({ credential }).httpAuth }));
+    try {
+      // The whole tool result is relayed, so a refusal reaches the page as one.
+      const view = await appBridgeView(doc, async (name, args) => (await as.callTool({ name, arguments: args })) as object);
+      const text = () => view.document.querySelector('[data-panel="list"]')?.textContent ?? '';
+      await vi.waitFor(() => expect(text()).toMatch(/WYRD_|No execution matches/));
+      return text();
+    } finally {
+      await as.close();
+    }
+  };
+  const artifactDenied = await artifactList(narrowKey);
+  expect(artifactDenied).toContain(DENIED);
+  expect(artifactDenied).not.toContain('No execution matches');
+  expect(await artifactList(foreignKey)).toContain('No execution matches these filters in this window.');
+  // A server that cannot be reached is a problem, never an empty list.
+  const DOWN = 'http://127.0.0.1:9';
+  const unreachable = { result: { state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } } };
+  expect(await loadRecordTable({ signal: 'executions' }, { executor: nodeExecutor(WyrdClient.connect({ serverUrl: DOWN, credential: server.apiKey })), range })).toMatchObject(unreachable);
+  const gone = await mcpOver(server.baseUrl, client);
+  await gone.close();
+  expect(await loadRecordTable({ signal: 'executions' }, { executor: gone.executor, range })).toMatchObject(unreachable);
+  env.WYRD_SERVER_URL = DOWN;
+  expect(await bff(own)).toMatchObject(unreachable);
+  env.WYRD_SERVER_URL = server.baseUrl;
+  vi.stubEnv('WYRD_SERVER_URL', DOWN);
+  const appDown = await app();
+  vi.stubEnv('WYRD_SERVER_URL', server.baseUrl);
+  expect(appDown).toMatchObject(unreachable);
+  const dark = await appBridgeView(doc, async () => {
+    throw new Error('the host cannot reach its server');
+  });
+  await vi.waitFor(() => expect(dark.document.querySelector('[data-panel="list"]')?.textContent).toMatch(/WYRD_[A-Z0-9_]+/));
+  expect(dark.document.querySelector('[data-panel="list"]')?.textContent).not.toContain('No execution matches');
+});
+
+/** A fresh deployment with the GitHub App mock, for a tenant that connects a repository. */
+const reviewed = serverTest({ githubApp: true, perTest: true });
+/** The same deployment, which also runs Verifiers. */
+const deferred = serverTest({ githubApp: true, perTest: true, verificationRuntime: true });
+
+/** An admin of the tenant after it connected installation 101 with `acme/api` (provider id 1), `acme/web` (2) and `more`. */
+async function connectGithub(server: NativeWyrdTestServer, more: { id: number; fullName: string }[] = []): Promise<WyrdClient> {
+  const github = server.githubApp;
+  github.addInstallation(101, [
+    { id: 1, fullName: 'acme/api' },
+    { id: 2, fullName: 'acme/web' },
+    ...more
+  ]);
+  github.addUser('octo', [101]);
+  github.signIn('octo');
+  github.installTarget(101);
+  const key = server.bootstrapService(['admin'], 'verify_repository_admin');
+  const admin = WyrdClient.connect({ credential: key });
+  const connection = await (await GithubConnection.connect({ client: admin })).begin();
+  expect(signInGithubBrowser(server.baseUrl, server.tenantSlug, key).open(connection.authorization_url).status).toBe(200);
+  return admin;
+}
+
+deferred('Verify lists an execution waiting for deferred evidence by its recorded status', async ({ server }) => {
+  // The repository's `ci-gate` Verifier needs a `ci` input that CI publishes later, so its pull request execution parks.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  await (await Cards.connect({ client: admin })).declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  github.setPullRequest(2, 7, 'b1'.repeat(20), 'a1'.repeat(20));
+  expect(github.deliverPullRequest(server.baseUrl, 101, 2, 7, 'opened')).toBe(202);
+
+  const context = { executor: nodeExecutor(admin), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  let rows: readonly (readonly unknown[])[] = [];
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      const loaded = await loadRecordTable({ signal: 'executions', columns: ['execution_id', 'status', 'verdict'], where: [{ column: 'status', value: 'waiting' }] }, context);
+      rows = loaded.result.state === 'populated' ? loaded.result.data.rows.rows : [];
+      expect(rows).toHaveLength(1);
+    },
+    { timeout: 30_000, interval: 500 }
+  );
+  const [[id, status, verdict]] = rows;
+  expect([status, verdict]).toEqual(['waiting', null]);
+  // The list's status is the one the execution's own exact read reports, with the input it waits for.
+  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: id as string }]);
+  expect(live.ok && [live.value.status, live.value.waiting]).toEqual(['waiting', ['ci']]);
+});
+
+reviewed('Verify lists pending work admitted for a pull request by its recorded status', async ({ server }) => {
+  // The tenant connects installation 101 and declares the review policy of its repository `acme/api` (provider id 1).
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  await declarePolicy(await Cards.connect({ client: admin }), github.host, 'acme/api', 'minimal');
+
+  // The pull request opens and is then pushed to, which supersedes its first execution. This deployment runs no Verifier, so the second stays pending.
+  github.setPullRequest(1, 7, 'b1', 'a1');
+  expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
+  github.setPullRequest(1, 7, 'b1', 'b2');
+  expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'synchronize')).toBe(202);
+
+  const context = { executor: nodeExecutor(admin), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  const list = async (where: { column: string; value: string }[]) => {
+    server.flushBifrost();
+    const loaded = await loadRecordTable({ signal: 'executions', columns: ['origin', 'status', 'verdict'], where }, context);
+    if (loaded.result.state !== 'populated') return [];
+    const { columns, rows } = loaded.result.data.rows;
+    return rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
+  };
+
+  // The superseded execution is listed as cancelled and its successor as pending, neither with a verdict.
+  await vi.waitFor(async () => expect((await list([])).map((row) => [row.status, row.verdict]).sort()).toEqual([['cancelled', null], ['pending', null]]), { timeout: 30_000, interval: 500 });
+
+  // The pending row is the execution its own exact read describes.
+  const [pending] = await list([{ column: 'status', value: 'pending' }]);
+  expect(pending.origin).toBe('pull_request');
+  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: pending.execution_id as string }]);
+  expect(live.ok && live.value.status).toBe('pending');
+  // Status and verdict combine: unfinished work has no verdict, so pending work that passed matches nothing.
+  expect(await list([{ column: 'status', value: 'pending' }, { column: 'verdict', value: 'passed' }])).toEqual([]);
+});
+
+/** The `coding-verifier` statement every request of its `spans-reviewed` check carries. */
+const LIVE_REVIEW = 'spans were reviewed live';
+/** What a Chat Completions request carrying tool results contains. */
+const TOOL_TURN = /"role"\s*:\s*"tool"/;
+/** The trace the coding session's first turn names. */
+const SESSION_TRACE = '7d3efb1b173fecfa5cf1d7a7e9c2a441';
+
+/**
+ * A server whose judge reviews a session's spans: it reads the span names of
+ * the trace its answer names through `bifrost.query`, then passes citing the
+ * first trace of the session; every other judge agrees.
+ */
+const traced = assistantTest({
+  perTest: true,
+  judge: (request) => {
+    if (!request.body.includes(LIVE_REVIEW)) return judgeReply(AGREES);
+    if (TOOL_TURN.test(request.body)) return judgeReply('{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}');
+    const [traceId] = request.body.match(/[0-9a-f]{32}/) ?? [];
+    return toolTurn([toolCall('call-spans', 'bifrost.query', { sql: `SELECT name FROM bifrost.traces.spans WHERE trace_id = decode('${traceId}', 'hex') ORDER BY name`, max_rows: 10 })]);
+  }
+});
+
+/** A deployment whose model answers every call ten seconds late, past a short Verifier limit. */
+const stalled = assistantTest({ perTest: true, judge: () => ({ ...judgeReply('{"done":true}'), delayMs: 10_000 }) });
+
+stalled('Verify lists a timed out and an errored execution by their recorded status', async ({ server, assistant: _ }) => {
+  // The assistant fixture deploys the model on the gateway, which the desk's section reviewer calls.
+  const cards = await Cards.connect();
+  const desk = await cards.declareFromPath(fixture('cards/verifier_orchestration/orchestration-desk.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-deadline-'));
+  await cards.pull(desk.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: desk.root.name });
+  const orchestration = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await orchestration.startBifrost();
+  // `admission-deadline` allows itself three seconds; its one section review is still waiting on the model when they pass.
+  const slow = await orchestration.run().observe.submit('admission-deadline', { sections: ['d0'] });
+  // `admission-sweep` declares its sections as strings; the engine refuses a number before any step runs.
+  const invalid = await orchestration.run().observe.submit('admission-sweep', { sections: [0] });
+  if (slow.kind !== 'queued' || invalid.kind !== 'queued') throw new Error('both submissions queue an execution');
+
+  const context = { executor: nodeExecutor(WyrdClient.connect()), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  /** The executions the list shows under `status`, by column name. */
+  const listed = async (status: string) => {
+    server.flushBifrost();
+    const loaded = await loadRecordTable({ signal: 'executions', columns: ['status', 'verdict'], where: [{ column: 'status', value: status }] }, context);
+    if (loaded.result.state !== 'populated') return [];
+    const { columns, rows } = loaded.result.data.rows;
+    return rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
+  };
+  const expected = [
+    { execution: slow.execution.id, status: 'timed_out', code: 'execution_timed_out' },
+    { execution: invalid.execution.id, status: 'errored', code: 'input_invalid' }
+  ];
+  for (const { execution, status, code } of expected) {
+    await vi.waitFor(
+      async () => {
+        const rows = await listed(status);
+        expect(rows).toMatchObject([{ execution_id: execution, status, verdict: null }]);
+        expect(rows).toHaveLength(1);
+      },
+      { timeout: 45_000, interval: 500 }
+    );
+    // The list's status is the one the execution's own exact read reports.
+    const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: execution }]);
+    expect(live.ok && [live.value.status, live.value.error?.code]).toEqual([status, code]);
+  }
+  await orchestration.shutdown();
+});
+
+traced('Verify lists an execution retrying for a trace that has not landed by its recorded status', async ({ server, assistant: _ }) => {
+  const cards = await Cards.connect();
+  const policyDesk = await cards.declareFromPath(fixture('cards/verifier_building_blocks/policy-desk.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-retrying-'));
+  await cards.pull(policyDesk.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: policyDesk.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  // The check reads a trace nothing has written, so each attempt finds its evidence unavailable and the execution retries.
+  const submitted = await desk.run().observe.submit('whole-trace', { trace: 'ab'.repeat(16) });
+  if (submitted.kind !== 'queued') throw new Error('whole-trace queues an execution');
+  const id = submitted.execution.id;
+
+  const context = { executor: nodeExecutor(WyrdClient.connect()), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      const loaded = await loadRecordTable({ signal: 'executions', columns: ['status', 'verdict'], where: [{ column: 'status', value: 'retrying' }] }, context);
+      if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+      const { columns, rows } = loaded.result.data.rows;
+      const listed = rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
+      expect(listed).toMatchObject([{ execution_id: id, status: 'retrying', verdict: null }]);
+      expect(listed).toHaveLength(1);
+    },
+    { timeout: 30_000, interval: 500 }
+  );
+  // The list's status is the one the execution's own exact read reports.
+  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: id }]);
+  expect(live.ok && [live.value.status, live.value.error?.code]).toEqual(['retrying', 'evidence_unavailable']);
+  await desk.shutdown();
+});
+
+traced('a session judgment cites an exact trace: the citation leads to its pinned member and trace, a later span revises nothing, and trace reads keep their own permission', async ({ server, assistant: _ }) => {
+  // A coding session of three turns; the first names a retained trace.
+  await seedSignals(server, server.apiKey, { trace: SESSION_TRACE, service: 'coding-agent' });
+  const cards = await Cards.connect();
+  const coding = await cards.declareFromPath(fixture('cards/verify_in_real_time/coding.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-coding-'));
+  await cards.pull(coding.root, bundle);
+  const { principalId, key } = await runtimeAccount({ kind: 'Service', name: coding.root.name });
+  // The judge reads spans as the Service, which needs the tool and query grants.
+  server.scopedApiKey('ui_live_reader', ['tool:invoke', 'bifrost_query:read']);
+  await (await Principals.connect()).bind({ subject: { principal: { id: principalId, kind: 'service' } }, role: 'ui_live_reader', scope: 'all' });
+  const token = await WyrdClient.connect().accessToken();
+  /** The binding of `owner` that judges a session when it ends. */
+  const sessionBinding = async (owner: Exact) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as { group_end?: unknown }).group_end) return id;
+    }
+    throw new Error(`${owner.name} has no session binding`);
+  };
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  const run = desk.run('agent');
+  const calls = [{ call: 'prompt', tests: 'passed' }, { call: 'edit', tests: 'failed' }, { call: 'test', tests: 'passed' }];
+  for (const [index, call] of calls.entries()) await run.observe.verify('coding-turn', index === 0 ? { call, trace: SESSION_TRACE } : { call }, { group_id: 'ui-coding' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await sessionBinding(exact(declared(coding))), 90_000);
+
+  // Another Service ends a session under the same group id: the two stay apart by owner.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const supportBundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-coding-support-'));
+  await cards.pull(support.root, supportBundle);
+  const helpdesk = WyrdState.fromPath(supportBundle, { client: WyrdClient.connect({ credential: (await runtimeAccount({ kind: 'Service', name: support.root.name })).key }) });
+  await helpdesk.startBifrost();
+  for (const turn of [1, 2, 3]) await helpdesk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-coding' });
+  await helpdesk.shutdown();
+  const other = await groupExecution(server, await sessionBinding(exact(declared(support))), 90_000);
+  server.flushBifrost();
+  const members = session.group?.sources.traces.execution_ids ?? [];
+  expect(members).toHaveLength(3);
+  // Same group id, two owners: each judged execution names its own Service and pins only its own members.
+  expect([session.group_id, other.group_id]).toEqual(['ui-coding', 'ui-coding']);
+  expect([session.owner_card_uid, other.owner_card_uid]).toEqual([declared(coding).uid, declared(support).uid]);
+  const otherMembers = other.group?.sources.turns.execution_ids ?? [];
+  expect(otherMembers).toHaveLength(3);
+  expect(members.filter((id) => otherMembers.includes(id))).toEqual([]);
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  /** The session's judgments and pinned members, as one host reads them. */
+  const recorded = async (executor: Executor, surface: string) => {
+    const judgment = data(await loadExecution({ executionId: session.execution_id, node: 'req:spans-reviewed' }, { executor }), surface);
+    const sources = data(await loadExecution({ executionId: session.execution_id, node: 'input:traces' }, { executor }), surface);
+    return { verdict: judgment.status.result?.outcome.verdict, requirements: judgment.status.result?.outcome.requirements, members: sources.members?.map((member) => member.execution_id) };
+  };
+  try {
+    const before = await recorded(nodeExecutor(client), 'node');
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      // The judgment cites the first trace of the session by its exact slot and locator; membership is the recorded snapshot.
+      const read = await recorded(executor, surface);
+      expect(read, surface).toEqual(before);
+      expect(read.verdict, surface).toBe('failed');
+      expect(read.requirements?.find((each) => each.id === 'spans-reviewed'), surface).toMatchObject({ outcome: 'passed', citations: [{ slot: 'traces', locator: { json_pointer: '/0' } }] });
+      expect(read.members, surface).toEqual(members);
+      // The other owner's session, read by the same host, lists only its own members under its own owner.
+      const theirs = data(await loadExecution({ executionId: other.execution_id, node: 'input:turns' }, { executor }), surface);
+      expect([theirs.status.owner_card_uid, theirs.members?.map((member) => member.execution_id)], surface).toEqual([declared(support).uid, otherMembers]);
+      // The cited position is the first pinned member, whose accepted input names the exact trace.
+      const cited = data(await loadExecution({ executionId: members[0], node: 'input:trace' }, { executor }), surface);
+      expect(JSON.stringify(cited.inputs), surface).toContain(SESSION_TRACE);
+      // That exact trace is read by its ID alone, with no list range or filter.
+      const waterfall = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor });
+      expect(waterfall.result.state, surface).toBe('populated');
+      // A trace list over a later day does not hold this trace; the citation still opens it.
+      const listed = await loadRecordTable({ signal: 'traces' }, { executor, range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' } });
+      expect(['populated', 'empty'], surface).toContain(listed.result.state);
+      expect(JSON.stringify(listed.result), surface).not.toContain(SESSION_TRACE);
+    }
+
+    // A span that arrives after the judgment joins the trace and revises neither the judgment nor the membership.
+    const late = nanos(new Date().toISOString());
+    await exportOtlp(server, server.apiKey, '/v1/traces', {
+      resourceSpans: [{ resource: { attributes: [] }, scopeSpans: [{ scope: { name: 'wyrd-ui-journey' }, spans: [{ traceId: SESSION_TRACE, spanId: 'a1b2c3d4e5f60718', name: 'late-test-run', kind: 1, startTimeUnixNano: late, endTimeUnixNano: late, status: { code: 0 }, attributes: [] }] }] }]
+    });
+    server.flushBifrost();
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const grown = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor });
+      expect(JSON.stringify(grown.result), surface).toContain('late-test-run');
+      expect(await recorded(executor, surface)).toEqual(before);
+    }
+
+    // A principal that may read executions but not traces still sees the citation; the trace itself is refused to it, and the refusal is drawn.
+    const narrowClient = WyrdClient.connect({ credential: server.scopedApiKey('ui_traced_narrow', ['executions:read']) });
+    const narrowMcp = await mcpOver(server.baseUrl, narrowClient);
+    try {
+      for (const [surface, narrow] of [['node', nodeExecutor(narrowClient)], ['mcp', narrowMcp.executor]] as const) {
+        expect((await recorded(narrow, surface)).requirements, surface).toEqual(before.requirements);
+        const refused = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: narrow });
+        expect(refused.result, surface).toMatchObject({ state: 'denied', problem: { code: QUERY_FORBIDDEN } });
+        const drawn = render(TraceWaterfall, refused);
+        expect(drawn.container.textContent, surface).toContain(QUERY_FORBIDDEN);
+        expect(drawn.container.textContent, surface).not.toContain('edit-file');
+        drawn.unmount();
+      }
+    } finally {
+      await narrowMcp.close();
+    }
+    // Another tenant finds neither the session nor the trace.
+    const outsider = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-traced-foreign'), ['admin'], 'ui-traced-admin') }));
+    expect((await loadExecution({ executionId: session.execution_id }, { executor: outsider })).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+    expect((await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: outsider })).result.state).toBe('empty');
+  } finally {
+    await mcp.close();
+  }
+});
+
+reviewed('Repository Cards join GitHub access by repository id through the Node and MCP hosts', async ({ server }) => {
+  // The tenant connects installation 101 (api, web, docs), declares two versions of `api`, an empty policy for `web`, and nothing for `docs`.
+  const github = server.githubApp;
+  const admin = await connectGithub(server, [{ id: 3, fullName: 'acme/docs' }]);
+  const cards = await Cards.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/verify_in_real_time/answer-check.yaml'));
+  const declare = (fullName: string, policy: string) => declarePolicy(cards, github.host, fullName, policy);
+  const first = await declare('acme/api', 'minimal');
+  const second = await declare('acme/api', 'changed');
+  const web = await declare('acme/web', 'empty');
+  const api = (version: string) => ({ kind: 'Repository', name: 'api', version }) as const;
+  const row = ({ card, fullName, repositoryId, bindings, access, readiness }: RepositoryRow) => ({ card: card?.name, selected: card?.selected, versions: card?.versions, fullName, repositoryId, bindings, access, readiness });
+  const read = async (executor: Executor) => {
+    const context = { executor };
+    return {
+      index: await loadRepositoryIndex({}, context),
+      inactive: await loadRepositoryIndex({ show: 'inactive', query: 'ACME/' }, context),
+      older: await loadRepositoryPolicy({ cardRef: api(first.version), declaration: 'toml' }, context),
+      selected: await loadRepositoryPolicy({ cardRef: api(second.version) }, context),
+      docs: await loadRepositoryDeclare({ repositoryId: '3' }, context),
+      declared: await loadRepositoryDeclare({ repositoryId: '1' }, context),
+      unknown: await loadRepositoryDeclare({ repositoryId: '999' }, context),
+      github: await loadGithubIntegration({}, context)
+    };
+  };
+
+  const mcp = await mcpOver(server.baseUrl, admin);
+  const node = await read(nodeExecutor(admin));
+  // The MCP host reads the same facts through the existing tools.
+  expect(JSON.parse(JSON.stringify(await read(mcp.executor)))).toEqual(JSON.parse(JSON.stringify(node)));
+  await mcp.close();
+
+  // Registration, access and readiness are separate facts per repository, joined by provider id.
+  const index = node.index.result;
+  expect(index.state === 'populated' && index.data.rows.map(row)).toEqual([
+    { card: 'api', selected: second.version, versions: 2, fullName: 'acme/api', repositoryId: '1', bindings: 2, access: 'granted', readiness: 'ready' },
+    { card: 'web', selected: web.version, versions: 1, fullName: 'acme/web', repositoryId: '2', bindings: 0, access: 'granted', readiness: 'none' },
+    { card: undefined, selected: undefined, versions: undefined, fullName: 'acme/docs', repositoryId: '3', bindings: 0, access: 'granted', readiness: 'undeclared' }
+  ]);
+  expect(node.inactive.result.state === 'populated' && [node.inactive.result.data.rows.map((each) => each.card?.name), node.inactive.result.data.total]).toEqual([['web'], 3]);
+  // Viewing the older version reads it as not selected; the selected policy and its readiness stay the server's.
+  expect(node.older.result.state === 'populated' && node.older.result.data).toMatchObject({
+    selected: false,
+    selectedVersion: second.version,
+    fullName: 'acme/api',
+    installation: 101,
+    access: 'granted',
+    readiness: 'ready',
+    selectedBindings: 2,
+    bindings: [{ name: 'code-review', startsOn: 'runs_on: pull_request', state: 'not selected' }]
+  });
+  expect(node.older.result.state === 'populated' && node.older.result.data.declaration).toContain(`# Projection of Repository/api@${first.version}, not the declared file.`);
+  expect(node.selected.result.state === 'populated' && [node.selected.result.data.selected, node.selected.result.data.bindings.map((each) => [each.name, each.state])]).toEqual([
+    true,
+    [['code-review', 'active'], ['answer-check', 'active']]
+  ]);
+  expect((await cards.get(api(second.version))).status?.repository?.selected).toBe(true);
+  // A reachable repository without a Card can be declared; one with a Card, or an id the connection does not reach, names nothing.
+  expect(node.docs.result.state === 'populated' && node.docs.result.data).toMatchObject({ repositoryId: '3', fullName: 'acme/docs', host: github.host });
+  for (const each of [node.declared, node.unknown]) expect(each.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
+  expect(node.github.result.state === 'populated' && [node.github.result.data.connection.state, node.github.result.data.connection.repositories.map((each) => each.full_name)]).toEqual([
+    'active',
+    ['acme/api', 'acme/web', 'acme/docs']
+  ]);
+  for (const secret of github.secrets()) expect(JSON.stringify(node)).not.toContain(secret);
+
+  // A viewer reads Cards but not the connection: the refusal stays the connection's, access is not guessed, and Settings reads no Card.
+  const requests: WireRequest[] = [];
+  const viewer = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapService(['viewer'], 'repositories_viewer') }));
+  const recorded: Executor = { run: (batch, signal) => (requests.push(...batch), viewer.run(batch, signal)) };
+  const viewed = (await loadRepositoryIndex({}, { executor: recorded })).result;
+  expect(viewed.state === 'populated' && viewed.data.connection.state).toBe('denied');
+  expect(viewed.state === 'populated' && viewed.data.rows.map(row)).toMatchObject([
+    { card: 'api', access: 'granted', readiness: 'ready' },
+    { card: 'web', access: 'granted', readiness: 'none' }
+  ]);
+  requests.length = 0;
+  expect((await loadGithubIntegration({}, { executor: recorded })).result).toMatchObject({ state: 'denied', problem: { code: 'WYRD_PERMISSION_403_DENIED_RBAC' } });
+  expect((await loadRepositoryDeclare({ repositoryId: '3' }, { executor: recorded })).result.state).toBe('denied');
+  expect(requests).toEqual([{ op: 'github.get_connection' }, { op: 'github.get_connection' }]);
+
+  // Another tenant sees none of it by name or id.
+  const foreign = { executor: nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('repositories-b'), ['admin'], 'repositories_b_admin') })) };
+  const theirs = (await loadRepositoryIndex({}, foreign)).result;
+  expect(theirs.state === 'populated' && [theirs.data.total, theirs.data.connection.state === 'populated' && theirs.data.connection.data.state]).toEqual([0, 'not_connected']);
+  expect((await loadRepositoryPolicy({ cardRef: api(second.version) }, foreign)).result).toMatchObject({ state: 'error', problem: { status: 404 } });
+  expect((await loadRepositoryDeclare({ repositoryId: '3' }, foreign)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
+
+  // Disconnecting removes access only: the Cards and their selected policy stay, and nothing starts without access.
+  await (await GithubConnection.connect({ client: admin })).disconnect();
+  const after = (await loadRepositoryIndex({}, { executor: nodeExecutor(admin) })).result;
+  expect(after.state === 'populated' && after.data.rows.map(row)).toEqual([
+    { card: 'api', selected: second.version, versions: 2, fullName: undefined, repositoryId: '1', bindings: 2, access: 'none', readiness: 'inactive' },
+    { card: 'web', selected: web.version, versions: 1, fullName: undefined, repositoryId: '2', bindings: 0, access: 'none', readiness: 'inactive' }
+  ]);
 });

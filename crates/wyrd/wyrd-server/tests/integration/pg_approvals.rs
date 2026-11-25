@@ -13,8 +13,10 @@ use wyrd_runtime::Permission;
 use wyrd_server::scribe_outbox::{ScribeTable, fenced_batch_id};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
-use wyrd_spec::auth::TokenAudience;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::auth::{CardPermissionScope, PermissionScope, TokenAudience};
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::{CardName, CardUid};
+use wyrd_sql::queries::cards::card_scopes;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::pg_deferred_evidence::limits;
@@ -109,11 +111,11 @@ impl Deployment {
         }
     }
 
-    /// The Verifier Card `execution` froze.
+    /// The exact scope of the Verifier Card `execution` froze.
     ///
     /// # Panics
-    /// Panics when the read fails.
-    async fn verifier_of(&self, execution: Uuid) -> CardUid {
+    /// Panics when the read fails or the Verifier is not registered.
+    async fn verifier_of(&self, execution: Uuid) -> CardPermissionScope {
         let mut conn = self.conn().await;
         let (uid,): (Uuid,) = sqlx::query_as(
             "SELECT verifier_card_uid FROM wyrd.verifier_executions WHERE execution_id = $1",
@@ -122,8 +124,12 @@ impl Deployment {
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("execution reads");
+        let uid = CardUid::from_uuid(uid).expect("card uid");
+        let mut scopes = card_scopes(&mut conn, std::slice::from_ref(&uid))
+            .await
+            .expect("scope reads");
         conn.commit().await.expect("read commits");
-        CardUid::from_uuid(uid).expect("card uid")
+        scopes.remove(&uid).expect("the Verifier is registered")
     }
 
     /// A user of this tenant holding `roles`, as its id and JWT.
@@ -131,6 +137,42 @@ impl Deployment {
     /// # Panics
     /// Panics when the bootstrap fails.
     async fn user(&self, name: &str, roles: &[&str]) -> (Uuid, String) {
+        self.user_at(name, roles, None).await
+    }
+
+    /// A user of this tenant holding `roles`, bound at `scope` when given and
+    /// tenant-wide otherwise, as its id and JWT.
+    ///
+    /// # Panics
+    /// Panics when the bootstrap or binding fails.
+    async fn user_at(
+        &self,
+        name: &str,
+        roles: &[&str],
+        scope: Option<&PermissionScope>,
+    ) -> (Uuid, String) {
+        let Some(scope) = scope else {
+            return self.bootstrapped(name, roles).await;
+        };
+        let (id, jwt) = self.bootstrapped(name, &[]).await;
+        let principal = Bootstrap::User {
+            id: wyrd_spec::auth::PrincipalId::new(id),
+            jwt: jwt.clone(),
+        };
+        for role in roles {
+            self.server
+                .grant_role_at(&principal, role, scope)
+                .await
+                .expect("scoped role binds");
+        }
+        (id, jwt)
+    }
+
+    /// A bootstrapped user holding tenant-wide `roles`.
+    ///
+    /// # Panics
+    /// Panics when the bootstrap fails.
+    async fn bootstrapped(&self, name: &str, roles: &[&str]) -> (Uuid, String) {
         let Bootstrap::User { id, jwt } = self
             .server
             .bootstrap_user(name, roles)
@@ -227,7 +269,7 @@ fn occurrence_status<'a>(served: &'a Value, step: &str) -> &'a Value {
 /// occurrence. Publishing `ci` resumes it, but it still waits for the
 /// approval alone. A viewer, a person allowed to approve only another
 /// Verifier, and another tenant cannot decide; an unknown occurrence is not
-/// found. An editor approves with a reason and receives the durable receipt;
+/// found. An approver approves with a reason and receives the durable receipt;
 /// the same request replays it, while a different decision or decider is
 /// refused as not pending. The execution passes under its original id and
 /// inspection shows who approved. A second pull request is rejected by a
@@ -272,20 +314,23 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
     assert_eq!(denied["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
 
     let verifier = deployment.verifier_of(execution).await;
-    let other = CardUid::from_uuid(Uuid::now_v7()).expect("card uid");
+    let other = PermissionScope::Card(CardPermissionScope::family(
+        CardKind::Verifier,
+        CardName::new("other-signoff").expect("name"),
+    ));
     deployment
         .server
         .seed_role(
             "other_approver",
             &[
-                Permission::verifier_read_any(),
-                Permission::verifier_approve(other),
+                Permission::executions_read_any(),
+                Permission::verifier_approve_any(),
             ],
         )
         .await
         .expect("role seeds");
     let (_, misscoped) = deployment
-        .user("approval-misscoped", &["other_approver"])
+        .user_at("approval-misscoped", &["other_approver"], Some(&other))
         .await;
     let (status, denied) = deployment
         .decide(&misscoped, execution, &approval, &approve)
@@ -330,7 +375,9 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
     assert_eq!(refused["code"], "WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND");
 
-    let (approver, approver_jwt) = deployment.user("approval-editor", &["editor"]).await;
+    let (approver, approver_jwt) = deployment
+        .user("approval-editor", &["approver", "viewer"])
+        .await;
     let (status, receipt) = deployment
         .decide(&approver_jwt, execution, &approval, &approve)
         .await;
@@ -374,15 +421,28 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
 
     deployment
         .server
-        .seed_role(
-            "signoff_approver",
-            &[Permission::verifier_approve(verifier)],
-        )
+        .seed_role("signoff_approver", &[Permission::verifier_approve_any()])
         .await
         .expect("role seeds");
     let (scoped, scoped_jwt) = deployment
-        .user("approval-scoped", &["signoff_approver"])
+        .user_at(
+            "approval-scoped",
+            &["signoff_approver"],
+            Some(&PermissionScope::Card(verifier)),
+        )
         .await;
+    deployment
+        .server
+        .grant_role_at(
+            &Bootstrap::User {
+                id: wyrd_spec::auth::PrincipalId::new(scoped),
+                jwt: scoped_jwt.clone(),
+            },
+            "viewer",
+            &PermissionScope::All,
+        )
+        .await
+        .expect("the scoped approver reads the parent");
     let rejected = deployment.open(2, H2).await;
     deployment.until(rejected, "waiting").await;
     let (status, receipt) = deployment.publish_ci(H2, json!({"status": "green"})).await;
@@ -462,7 +522,9 @@ async fn an_approval_expires_with_its_execution() {
     assert_ne!(first, second, "each execution has its own occurrence");
     deployment.until(current, "timed_out").await;
 
-    let (_, approver) = deployment.user("approval-late", &["editor"]).await;
+    let (_, approver) = deployment
+        .user("approval-late", &["approver", "viewer"])
+        .await;
     for (execution, approval) in [(superseded, &first), (current, &second)] {
         let served = deployment.status(execution).await;
         let expired = occurrence(&served);
@@ -667,7 +729,9 @@ async fn a_decision_outlives_its_retry_receipt() {
         .as_str()
         .expect("approval id")
         .to_owned();
-    let (approver, approver_jwt) = deployment.user("approval-editor", &["editor"]).await;
+    let (approver, approver_jwt) = deployment
+        .user("approval-editor", &["approver", "viewer"])
+        .await;
     let approve = json!({"decision": "approved", "reason": "reviewed the diff"});
     let (status, receipt) = deployment
         .decide(&approver_jwt, execution, &approval, &approve)
@@ -992,7 +1056,7 @@ async fn a_cold_decision_needs_only_its_own_connection() {
             .await
             .expect("server restarts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("pull-request-editor-again", &["editor"])
+        .bootstrap_user("pull-request-editor-again", &["approver", "viewer"])
         .await
         .expect("editor bootstraps")
     else {
@@ -1022,7 +1086,7 @@ async fn a_cold_decision_needs_only_its_own_connection() {
 
 /// A service account deciding on a user's behalf is the decision's actor.
 ///
-/// A user delegates to an `editor` Service rooted at its own Card, whose Card
+/// A user delegates to an approving Service rooted at its own Card, whose Card
 /// scope does not carry the Repository subject; the delegated token approves,
 /// and the receipt and inspection name the Service as the actor. The same
 /// delegated request replays the receipt, while the user directly and a second
@@ -1041,11 +1105,13 @@ async fn a_service_account_decides_on_a_users_behalf() {
         .expect("approval id")
         .to_owned();
 
-    let (_, user_jwt) = deployment.user("approval-delegator", &["editor"]).await;
+    let (_, user_jwt) = deployment
+        .user("approval-delegator", &["approver", "viewer"])
+        .await;
     let on_behalf = async |name: &str| {
         let actor = deployment
             .server
-            .bootstrap_service(name, &["editor"])
+            .bootstrap_service(name, &["approver", "viewer"])
             .await
             .expect("actor Service bootstraps");
         let actor_jwt = deployment

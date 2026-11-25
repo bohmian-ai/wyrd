@@ -158,6 +158,7 @@ pub fn shell_owners(
 ) -> AppStateInner {
     let verification = Verification::new(
         postgres.wyrd().clone(),
+        Arc::clone(bifrost.scribe_outbox()),
         None,
         OperatorSecrets::default(),
         crate::verification::RuntimeLimits::default().execution_timeout,
@@ -287,13 +288,51 @@ pub(crate) fn test_caller(
             wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
             wyrd_runtime::PrincipalKind::User,
             tenant,
-            Vec::new(),
             wyrd_runtime::permission::PermissionSet::from_iter(permissions),
         ),
         request_id: wyrd_spec::request_id::RequestId::now_v7(),
         delegation_chain: Vec::new(),
         executed_by: None,
     }
+}
+
+/// Install a current authority for `tenant` in which `users` are live
+/// User accounts and `services` live Service accounts, none holding any
+/// grant, so a token naming them authorizes without a database read.
+pub(crate) fn admit_accounts(
+    state: &AppState,
+    tenant: wyrd_spec::DataTenantId,
+    users: &[wyrd_spec::auth::PrincipalId],
+    services: &[wyrd_spec::auth::PrincipalId],
+) {
+    use sqlx::types::Json;
+    use wyrd_sql::queries::auth::{AuthorityServiceAccount, AuthorityState};
+    let loaded = wyrd_auth::authority::TenantAuthority::compile(AuthorityState {
+        revision: 0,
+        bindings: Json(Vec::new()),
+        memberships: Json(Vec::new()),
+        users: Json(
+            users
+                .iter()
+                .map(wyrd_spec::auth::PrincipalId::as_uuid)
+                .collect(),
+        ),
+        service_accounts: Json(
+            services
+                .iter()
+                .map(|id| AuthorityServiceAccount {
+                    id: id.as_uuid(),
+                    principal_kind: "service".to_owned(),
+                    restriction_kind: None,
+                    restriction_name: None,
+                })
+                .collect(),
+        ),
+        api_keys: Json(Vec::new()),
+    })
+    .expect("an empty authority compiles");
+    let generation = state.auth.authority.generation();
+    state.auth.authority.install(tenant, generation, loaded);
 }
 
 /// The library test binary's allocator: the system allocator plus a count of

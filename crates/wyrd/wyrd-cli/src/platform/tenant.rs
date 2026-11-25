@@ -114,6 +114,7 @@ async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
         .create_tenant(&wyrd_spec::auth::CreateTenantRequest {
             slug,
             display_name: args.display_name,
+            human_admin: None,
         })
         .await
         .map_err(|source| WyrdCliError::Server { source })?;

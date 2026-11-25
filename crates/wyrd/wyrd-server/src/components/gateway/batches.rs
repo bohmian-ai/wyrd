@@ -186,6 +186,7 @@ fn invocable(caller: &Caller) -> (Vec<String>, Vec<String>, bool) {
     for permission in caller
         .principal
         .effective_permissions
+        .grants()
         .iter()
         .filter(|permission| {
             permission.resource.covers(&Resource::Gateway)
@@ -201,7 +202,8 @@ fn invocable(caller: &Caller) -> (Vec<String>, Vec<String>, bool) {
                 models.push(format!("{}/{}", deployment.as_str(), model.as_str()));
             }
             PermissionScope::Bifrost(_)
-            | PermissionScope::Verifier(_)
+            | PermissionScope::Card(_)
+            | PermissionScope::GithubConnection(_)
             | PermissionScope::Tool(_) => {}
         }
     }

@@ -2,10 +2,10 @@
 //!
 //! A row is keyed by the SHA-256 of a random session identifier that exists
 //! only in the browser's HttpOnly cookie. [`insert_browser_session`] records a
-//! session once a provider sign-in, local password or recovery key verified
-//! the principal, [`live_browser_session`] finds an unexpired, unrevoked
-//! session whose recovery key or local password revision (if any) is still
-//! current, and [`revoke_browser_session`] ends one session at logout. Forced RLS is the only tenant selection, and
+//! session once a provider sign-in, shared social sign-in, local password or
+//! recovery key verified the principal, [`live_browser_session`] finds an
+//! unexpired, unrevoked session whose recovery key, local password revision
+//! or linked social identity (if any) is still current, and [`revoke_browser_session`] ends one session at logout. Forced RLS is the only tenant selection, and
 //! `PostgreSQL` owns every time: callers bind the lifetime, never an instant.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::auth::{Sha256Hex, SocialProvider};
 
 use crate::TenantConn;
-use crate::row_types::auth::HumanConnectionBinding;
+use crate::row_types::auth::{HumanConnectionBinding, HumanLoginAnchor};
 
 /// Drop this tenant's sessions past their absolute expiry.
 const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r"
@@ -25,22 +25,33 @@ const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r"
 ";
 
 /// Record one session owned by the RLS tenant; `PostgreSQL` derives its
-/// absolute expiry from the bound lifetime in seconds.
+/// absolute expiry from the bound lifetime in seconds. A password or social
+/// session is not recorded while the tenant requires company SSO, so a
+/// completion racing a policy change never outlives it.
 const INSERT_BROWSER_SESSION_SQL: &str = r"
     INSERT INTO wyrd.auth_browser_sessions (
         session_hash, data_tenant_id, principal_id, connection_id,
-        connection_revision, api_key_id, password_revision, expires_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, statement_timestamp() + ($8 * interval '1 second'))
+        connection_revision, api_key_id, password_revision, social_provider,
+        social_provider_revision, social_identity_id, expires_at
+    ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             statement_timestamp() + ($11 * interval '1 second')
+       WHERE ($7::bigint IS NULL AND $8::text IS NULL)
+          OR NOT EXISTS (SELECT 1 FROM wyrd.auth_login_policies WHERE require_company_sso)
     RETURNING expires_at
 ";
 
 /// The unexpired, unrevoked session with this hash whose recovery key, when
 /// it has one, is itself unrevoked and unexpired, and whose local password
-/// revision, when it has one, is still its User's current revision. `recent`
+/// revision, when it has one, is still its User's current revision, and
+/// whose linked social identity, when it has one, still belongs to the
+/// session's User (removing the identity deletes the session), and that is
+/// not a password or social session while the tenant requires company SSO.
+/// `recent`
 /// is whether the session was created in the last five minutes.
 const LIVE_BROWSER_SESSION_SQL: &str = r"
     SELECT s.principal_id, s.connection_id, s.connection_revision, s.api_key_id,
-           s.password_revision, s.expires_at,
+           s.password_revision, s.social_provider, s.social_provider_revision,
+           s.social_identity_id, s.expires_at,
            s.created_at > statement_timestamp() - interval '5 minutes' AS recent
       FROM wyrd.auth_browser_sessions s
       LEFT JOIN wyrd.auth_api_keys k
@@ -49,6 +60,9 @@ const LIVE_BROWSER_SESSION_SQL: &str = r"
       LEFT JOIN wyrd.auth_users u
         ON u.data_tenant_id = s.data_tenant_id
        AND u.id = s.principal_id
+      LEFT JOIN wyrd.auth_user_identities i
+        ON i.data_tenant_id = s.data_tenant_id
+       AND i.id = s.social_identity_id
      WHERE s.session_hash = $1
        AND s.revoked_at IS NULL
        AND s.expires_at > statement_timestamp()
@@ -60,6 +74,11 @@ const LIVE_BROWSER_SESSION_SQL: &str = r"
        AND (s.password_revision IS NULL
             OR (u.password_hash IS NOT NULL
                 AND u.password_revision = s.password_revision))
+       AND (s.social_identity_id IS NULL OR i.user_id = s.principal_id)
+       AND ((s.password_revision IS NULL AND s.social_provider IS NULL)
+            OR NOT EXISTS (SELECT 1 FROM wyrd.auth_login_policies p
+                            WHERE p.data_tenant_id = s.data_tenant_id
+                              AND p.require_company_sso))
 ";
 
 /// Revoke the live session with this hash.
@@ -81,6 +100,34 @@ pub enum BrowserSessionAuthority {
     /// A local password sign-in at this password revision of the session's
     /// User.
     Password(i64),
+    /// A shared social sign-in through this provider revision and linked
+    /// identity of the session's User.
+    Social(SocialAnchor),
+}
+
+/// The shared social sign-in a credential was created through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocialAnchor {
+    /// The shared provider.
+    pub provider: SocialProvider,
+    /// The exact platform provider revision the sign-in went through.
+    pub provider_revision: i64,
+    /// The `wyrd.auth_user_identities` id the provider identity resolved to.
+    pub identity_id: Uuid,
+}
+
+impl BrowserSessionAuthority {
+    /// The human login anchor this authority is, or `None` for a recovery
+    /// sign-in, which proves no human authentication, and for a social
+    /// sign-in, which anchors no device approval or refresh token yet.
+    #[must_use]
+    pub const fn human_anchor(&self) -> Option<HumanLoginAnchor> {
+        match *self {
+            Self::Connection(binding) => Some(HumanLoginAnchor::Connection(binding)),
+            Self::Password(revision) => Some(HumanLoginAnchor::Password(revision)),
+            Self::ApiKey(_) | Self::Social(_) => None,
+        }
+    }
 }
 
 /// A live browser session as [`live_browser_session`] found it.
@@ -109,6 +156,12 @@ struct LiveRow {
     api_key_id: Option<Uuid>,
     /// The local password revision, for a password sign-in.
     password_revision: Option<i64>,
+    /// The shared provider, for a social sign-in.
+    social_provider: Option<String>,
+    /// That provider's revision.
+    social_provider_revision: Option<i64>,
+    /// The linked identity id.
+    social_identity_id: Option<Uuid>,
     /// Absolute expiry.
     expires_at: DateTime<Utc>,
     /// Created in the last five minutes.
@@ -117,7 +170,8 @@ struct LiveRow {
 
 /// Insert a browser session keyed by `session_hash` for `principal_id`,
 /// created through `authority`, whose absolute expiry `PostgreSQL` derives
-/// from `ttl`, and return that expiry.
+/// from `ttl`, and return that expiry; `None`, recording nothing, for a
+/// password or social `authority` while the tenant requires company SSO.
 ///
 /// First purges this tenant's expired sessions. The table refuses a lifetime
 /// above twelve hours and a reused session hash.
@@ -130,15 +184,16 @@ pub async fn insert_browser_session(
     principal_id: Uuid,
     authority: BrowserSessionAuthority,
     ttl: Duration,
-) -> Result<DateTime<Utc>, sqlx::Error> {
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     let tenant = conn.data_tenant_id().as_uuid();
     sqlx::query(PURGE_EXPIRED_BROWSER_SESSIONS_SQL)
         .execute(&mut **conn.transaction())
         .await?;
-    let (connection, api_key_id, password_revision) = match authority {
-        BrowserSessionAuthority::Connection(binding) => (Some(binding), None, None),
-        BrowserSessionAuthority::ApiKey(api_key_id) => (None, Some(api_key_id), None),
-        BrowserSessionAuthority::Password(revision) => (None, None, Some(revision)),
+    let (connection, api_key_id, password_revision, social) = match authority {
+        BrowserSessionAuthority::Connection(binding) => (Some(binding), None, None, None),
+        BrowserSessionAuthority::ApiKey(api_key_id) => (None, Some(api_key_id), None, None),
+        BrowserSessionAuthority::Password(revision) => (None, None, Some(revision), None),
+        BrowserSessionAuthority::Social(anchor) => (None, None, None, Some(anchor)),
     };
     sqlx::query(INSERT_BROWSER_SESSION_SQL)
         .bind(session_hash.as_bytes().as_slice())
@@ -148,10 +203,14 @@ pub async fn insert_browser_session(
         .bind(connection.map(|binding| binding.connection_revision))
         .bind(api_key_id)
         .bind(password_revision)
+        .bind(social.map(|anchor| anchor.provider.as_str()))
+        .bind(social.map(|anchor| anchor.provider_revision))
+        .bind(social.map(|anchor| anchor.identity_id))
         .bind(ttl.as_secs_f64())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .and_then(|row| sqlx::Row::try_get(&row, "expires_at"))
+        .fetch_optional(&mut **conn.transaction())
+        .await?
+        .map(|row| sqlx::Row::try_get(&row, "expires_at"))
+        .transpose()
 }
 
 /// This tenant's unexpired, unrevoked session with `session_hash`, when its
@@ -173,20 +232,43 @@ pub async fn live_browser_session(
         .fetch_optional(&mut **conn.transaction())
         .await?;
     row.map(|row| {
+        let social = match (
+            row.social_provider.as_deref().map(SocialProvider::parse),
+            row.social_provider_revision,
+            row.social_identity_id,
+        ) {
+            (Some(Some(provider)), Some(provider_revision), Some(identity_id)) => {
+                Some(SocialAnchor {
+                    provider,
+                    provider_revision,
+                    identity_id,
+                })
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(sqlx::Error::Decode(
+                    "browser session social anchor is corrupt".into(),
+                ));
+            }
+        };
         let authority = match (
             row.connection_id,
             row.connection_revision,
             row.api_key_id,
             row.password_revision,
+            social,
         ) {
-            (Some(connection_id), Some(connection_revision), None, None) => {
+            (None, None, None, None, Some(anchor)) => BrowserSessionAuthority::Social(anchor),
+            (Some(connection_id), Some(connection_revision), None, None, None) => {
                 BrowserSessionAuthority::Connection(HumanConnectionBinding {
                     connection_id,
                     connection_revision,
                 })
             }
-            (None, None, Some(api_key_id), None) => BrowserSessionAuthority::ApiKey(api_key_id),
-            (None, None, None, Some(revision)) => BrowserSessionAuthority::Password(revision),
+            (None, None, Some(api_key_id), None, None) => {
+                BrowserSessionAuthority::ApiKey(api_key_id)
+            }
+            (None, None, None, Some(revision), None) => BrowserSessionAuthority::Password(revision),
             _ => {
                 return Err(sqlx::Error::Decode(
                     "browser session authority is corrupt".into(),

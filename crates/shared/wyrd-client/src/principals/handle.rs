@@ -5,13 +5,15 @@ use std::sync::Arc;
 use reqwest::Method;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CreateUserInvitationRequest,
-    CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
-    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, PrincipalId, PrincipalPage,
-    PrincipalQuery, PrincipalRoles, PrincipalSummary, RevokePrincipalRequest, RoleAssignmentChange,
-    WorkloadRestriction,
+    AccessSummary, CreateGroupRequest, CreateRoleBindingRequest, CreateServicePrincipalRequest,
+    CreateServicePrincipalResponse, CreateUserInvitationRequest, CreateUserRequest, CreatedUser,
+    CredentialListQuery, CredentialListResponse, CurrentUserProfile, GroupList, GroupView,
+    IssuedCredential, IssuedUserInvitations, PrincipalId, PrincipalPage, PrincipalQuery,
+    PrincipalSummary, PutRoleRequest, RevokePrincipalRequest, RoleBindingList, RoleBindingQuery,
+    RoleBindingView, RoleList, RoleView, WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::{AccessGroupId, RoleBindingId};
 
 use crate::client::WyrdClient;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -113,11 +115,11 @@ impl Principals {
             .await
     }
 
-    /// Invite a person to sign up as a local User holding the named Roles;
-    /// the one-time code is returned once.
+    /// Invite each recipient to sign up as a User holding the scoped
+    /// assignments; each one-time link is returned once.
     ///
     /// # Arguments
-    /// * `request` - The Role names the enrolled User receives.
+    /// * `request` - The recipients and the assignments each enrolled User receives.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks User management and tenant
@@ -125,7 +127,7 @@ impl Principals {
     pub async fn invite_user(
         &self,
         request: &CreateUserInvitationRequest,
-    ) -> Result<IssuedUserInvitation, WyrdError> {
+    ) -> Result<IssuedUserInvitations, WyrdError> {
         self.client
             .http
             .request_json(
@@ -361,89 +363,199 @@ impl Principals {
             .await
     }
 
-    /// List a principal's Role assignments and where each came from.
-    ///
-    /// A user may hold one Role from both its identity provider (`idp`) and
-    /// an administrator (`direct`); its effective Roles are the union.
+    /// One account's current access: every contributing direct, group and
+    /// provider binding with its source, and the combined scoped permissions
+    /// the server enforces.
     ///
     /// # Arguments
-    /// * `principal_id` - The principal whose assignments are listed.
+    /// * `principal_id` - The account whose access is summarized.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks principal administration or
     /// no assignable principal has this id in the caller's tenant.
-    pub async fn roles(&self, principal_id: &PrincipalId) -> Result<PrincipalRoles, WyrdError> {
+    pub async fn access(&self, principal_id: &PrincipalId) -> Result<AccessSummary, WyrdError> {
+        self.get(&format!("/v1/principals/{principal_id}/access"))
+            .await
+    }
+
+    /// Every tenant role with its operations.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks principal administration.
+    pub async fn roles(&self) -> Result<RoleList, WyrdError> {
+        self.get("/v1/access/roles").await
+    }
+
+    /// Create or replace a custom role's operations; built-ins are read-only.
+    ///
+    /// # Arguments
+    /// * `role` - The custom role name.
+    /// * `request` - Its operations from the closed catalog.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a tenant administrator,
+    /// the name is built-in or malformed, or the bundle is empty.
+    pub async fn put_role(
+        &self,
+        role: &str,
+        request: &PutRoleRequest,
+    ) -> Result<RoleView, WyrdError> {
         self.client
             .http
-            .request_json::<(), _>(
-                Method::GET,
-                &format!("/v1/principals/{principal_id}/roles"),
-                None,
+            .request_json(
+                Method::PUT,
+                &format!("/v1/access/roles/{}", urlencoding::encode(role)),
+                Some(request),
             )
             .await
     }
 
-    /// Grant a principal a direct Role assignment.
+    /// Delete a custom role no binding references.
     ///
-    /// Idempotent: `changed` is `false` when the principal already held the
-    /// Role directly. The Role reaches the principal's next token.
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a tenant administrator, or
+    /// the role is built-in, unknown or still bound.
+    pub async fn delete_role(&self, role: &str) -> Result<RoleView, WyrdError> {
+        self.send::<(), _>(
+            Method::DELETE,
+            &format!("/v1/access/roles/{}", urlencoding::encode(role)),
+            None,
+        )
+        .await
+    }
+
+    /// List role bindings matching `query`.
     ///
-    /// # Arguments
-    /// * `principal_id` - The principal to grant the Role to.
-    /// * `role` - The built-in or tenant Role name.
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks principal administration.
+    pub async fn bindings(&self, query: &RoleBindingQuery) -> Result<RoleBindingList, WyrdError> {
+        let query = serde_urlencoded::to_string(query)
+            .map_err(|error| WyrdError::internal(format!("encode binding query: {error}")))?;
+        let path = if query.is_empty() {
+            "/v1/access/bindings".to_owned()
+        } else {
+            format!("/v1/access/bindings?{query}")
+        };
+        self.get(&path).await
+    }
+
+    /// Bind one role to one account or group at one explicit scope.
+    ///
+    /// Idempotent. The grant reaches the subject's existing credentials once
+    /// the server's authority propagates, still bounded by each credential's
+    /// ceiling.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller is not a tenant administrator, the
-    /// Role does not exist, or no assignable principal has this id.
-    pub async fn grant_role(
+    /// role or subject is unknown, or the role grants nothing at the scope.
+    pub async fn bind(
         &self,
-        principal_id: &PrincipalId,
-        role: &str,
-    ) -> Result<RoleAssignmentChange, WyrdError> {
-        self.change_role(Method::PUT, principal_id, role).await
+        request: &CreateRoleBindingRequest,
+    ) -> Result<RoleBindingView, WyrdError> {
+        self.send(Method::POST, "/v1/access/bindings", Some(request))
+            .await
     }
 
-    /// Revoke a principal's direct Role assignment.
-    ///
-    /// Idempotent: `changed` is `false` when the principal held no direct
-    /// assignment of the Role. A user's `idp` assignment of the same Role is
-    /// left for the identity provider. Tokens already issued keep their
-    /// bounded lifetime; the next token omits the Role.
-    ///
-    /// # Arguments
-    /// * `principal_id` - The principal to revoke the Role from.
-    /// * `role` - The built-in or tenant Role name.
+    /// Remove one directly administered binding. Authority another binding
+    /// grants remains.
     ///
     /// # Errors
-    /// Returns the errors documented on [`Self::grant_role`].
-    pub async fn revoke_role(
-        &self,
-        principal_id: &PrincipalId,
-        role: &str,
-    ) -> Result<RoleAssignmentChange, WyrdError> {
-        self.change_role(Method::DELETE, principal_id, role).await
+    /// Returns a Wyrd error when the caller is not a tenant administrator or
+    /// the binding is unknown or provider-administered.
+    pub async fn unbind(&self, binding_id: &RoleBindingId) -> Result<RoleBindingView, WyrdError> {
+        self.send::<(), _>(
+            Method::DELETE,
+            &format!("/v1/access/bindings/{binding_id}"),
+            None,
+        )
+        .await
     }
 
-    /// Send one bodyless direct-assignment write.
+    /// Every local group with its members.
     ///
     /// # Errors
-    /// Returns the server's stable Wyrd error for a refused write.
-    async fn change_role(
+    /// Returns a Wyrd error when the caller lacks principal administration.
+    pub async fn groups(&self) -> Result<GroupList, WyrdError> {
+        self.get("/v1/access/groups").await
+    }
+
+    /// Create an empty local group.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a tenant administrator or
+    /// the name is empty or taken.
+    pub async fn create_group(&self, request: &CreateGroupRequest) -> Result<GroupView, WyrdError> {
+        self.send(Method::POST, "/v1/access/groups", Some(request))
+            .await
+    }
+
+    /// Delete a group with its memberships and bindings.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a tenant administrator or
+    /// the group is unknown.
+    pub async fn delete_group(&self, group_id: &AccessGroupId) -> Result<GroupView, WyrdError> {
+        self.send::<(), _>(
+            Method::DELETE,
+            &format!("/v1/access/groups/{group_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// Add one account to a group; idempotent.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a tenant administrator, or
+    /// the group or account is unknown.
+    pub async fn add_group_member(
+        &self,
+        group_id: &AccessGroupId,
+        principal_id: &PrincipalId,
+    ) -> Result<GroupView, WyrdError> {
+        self.send::<(), _>(
+            Method::PUT,
+            &format!("/v1/access/groups/{group_id}/members/{principal_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// Remove one account from a group; idempotent.
+    ///
+    /// # Errors
+    /// Returns the errors documented on [`Self::add_group_member`].
+    pub async fn remove_group_member(
+        &self,
+        group_id: &AccessGroupId,
+        principal_id: &PrincipalId,
+    ) -> Result<GroupView, WyrdError> {
+        self.send::<(), _>(
+            Method::DELETE,
+            &format!("/v1/access/groups/{group_id}/members/{principal_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// Send one bodyless read.
+    ///
+    /// # Errors
+    /// Returns the server's stable Wyrd error.
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, WyrdError> {
+        self.send::<(), _>(Method::GET, path, None).await
+    }
+
+    /// Send one request with an optional JSON body.
+    ///
+    /// # Errors
+    /// Returns the server's stable Wyrd error.
+    async fn send<B: serde::Serialize + Sync, T: serde::de::DeserializeOwned>(
         &self,
         method: Method,
-        principal_id: &PrincipalId,
-        role: &str,
-    ) -> Result<RoleAssignmentChange, WyrdError> {
-        self.client
-            .http
-            .request_json::<(), _>(
-                method,
-                &format!(
-                    "/v1/principals/{principal_id}/roles/{}",
-                    urlencoding::encode(role)
-                ),
-                None,
-            )
-            .await
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<T, WyrdError> {
+        self.client.http.request_json(method, path, body).await
     }
 }

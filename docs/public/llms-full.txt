@@ -195,7 +195,10 @@ Enter your database URL and a tenant name when asked, and decline the other offe
 Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
 ```
 
-It also prints a root credential once. Save it; it recovers a lost tenant key.
+It also prints two secrets once, on the terminal only. Save both:
+
+- a root credential, which recovers a lost tenant key;
+- the password of the tenant's `admin` user, with the page where you sign in to the Wyrd UI.
 
 **Start it without prompts:**
 
@@ -2380,7 +2383,11 @@ Open a pull request on the repository. When GitHub delivers the event, Wyrd queu
 wyrd execution status --execution-id <execution_id>
 ```
 
-Reading a pull request's execution needs `cards:read` as well as `verifier:read` on its Verifier. Its `pull_request` field shows what the execution was pinned to when GitHub's delivery was accepted: the pull request `number`, the `base` and `head` branch and exact commit, the head repository (it differs for a fork), and the `delivery_id` that admitted it. The policy is always the repository's selected version at that moment, never `wyrd.toml` from the pull request's own branch.
+Reading a pull request's execution, its results, and its evidence needs `executions:read` on the Repository, which a `viewer` binding on the Repository gives; no grant on the Verifier is needed. Its `pull_request` field shows what the execution was pinned to when GitHub's delivery was accepted: the pull request `number`, the `base` and `head` branch and exact commit, the head repository (it differs for a fork), the `generation` shared by every execution admitted together, its complete `members`, and the `delivery_id` or review `request_key` that admitted it. The policy is always the repository's selected version at that moment, never `wyrd.toml` from the pull request's own branch.
+
+To review a pull request again without a new commit, send `POST /v1/integrations/github/pull-requests/reviews` with its `host`, `repository_id` and `number` and an `Idempotency-Key`, or call `review_pull_request` on `GithubConnection` in an SDK or `github_connection.review_pull_request` over MCP. Wyrd admits a new generation under the selected policy, supersedes the older one, and returns the `generation` and every member execution, refused ones included. A retry with the same key returns the same generation, even after the head moves. It needs `cards:read`, and `verifier:run` on every selected Verifier. A pull request that is closed, a draft, missing, or bound to no Verifier answers `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` with `details.reason`, and nothing is admitted.
+
+Every member, refused ones included, keeps its pins in `bifrost.verification.execution_inputs` with origin `pull_request`, and its `recorded_at` is the time its generation observed the pull request. The current set is the generation with the latest `recorded_at`. A set is complete only when every execution in its `members` has a record; fewer visible records mean its handoff has not finished.
 
 Opening, reopening, marking ready for review, pushing commits and changing the base branch queue a new run. Draft pull requests and title or description edits queue nothing. An unfinished run that no longer applies ends `cancelled` with one of these error codes and keeps its pins:
 
@@ -2752,7 +2759,7 @@ The function must return the requirement's [verdict](/wyrd/reference/verifier-ca
 | `reason` | One sentence shown in the result |
 | `citations` | Where in the evidence the decision rests, as `{slot, locator}` |
 
-Any other shape, or an exception, makes the requirement `inconclusive`, and so does a `passed` outcome without a citation. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
+Any other shape, an exception, or a citation that does not locate evidence the check reaches makes the requirement `inconclusive`. A valid verdict counts as returned, including a `passed` outcome with no citations. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
 
 Tickets come from the agent, so bind this Verifier to the agent component rather than the whole Service:
 
@@ -3323,7 +3330,7 @@ for citation in judged.get("citations", []):
     print(citation["slot"], citation["locator"])  # attachment_<n> and the cited lines
 ```
 
-A pass without a citation counts as `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) explains.
+The judge's verdict counts as returned, with or without citations; a citation that does not locate the handbook makes the requirement `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) explains.
 
 ## Grouped session
 
@@ -4566,19 +4573,19 @@ A schedule runs as the Service's own account, and only while that account has re
 **Python**
 
 ```bash
-uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+uv run wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 **Rust**
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 **TypeScript**
 
 ```bash
-pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+pnpm wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 Copy the credential it prints into an environment variable for the next step:
@@ -5022,7 +5029,7 @@ Have a pull request's Verifier wait for a person to sign off, then approve it so
 ## Before you start
 
 - A repository connected and declared as in [Repositories](/wyrd/build-and-verify/declare/declare-a-repository/).
-- A credential for the approver that holds `verifier:approve` on the Verifier, such as one with the `editor` role.
+- A credential for the approver with two grants: `approver` on the Verifier, and `viewer` on the Repository, because a pull request's execution is read through its Repository. `editor` cannot approve. [Permissions](/wyrd/operate/grant-and-inspect-permissions/#2-bind-or-remove-a-role) shows how to bind them, such as `approver:Verifier/<verifier-name>` and `viewer:Repository/<repository-name>`.
 
 ## 1. Add an approval step
 
@@ -5132,7 +5139,7 @@ The SDKs decide on the execution handle: `execution.decide(approval_id, "approve
 
 | You see | Fix |
 | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `verifier:approve` on this Verifier and read access to the Card it verifies |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `approver` on this Verifier and `viewer` on the Repository |
 | `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` | Copy the `approval_id` from this execution's `approvals`; each execution has its own |
 | `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` | It was already decided, or the execution ended; `details.status` says which. Inspect the execution |
 | `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` | The outcome is unknown: run the same command again; a stored decision replays |
@@ -5311,19 +5318,26 @@ spec:
       check:
         kind: code
         entrypoint: judge
-        inputs: {report: steps.review.output}  # the code_review report
+        inputs: {report: steps.review.output, pr: steps.pr.output.pr}  # the code_review report and the pinned pull request
         source:
           inline: |
-            def judge(report):
+            # `pull_request` is the extraction's own source slot: these cite the
+            # reviewed head commit and the commit the review compared from.
+            CITATIONS = [
+                {"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}},
+                {"slot": "pull_request", "locator": {"json_pointer": "/review/comparison_base"}},
+            ]
+
+            def judge(report, pr):
                 if not report["coverage"]["complete"]:
-                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": []}
+                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": CITATIONS}
                 if any(f["severity"] in ("critical", "high") for f in report["findings"]):
-                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": []}
-                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": []}
+                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": CITATIONS}
+                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": CITATIONS}
 
 ```
 
-The `pr` step extracts the pull request; `review` hands its source to the Agent. `acceptable-review` fails on a `critical` or `high` finding and is `inconclusive` when the review did not cover the whole change, so an empty report from an incomplete review never passes. Change the rule to suit your team.
+The `pr` step extracts the pull request; `review` hands its source to the Agent. `acceptable-review` fails on a `critical` or `high` finding and is `inconclusive` when the review did not cover the whole change, so an empty report from an incomplete review never passes. Its verdict cites the reviewed pull request through `pull_request`, the extraction's own source slot, so a clean review with no findings still names the commits it reviewed. Change the rule to suit your team.
 
 ## 3. Bind it to pull requests
 
@@ -5883,13 +5897,19 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<server-host>:8080/readyz
 
 `200` means the server checked the schema and the login and is serving. If the server exits instead, its last log line says why; see [Troubleshoot a deployment](/wyrd/operate/troubleshoot-a-deployment/).
 
+**Put the image behind a proxy that keeps each visitor's address:**
+Wyrd limits sign-in and signup starts per visitor address. The `bohmian/wyrd` image takes each visitor's address from the TCP connection that reaches its port 8080. Behind a load balancer that opens its own connections, every visitor arrives from the balancer's address and shares one limit. Use a balancer that preserves the client address, or set `WYRD_CLIENT_ADDRESS_HEADER` to a single-address header your edge always overwrites, such as `CF-Connecting-IP`, and make sure nothing else can reach port 8080.
+
 ## 4. Create the first tenant
 
 With the server running, from a machine that has the same two database URLs exported:
 
 ```bash
-wyrd-server setup --tenant acme --server http://<server-host>:8080
+wyrd-server setup --tenant acme --server http://<server-host>:8080 \
+  --admin-username alice --admin-password-stdin < alice-password.txt
 ```
+
+`--admin-username` names the tenant's first person, who signs in with a password and needs neither a mail relay nor an identity provider. The password is read from the first line of standard input, so it never enters the command line or your shell history; without `--admin-password-stdin`, `setup` asks for it at a hidden prompt. It must be 15 to 128 characters; a passphrase works well.
 
 On a fresh database this creates the platform root and prints its `wyrd_global_...` credential, then creates the tenant and prints:
 
@@ -5899,9 +5919,29 @@ slug: acme
 admin_principal_id: <uuid>
 admin_credential: <key>
 This is the only time the tenant credential is shown. Store it now.
+admin_username: alice
+login_url: https://wyrd.example.com/t/acme/login
 ```
 
-Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Rerunning `setup` for an active tenant prints `is already set up; nothing to do.` To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Give `login_url` and the password to the person named by `--admin-username`.
+
+`setup` is safe to rerun. For an active tenant it prints `is already set up; nothing to do.` and discloses nothing. If a run was interrupted, rerun the same command: it finishes the tenant and keeps the administrator the first run created. To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+
+## 5. Decide who can create a workspace
+
+A new deployment is private. Nobody can create a workspace from the sign-in page, and the root page offers only sign-in to a workspace someone already knows. People join a workspace with an invitation from its administrator, which is a different step from creating one: [Add people](/wyrd/operate/add-people/) covers joining.
+
+To let visitors create their own workspaces, a platform administrator turns signup on:
+
+```bash
+curl -X PUT https://wyrd.example.com/platform/login-settings \
+  -H "X-Wyrd-Access-Token: Bearer $PLATFORM_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"password_enabled":true,"signup_enabled":true,"signup_workspace_cap":1}'
+```
+
+The root page then shows **Create a workspace**. A visitor proves an email address or a Google or GitHub account, names the workspace and its URL, and becomes its administrator. `signup_workspace_cap` limits how many workspaces one proven identity may create; the page says so when it is reached.
+
+Email signup, **Find my workspaces**, recovery email and mailed password reset codes need a mail relay ([Email invitations](/wyrd/operate/add-people/#email-invitations)). Without one, Wyrd sends no mail and the pages say so instead of offering those steps: invitations are copied links, and an administrator issues password reset codes.
 
 Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/wyrd/get-started/use-with-your-coding-agent/), and grant roles to others; [Identity and access](/wyrd/understand/identity-and-authorization/) explains the model.
 
@@ -5933,7 +5973,7 @@ Ship a Service with two keys: one for CI, which declares the Service and pulls i
 Once per tenant, as an administrator:
 
 ```bash
-wyrd principal credential create-principal --name ci-deploy --role editor
+wyrd principal credential create-principal --name ci-deploy --grant editor:all
 ```
 
 ```text
@@ -5942,14 +5982,14 @@ credential: <key>
 This is the only time the credential is shown. Store it now.
 ```
 
-Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
+Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor:all` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
 
 ## 2. Create the Service's account
 
 Once per Service, not once per release:
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 Store this credential where your deployment reads secrets. `workload` records evidence and runs Verifiers, but cannot change a Card, so a leaked runtime key cannot change what your Service is verified against. `--workload-name checkout` limits the key to releases of `checkout`, and makes it the account that scheduled Verifiers for `checkout` run as.
@@ -6040,7 +6080,7 @@ Page: /wyrd/operate/add-people/
 
 > Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
 
-People sign in to Wyrd through your organization's identity provider, such as Okta or Keycloak. Wyrd stores no passwords and has no invite step: a person's account is created the first time they sign in. A new account holds no role until you grant one.
+People sign in to Wyrd with a local username and password, or through your organization's identity provider, such as Okta or Keycloak. This guide connects a provider: then a person's account is created the first time they sign in, and it holds no role until you grant one. To add people without a provider, see [Without an identity provider](#without-an-identity-provider).
 
 You connect the provider once per tenant. Wyrd only trusts a connection after a real test sign-in succeeds, so a typo in the issuer or client ID cannot lock your team out.
 
@@ -6152,7 +6192,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 The response shows `"state":"Active"`. The recovery key proves an administrator can still get in with a key if the provider ever breaks; Wyrd checks it and does not store it. Keep the `admin_credential` in your secret manager for that reason.
 
-## 6. Sign in and grant roles
+## 6. Sign in and grant access
 
 Each person signs in once from a terminal:
 
@@ -6160,14 +6200,14 @@ Each person signs in once from a terminal:
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no role yet. As the administrator, find it and grant a role:
+The browser opens at your provider; they sign in and approve the code the CLI shows. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
 
 ```bash
 wyrd principal list --kind user --email alice@example.com
-wyrd principal role grant --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind user --grant editor:all
 ```
 
-The role takes effect within 5 minutes, when their access token next renews. [Roles](/wyrd/understand/identity-and-authorization/#roles) lists what each role allows.
+`editor:all` covers the whole tenant; `viewer:Repository/payments` would cover one Repository family. The grant reaches their current session within about 5 seconds; they do not sign in again. [Roles](/wyrd/understand/identity-and-authorization/#roles) lists what each role allows.
 
 ## Map provider groups to roles
 
@@ -6196,17 +6236,65 @@ Then add `groups` to `claim_mapping` and a `group_role_map` to `connection.json`
 
 Repeat steps 3 to 5 with the new `revision` the stage call returns. Only a connection that passes its own test replaces the active one, so sign-in keeps working until then.
 
-Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Roles you grant with `wyrd principal role grant` are separate: sign-in never adds or removes them.
+Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Bindings you grant with `wyrd principal access grant` are separate: sign-in never adds or removes them.
+
+## Require company sign-in
+
+Once the connection is active, you can make it the only way people sign in to the tenant. Password and Google or GitHub sign-in then stop, and so do the sessions and CLI sign-ins they started. API keys keep working.
+
+1. Sign in to the UI through your company provider, as an account that holds `admin`.
+2. Open **Settings**. **Require company SSO** shows how many active accounts cannot sign in through your company.
+3. Check **Require company SSO for every person** and select **Enable**.
+
+The page then reads `✓ Required`, and the sign-in page offers only your company provider. **Disable** works the same way. Disabling lets password and social sign-in start again, but every session and CLI sign-in that enabling ended stays ended.
+
+**Wyrd never links accounts:**
+A password, Google or GitHub account and a company account are separate accounts, even with the same email. Requiring company sign-in moves no roles, keys or history to the company account. Grant the company accounts their roles before you enable it. The warning count tells you how many accounts this leaves out.
+
+Enabling and disabling need a company sign-in from the last five minutes. An API key or a recovery session cannot change the policy. If your provider is down while company sign-in is required, people cannot sign in until it returns or you activate a replacement connection with the recovery key, as in step 5.
 
 ## Without an identity provider
 
-Until you connect a provider, give each person a key on their own account:
+Wyrd keeps local Users of its own, so a team can sign in before or without connecting a provider. As the administrator, invite a person with the grants their account receives:
 
 ```bash
-wyrd principal credential create-principal --name alice --role editor
+wyrd principal user invite --recipient alice@example.com --recipient bob@example.com \
+  --grant viewer:Repository/payments
 ```
 
-They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
+Each recipient gets a separate `invitation_link`, printed only this once. Send each person their link. Until an operator configures a mail relay (see [Email invitations](#email-invitations)), Wyrd does not email links, and `delivery` reads `not_emailed`. The person opens the link and chooses a username and password. Each link works once, for 24 hours. Anyone holding a live link can use it, so revoke one that reached the wrong person. `GET /v1/principals/users/invitations` lists pending invitations without their links. `POST /v1/principals/users/invitations/{id}/resend` replaces a link, and the old one stops working. `DELETE /v1/principals/users/invitations/{id}` revokes it.
+
+You can also create the User yourself. The password is read from standard input, so it never enters the command line or your shell history:
+
+```bash
+wyrd principal user create --username alice --grant editor:all < alice-password.txt
+```
+
+When a platform operator has enabled Google sign-in for the deployment, the invitation page also offers **Join with Google**. The person's account is then tied to that Google account, whatever its email address, and they return with **Continue with Google** on the sign-in page. A Google account that already has an account in the tenant cannot use a second link; the sign-in page tells them to sign in instead.
+
+In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email addresses and choose a role and a scope, and the page shows each link once. **Pending invitations** lists every live invitation, with **Resend** and **Revoke**.
+
+Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
+
+## Recovery email and password reset
+
+A person with a password resets it on the sign-in page with **Reset your password**. With a mail relay, they enter their username and Wyrd emails a one-time code to the account's verified recovery email; the page answers every username the same, so it never says whether an account exists. Without a relay, or when the account has no verified recovery email, an administrator issues the code with `POST /v1/principals/users/{principal_id}/password-reset` and gives it to the person. A code works once, for fifteen minutes. Setting the new password signs the person out everywhere and ends their CLI sign-ins; API keys keep working.
+
+Each person verifies their own recovery email under **Settings**, then **Account**, then **Recovery email**. The section appears only when the deployment has a mail relay, needs a sign-in from the last five minutes, and never shows the current address. Wyrd emails a link to the new address; opening it in the same browser while signed in finishes the change, and the previous address is told. A verified recovery email is also what **Find my workspaces** uses to list the workspaces that address can sign in to; an unverified profile email is never used for either.
+
+## Email invitations
+
+Wyrd can also email each invitation link through an SMTP relay you already use: your company's mail server or a transactional mail service such as Resend. Set up the sending account and domain with that service first. As a platform administrator, store the relay. The password is sealed and never returned, and tenant administrators can neither read nor change it:
+
+```bash
+curl -X PUT https://wyrd.example.com/platform/mail \
+  -H "X-Wyrd-Access-Token: Bearer $PLATFORM_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"host":"smtp.example.com","port":587,"tls":"starttls","username":"wyrd","password":"…","sender":"invites@example.com"}'
+```
+
+`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. To change other settings later, send the same `username` without `password` and Wyrd keeps the stored password; a new `username` needs its `password`, and leaving out `username` removes the stored sign-in. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
+
+From then on, Wyrd emails each new or resent link separately to its recipient and still returns it to you. `delivery` reads `accepted` when the relay took the message. That is not proof it reached an inbox. It reads `failed` when the relay refused it or could not be reached. The invitation stays pending, so copy the link or resend once the relay works. Wyrd does not queue or retry mail.
 
 ## If it fails
 
@@ -6215,7 +6303,8 @@ They set it as `WYRD_API_KEY`. Each call is audited under that account. The acco
 | The provider says the redirect URI is invalid | Register the exact `callback_url` from step 1. Call the API at the public address, not an internal one |
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` from activate | The test expired after 15 minutes, or you staged a new revision since. Rerun step 4 |
 | `WYRD_AUTH_409_CONNECTION_CONFLICT` | `expected_revision` is stale, or the recovery key is not an admin key of this tenant. Read the current revision with the step 1 call |
-| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no role yet. Grant one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
+| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` when you enable or disable company sign-in | Sign in through your company again, return to **Settings**, and confirm again |
+| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no grant yet. Bind one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
 
 ## Next
 
@@ -6276,9 +6365,9 @@ Only a server that runs this release's Verifiers offers `call_tool` to `code.run
 
 Page: /wyrd/operate/grant-and-inspect-permissions/
 
-> See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
+> See a principal's access, bind or remove a role at an explicit scope, cut a principal off, and confirm the result in the audit log.
 
-Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant.
+Bind a role at a scope to give a principal more access, remove the binding to take it away, and read the audit log to confirm what the server decided. Every grant names its scope: `all` for the whole tenant, or one Card family such as `Repository/payments`.
 
 ## Prerequisites
 
@@ -6287,59 +6376,46 @@ Grant a role to give a principal more access, revoke it to take access away, and
 
 If you are not sure which role you need, [Identity and access](/wyrd/understand/identity-and-authorization/#roles) lists what each built-in role allows.
 
-## 1. Find the principal and its roles
+## 1. Find the principal and its access
 
 The CLI uses your saved endpoint, or `--server` / `WYRD_SERVER_URL`:
 
 ```bash
 wyrd principal list --kind service
-wyrd principal role list --principal <principal-id>
+wyrd principal access show --principal <principal-id>
 ```
 
-A Service account holds the roles it was created with; [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) creates one with `editor` and one with `workload`. A tenant administrator holds `admin`.
+`show` prints one `grant` line per binding, with its binding ID, `role:scope`, and source (`direct`, `provider`, or `group:<name>`), then the combined permissions. A Service account holds the grants it was created with; [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) creates one with `editor:all` and one with `workload:all`. A tenant administrator holds `admin:all`.
 
-## 2. Grant or revoke a role
+## 2. Bind or remove a role
+
+A grant is `ROLE:SCOPE`. The scope is required: `all`, `KIND/NAME` for a Card family and its future versions, or `KIND/NAME@UID` for one exact version.
 
 ```bash
-wyrd principal role grant --principal <principal-id> --role editor
-wyrd principal role revoke --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind service --grant editor:all
+wyrd principal access grant --principal <principal-id> --kind user --grant viewer:Repository/payments
+wyrd principal access revoke --binding <binding-id>
 ```
 
-The same call from an SDK:
+`grant` prints the binding: its ID, `role:scope`, subject, and source. `revoke` takes that binding ID, which `show` also lists.
 
-**Python**
+Every SDK's `Principals` handle makes the same three calls, `bind`, `access`, and `unbind`, with the same request fields, and so do the `principals.bind`, `principals.access`, and `principals.unbind` [MCP tools](/wyrd/reference/mcp-tools/#principal-access).
 
-```python
-from wyrd.auth import Principals
+A bind is idempotent: binding the same role at the same scope again returns the same binding.
 
-principals = Principals()
-result = principals.grant_role(principal_id, "editor")
-print(result["changed"], result["roles"])
-```
+The change reaches running servers within about 5 seconds, including on credentials and tokens the principal already holds; nothing needs to sign in again or renew a token. Removing one binding leaves any other binding that grants the same access, such as `admin:all` or a group or identity-provider binding. A provider binding cannot be removed here; change the group mapping instead.
 
-**Rust**
+## In the UI
 
-```rust
-use wyrd_ai::auth::Principals;
+**Settings**, then **Access**, does the same work in the browser for a signed-in tenant administrator. It has four tabs:
 
-let principals = Principals::connect().await?;
-let result = principals.grant_role(&principal_id, "editor").await?;
-println!("{} {:?}", result.changed, result.roles);
-```
+- **Users** and **Service accounts** list the accounts. Select one to see each binding with its role, scope and source, and the combined permissions. Grant a role at a scope there, or remove a direct binding. A new Service account's key, and each key you issue later, is shown once.
+- **Roles** lists the built-in roles and creates, edits and deletes custom ones.
+- **Groups** creates groups, changes their members, and grants a group a role at a scope. Members inherit it.
 
-**TypeScript**
+No scope is preselected. A Card family covers every version of that Card, including later ones; an exact version covers only that one. A grant the server refuses saves nothing.
 
-```typescript
-import { Principals } from "wyrd-ai";
-
-const principals = await Principals.connect();
-const result = await principals.grantRole(principalId, "editor");
-console.log(result.changed, result.roles);
-```
-
-A grant is idempotent: granting a role the principal already holds returns `changed: false` and the unchanged role list.
-
-The change reaches a running service within 5 minutes, when its access token is next renewed. Revoking a role that a person also gets from an identity-provider group does not remove it; change the group mapping instead.
+A person who opens a page they have no access to sees **Copy access request**. It copies their account, the tenant, the action and the link they opened, for them to send you in your own channel. Wyrd sends nothing and keeps no record of it, and the text is the same whether the target is hidden or does not exist.
 
 ## 3. Cut a principal off
 
@@ -6369,9 +6445,9 @@ Run it with any SDK's `Bifrost.sql`, or the `bifrost.query` MCP tool. A refused 
 
 | Error code | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential does not hold `admin` | Use the tenant administrator's credential |
+| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential is not a tenant administrator's | Use the tenant administrator's credential |
 | `WYRD_AUTH_401_CREDENTIAL_REVOKED` | The principal or its tenant is suspended | Ask a tenant or platform administrator to restore it |
-| The service still has the old access | Its token was issued before the change | Wait up to 5 minutes for the next renewal |
+| The principal still has the old access after 5 seconds | Another binding still grants it | Run `wyrd principal access show` and remove or change the binding that still grants it |
 
 # Troubleshooting
 
@@ -6559,7 +6635,7 @@ To release the installation, run `wyrd github disconnect`. Wyrd stops starting G
 
 ## Next
 
-- [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): connecting needs `identity_connections:write`, which `admin` holds.
+- [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): reading the connection needs `github_connections:read` and connecting or disconnecting `github_connections:write`; `admin` holds both. Neither grants OIDC administration or any Card.
 
 # Foundations of verification
 
@@ -7398,24 +7474,40 @@ Each Service has at most one restricted account, and its scheduled Verifiers run
 
 ## Keys and tokens
 
-The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. A role change reaches a running Service at its next renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
+The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. The token says who is calling; it does not carry the account's grants. The server checks current grants on every call, so a grant or removal reaches running servers within about 5 seconds, on tokens already issued, without a new sign-in or renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
 
 ## Roles
 
-A permission is written `resource:action`, such as `cards:write`. A role is a set of permissions. Every tenant has four built-in roles, each including everything in the one above it:
+A permission is written `resource:action`, such as `cards:write`. A role is a set of operations; it says what an account may do, never where. A binding gives one role to one account or group at one explicit scope:
 
-| Role | Adds | Typical holder |
+| Scope | Covers |
+| --- | --- |
+| `all` | Every object in the tenant |
+| `KIND/NAME`, such as `Repository/payments` | That Card family: every version, future versions, and their retained evidence |
+| `KIND/NAME@UID` | One exact Card version only |
+
+Grants from several bindings add up, and nothing is granted by default: signing in alone grants nothing. Every tenant has six built-in roles. They are separate bundles, not a ladder:
+
+| Role | Allows within its scope | Typical holder |
 | --- | --- | --- |
-| `viewer` | Reading Cards, results, the audit log, and Bifrost tables | A person who inspects results |
-| `workload` | Recording Runs and observations, running Verifiers, calling the LLM gateway | A running Service |
-| `editor` | Declaring and deleting Cards, uploading artifacts | CI, or a person who changes declarations |
-| `admin` | Everything, including accounts, keys, and gateway settings | The tenant administrator |
+| `viewer` | Reading Cards, executions, results, and evidence, and authorized Bifrost queries; not the audit log or captured gateway payloads | A person who inspects results |
+| `workload` | Viewer reads, plus recording Runs and observations, running and cancelling Verifiers, and calling granted LLM gateways | A running Service |
+| `editor` | Workload operations, plus declaring and deleting Cards, uploading artifacts, and locking policy; no approvals or access administration | CI, or a person who changes declarations |
+| `approver` | Reading Cards and deciding pending approvals of the bound Verifiers; no execution reads, authoring, or running | A person who signs off on a step |
+| `auditor` | Reading the tenant audit log; nothing else | A security reviewer |
+| `admin` | Everything, including accounts, keys, grants, and gateway settings; bound at `all` only | The tenant administrator |
 
-Roles apply to the whole tenant. `workload` cannot change a Card, so a running Service cannot change what it is verified against.
+`workload` cannot change a Card, so a running Service cannot change what it is verified against. Built-in roles are read-only; an administrator can add custom roles from the same operations with `wyrd principal access put-role`.
+
+## Executions and their evidence
+
+An execution and everything it records, including results, publications, approvals, and evidence, are read through its trusted parent, which the server fixes when it accepts the work: the subject Card for ordinary verification, the Verifier for direct work with no subject, and the Repository for pull request work. Reading them needs `executions:read` on that parent, which `viewer` holds; access to the Verifier that ran is not needed and does not unlock them. An execution whose parent the caller cannot read looks the same as one that does not exist.
+
+Deciding an approval needs `verifier:approve` on the execution's Verifier and `executions:read` on its parent. An `approver` bound to a Verifier therefore also needs a `viewer` binding on the parent, such as the Repository for pull request work.
 
 ## Every decision is audited
 
-Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table a `viewer` can query.
+Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table only `auditor` and `admin` can query.
 
 # Architecture
 
@@ -7702,7 +7794,7 @@ An `agent` or `code` check returns a verdict:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
+A citation names the original slot, the `attachment_<n>` slot a fixed workspace file reports in `sources`, or `pull_request`, never an extract step or `/work` file. `pull_request` is the original source of a successful `extract` with `extractor: pull_request`: every value derived from that step's output reaches it, and its `json_pointer` locators resolve against that execution's extraction, such as `{"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}}`. A Verifier using that extractor cannot declare an input named `pull_request`. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. A valid verdict keeps its outcome, including a `passed` verdict with no citations. A citation of a slot the check does not reach, or of a location its evidence does not have, makes the requirement `inconclusive` with a reason starting `invalid citation:`; the verdict is not kept. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
 
 ### Custom data
 
@@ -7745,6 +7837,7 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `graph` | `depends_on` forms a cycle |
 | `media_as_text` | A `media` slot is bound to an Agent text placeholder |
 | `extract_source` | An `extract` step names both or neither of `from` and `extractor`, or `from` is not a whole `media` slot |
+| `source_slot` | A Verifier with an `extract` step using `extractor: pull_request` declares an input named `pull_request` |
 | `extract_format` | An `extract` step reads a slot with a format it cannot extract |
 | `operator` | An operator's parameters are invalid, such as a bad regex |
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |
@@ -7916,7 +8009,7 @@ import json
 
 card = await call_tool('cards.get', {'card_ref': {'kind': 'Service', 'name': 'policy-desk', 'version': '1.0.0'}})
 try:
-    await call_tool('bifrost.query', {'sql': 'SELECT execution_id FROM bifrost.verification.results LIMIT 1', 'max_rows': 1})
+    await call_tool('bifrost.query', {'sql': 'SELECT name FROM bifrost.traces.spans LIMIT 1', 'max_rows': 1})
     query = 'allowed'
     again = None
 except RuntimeError as error:
@@ -8141,20 +8234,20 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status with its compact result | Read one execution |
-| `verification.get_execution_details` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
-| `verification.list_invocations` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
-| `verification.list_publications` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
-| `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
-| `verification.download_publication` | `verifier:read` on the execution's Verifier | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
+| `verification.get_execution` | `executions:read` on the execution's trusted parent | `{execution_id}` → execution status with its compact result | Read one execution |
+| `verification.get_execution_details` | `executions:read` on the execution's trusted parent | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
+| `verification.list_invocations` | `executions:read` on the execution's trusted parent | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
+| `verification.list_publications` | `executions:read` on the execution's trusted parent | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
+| `verification.get_publication` | `executions:read` on the execution's trusted parent | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
+| `verification.download_publication` | `executions:read` on the execution's trusted parent | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
 | `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
 | `verification.publish_evidence` | `verifier:run` on each subscribed Verifier | `{repository: "owner/name", tags: {commit}, input, value}` → `{evidence_id, repository, tags, input, status, matched_subscriptions, recorded_at}` | Publish a deferred input for one commit; waiting executions resume; `status` is `accepted` or `replayed` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 | `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
-| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `cards:read` on its subject | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
+| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `executions:read` on its trusted parent | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
 
-`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. An execution's trusted parent is fixed when the work is accepted: the subject Card, the Verifier for direct work with no subject, or the Repository for pull request work; a grant on the Verifier that ran does not unlock it. An execution whose parent the caller cannot read answers not found. `verification.execute` refuses a scheduled drift Verifier.
 
 ## Bifrost
 
@@ -8188,6 +8281,25 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 
 A token already minted from a revoked credential lapses within five minutes.
 
+## Principal access
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `principals.access` | `service_accounts:write` | `{principal_id}` → AccessSummary | Read an account's grants, their sources, and combined permissions |
+| `principals.list_roles` | `service_accounts:write` | `{}` → RoleList | List built-in and custom roles |
+| `principals.list_bindings` | `service_accounts:write` | `{principal_id?, group_id?, role?}` → RoleBindingList | List role bindings, optionally for one account, group, or role |
+| `principals.list_groups` | `service_accounts:write` | `{}` → GroupList | List local groups and their members |
+| `principals.put_role` | `*` | `{role, operations}` → RoleView | Create or replace a custom role |
+| `principals.delete_role` | `*` | `{role}` → RoleView | Delete a custom role no binding references |
+| `principals.bind` | `*` | CreateRoleBindingRequest → RoleBindingView | Bind a role to an account or group at an explicit scope |
+| `principals.unbind` | `*` | `{binding_id}` → RoleBindingView | Remove a directly administered binding |
+| `principals.create_group` | `*` | `{name}` → GroupView | Create an empty local group |
+| `principals.delete_group` | `*` | `{group_id}` → GroupView | Delete a group with its memberships and bindings |
+| `principals.add_group_member` | `*` | `{group_id, principal_id}` → GroupView | Add an account to a group |
+| `principals.remove_group_member` | `*` | `{group_id, principal_id}` → GroupView | Remove an account from a group |
+
+A binding change reaches the subject's existing credentials within about five seconds.
+
 ## Operator connections
 
 | Tool | Permission | Input → output | Purpose |
@@ -8200,15 +8312,17 @@ A token already minted from a revoked credential lapses within five minutes.
 
 ## GitHub connection
 
-The read is listed for every caller; the writes are listed only for a caller
-holding `identity_connections:write`. GitHub's setup and OAuth callback are
+The read is listed for every caller; connect and disconnect are listed only for
+a caller holding `github_connections:write`, and the review request only for
+one holding any `verifier:run`. GitHub's setup and OAuth callback are
 browser redirects, not tools.
 
 | Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
-| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
-| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+| `github_connection.get` | `github_connections:read` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `github_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `github_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+| `github_connection.review_pull_request` | `cards:read`; `verifier:run` on every selected Verifier | `{host, repository_id, number, idempotency_key}` → GithubPullRequestReviewResponse | Request a fresh review of an open, ready pull request by its Repository's whole binding set; a retry of the key returns the same generation and members |
 
 ## Gateway administration
 
@@ -8565,9 +8679,12 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_TOKEN_EXPIRED` | 401 | Token expired | Re-authenticate to obtain a fresh token. |
 | `WYRD_AUTH_401_UNAUTHENTICATED` | 401 | Not authenticated | Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer &lt;token&gt;`. |
 | `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` | 401 | Workload root refused | `workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID. |
+| `WYRD_AUTH_403_METHOD_UNAVAILABLE` | 403 | Method not available | Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it. |
 | `WYRD_AUTH_403_ORIGIN_REFUSED` | 403 | Request origin refused | Send browser-session requests from the Wyrd application's own origin; cross-site and origin-less browser-session mutations are refused. |
 | `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
-| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one. |
+| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with a method the operation accepts, then retry within five minutes; an API key or recovery session cannot prove a recent sign-in. |
+| `WYRD_AUTH_403_SIGNUP_CHALLENGE` | 403 | Signup challenge not passed | Complete the human check on the signup page again and resubmit; each token is used once. |
+| `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT` | 403 | Workspace limit reached | Sign in to a workspace this identity already owns, or ask an operator to retire one; retrying does not help. |
 | `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION` | 403 | Delegated permissions cannot be represented | The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant. |
 | `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | 403 | Workload context required | This account is restricted to one workload family, so Card-attributed emission needs the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root. |
 | `WYRD_AUTH_404_ADMIN_NOT_FOUND` | 404 | Admin resource not found in tenant | Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant. |
@@ -8577,7 +8694,11 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` | 409 | Tenant OIDC candidate is not freshly tested | Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test. |
 | `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
 | `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
+| `WYRD_AUTH_429_EMAIL_ATTEMPTS` | 429 | Too many email requests | Wait `details.retry_after_seconds` until the fixed email window ends, then ask again. |
 | `WYRD_AUTH_429_PASSWORD_ATTEMPTS` | 429 | Too many password attempts | Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again. |
+| `WYRD_AUTH_429_SIGNUP_ATTEMPTS` | 429 | Too many workspace signups | Wait `details.retry_after_seconds` until the fixed signup window ends, then try again. |
+| `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` | 429 | Too many sign-in starts | Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again. |
+| `WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE` | 503 | Authorization state unavailable | Retry with backoff. The credential is still valid; the server cannot confirm current grants until its database is reachable. |
 | `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` | 503 | OIDC discovery unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure. |
 | `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | 503 | Auth verify backend unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure. |
 
@@ -8674,6 +8795,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` | 403 | GitHub repository not accessible | Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it. |
 | `WYRD_GITHUB_404_NOT_CONNECTED` | 404 | GitHub not connected | Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser. |
 | `WYRD_GITHUB_409_CONNECTION_CONFLICT` | 409 | GitHub connection conflict | An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed. |
+| `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` | 409 | Pull request not reviewable | Request a review only for an open, ready pull request of a repository whose selected Repository declares pull_request bindings; details.reason is not_found, closed, draft or no_bindings, and no work was accepted. |
 | `WYRD_GITHUB_503_NOT_CONFIGURED` | 503 | GitHub integration not configured | Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected. |
 | `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | 503 | GitHub unavailable | Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy. |
 
@@ -8957,7 +9079,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_400_INGEST_PROTO` | 400 | Invalid ingest request | Fix the ingest request fields and retry with a valid Wyrd ingest payload. |
 | `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` | 400 | OTLP request body malformed | The OTLP request body could not be decoded. Verify the Content-Type matches the encoding (application/x-protobuf or application/json) and that the payload is a valid OTLP ExportRequest. |
 | `WYRD_VALA_400_PAGE_TOKEN_INVALID` | 400 | Page token invalid | Restart the query from page 1 without a page_token. |
-| `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected. |
+| `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement, or one EXPLAIN [ANALYZE] of it; DDL/DML and unsupported constructs are rejected. |
 | `WYRD_VALA_400_SCHEMA_PARSE` | 400 | Bifrost schema parse failed | Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data. |
 | `WYRD_VALA_400_VARIANT_INVALID_JSON` | 400 | Invalid Variant JSON | Supply valid JSON text or a valid arrow.parquet.variant value for the Variant field; use try_parse_json in SQL to map invalid text to null. |
 | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` | 400 | Variant numeric value out of range | Send integers within the signed 64-bit or Variant decimal range, or send the number as a string. |

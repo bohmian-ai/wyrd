@@ -17,3 +17,14 @@ pub enum Extractor {
     /// execution was admitted for.
     PullRequest,
 }
+
+/// The input slot naming the engine-owned original source of a successful
+/// `pull_request` extraction.
+///
+/// Every output derived from the extraction reaches this slot, so an Agent or
+/// code check can cite the reviewed pull request as
+/// `{"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}}`,
+/// with the pointer resolved against that execution's retained extraction.
+/// A Verifier using the extractor cannot declare an input of this name, so a
+/// caller never supplies or replaces it.
+pub const PULL_REQUEST_SOURCE: &str = "pull_request";

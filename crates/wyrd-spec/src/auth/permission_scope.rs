@@ -2,20 +2,21 @@
 //!
 //! Wyrd RBAC is `(resource, action, scope)`. This module owns the `scope` axis:
 //! the closed, domain-tagged union naming *which objects* a grant reaches. It
-//! lives in the contract layer because the shape is persisted in
-//! `wyrd.auth_roles.permissions`, projected into generated schemas, and read by
-//! clients; the runtime permission model in `wyrd-runtime` consumes it rather
-//! than redefining it.
+//! lives in the contract layer because the shape is persisted in role
+//! bindings, credential ceilings, and accepted execution authority, projected
+//! into generated schemas, and read by clients.
 //!
 //! Scope is required on every permission. A grant that targets no object uses
 //! [`PermissionScope::All`], which covers every object of the permission's own
-//! resource and action and never widens either of those axes.
+//! resource and action inside the verified tenant and never widens either of
+//! those axes.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::card::agent::BuiltinTool;
-use crate::ids::{CardUid, ModelId, ProviderDeploymentName};
+use crate::envelope::CardKind;
+use crate::ids::{CardName, CardUid, GithubConnectionId, ModelId, ProviderDeploymentName};
 
 /// Longest accepted catalog or schema identifier segment.
 const MAX_IDENTIFIER_LEN: usize = 63;
@@ -31,6 +32,12 @@ pub enum PermissionScopeError {
         field: &'static str,
         /// The rejected value, retained so the operator can see what was stored.
         value: String,
+    },
+    /// A Card scope names a kind that can never be registered.
+    #[error("permission scope names Card kind {kind}, which is not registrable")]
+    UnregistrableCardKind {
+        /// The rejected kind, as its wire spelling.
+        kind: String,
     },
 }
 
@@ -49,10 +56,111 @@ pub enum PermissionScope {
     Bifrost(BifrostPermissionScope),
     /// One gateway deployment or exact deployment/model pair.
     Gateway(GatewayAccess),
-    /// One Verifier Card, by its exact UID.
-    Verifier(CardUid),
+    /// One Card family, or one exact version of it.
+    Card(CardPermissionScope),
+    /// The tenant's GitHub connection, by its stable connection id.
+    GithubConnection(GithubConnectionId),
     /// One exact built-in Agent tool, never a prefix or path.
     Tool(BuiltinTool),
+}
+
+/// The Card objects one grant reaches.
+///
+/// Family identity is tenant + kind + name, so a family grant covers every
+/// existing and future version and the retained history of deleted ones. An
+/// exact version follows its UID and never a replacement version. The exact
+/// variant carries its trusted family so family coverage is a pure
+/// comparison; the server derives that family from its own Card state or
+/// retained admission metadata, never from a caller's assertion.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CardPermissionScope {
+    /// Every version of one Card family.
+    Family {
+        /// Card kind of the family.
+        kind: CardKind,
+        /// Card name of the family.
+        name: CardName,
+    },
+    /// One exact Card version, with its trusted family.
+    Version {
+        /// Card kind of the version's family.
+        kind: CardKind,
+        /// Card name of the version's family.
+        name: CardName,
+        /// Exact immutable version UID.
+        uid: CardUid,
+    },
+}
+
+impl CardPermissionScope {
+    /// The exact-version scope of `uid` in family `kind`/`name`.
+    #[must_use]
+    pub const fn version(kind: CardKind, name: CardName, uid: CardUid) -> Self {
+        Self::Version { kind, name, uid }
+    }
+
+    /// The family scope of `kind`/`name`.
+    #[must_use]
+    pub const fn family(kind: CardKind, name: CardName) -> Self {
+        Self::Family { kind, name }
+    }
+
+    /// The exact-version scope of `uid` in the trusted family `reference`
+    /// names. Callers pass a reference the server resolved, never one a
+    /// caller supplied.
+    #[must_use]
+    pub fn exact(reference: &crate::reference::CardRef, uid: CardUid) -> Self {
+        Self::version(reference.kind.clone(), reference.name.clone(), uid)
+    }
+
+    /// The family kind this scope names.
+    #[must_use]
+    pub const fn kind(&self) -> &CardKind {
+        match self {
+            Self::Family { kind, .. } | Self::Version { kind, .. } => kind,
+        }
+    }
+
+    /// The family name this scope names.
+    #[must_use]
+    pub const fn name(&self) -> &CardName {
+        match self {
+            Self::Family { name, .. } | Self::Version { name, .. } => name,
+        }
+    }
+
+    /// True when this Card scope's objects include every object `required` names.
+    ///
+    /// A family covers itself and every exact version of that family; an
+    /// exact version covers only the same UID in the same family and never
+    /// the family.
+    #[must_use]
+    pub fn covers(&self, required: &Self) -> bool {
+        match (self, required) {
+            (Self::Family { .. }, _) => {
+                self.kind() == required.kind() && self.name() == required.name()
+            }
+            (Self::Version { .. }, Self::Version { .. }) => self == required,
+            (Self::Version { .. }, Self::Family { .. }) => false,
+        }
+    }
+
+    /// Rejects a Card scope naming a kind that can never be registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PermissionScopeError::UnregistrableCardKind`] for
+    /// [`CardKind::External`].
+    pub fn validate(&self) -> Result<(), PermissionScopeError> {
+        if *self.kind() == CardKind::External {
+            return Err(PermissionScopeError::UnregistrableCardKind {
+                kind: self.kind().wire_name().to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The gateway deployment objects one invoke grant reaches.
@@ -147,18 +255,38 @@ pub struct BifrostTableScope {
 impl PermissionScope {
     /// True when this scope's objects include every object `required` names.
     ///
-    /// [`Self::All`] covers everything; a Bifrost scope never covers `All`,
-    /// because "all objects" is strictly wider than any single schema or table.
-    /// A Verifier or tool scope covers only the same Verifier UID or tool.
+    /// [`Self::All`] covers everything; an object scope never covers `All`,
+    /// because "all objects" is strictly wider than any single object. A Card
+    /// family covers its versions; a GitHub connection or tool scope covers
+    /// only the same connection or tool.
     #[must_use]
     pub fn covers(&self, required: &Self) -> bool {
         match (self, required) {
             (Self::All, _) => true,
             (Self::Bifrost(granted), Self::Bifrost(required)) => granted.covers(required),
             (Self::Gateway(granted), Self::Gateway(required)) => granted.covers(required),
-            (Self::Verifier(granted), Self::Verifier(required)) => granted == required,
+            (Self::Card(granted), Self::Card(required)) => granted.covers(required),
+            (Self::GithubConnection(granted), Self::GithubConnection(required)) => {
+                granted == required
+            }
             (Self::Tool(granted), Self::Tool(required)) => granted == required,
-            (Self::Bifrost(_) | Self::Gateway(_) | Self::Verifier(_) | Self::Tool(_), _) => false,
+            (
+                Self::Bifrost(_)
+                | Self::Gateway(_)
+                | Self::Card(_)
+                | Self::GithubConnection(_)
+                | Self::Tool(_),
+                _,
+            ) => false,
+        }
+    }
+
+    /// The Card scope this object scope names, if it names Cards.
+    #[must_use]
+    pub const fn card(&self) -> Option<&CardPermissionScope> {
+        match self {
+            Self::Card(scope) => Some(scope),
+            _ => None,
         }
     }
 
@@ -180,13 +308,15 @@ impl PermissionScope {
     ///
     /// Returns [`PermissionScopeError::InvalidIdentifier`] when a catalog or
     /// schema segment is empty, longer than 63 characters, or contains anything
-    /// other than ASCII alphanumerics, `_`, or `-`. Gateway identities are
-    /// validated when their typed ids decode, so a gateway, Verifier, or tool
-    /// scope is always valid.
+    /// other than ASCII alphanumerics, `_`, or `-`, and
+    /// [`PermissionScopeError::UnregistrableCardKind`] for a Card scope on a
+    /// kind that is never registered. Gateway, GitHub connection, Card name,
+    /// and UID identities are validated when their typed ids decode.
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         match self {
-            Self::All | Self::Gateway(_) | Self::Verifier(_) | Self::Tool(_) => Ok(()),
+            Self::All | Self::Gateway(_) | Self::GithubConnection(_) | Self::Tool(_) => Ok(()),
             Self::Bifrost(scope) => scope.validate(),
+            Self::Card(scope) => scope.validate(),
         }
     }
 }

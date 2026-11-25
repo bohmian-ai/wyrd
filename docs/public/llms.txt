@@ -53,7 +53,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/): Give CI and each Service its own key, declare and pull the Service in CI, and start the application from the bundle.
 - [Add people](/wyrd/operate/add-people/): Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
 - [Verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
-- [Permissions](/wyrd/operate/grant-and-inspect-permissions/): See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
+- [Permissions](/wyrd/operate/grant-and-inspect-permissions/): See a principal's access, bind or remove a role at an explicit scope, cut a principal off, and confirm the result in the audit log.
 - [Troubleshooting](/wyrd/operate/troubleshoot-a-deployment/): Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
 - [Connect GitHub](/wyrd/operate/connect-github/): Register the deployment's GitHub App once, then connect a tenant to one GitHub installation and check which repositories it can reach.
 

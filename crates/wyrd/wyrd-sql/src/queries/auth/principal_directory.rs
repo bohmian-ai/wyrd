@@ -2,38 +2,93 @@
 //! Roles to.
 //!
 //! Assignable principals are users and Service accounts that are not
-//! deleted. The tenant administrator and the internal `system` writer are
-//! deliberately absent: their authority is fixed and never re-assigned.
+//! deleted (see `assignable_principals_union!`).
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sqlx::types::Uuid;
 use wyrd_spec::auth::WorkloadFamily;
 
 use crate::TenantConn;
+use crate::queries::auth::roles::role_holders;
 use crate::queries::auth::service_accounts::workload_family;
 
-/// Users and Service accounts in one shape; each statement below appends its
-/// own predicate.
-macro_rules! assignable_principals_sql {
+/// Users and Service accounts a tenant administrator can assign Roles to, in
+/// one shape. The tenant administrator and the internal `system` writer are
+/// absent: their authority is fixed and never re-assigned. Shared by the
+/// principal directory and Role member counts so both describe the same
+/// people.
+macro_rules! assignable_principals_union {
     () => {
         r"
-        SELECT id, kind, status, email, name, restriction_kind, restriction_name
-          FROM (
-                SELECT id, 'user'::text AS kind, status, email,
-                       NULL::text AS name, NULL::text AS restriction_kind,
-                       NULL::text AS restriction_name
-                  FROM wyrd.auth_users
-                 WHERE data_tenant_id = wyrd.current_tenant()
-                   AND status <> 'deleted'
+                SELECT u.id, 'user'::text AS kind, u.status, u.email,
+                       u.username AS name, u.display_name,
+                       (SELECT i.issuer FROM wyrd.auth_user_identities i
+                         WHERE i.data_tenant_id = u.data_tenant_id AND i.user_id = u.id
+                         ORDER BY i.created_at, i.issuer LIMIT 1) AS identity_issuer,
+                       NULL::text AS restriction_kind, NULL::text AS restriction_name
+                  FROM wyrd.auth_users u
+                 WHERE u.data_tenant_id = wyrd.current_tenant()
+                   AND u.status <> 'deleted'
                 UNION ALL
-                SELECT id, principal_kind AS kind, status, NULL::text AS email,
-                       name, restriction_kind, restriction_name
-                  FROM wyrd.auth_service_accounts
-                 WHERE data_tenant_id = wyrd.current_tenant()
-                   AND principal_kind = 'service'
-                   AND status <> 'deleted'
-               ) principals
+                SELECT s.id, s.principal_kind AS kind, s.status, NULL::text AS email,
+                       s.name, NULL::text AS display_name, NULL::text AS identity_issuer,
+                       s.restriction_kind, s.restriction_name
+                  FROM wyrd.auth_service_accounts s
+                 WHERE s.data_tenant_id = wyrd.current_tenant()
+                   AND s.principal_kind = 'service'
+                   AND s.status <> 'deleted'
         "
+    };
+}
+pub(crate) use assignable_principals_union;
+
+/// Each assignable principal with the Roles it holds; each statement below
+/// appends its own predicate.
+///
+/// `roles` is the distinct `{role, scope}` pairs the account holds directly
+/// or through a Group, ordered by role then scope.
+macro_rules! assignable_principals_sql {
+    () => {
+        concat!(
+            r"
+        SELECT id, kind, status, email, name, display_name, identity_issuer,
+               restriction_kind, restriction_name,
+               COALESCE((
+                   SELECT jsonb_agg(a.assignment ORDER BY a.assignment->>'role', a.assignment->'scope')
+                     FROM (SELECT DISTINCT jsonb_build_object('role', r.name, 'scope', b.scope) AS assignment
+                             FROM wyrd.auth_role_bindings b
+                             JOIN wyrd.auth_roles r
+                               ON r.data_tenant_id = b.data_tenant_id AND r.id = b.role_id
+                            WHERE b.data_tenant_id = wyrd.current_tenant()
+                              AND (b.user_id = principals.id
+                                   OR b.service_account_id = principals.id
+                                   OR b.group_id IN (
+                                       SELECT m.group_id FROM wyrd.auth_group_memberships m
+                                        WHERE m.data_tenant_id = b.data_tenant_id
+                                          AND (m.user_id = principals.id
+                                               OR m.service_account_id = principals.id)))) a
+               ), '[]'::jsonb) AS roles
+          FROM (",
+            assignable_principals_union!(),
+            r") principals
+        "
+        )
+    };
+}
+
+/// The directory filters shared by a page and its status counts: kind, exact
+/// email, exact name and Role held at any scope.
+macro_rules! principal_filter_sql {
+    () => {
+        concat!(
+            r"
+         WHERE ($1::text IS NULL OR kind = $1)
+           AND ($2::text IS NULL OR email = $2)
+           AND ($3::text IS NULL OR name = $3)
+           AND ($4::text IS NULL OR id IN (",
+            role_holders!("r.name = $4"),
+            r"))"
+        )
     };
 }
 
@@ -44,13 +99,22 @@ const ASSIGNABLE_PRINCIPAL_BY_ID_SQL: &str =
 /// A filtered keyset page of assignable principals, ordered by id.
 const LIST_ASSIGNABLE_PRINCIPALS_SQL: &str = concat!(
     assignable_principals_sql!(),
+    principal_filter_sql!(),
     r"
-         WHERE ($1::text IS NULL OR kind = $1)
-           AND ($2::text IS NULL OR email = $2)
-           AND ($3::text IS NULL OR name = $3)
-           AND ($4::uuid IS NULL OR id > $4)
+           AND ($5::uuid IS NULL OR id > $5)
          ORDER BY id
-         LIMIT $5"
+         LIMIT $6"
+);
+
+/// Status counts over every principal the filters match, ignoring paging.
+const COUNT_ASSIGNABLE_PRINCIPALS_SQL: &str = concat!(
+    r"
+        SELECT count(*) FILTER (WHERE status = 'active') AS active,
+               count(*) FILTER (WHERE status = 'suspended') AS suspended
+          FROM (",
+    assignable_principals_union!(),
+    r") principals",
+    principal_filter_sql!()
 );
 
 /// One assignable principal.
@@ -64,12 +128,27 @@ pub struct AssignablePrincipalRow {
     pub status: String,
     /// Email, for users that have one.
     pub email: Option<String>,
-    /// Principal name, for Service accounts.
+    /// A Service account's name, or a local User's username.
     pub name: Option<String>,
+    /// A User's provider-sourced display name.
+    pub display_name: Option<String>,
+    /// Issuer of a User's linked external identity, when it has one.
+    pub identity_issuer: Option<String>,
     /// Restricting family kind, for a family-restricted Service account.
     pub restriction_kind: Option<String>,
     /// Restricting family name, for a family-restricted Service account.
     pub restriction_name: Option<String>,
+    /// JSON array of the distinct `{role, scope}` pairs the account holds.
+    pub roles: serde_json::Value,
+}
+
+/// How many principals matching a directory filter are in each status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct PrincipalStatusCountsRow {
+    /// Active principals.
+    pub active: i64,
+    /// Suspended principals.
+    pub suspended: i64,
 }
 
 impl AssignablePrincipalRow {
@@ -93,8 +172,11 @@ pub struct PrincipalFilter<'a> {
     pub kind: Option<&'a str>,
     /// Exact email; only users carry one.
     pub email: Option<&'a str>,
-    /// Exact name; only Service accounts carry one.
+    /// Exact name: a Service account's name or a local User's username.
     pub name: Option<&'a str>,
+    /// Role name the principal holds at any scope, directly or through a
+    /// Group.
+    pub role: Option<&'a str>,
     /// Return only principals whose id sorts after this one.
     pub after: Option<Uuid>,
 }
@@ -134,22 +216,44 @@ pub async fn list_assignable_principals(
         .bind(filter.kind)
         .bind(filter.email)
         .bind(filter.name)
+        .bind(filter.role)
         .bind(filter.after)
         .bind(limit)
         .fetch_all(&mut **conn.transaction())
         .await
 }
 
+/// Count the principals in each status that `filter` matches, across every
+/// page; `filter.after` is ignored.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the query.
+pub async fn count_assignable_principals(
+    conn: &mut TenantConn<'_>,
+    filter: PrincipalFilter<'_>,
+) -> Result<PrincipalStatusCountsRow, sqlx::Error> {
+    sqlx::query_as::<_, PrincipalStatusCountsRow>(COUNT_ASSIGNABLE_PRINCIPALS_SQL)
+        .bind(filter.kind)
+        .bind(filter.email)
+        .bind(filter.name)
+        .bind(filter.role)
+        .fetch_one(&mut **conn.transaction())
+        .await
+}
+
 /// SQL-shape checks of the assignable-principal directory statements.
 #[cfg(test)]
 mod tests {
-    use super::{ASSIGNABLE_PRINCIPAL_BY_ID_SQL, LIST_ASSIGNABLE_PRINCIPALS_SQL};
+    use super::{
+        ASSIGNABLE_PRINCIPAL_BY_ID_SQL, COUNT_ASSIGNABLE_PRINCIPALS_SQL,
+        LIST_ASSIGNABLE_PRINCIPALS_SQL,
+    };
 
-    /// Neither lookup nor listing reaches deleted principals, the tenant
+    /// Neither lookup, listing nor counting reaches deleted principals, the tenant
     /// administrator, or the `system` writer.
     ///
     /// # Panics
-    /// Panics when either statement does not carry exactly two
+    /// Panics when a statement does not carry exactly two
     /// `status <> 'deleted'` guards or does not restrict rows to
     /// `principal_kind = 'service'`.
     #[test]
@@ -157,6 +261,7 @@ mod tests {
         for sql in [
             ASSIGNABLE_PRINCIPAL_BY_ID_SQL,
             LIST_ASSIGNABLE_PRINCIPALS_SQL,
+            COUNT_ASSIGNABLE_PRINCIPALS_SQL,
         ] {
             assert_eq!(sql.matches("status <> 'deleted'").count(), 2);
             assert!(sql.contains("principal_kind = 'service'"));

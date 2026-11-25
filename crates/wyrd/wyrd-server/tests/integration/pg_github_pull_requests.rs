@@ -6,22 +6,32 @@
 //! Verifiers to its pull requests. The default test server holds the
 //! Verifier runner, so admitted work stays queued until a test claims it.
 
+use arrow::array::{Array as _, StringArray};
+use arrow::datatypes::DataType;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::Duration;
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wyrd_client::Bifrost;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
 use wyrd_server::verification::RuntimeLimits;
-use wyrd_spec::ids::VerificationResultId;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::github_connection::{
+    GithubPullRequestReviewRequest, GithubPullRequestReviewResponse,
+};
+use wyrd_spec::ids::{RepositoryId, VerificationResultId};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{
     Completion, Settlement, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
+
+use super::pg_hosted_artifacts::client;
 
 /// The connected repository.
 pub(crate) const REPOSITORY: u64 = 4242;
@@ -140,7 +150,7 @@ impl Deployment {
             .expect("bound test server starts");
         Self::connect(&server, &mock).await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("pull-request-editor", &["editor"])
+            .bootstrap_user("pull-request-editor", &["editor", "approver"])
             .await
             .expect("editor bootstraps")
         else {
@@ -276,6 +286,74 @@ impl Deployment {
         .expect("executions read");
         conn.commit().await.expect("read commits");
         rows
+    }
+
+    /// Wait until the newest recorded status of every one of `executions`,
+    /// read through the editor's SDK Bifrost query, is `expected`.
+    ///
+    /// # Panics
+    /// Panics when the query fails or any newest status still differs after
+    /// ten seconds.
+    pub(crate) async fn await_newest(&self, executions: &[Uuid], expected: &str) {
+        self.await_newest_as(&self.jwt, executions, expected).await;
+    }
+
+    /// [`Self::await_newest`], read as `jwt`.
+    ///
+    /// # Panics
+    /// Panics as [`Self::await_newest`] does.
+    pub(crate) async fn await_newest_as(&self, jwt: &str, executions: &[Uuid], expected: &str) {
+        let ids = executions
+            .iter()
+            .map(|execution| format!("'{execution}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT e.execution_id, e.status FROM bifrost.verification.execution_events e \
+             JOIN (SELECT execution_id, max(occurred_at) AS occurred_at \
+                     FROM bifrost.verification.execution_events \
+                    WHERE event = 'status' GROUP BY execution_id) l \
+               ON e.execution_id = l.execution_id AND e.occurred_at = l.occurred_at \
+            WHERE e.event = 'status' AND e.execution_id IN ({ids})"
+        );
+        let sdk = client(self.base(), jwt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut stream = Bifrost::query_only(&sdk)
+                .query(&BifrostQueryRequest {
+                    params: Vec::new(),
+                    sql: sql.clone(),
+                    deadline_ms: Some(30_000),
+                })
+                .await
+                .expect("status events query");
+            let mut newest = std::collections::BTreeMap::new();
+            while let Some(batch) = stream.next_batch().await.expect("status batch reads") {
+                let text = |column: usize| {
+                    arrow::compute::cast(batch.column(column), &DataType::Utf8)
+                        .expect("column casts to text")
+                };
+                let (ids, statuses) = (text(0), text(1));
+                let ids = ids.as_any().downcast_ref::<StringArray>().expect("text");
+                let statuses = statuses
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("text");
+                for row in 0..batch.num_rows() {
+                    newest.insert(ids.value(row).to_owned(), statuses.value(row).to_owned());
+                }
+            }
+            if executions.iter().all(|execution| {
+                newest.get(&execution.to_string()).map(String::as_str) == Some(expected)
+            }) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "newest statuses never all became {expected}: {newest:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// The frozen Verifier name and version, the admitting Repository
@@ -525,8 +603,9 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
             "head_repository_id": "4242",
             "delivery_id": opened,
             "generation": served["pull_request"]["generation"],
+            "members": [a[0].execution_id.to_string(), a[1].execution_id.to_string()],
         }),
-        "the execution is pinned to GitHub's current source"
+        "the execution is pinned to GitHub's current source and its generation's members"
     );
     let text = served.to_string();
     for secret in mock.secrets() {
@@ -790,6 +869,10 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
         ],
         "access loss keeps settled history"
     );
+    // Supersession, draft, close and access loss each record the
+    // cancellation as the execution's current status.
+    let cancelled: Vec<Uuid> = rows.iter().map(|row| row.execution_id).collect();
+    deployment.await_newest(&cancelled, "cancelled").await;
 }
 
 /// Forty-one PRs opened at once each admit exactly one execution per
@@ -1937,12 +2020,13 @@ async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, 
 }
 
 /// Inspecting a PR execution, and its sibling progress read, needs
-/// repository read as well as `verifier:read`, also once the queue row is
-/// gone and only the accepted state remains.
+/// `executions:read` on its trusted parent, the Repository: the same grant
+/// on the shared Verifier reads it as unknown, also once the queue row is gone and
+/// only the accepted state remains.
 ///
 /// # Panics
-/// Panics when a caller without `cards:read` reads a PR execution, or one
-/// holding both is refused.
+/// Panics when a caller reading only the Verifier reads a PR execution, or
+/// one reading the Repository is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_request_inspection_requires_repository_read() {
     use wyrd_runtime::Permission;
@@ -1954,14 +2038,31 @@ async fn pull_request_inspection_requires_repository_read() {
         .set_pull_request(REPOSITORY, 30, PullRequest::open(REPOSITORY, "b1", "i1"));
     assert_eq!(deployment.send(30, "opened").await.0, StatusCode::ACCEPTED);
     let execution = deployment.settled(30..=30).await[0].execution_id;
+    let verifier = {
+        let mut conn = deployment.conn().await;
+        let (uid,): (Uuid,) = sqlx::query_as(
+            "SELECT verifier_card_uid FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(execution)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("execution reads");
+        let uid = wyrd_spec::ids::CardUid::from_uuid(uid).expect("card uid");
+        let mut scopes =
+            wyrd_sql::queries::cards::card_scopes(&mut conn, std::slice::from_ref(&uid))
+                .await
+                .expect("scope reads");
+        conn.commit().await.expect("read commits");
+        scopes.remove(&uid).expect("the Verifier is registered")
+    };
     server
-        .seed_role("pr_verifier_only", &[Permission::verifier_read_any()])
+        .seed_role("pr_verifier_only", &[Permission::executions_read(verifier)])
         .await
         .expect("role seeds");
     server
         .seed_role(
             "pr_verifier_and_repository",
-            &[Permission::verifier_read_any(), Permission::card_read()],
+            &[Permission::executions_read_any(), Permission::card_read()],
         )
         .await
         .expect("role seeds");
@@ -1994,9 +2095,10 @@ async fn pull_request_inspection_requires_repository_read() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     for uri in [&status, &invocations] {
+        // Without the Repository parent the execution reads as unknown.
         let (code, body) = read_as(&deployment, &verifier_only, uri).await;
-        assert_eq!(code, StatusCode::FORBIDDEN, "{uri}: {body}");
-        assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(code, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert_eq!(body["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
         assert_eq!(
             read_as(&deployment, &both, uri).await.0,
             StatusCode::OK,
@@ -2016,12 +2118,1010 @@ async fn pull_request_inspection_requires_repository_read() {
     let (code, body) = read_as(&deployment, &verifier_only, &status).await;
     assert_eq!(
         code,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "retained PR state still needs repository read: {body}"
     );
     let (code, body) = read_as(&deployment, &both, &status).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "completed");
+}
+
+/// One PR execution's retained input record, as an authorized SDK Bifrost
+/// query returns it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct Retained {
+    /// The execution.
+    pub(crate) execution_id: Uuid,
+    /// The Repository Card version whose binding admitted it.
+    pub(crate) workload_card_uid: Option<String>,
+    /// Its frozen PR pins.
+    pub(crate) inputs: Value,
+    /// When its generation observed the pull request, as text that orders
+    /// chronologically.
+    pub(crate) recorded_at: String,
+}
+
+impl Deployment {
+    /// Every retained `pull_request` input record of PR `number`, read as
+    /// `jwt` through the SDK's Bifrost query once at least `count` are
+    /// visible.
+    ///
+    /// # Panics
+    /// Panics when the query fails or fewer than `count` are visible after
+    /// ten seconds.
+    pub(crate) async fn retained_as(&self, jwt: &str, number: u64, count: usize) -> Vec<Retained> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows = self
+                .history_as(jwt, number, "TRUE")
+                .await
+                .expect("retained inputs query");
+            if rows.len() >= count {
+                return rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {count} members retained: {rows:?}",
+                rows.len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The retained `pull_request` input records of PR `number` matching
+    /// the SQL `predicate`, read once as `jwt` through the SDK's Bifrost
+    /// query.
+    ///
+    /// # Errors
+    /// Returns the query's refusal, such as a caller lacking the table.
+    pub(crate) async fn history_as(
+        &self,
+        jwt: &str,
+        number: u64,
+        predicate: &str,
+    ) -> Result<Vec<Retained>, wyrd_client::bifrost::BifrostClientError> {
+        let rows: Vec<Retained> = Bifrost::query_only(&client(self.base(), jwt))
+            .sql_as(
+                &format!(
+                    "SELECT execution_id, workload_card_uid, inputs, \
+                            CAST(recorded_at AS VARCHAR) AS recorded_at \
+                       FROM bifrost.verification.execution_inputs \
+                      WHERE origin = 'pull_request' AND ({predicate}) ORDER BY execution_id"
+                ),
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.inputs["number"] == json!(number))
+            .collect())
+    }
+
+    /// The card UID of Repository `policy` at `version`.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    pub(crate) async fn policy_uid(&self, version: &str) -> String {
+        let mut conn = self.conn().await;
+        let uid: Uuid = sqlx::query_scalar(
+            "SELECT card_uid FROM wyrd.cards
+              WHERE kind = 'Repository' AND name = 'policy' AND version = $1",
+        )
+        .bind(version)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("policy reads");
+        conn.commit().await.expect("read commits");
+        uid.to_string()
+    }
+}
+
+/// Assert `retained` holds exactly `rows`' executions, each naming the same
+/// generation, the selected `policy`, and the complete member list in
+/// binding order.
+///
+/// # Panics
+/// Panics when a member is missing, duplicated or names other membership.
+fn assert_complete(retained: &[Retained], rows: &[Row], policy: &str) {
+    let members: Vec<Value> = rows
+        .iter()
+        .map(|row| json!(row.execution_id.to_string()))
+        .collect();
+    let mut ids: Vec<Uuid> = retained.iter().map(|row| row.execution_id).collect();
+    ids.sort_unstable();
+    let mut expected: Vec<Uuid> = rows.iter().map(|row| row.execution_id).collect();
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "every member is retained once");
+    let generation = &retained[0].inputs["generation"];
+    for row in retained {
+        assert_eq!(&row.inputs["generation"], generation, "{row:?}");
+        assert_eq!(row.inputs["members"], json!(members), "{row:?}");
+        assert_eq!(row.workload_card_uid.as_deref(), Some(policy), "{row:?}");
+    }
+}
+
+/// Every member of an admitted generation is retained with its generation,
+/// selected policy and complete membership, refused members included: a
+/// mixed generation keeps its runnable and its refused member, and an
+/// all-refused generation keeps both refusals. Refused members record their
+/// `errored` status and never become runnable.
+///
+/// # Panics
+/// Panics when a member is not retained, membership is incomplete, a refusal
+/// has no recorded status, or a refused member is claimable.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_admitted_member_is_retained_with_its_status() {
+    let deployment = Deployment::start().await;
+    let Bootstrap::User { jwt: reader, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-reader", &["editor"])
+        .await
+        .expect("reader bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let policy = deployment.policy_uid("1.0.0").await;
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    sqlx::query(
+        "UPDATE wyrd.cards SET status = 'deleted' WHERE kind = 'Verifier' AND name = 'z-review'",
+    )
+    .execute(&pool)
+    .await
+    .expect("z-review is deleted");
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 21, PullRequest::open(REPOSITORY, "b1", "m1"));
+
+    assert_eq!(deployment.send(21, "opened").await.0, StatusCode::ACCEPTED);
+    let mixed = deployment.rows(21).await;
+    let mut statuses: Vec<&str> = mixed.iter().map(|row| row.status.as_str()).collect();
+    statuses.sort_unstable();
+    assert_eq!(statuses, ["errored", "pending"], "{mixed:?}");
+    assert_complete(
+        &deployment.retained_as(&reader, 21, 2).await,
+        &mixed,
+        &policy,
+    );
+    let refused: Vec<Uuid> = mixed
+        .iter()
+        .filter(|row| row.status == "errored")
+        .map(|row| row.execution_id)
+        .collect();
+    deployment
+        .await_newest_as(&reader, &refused, "errored")
+        .await;
+    let claimed = deployment.claim(10).await;
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|claim| claim.lease.execution_id.as_uuid())
+            .collect::<Vec<_>>(),
+        mixed
+            .iter()
+            .filter(|row| row.status == "pending")
+            .map(|row| row.execution_id)
+            .collect::<Vec<_>>(),
+        "only the runnable member is claimable"
+    );
+
+    sqlx::query(
+        "UPDATE wyrd.auth_users SET status = 'suspended'
+          WHERE id = (SELECT o.sub_principal_id FROM wyrd.cards c
+                        JOIN wyrd.card_declaration_operations o
+                          ON o.operation_id = c.selection_occurrence
+                       WHERE c.kind = 'Repository' AND c.name = 'policy')",
+    )
+    .execute(&pool)
+    .await
+    .expect("the editor is suspended");
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 22, PullRequest::open(REPOSITORY, "b1", "r1"));
+    assert_eq!(deployment.send(22, "opened").await.0, StatusCode::ACCEPTED);
+    let refusals = deployment.rows(22).await;
+    assert!(
+        refusals.iter().all(|row| row.status == "errored"),
+        "{refusals:?}"
+    );
+    assert_complete(
+        &deployment.retained_as(&reader, 22, 2).await,
+        &refusals,
+        &policy,
+    );
+    deployment
+        .await_newest_as(
+            &reader,
+            &refusals
+                .iter()
+                .map(|row| row.execution_id)
+                .collect::<Vec<_>>(),
+            "errored",
+        )
+        .await;
+    assert!(
+        deployment.claim(10).await.is_empty(),
+        "a refusal is never runnable"
+    );
+}
+
+impl Deployment {
+    /// The SDK's GitHub connection handle acting as `jwt`.
+    ///
+    /// # Panics
+    /// Panics when the handle cannot connect.
+    pub(crate) async fn github(&self, jwt: &str) -> wyrd_client::GithubConnection {
+        wyrd_client::GithubConnection::connect_with(&client(self.base(), jwt))
+            .await
+            .expect("GitHub handle connects")
+    }
+
+    /// Send one review request for PR `number` under `key` as the editor,
+    /// without the SDK's transport retry, and return its status and body.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be sent.
+    pub(crate) async fn review_once(&self, number: u64, key: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/integrations/github/pull-requests/reviews")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", key)
+            .body(Body::from(
+                serde_json::to_vec(&self.review(number)).expect("serializes"),
+            ))
+            .expect("request builds");
+        let response = self
+            .server
+            .oneshot_authenticated(&self.jwt, request)
+            .await
+            .expect("review responds");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// The review request for PR `number` of the connected repository.
+    pub(crate) fn review(&self, number: u64) -> GithubPullRequestReviewRequest {
+        GithubPullRequestReviewRequest {
+            host: self.mock.host(),
+            repository_id: RepositoryId::new(REPOSITORY.to_string()).expect("valid id"),
+            number,
+        }
+    }
+}
+
+/// The execution ids of `rows`.
+fn ids(rows: &[Row]) -> Vec<Uuid> {
+    rows.iter().map(|row| row.execution_id).collect()
+}
+
+/// The execution ids a review response accepted.
+fn accepted(response: &GithubPullRequestReviewResponse) -> Vec<Uuid> {
+    response
+        .executions
+        .iter()
+        .map(wyrd_spec::ids::ExecutionId::as_uuid)
+        .collect()
+}
+
+/// An explicit review request admits a new generation at an unchanged head
+/// under each distinct key and supersedes the older one; a sequential,
+/// concurrent or post-restart retry of a key returns its generation and
+/// members unchanged; a policy change applies only to later requests;
+/// ordinary redelivery still replays the current generation; and a retry of
+/// an older key after the head advanced returns its superseded generation
+/// without admitting or reactivating work.
+///
+/// # Panics
+/// Panics when a request admits other members than expected, a retry
+/// changes membership, or superseded work becomes runnable again.
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_review_requests_admit_new_generations_and_replay_by_key() {
+    let deployment = Deployment::start().await;
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 31, PullRequest::open(REPOSITORY, "b1", "s1"));
+    assert_eq!(deployment.send(31, "opened").await.0, StatusCode::ACCEPTED);
+    let delivered = ids(&deployment.rows(31).await);
+    let github = deployment.github(&deployment.jwt).await;
+    let request = deployment.review(31);
+
+    let first = github
+        .review_pull_request(&request, "review-31-a")
+        .await
+        .expect("a fresh review is accepted");
+    assert_eq!(first.executions.len(), 2, "{first:?}");
+    let rows = deployment.rows(31).await;
+    assert_eq!(rows.len(), 4, "a new generation at the same head: {rows:?}");
+    assert_eq!(
+        ids(&rows[2..]),
+        accepted(&first),
+        "members in binding order"
+    );
+    assert!(
+        rows[..2].iter().all(|row| row.status == "cancelled"
+            && row.code.as_deref() == Some("pull_request_superseded")),
+        "the delivered generation is superseded: {rows:?}"
+    );
+    assert!(
+        rows[2..]
+            .iter()
+            .all(|row| row.status == "pending" && !row.reserved && row.head == "s1"),
+        "{rows:?}"
+    );
+    assert_eq!(ids(&rows[..2]), delivered);
+
+    assert_eq!(
+        github
+            .review_pull_request(&request, "review-31-a")
+            .await
+            .expect("a retry is accepted"),
+        first,
+        "a retry returns the same generation and members"
+    );
+    let (left, right) = tokio::join!(
+        github.review_pull_request(&request, "review-31-b"),
+        github.review_pull_request(&request, "review-31-b"),
+    );
+    let second = left.expect("a concurrent request is accepted");
+    assert_eq!(
+        right.expect("its concurrent retry"),
+        second,
+        "concurrent retries share one generation"
+    );
+    assert_ne!(second.generation, first.generation);
+    assert_eq!(deployment.rows(31).await.len(), 6, "one generation per key");
+
+    assert_eq!(deployment.send(31, "edited").await.0, StatusCode::ACCEPTED);
+    let (status, _) = deployment.send(31, "reopened").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        deployment.rows(31).await.len(),
+        6,
+        "an ordinary redelivery replays the current generation"
+    );
+
+    deployment
+        .declare(POLICY_V2, "pull-request-policy-v2")
+        .await;
+    let narrowed = github
+        .review_pull_request(&request, "review-31-c")
+        .await
+        .expect("a request under the new policy is accepted");
+    assert_eq!(
+        narrowed.executions.len(),
+        1,
+        "the newly selected policy binds one Verifier"
+    );
+
+    deployment
+        .mock
+        .edit_pull_request(REPOSITORY, 31, |pr| pr.head_sha = "s2".to_owned());
+    assert_eq!(
+        deployment.send(31, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    let advanced = deployment.rows(31).await;
+    assert_eq!(advanced.len(), 8, "{advanced:?}");
+    assert_eq!(advanced[7].head, "s2");
+    assert_eq!(
+        advanced[6].status, "cancelled",
+        "the head advance supersedes it"
+    );
+
+    assert_eq!(
+        github
+            .review_pull_request(&request, "review-31-a")
+            .await
+            .expect("an old retry is answered"),
+        first,
+        "an old retry returns its own generation"
+    );
+    let after = deployment.rows(31).await;
+    assert_eq!(
+        after, advanced,
+        "an old retry admits and reactivates nothing"
+    );
+
+    let Deployment { mock, server, jwt } = deployment;
+    let restarted =
+        Box::pin(server.restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock)))
+            .await
+            .expect("server restarts");
+    let deployment = Deployment {
+        mock,
+        server: restarted,
+        jwt,
+    };
+    let github = deployment.github(&deployment.jwt).await;
+    assert_eq!(
+        github
+            .review_pull_request(&request, "review-31-c")
+            .await
+            .expect("a retry after restart is answered"),
+        narrowed,
+        "a retry after a restart returns the same generation"
+    );
+    assert_eq!(deployment.rows(31).await, after);
+}
+
+/// A review request accepts no work when the caller may not run a selected
+/// Verifier, names another host, or names a pull request that is missing,
+/// closed, draft or bound by no Verifier; a provider or accountable
+/// authority failure is a typed retryable error whose retry under the same
+/// key is then accepted.
+///
+/// # Panics
+/// Panics when a refused request admits work or answers another code.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_review_requests_accept_nothing() {
+    let deployment = Deployment::start().await;
+    let code = |error: WyrdError| error.code().to_owned();
+    let Bootstrap::User { jwt: viewer, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-viewer", &["viewer"])
+        .await
+        .expect("viewer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 41, PullRequest::open(REPOSITORY, "b1", "d1"));
+    let denied = deployment
+        .github(&viewer)
+        .await
+        .review_pull_request(&deployment.review(41), "denied-41")
+        .await
+        .expect_err("a viewer may not request a review");
+    assert_eq!(code(denied), "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert!(deployment.rows(41).await.is_empty());
+
+    let github = deployment.github(&deployment.jwt).await;
+    let mut other = deployment.review(41);
+    other.host = "github.example".to_owned();
+    assert_eq!(
+        code(
+            github
+                .review_pull_request(&other, "host-key-41")
+                .await
+                .expect_err("another host")
+        ),
+        "WYRD_GITHUB_400_INVALID_REQUEST"
+    );
+
+    deployment.mock.set_pull_request(
+        REPOSITORY,
+        42,
+        PullRequest {
+            open: false,
+            ..PullRequest::open(REPOSITORY, "b1", "c1")
+        },
+    );
+    deployment.mock.set_pull_request(
+        REPOSITORY,
+        43,
+        PullRequest {
+            draft: true,
+            ..PullRequest::open(REPOSITORY, "b1", "c1")
+        },
+    );
+    for (number, reason) in [(42, "closed"), (43, "draft"), (44, "not_found")] {
+        let refused = github
+            .review_pull_request(&deployment.review(number), "ineligible")
+            .await
+            .expect_err("an ineligible pull request is not reviewable");
+        assert_eq!(
+            refused.code(),
+            "WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE",
+            "{refused}"
+        );
+        assert_eq!(
+            refused.as_problem_json()["details"]["reason"],
+            json!(reason),
+            "{refused}"
+        );
+        assert!(deployment.rows(number).await.is_empty());
+    }
+
+    deployment
+        .mock
+        .fail_next_pull_request_read(StatusCode::BAD_GATEWAY);
+    let (status, unavailable) = deployment.review_once(41, "retry-41").await;
+    assert_eq!(
+        (status, &unavailable["code"]),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!("WYRD_GITHUB_503_PROVIDER_UNAVAILABLE")
+        ),
+        "{unavailable}"
+    );
+    assert!(deployment.rows(41).await.is_empty());
+    let retried = github
+        .review_pull_request(&deployment.review(41), "retry-41")
+        .await
+        .expect("the retry under the same key is accepted");
+    assert_eq!(accepted(&retried), ids(&deployment.rows(41).await));
+
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    // The schema keeps every SYSTEM principal active; this fixture database
+    // lifts that check so the accountable authority has no SYSTEM actor.
+    let system = |sql: &'static str| sqlx::raw_sql(sql).execute(&pool);
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 45, PullRequest::open(REPOSITORY, "b1", "u1"));
+    system(
+        "ALTER TABLE wyrd.auth_service_accounts
+             DROP CONSTRAINT auth_service_accounts_system_active_check;
+         UPDATE wyrd.auth_service_accounts SET status = 'suspended'
+          WHERE principal_kind = 'system';",
+    )
+    .await
+    .expect("SYSTEM is suspended");
+    let (status, undecided) = deployment.review_once(45, "authority-45").await;
+    assert_eq!(
+        (status, &undecided["code"]),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
+        ),
+        "{undecided}"
+    );
+    assert!(deployment.rows(45).await.is_empty());
+    system(
+        "UPDATE wyrd.auth_service_accounts SET status = 'active'
+          WHERE principal_kind = 'system';
+         ALTER TABLE wyrd.auth_service_accounts
+           ADD CONSTRAINT auth_service_accounts_system_active_check
+           CHECK (principal_kind <> 'system' OR status = 'active');",
+    )
+    .await
+    .expect("SYSTEM is restored");
+    let decided = github
+        .review_pull_request(&deployment.review(45), "authority-45")
+        .await
+        .expect("the retry under the same key is accepted");
+    assert_eq!(accepted(&decided), ids(&deployment.rows(45).await));
+
+    deployment
+        .declare(POLICY_EMPTY, "pull-request-policy-empty")
+        .await;
+    let unbound = github
+        .review_pull_request(&deployment.review(41), "unbound-41")
+        .await
+        .expect_err("a policy binding nothing reviews nothing");
+    assert_eq!(
+        unbound.as_problem_json()["details"]["reason"],
+        json!("no_bindings")
+    );
+    assert_eq!(
+        accepted(&retried),
+        ids(&deployment.rows(41).await),
+        "no state changed"
+    );
+}
+
+/// The newest retained generation in `retained` by its observation time,
+/// and whether every member it names is visible.
+fn current(retained: &[Retained]) -> Option<(Value, bool)> {
+    let newest = retained
+        .iter()
+        .max_by(|a, b| a.recorded_at.cmp(&b.recorded_at))?;
+    let generation = &newest.inputs["generation"];
+    let visible: Vec<Value> = retained
+        .iter()
+        .filter(|row| &row.inputs["generation"] == generation)
+        .map(|row| json!(row.execution_id.to_string()))
+        .collect();
+    let members = newest.inputs["members"].as_array()?;
+    Some((
+        generation.clone(),
+        members.iter().all(|member| visible.contains(member)),
+    ))
+}
+
+/// The retained records of `generation` in `retained`.
+fn of<'r>(retained: &'r [Retained], generation: &Value) -> Vec<&'r Retained> {
+    retained
+        .iter()
+        .filter(|row| &row.inputs["generation"] == generation)
+        .collect()
+}
+
+/// Authorized retained reads resolve a pull request's current review set
+/// and history from its records alone: while a generation's handoff is
+/// interrupted its visible records are fewer than the members the domain
+/// read names, so it is never presented as complete, and recovery completes
+/// it; the current set is the one with the latest PostgreSQL observation
+/// time its records carry, whatever order they are read in, and every
+/// earlier set keeps its complete membership; a time bound selects history
+/// before it. A caller with no read is refused before any row or count, a
+/// reader of another Repository family sees none of them and counts none,
+/// and another tenant's reader sees none of them.
+///
+/// # Panics
+/// Panics when visibility is reported complete early, latest regresses,
+/// history differs, or an unauthorized reader sees membership or counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_reads_resolve_current_and_history_membership() {
+    let deployment = Deployment::start().await;
+    let Bootstrap::User { jwt: reader, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-historian", &["viewer"])
+        .await
+        .expect("reader bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let github = deployment.github(&deployment.jwt).await;
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 51, PullRequest::open(REPOSITORY, "b1", "h1"));
+    let first = github
+        .review_pull_request(&deployment.review(51), "history-51-a")
+        .await
+        .expect("the first review is accepted");
+    let first_generation = json!(first.generation.to_string());
+    let retained = deployment.retained_as(&reader, 51, 2).await;
+    assert_eq!(current(&retained), Some((first_generation.clone(), true)));
+
+    deployment
+        .server
+        .flush_bifrost()
+        .await
+        .expect("setup settles");
+    let held = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_inputs")
+        .expect("Scribe stalls");
+    let delayed = {
+        let github = deployment.github(&deployment.jwt).await;
+        let request = deployment.review(51);
+        tokio::spawn(async move {
+            github
+                .review_pull_request(&request, "history-51-b")
+                .await
+                .expect("the delayed review is accepted")
+        })
+    };
+    held.wait_entered().await;
+    let rows = deployment.rows(51).await;
+    assert_eq!(
+        rows.len(),
+        4,
+        "the delayed generation is reserved: {rows:?}"
+    );
+    let pending = deployment.status(rows[2].execution_id).await;
+    let delayed_generation = pending["pull_request"]["generation"].clone();
+    assert_eq!(
+        pending["pull_request"]["members"],
+        json!([rows[2].execution_id, rows[3].execution_id]),
+        "the domain read names the whole interrupted set"
+    );
+    let during = deployment
+        .history_as(&reader, 51, "TRUE")
+        .await
+        .expect("history reads");
+    assert!(
+        of(&during, &delayed_generation).len() < 2,
+        "the interrupted set is not fully visible: {during:?}"
+    );
+    assert_ne!(
+        current(&during),
+        Some((delayed_generation.clone(), true)),
+        "an interrupted set is never complete"
+    );
+
+    held.release();
+    let recovered = delayed.await.expect("the delayed review joins");
+    assert_eq!(json!(recovered.generation.to_string()), delayed_generation);
+    let after = deployment.retained_as(&reader, 51, 4).await;
+    assert_eq!(
+        current(&after),
+        Some((delayed_generation.clone(), true)),
+        "recovery completes the interrupted set"
+    );
+
+    let newest = github
+        .review_pull_request(&deployment.review(51), "history-51-c")
+        .await
+        .expect("the newer review is accepted");
+    let newest_generation = json!(newest.generation.to_string());
+    let mut history = deployment.retained_as(&reader, 51, 6).await;
+    assert_eq!(current(&history), Some((newest_generation.clone(), true)));
+    let observed: Vec<&String> = [&first_generation, &delayed_generation, &newest_generation]
+        .iter()
+        .map(|generation| {
+            let members = of(&history, generation);
+            assert_eq!(members.len(), 2, "{generation}: {history:?}");
+            assert!(members.iter().all(|row| {
+                row.inputs["members"].as_array().map(Vec::len) == Some(2)
+                    && row.recorded_at == members[0].recorded_at
+            }));
+            &members[0].recorded_at
+        })
+        .collect();
+    assert!(
+        observed.windows(2).all(|pair| pair[0] < pair[1]),
+        "each generation records its own later observation: {observed:?}"
+    );
+    history.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+    assert_eq!(
+        current(&history),
+        Some((newest_generation.clone(), true)),
+        "older records read last do not replace the current set"
+    );
+    let cutoff = &of(&history, &newest_generation)[0].recorded_at;
+    let earlier = deployment
+        .history_as(
+            &reader,
+            51,
+            &format!("recorded_at < CAST('{cutoff}' AS TIMESTAMP)"),
+        )
+        .await
+        .expect("bounded history reads");
+    let mut generations: Vec<Value> = earlier
+        .iter()
+        .map(|row| row.inputs["generation"].clone())
+        .collect();
+    generations.dedup();
+    assert_eq!(earlier.len(), 4, "{earlier:?}");
+    assert!(
+        !generations.contains(&newest_generation),
+        "a bound before the current set selects only history"
+    );
+
+    let refusal = |error: wyrd_client::bifrost::BifrostClientError| match error {
+        wyrd_client::bifrost::BifrostClientError::Transport(error) => error.code().to_owned(),
+        other => format!("{other:?}"),
+    };
+    let reader_of = |name: &'static str, grants: Vec<wyrd_runtime::Permission>| {
+        let server = &deployment.server;
+        async move {
+            server.seed_role(name, &grants).await.expect("role seeds");
+            let Bootstrap::User { jwt, .. } = server
+                .bootstrap_user(&name.replace('_', "-"), &[name])
+                .await
+                .expect("reader bootstraps")
+            else {
+                panic!("user bootstrap returned a non-user principal");
+            };
+            jwt
+        }
+    };
+    let counted = |jwt: String| {
+        let base = deployment.base().to_owned();
+        async move {
+            Bifrost::query_only(&client(&base, &jwt))
+                .sql_as::<Value>(
+                    "SELECT count(*) AS members FROM bifrost.verification.execution_inputs",
+                    &[],
+                )
+                .await
+        }
+    };
+
+    // A caller with no read is refused before any row or count.
+    let blind = reader_of("pull_request_blind", Vec::new()).await;
+    let members = deployment
+        .history_as(&blind, 51, "TRUE")
+        .await
+        .expect_err("membership is refused");
+    assert_eq!(refusal(members), "WYRD_PERMISSION_403_DENIED_RBAC");
+    let refused = counted(blind).await.expect_err("counts are refused");
+    assert_eq!(refusal(refused), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    // A reader of another Repository family sees no membership and counts none.
+    let other_family =
+        wyrd_runtime::PermissionScope::Card(wyrd_runtime::CardPermissionScope::family(
+            wyrd_spec::envelope::CardKind::Repository,
+            wyrd_spec::ids::CardName::new("other").expect("name"),
+        ));
+    let elsewhere = reader_of(
+        "pull_request_elsewhere",
+        vec![wyrd_runtime::Permission::card_read().at(other_family)],
+    )
+    .await;
+    assert!(
+        deployment
+            .history_as(&elsewhere, 51, "TRUE")
+            .await
+            .expect("another family's history reads")
+            .is_empty()
+    );
+    assert_eq!(
+        counted(elsewhere.clone())
+            .await
+            .expect("another family counts"),
+        [json!({"members": 0})]
+    );
+
+    // A reader of executions at this Repository's family sees exactly the
+    // viewer's membership and count, and opens each member through the
+    // dedicated execution read, which another family's reader cannot tell
+    // from an absent execution.
+    let policy = reader_of(
+        "pull_request_policy",
+        vec![wyrd_runtime::Permission::executions_read(
+            wyrd_runtime::CardPermissionScope::family(
+                wyrd_spec::envelope::CardKind::Repository,
+                wyrd_spec::ids::CardName::new("policy").expect("name"),
+            ),
+        )],
+    )
+    .await;
+    let scoped = deployment
+        .history_as(&policy, 51, "TRUE")
+        .await
+        .expect("the family reader's history reads");
+    let ids = |rows: &[Retained]| rows.iter().map(|row| row.execution_id).collect::<Vec<_>>();
+    let viewed = deployment
+        .history_as(&reader, 51, "TRUE")
+        .await
+        .expect("the viewer's history reads");
+    assert_eq!(ids(&scoped), ids(&viewed));
+    assert_eq!(scoped.len(), 6, "{scoped:?}");
+    assert_eq!(
+        counted(policy.clone())
+            .await
+            .expect("the family reader counts"),
+        counted(reader.clone()).await.expect("the viewer counts"),
+    );
+    let read_as = |jwt: String, execution: Uuid| {
+        let server = &deployment.server;
+        async move {
+            server
+                .oneshot_authenticated(
+                    &jwt,
+                    Request::builder()
+                        .uri(format!("/v1/verification/executions/{execution}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("the execution read responds")
+                .status()
+        }
+    };
+    let (execution, unknown) = (scoped[0].execution_id, Uuid::now_v7());
+    assert_eq!(read_as(policy, execution).await, StatusCode::OK);
+    assert_eq!(
+        read_as(elsewhere.clone(), execution).await,
+        read_as(elsewhere, unknown).await,
+        "another family's execution reads as an unknown one"
+    );
+
+    let other = deployment
+        .server
+        .seed_tenant("pull-request-foreign")
+        .await
+        .expect("second tenant seeds");
+    let foreigner = deployment
+        .server
+        .bootstrap_service_in_tenant(other, "pull-request-foreigner", &["viewer"])
+        .await
+        .expect("foreign reader bootstraps");
+    let foreign = deployment
+        .server
+        .exchange_api_key(foreigner.api_key().expect("a machine principal"))
+        .await
+        .expect("foreign key exchanges");
+    assert!(
+        deployment
+            .history_as(&foreign, 51, "TRUE")
+            .await
+            .expect("foreign history reads")
+            .is_empty()
+    );
+    let counted: Vec<Value> = Bifrost::query_only(&client(deployment.base(), &foreign))
+        .sql_as(
+            "SELECT count(*) AS members FROM bifrost.verification.execution_inputs",
+            &[],
+        )
+        .await
+        .expect("foreign count reads");
+    assert_eq!(counted, [json!({ "members": 0 })]);
+}
+
+/// A review set whose handoff was lost to a restart, then superseded by a
+/// newer request before it was retried, is still retained with its complete
+/// membership when its key is retried, while the newer set stays current.
+///
+/// # Panics
+/// Panics when the interrupted request is acknowledged, the retry does not
+/// replay its generation, or its members are not retained.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_review_set_superseded_before_its_retry_is_still_retained() {
+    let Deployment { mock, server, jwt } = Deployment::start().await;
+    mock.set_pull_request(REPOSITORY, 61, PullRequest::open(REPOSITORY, "b1", "l1"));
+    server.flush_bifrost().await.expect("setup settles");
+    let held = server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_inputs")
+        .expect("Scribe stalls");
+    let lost = {
+        let url = format!(
+            "{}v1/integrations/github/pull-requests/reviews",
+            server
+                .base_url()
+                .expect("bound")
+                .trim_end_matches('/')
+                .to_owned()
+                + "/"
+        );
+        let body = GithubPullRequestReviewRequest {
+            host: mock.host(),
+            repository_id: RepositoryId::new(REPOSITORY.to_string()).expect("valid id"),
+            number: 61,
+        };
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("X-Wyrd-Access-Token", format!("Bearer {jwt}"))
+                .header("Idempotency-Key", "lost-61-a")
+                .json(&body)
+                .send()
+                .await
+                .map(|response| response.status())
+        })
+    };
+    held.wait_entered().await;
+    let restarted =
+        Box::pin(server.restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock)))
+            .await
+            .expect("server restarts");
+    held.release();
+    let answered = lost.await.expect("joins");
+    assert!(
+        !matches!(answered, Ok(status) if status.is_success()),
+        "an interrupted request is not accepted: {answered:?}"
+    );
+    let Bootstrap::User { jwt, .. } = restarted
+        .bootstrap_user("pull-request-retrier", &["editor"])
+        .await
+        .expect("retrier bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let deployment = Deployment {
+        mock,
+        server: restarted,
+        jwt,
+    };
+    let lost_rows = deployment.rows(61).await;
+    assert_eq!(
+        lost_rows.len(),
+        2,
+        "the lost set was reserved: {lost_rows:?}"
+    );
+
+    let github = deployment.github(&deployment.jwt).await;
+    let newer = github
+        .review_pull_request(&deployment.review(61), "newer-61-b")
+        .await
+        .expect("the newer review is accepted");
+    let retried = github
+        .review_pull_request(&deployment.review(61), "lost-61-a")
+        .await
+        .expect("the lost key replays");
+    assert_eq!(accepted(&retried), ids(&lost_rows));
+    let retained = deployment.retained_as(&deployment.jwt, 61, 4).await;
+    let lost_generation = json!(retried.generation.to_string());
+    assert_eq!(of(&retained, &lost_generation).len(), 2, "{retained:?}");
+    assert_eq!(
+        current(&retained),
+        Some((json!(newer.generation.to_string()), true)),
+        "the retried older set does not become current"
+    );
 }
 
 /// Publish everything `server`'s Scribe holds, so accepted rows have custody of

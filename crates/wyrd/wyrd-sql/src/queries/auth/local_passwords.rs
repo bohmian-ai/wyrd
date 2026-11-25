@@ -1,6 +1,6 @@
 //! Tenant-scoped local-password lifecycle queries: one-use enrollment
-//! invitations, operator-issued password resets, and fixed-window password
-//! failure counters.
+//! invitations, operator-issued and mailed password resets, and fixed-window
+//! password failure counters.
 //!
 //! Codes are stored only as the SHA-256 of their 256 random bits. Every
 //! deadline is derived by `PostgreSQL` from a bound or fixed duration, and
@@ -12,24 +12,41 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sqlx::types::Json;
 use uuid::Uuid;
-use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::auth::{InvitationDelivery, ScopedRoleAssignment, Sha256Hex};
 
 use crate::TenantConn;
 
 /// A stored enrollment invitation's safe metadata.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct InvitationRow {
     /// Invitation id.
     pub id: Uuid,
     /// The principal that issued it.
     pub issuer_principal_id: Uuid,
-    /// Role ids granted at enrollment, ordered by UUID.
-    pub role_ids: Vec<Uuid>,
-    /// Creation time.
+    /// The email address it is for.
+    pub recipient: String,
+    /// The stored [`InvitationDelivery`] label of its current link; read it
+    /// through [`InvitationRow::delivery`].
+    #[sqlx(rename = "delivery")]
+    pub delivery_label: String,
+    /// Role-and-scope assignments enrollment creates, revalidated against
+    /// current roles and issuer authority at consumption.
+    pub assignments: Json<Vec<ScopedRoleAssignment>>,
+    /// When its current link was issued.
     pub created_at: DateTime<Utc>,
     /// Absolute expiry.
     pub expires_at: DateTime<Utc>,
+}
+
+impl InvitationRow {
+    /// What became of emailing its current link. The column's check admits
+    /// only the three labels, so an unknown one reads as not emailed.
+    #[must_use]
+    pub fn delivery(&self) -> InvitationDelivery {
+        InvitationDelivery::parse(&self.delivery_label).unwrap_or(InvitationDelivery::NotEmailed)
+    }
 }
 
 /// A stored password reset's safe metadata.
@@ -41,6 +58,9 @@ pub struct PasswordResetRow {
     pub user_id: Uuid,
     /// The User's password revision when it was issued.
     pub password_revision: i64,
+    /// The verified-contact revision a mailed code was sent to; `None` for
+    /// an operator-issued code.
+    pub contact_revision: Option<i64>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Absolute expiry.
@@ -66,10 +86,10 @@ impl AttemptScope {
     }
 }
 
-/// Record an invitation for `role_ids` (stored ordered by UUID), issued by
+/// Record an invitation for `recipient` with scoped `assignments`, issued by
 /// `issuer`, whose code hashes to `code_hash`, expiring twenty-four hours
-/// after creation; returns its stored metadata. Expired invitations are
-/// purged first.
+/// after creation and not yet emailed; returns its stored metadata. Expired
+/// invitations are purged first.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the purge or insert.
@@ -78,27 +98,28 @@ pub async fn insert_invitation(
     id: Uuid,
     code_hash: &Sha256Hex,
     issuer: Uuid,
-    role_ids: &[Uuid],
+    recipient: &str,
+    assignments: &[ScopedRoleAssignment],
 ) -> Result<InvitationRow, sqlx::Error> {
     sqlx::query("DELETE FROM wyrd.auth_user_invitations WHERE expires_at <= statement_timestamp()")
         .execute(&mut **conn.transaction())
         .await?;
-    let mut ordered = role_ids.to_vec();
-    ordered.sort_unstable();
     sqlx::query_as::<_, InvitationRow>(
         r"
         INSERT INTO wyrd.auth_user_invitations (
-            id, data_tenant_id, code_hash, issuer_principal_id, role_ids, created_at, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, statement_timestamp(),
+            id, data_tenant_id, code_hash, issuer_principal_id, recipient, assignments,
+            created_at, expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp(),
                   statement_timestamp() + interval '24 hours')
-        RETURNING id, issuer_principal_id, role_ids, created_at, expires_at
+        RETURNING id, issuer_principal_id, recipient, delivery, assignments, created_at, expires_at
         ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
     .bind(code_hash.as_bytes().as_slice())
     .bind(issuer)
-    .bind(&ordered)
+    .bind(recipient)
+    .bind(Json(assignments))
     .fetch_one(&mut **conn.transaction())
     .await
 }
@@ -127,13 +148,83 @@ pub async fn consume_invitation(
            AND consumed_at IS NULL
            AND revoked_at IS NULL
            AND expires_at > statement_timestamp()
-        RETURNING id, issuer_principal_id, role_ids, created_at, expires_at
+        RETURNING id, issuer_principal_id, recipient, delivery, assignments, created_at, expires_at
         ",
     )
     .bind(code_hash.as_bytes().as_slice())
     .bind(user_id)
     .fetch_optional(&mut **conn.transaction())
     .await
+}
+
+/// The tenant's unexpired, unrevoked and unconsumed invitations, oldest first.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn pending_invitations(
+    conn: &mut TenantConn<'_>,
+) -> Result<Vec<InvitationRow>, sqlx::Error> {
+    sqlx::query_as::<_, InvitationRow>(
+        r"
+        SELECT id, issuer_principal_id, recipient, delivery, assignments, created_at, expires_at
+          FROM wyrd.auth_user_invitations
+         WHERE consumed_at IS NULL
+           AND revoked_at IS NULL
+           AND expires_at > statement_timestamp()
+         ORDER BY created_at, id
+        ",
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+}
+
+/// Replace the code of the unrevoked, unconsumed invitation `id` with one
+/// hashing to `code_hash`, restarting its twenty-four hours and marking it
+/// not yet emailed; the previous link stops enrolling. `None` when no such
+/// invitation remains. An expired one may be resent until it is purged.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn reissue_invitation(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    code_hash: &Sha256Hex,
+) -> Result<Option<InvitationRow>, sqlx::Error> {
+    sqlx::query_as::<_, InvitationRow>(
+        r"
+        UPDATE wyrd.auth_user_invitations
+           SET code_hash = $2,
+               delivery = 'not_emailed',
+               created_at = statement_timestamp(),
+               expires_at = statement_timestamp() + interval '24 hours'
+         WHERE id = $1
+           AND consumed_at IS NULL
+           AND revoked_at IS NULL
+        RETURNING id, issuer_principal_id, recipient, delivery, assignments, created_at, expires_at
+        ",
+    )
+    .bind(id)
+    .bind(code_hash.as_bytes().as_slice())
+    .fetch_optional(&mut **conn.transaction())
+    .await
+}
+
+/// Record what became of emailing the link whose code hashes to `code_hash`;
+/// a later resend has replaced the hash, so a stale outcome changes nothing.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn record_invitation_delivery(
+    conn: &mut TenantConn<'_>,
+    code_hash: &Sha256Hex,
+    delivery: InvitationDelivery,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE wyrd.auth_user_invitations SET delivery = $2 WHERE code_hash = $1")
+        .bind(code_hash.as_bytes().as_slice())
+        .bind(delivery.as_str())
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(())
 }
 
 /// Revoke the unconsumed invitation `id`; returns whether one was revoked.
@@ -160,6 +251,11 @@ pub async fn revoke_invitation(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bo
 /// `issuer`, whose code hashes to `code_hash`, expiring fifteen minutes after
 /// creation; returns its stored metadata. Expired resets are purged first.
 ///
+/// A code mailed to the User's verified contact carries that contact's
+/// `contact_revision` and replaces the User's earlier unconsumed mailed
+/// codes; operator-issued codes (`None`) replace nothing and are never
+/// replaced by a mailed one.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the purge or insert.
 pub async fn insert_password_reset(
@@ -169,18 +265,25 @@ pub async fn insert_password_reset(
     user_id: Uuid,
     password_revision: i64,
     issuer: Uuid,
+    contact_revision: Option<i64>,
 ) -> Result<PasswordResetRow, sqlx::Error> {
-    sqlx::query("DELETE FROM wyrd.auth_password_resets WHERE expires_at <= statement_timestamp()")
-        .execute(&mut **conn.transaction())
-        .await?;
+    sqlx::query(
+        "DELETE FROM wyrd.auth_password_resets
+          WHERE expires_at <= statement_timestamp()
+             OR ($2 AND user_id = $1 AND contact_revision IS NOT NULL AND consumed_at IS NULL)",
+    )
+    .bind(user_id)
+    .bind(contact_revision.is_some())
+    .execute(&mut **conn.transaction())
+    .await?;
     sqlx::query_as::<_, PasswordResetRow>(
         r"
         INSERT INTO wyrd.auth_password_resets (
             id, data_tenant_id, code_hash, user_id, password_revision, issuer_principal_id,
-            created_at, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp(),
+            contact_revision, created_at, expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, statement_timestamp(),
                   statement_timestamp() + interval '15 minutes')
-        RETURNING id, user_id, password_revision, created_at, expires_at
+        RETURNING id, user_id, password_revision, contact_revision, created_at, expires_at
         ",
     )
     .bind(id)
@@ -189,6 +292,7 @@ pub async fn insert_password_reset(
     .bind(user_id)
     .bind(password_revision)
     .bind(issuer)
+    .bind(contact_revision)
     .fetch_one(&mut **conn.transaction())
     .await
 }
@@ -210,7 +314,7 @@ pub async fn consume_password_reset(
          WHERE code_hash = $1
            AND consumed_at IS NULL
            AND expires_at > statement_timestamp()
-        RETURNING id, user_id, password_revision, created_at, expires_at
+        RETURNING id, user_id, password_revision, contact_revision, created_at, expires_at
         ",
     )
     .bind(code_hash.as_bytes().as_slice())

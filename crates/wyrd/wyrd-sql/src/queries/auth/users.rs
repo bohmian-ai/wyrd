@@ -31,6 +31,9 @@ pub struct UserRow {
 /// `auth_type` must satisfy the database check constraint. `password_hash` is
 /// present only for password-backed users.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
 pub async fn insert_user(
@@ -54,6 +57,7 @@ pub async fn insert_user(
     .bind(auth_type)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(())
 }
 
@@ -94,7 +98,11 @@ pub struct LocalCredentialRow {
 }
 
 /// Insert a new active local User with canonical `username` and the PHC
-/// `password_hash` verifier, at password revision zero.
+/// `password_hash` verifier, at password revision zero, and the optional
+/// unverified profile `email`. A profile email is never a verified contact.
+///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert, including a unique
@@ -104,20 +112,23 @@ pub async fn insert_local_user(
     id: Uuid,
     username: &str,
     password_hash: &str,
+    email: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r"
         INSERT INTO wyrd.auth_users (
-            id, data_tenant_id, username, password_hash, auth_type, status
-        ) VALUES ($1, $2, $3, $4, 'password', 'active')
+            id, data_tenant_id, username, password_hash, email, auth_type, status
+        ) VALUES ($1, $2, $3, $4, $5, 'password', 'active')
         ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
     .bind(username)
     .bind(password_hash)
+    .bind(email)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(())
 }
 
@@ -139,6 +150,31 @@ pub async fn local_credential_by_username(
         ",
     )
     .bind(username)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+}
+
+/// The tenant's first-created local User's credential, in any status;
+/// `None` when the tenant has no local User.
+///
+/// A signup-created tenant has exactly one local User until it is active,
+/// so a resumed creation finds its owner here whatever username the retry
+/// asks for.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn first_local_user(
+    conn: &mut TenantConn<'_>,
+) -> Result<Option<LocalCredentialRow>, sqlx::Error> {
+    sqlx::query_as::<_, LocalCredentialRow>(
+        r"
+        SELECT id, username, password_hash, password_revision, status
+          FROM wyrd.auth_users
+         WHERE password_hash IS NOT NULL
+         ORDER BY created_at, id
+         LIMIT 1
+        ",
+    )
     .fetch_optional(&mut **conn.transaction())
     .await
 }
@@ -182,6 +218,80 @@ pub async fn local_username(
         .map(Option::flatten)
 }
 
+/// What a User's own profile and the principal directory show about a User.
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct UserProfileRow {
+    /// Canonical local username; `None` for an account without a password.
+    pub username: Option<String>,
+    /// The account's email.
+    pub email: Option<String>,
+    /// The identity provider's name for the person, from the latest sign-in
+    /// that supplied one.
+    pub display_name: Option<String>,
+    /// Issuer of the User's linked external identity, when it has one; the
+    /// server maps it to a sign-in method.
+    pub identity_issuer: Option<String>,
+}
+
+/// The profile of User `id`; `None` for an unknown id.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn user_profile(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<Option<UserProfileRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserProfileRow>(USER_PROFILE_SQL)
+        .bind(id)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// One User's profile columns; the identity issuer is the earliest linked
+/// identity's, since an account links at most one.
+const USER_PROFILE_SQL: &str = r"
+SELECT u.username, u.email, u.display_name,
+       (SELECT i.issuer FROM wyrd.auth_user_identities i
+         WHERE i.data_tenant_id = u.data_tenant_id AND i.user_id = u.id
+         ORDER BY i.created_at, i.issuer LIMIT 1) AS identity_issuer
+  FROM wyrd.auth_users u
+ WHERE u.data_tenant_id = wyrd.current_tenant()
+   AND u.id = $1
+";
+
+/// Record the identity provider's `name` for User `id` after a successful
+/// sign-in.
+///
+/// A missing or blank `name` leaves the stored value unchanged, so a provider
+/// that stops sending one never erases it. Not an authorization change: the
+/// tenant's authorization revision does not advance.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn refresh_display_name(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    name: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+    sqlx::query(REFRESH_DISPLAY_NAME_SQL)
+        .bind(id)
+        .bind(name)
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(())
+}
+
+const REFRESH_DISPLAY_NAME_SQL: &str = r"
+UPDATE wyrd.auth_users
+   SET display_name = $2, updated_at = now()
+ WHERE data_tenant_id = wyrd.current_tenant()
+   AND id = $1
+   AND display_name IS DISTINCT FROM $2
+";
+
 /// Replace User `id`'s password verifier and advance its password revision,
 /// which ends every local session bound to an earlier one; returns the new
 /// revision.
@@ -220,6 +330,9 @@ pub async fn set_password_hash(
 ///
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
 pub async fn delete_user(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bool, sqlx::Error> {
@@ -232,6 +345,7 @@ pub async fn delete_user(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bool, sq
     .bind(id)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }
 

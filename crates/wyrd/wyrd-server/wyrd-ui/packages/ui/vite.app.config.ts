@@ -27,6 +27,8 @@ const singleFile: Plugin = {
 
 export default defineConfig({
   plugins: [svelte(), singleFile],
+  // A library build keeps `process.env.NODE_ENV`; the HTML runs in a browser, which has no `process`.
+  define: { 'process.env.NODE_ENV': JSON.stringify('production') },
   build: {
     outDir: 'dist',
     emptyOutDir: false,

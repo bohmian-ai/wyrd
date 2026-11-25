@@ -15,7 +15,7 @@
 //! cross the boundary as JSON text through the sandbox's `json` module, so
 //! no host object or callback is ever exposed to Python.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, Delivery, EvidenceReader, ToolBridge, verdict_from,
+    CheckOutput, Delivery, ToolBridge, verdict_from,
 };
 use wyrd_runtime::resources::{
     ByteCharge, ByteLedger, CommitObservation, CpuLanes, Operation, ProcessResources, WorkContext,
@@ -54,7 +54,6 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::CallProvenance;
 
 use super::HostedLimits;
@@ -108,6 +107,10 @@ pub struct Sandbox {
     waiting: AtomicUsize,
     /// Limits in force.
     limits: HostedLimits,
+    /// One permit every operation takes and drops inside its admission wait,
+    /// so a test holding it keeps operations counted as waiting.
+    #[cfg(feature = "test-support")]
+    admission_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl Sandbox {
@@ -167,6 +170,8 @@ impl Sandbox {
             operations: TaskTracker::new(),
             waiting: AtomicUsize::new(0),
             limits,
+            #[cfg(feature = "test-support")]
+            admission_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -220,15 +225,28 @@ impl Sandbox {
         }
     }
 
+    /// Hold every Python operation inside its admission wait, counted by
+    /// [`Self::waiting`], until the returned permit drops; process pressure
+    /// and every other workload are unaffected.
+    ///
+    /// # Panics
+    /// Panics when the gate is already held.
+    #[cfg(feature = "test-support")]
+    pub fn hold_admission_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        super::hold_all(&self.admission_gate)
+    }
+
     /// Report one worker committing more memory than the process ceiling
     /// until the returned observation drops, so every pressure sample is
     /// critical while the byte ledger keeps its room for the stores and
-    /// queries a run needs before and after Python.
+    /// queries a run needs before and after Python. Pressure is sampled
+    /// before this returns, so work submitted next already sees it critical.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn overcommit_for_test(&self) -> wyrd_runtime::resources::CommitObservation {
         let observation = self.workloads.observe_commitment();
         observation.set(u64::MAX);
+        self.workloads.sample(0);
         observation
     }
 
@@ -363,9 +381,9 @@ impl Sandbox {
     /// only paths the code can reach; every other OS call, host function, or
     /// undefined name is refused inside the sandbox.
     ///
-    /// The operation is admitted as `tenant`'s verification work, waiting while
-    /// process pressure pauses it, then charges the code and globals it
-    /// retains. No new session starts while any worker's telemetry is stale.
+    /// The operation first charges the code and globals it retains, so inputs
+    /// that cannot fit are refused at once, then is admitted as `tenant`'s
+    /// verification work, waiting while process pressure pauses it. No new session starts while any worker's telemetry is stale.
     /// The worker's observed bytes are attributed to the operation while it
     /// holds the worker. Python holds one CPU lane only while a turn runs; a
     /// program suspended on host calls or a `/work` writer holds none. Under
@@ -460,14 +478,18 @@ impl Sandbox {
             .time(Envelope::Capacity, async {
                 self.waiting.fetch_add(1, Ordering::Relaxed);
                 let _waiting = Waiting(&self.waiting);
-                let operation = tokio::time::timeout_at(
-                    deadline,
-                    self.workloads.admit(
-                        Workload::Verification,
-                        Some(tenant),
-                        Some(victim.clone()),
-                    ),
-                )
+                let operation = tokio::time::timeout_at(deadline, async {
+                    #[cfg(feature = "test-support")]
+                    drop(
+                        self.admission_gate
+                            .acquire()
+                            .await
+                            .expect("the test admission gate is never closed"),
+                    );
+                    self.workloads
+                        .admit(Workload::Verification, Some(tenant), Some(victim.clone()))
+                        .await
+                })
                 .await
                 .map_err(|_| {
                     refused(
@@ -1043,9 +1065,8 @@ pub struct OccupiedForTest {
     charge: Arc<std::sync::Mutex<Option<ByteCharge>>>,
     /// The task absorbing released memory into the charge.
     pin: tokio::task::JoinHandle<()>,
-    /// The Verification operation the charge is attributed to; dropped
-    /// after the charge returns its bytes.
-    _operation: wyrd_runtime::resources::Operation,
+    /// The verification operation the held bytes are attributed to.
+    _operation: Operation,
 }
 
 #[cfg(feature = "test-support")]
@@ -1203,12 +1224,12 @@ fn answer(
 pub struct CodeExecutor {
     /// The shared sandbox.
     sandbox: Arc<Sandbox>,
-    /// The execution's evidence, for citation validation.
+    /// The execution's evidence, for Artifact sources and tenancy.
     evidence: Arc<TenantEvidence>,
 }
 
 impl CodeExecutor {
-    /// Code execution over `sandbox` citing `evidence`.
+    /// Code execution over `sandbox` reading `evidence`.
     #[must_use]
     pub const fn new(sandbox: Arc<Sandbox>, evidence: Arc<TenantEvidence>) -> Self {
         Self { sandbox, evidence }
@@ -1298,13 +1319,13 @@ impl ActionExecutor for CodeExecutor {
 
 #[async_trait]
 impl CheckExecutor for CodeExecutor {
-    /// Run a `code` check and return its Verdict, keeping only citations
-    /// into evidence reachable through the call's bindings.
+    /// Run a `code` check and return its Verdict as the code returned it;
+    /// the engine validates its citations.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-code check or a result
     /// [`verdict_from`] refuses against the check's declared `verdict`
-    /// format, plus [`Self::run`] and citation-read failures.
+    /// format, plus [`Self::run`] failures.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         let Check::Code(code) = call.block else {
             return Err(terminal(
@@ -1316,16 +1337,7 @@ impl CheckExecutor for CodeExecutor {
             .map_err(|error| terminal(format!("the code check format is invalid: {error}")))?;
         let (value, provenance) = self.run(&code.call, &call.inputs, call.deadline).await?;
         let schema = SharedSchema::new(Value::Object(schema));
-        let mut verdict = verdict_from(&PreparedSchemas::default(), &schema, value)?;
-        let reachable: BTreeSet<SlotName> = call
-            .inputs
-            .values()
-            .flat_map(|input| input.sources.iter().cloned())
-            .collect();
-        verdict.citations = self
-            .evidence
-            .cited(&reachable, std::mem::take(&mut verdict.citations))
-            .await?;
+        let verdict = verdict_from(&PreparedSchemas::default(), &schema, value)?;
         Ok(CheckOutput {
             verdict,
             actual: None,

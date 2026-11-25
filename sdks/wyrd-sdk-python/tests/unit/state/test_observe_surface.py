@@ -42,6 +42,7 @@ def test_run_targets_the_root_service_with_a_uuidv7_identity(state: WyrdState) -
     assert isinstance(run.observe, Observe)
 
 
+@pytest.mark.usefixtures("unreachable_server")
 def test_run_exposes_bifrost_write_and_observe_verification(state: WyrdState) -> None:
     """Caller-table rows go through ``run.bifrost.write``; Observe keeps verification."""
     run = state.run()
@@ -631,6 +632,7 @@ def _broken(*_args: object, **_kwargs: object) -> None:
     raise RuntimeError("telemetry broke")
 
 
+@pytest.mark.usefixtures("unreachable_server")
 def test_registration_and_attach_failures_never_block_observations(
     state: WyrdState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -648,6 +650,7 @@ def test_registration_and_attach_failures_never_block_observations(
         _write_reaches_the_ordinary_boundary(entered)
 
 
+@pytest.mark.usefixtures("unreachable_server")
 def test_failing_enrichment_never_blocks_spans_or_observations(
     state: WyrdState,
     spans: tuple[TracerProvider, InMemorySpanExporter],
@@ -676,6 +679,7 @@ def model_run(state: WyrdState) -> Iterator[Run]:
     run.__exit__()
 
 
+@pytest.mark.usefixtures("unreachable_server")
 def test_exit_context_update_failure_never_blocks_observations(
     model_run: Run, monkeypatch: pytest.MonkeyPatch
 ) -> None:

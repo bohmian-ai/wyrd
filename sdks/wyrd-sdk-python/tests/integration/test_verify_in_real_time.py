@@ -67,7 +67,11 @@ CALLS = "/v1/chat/completions"
 def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     """The ``verifier:run`` grant on exactly the registered ``verifier``."""
     uid = declare(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
-    return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
+    return {
+        "resource": "verifier",
+        "action": "run",
+        "scope": {"card": {"version": {"kind": "Verifier", "name": verifier, "uid": str(uid)}}},
+    }
 
 
 def principal(service: str = "assistant") -> str:
@@ -672,7 +676,13 @@ def test_grouped_coding_uses_declared_sources(
     wyrd_server.scoped_api_key("py_live_reader", ["tool:invoke", "bifrost_query:read"])
     principals = Principals(client_of(wyrd_server))
     coding = principal("coding")
-    principals.grant_role(coding, "py_live_reader")
+    live_reader = principals.bind(
+        {
+            "subject": {"principal": {"id": coding, "kind": "service"}},
+            "role": "py_live_reader",
+            "scope": "all",
+        }
+    )
     state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("coding")))
     state.configure()
     state.start_bifrost()
@@ -736,7 +746,7 @@ def test_grouped_coding_uses_declared_sources(
     [read] = [text for text in reviews() if '"role": "tool"' in text]
     assert "edit-file" in read and "late-test-run" in read, "the check reads the spans live"
 
-    principals.revoke_role(coding, "py_live_reader")
+    principals.unbind(live_reader["id"])
     later = f"session-{secrets.token_hex(4)}"
     run.observe.verify("coding-turn", call=calls[0], trace=trace_id, group_id=later)
     revoked = group_execution(wyrd_server, binding_id, WAIT_SECONDS, judged["execution_id"])

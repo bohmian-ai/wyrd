@@ -50,7 +50,7 @@ docker run --rm --network "$net" "${serving_env[@]:0:4}" "$image" wyrd-server mi
 
 echo "== serve, set up acme, reach the providers"
 start_app development
-api_key="$(docker exec "$app" wyrd-server setup --tenant acme | sed -n 's/^admin_credential: //p')"
+api_key="$(setup_acme | sed -n 's/^admin_credential: //p')"
 [[ -n $api_key ]] || fail "setup disclosed no tenant credential"
 providers="$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{end}}' \
   "$(cd "$root" && docker compose ps -q keycloak)")"

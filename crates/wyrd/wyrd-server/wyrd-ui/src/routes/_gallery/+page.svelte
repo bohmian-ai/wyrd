@@ -21,23 +21,32 @@
   } from 'wyrd-ai-ui';
   import { WyrdView } from 'wyrd-ai-ui/view';
   import type { Executor } from 'wyrd-ai-ui';
+  import type { ComponentName } from 'wyrd-ai-ui/loaders';
   import {
     AUTHORED_SQL,
     bareSpan,
     card,
+    connectionExecutor,
     day,
     denied,
+    DRIFT_VERIFIER,
+    EXECUTIONS,
     fixtureExecutor,
     liveExecutor,
     LOG,
+    NATIVE,
+    PROMPT,
     RANGE,
     registered,
+    REPOSITORY,
     series,
+    SESSION_VERIFIER,
     stateExecutors,
     summary,
     terminal,
     timeseries,
-    TRACE
+    TRACE,
+    VERIFIER
   } from '$lib/ui-fixtures';
 
   let drawer = $state(false);
@@ -67,7 +76,7 @@
   }
   /** One component's checkpoint: the board regions it must match and its cases. */
   interface Checkpoint {
-    readonly component: 'StatStrip' | 'FacetRail' | 'RecordTable' | 'Chart' | 'TraceWaterfall' | 'RecordDetail';
+    readonly component: ComponentName;
     readonly regions: readonly (readonly [board: string, region: string])[];
     readonly note?: string;
     readonly cases: readonly Case[];
@@ -80,12 +89,152 @@
 
   const checkpoints = (live: Executor): Checkpoint[] => [
     {
+      component: 'CardInventory',
+      regions: [['Cards', 'filter bar, kind nav, version table and footer']],
+      cases: [
+        { label: 'all kinds · first page, more to load', input: {} },
+        { label: 'two pages kept after Load more', input: { pages: 2 } },
+        { label: 'filtered to Prompts with prereleases', input: { kind: 'Prompt', include_prerelease: true, query: 'support' } },
+        { label: 'filtered · no match', input: { query: 'nothing' }, state: 'empty' },
+        { label: 'empty tenant', input: {}, state: 'empty' },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: {}, state })),
+        { label: 'narrow', input: {}, narrow: true }
+      ]
+    },
+    {
+      component: 'CardFacts',
+      regions: [['Prompt', 'Metadata rail']],
+      cases: [
+        { label: 'metadata', input: { cardRef: PROMPT } },
+        { label: 'YAML', input: { cardRef: PROMPT, yaml: true } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))
+      ]
+    },
+    {
+      component: 'RelationshipList',
+      regions: [['Prompt', 'Relationships rail']],
+      cases: [{ label: 'outbound and inbound', input: { cardRef: { kind: 'Agent', name: 'support', version: '1.0.0' } } }, ...states({ cardRef: PROMPT })]
+    },
+    {
+      component: 'ArtifactTable',
+      regions: [['Cards', 'Files tab']],
+      cases: [{ label: 'registered files', input: { cardRef: card } }, ...states({ cardRef: card })]
+    },
+    {
+      component: 'PromptMessages',
+      regions: [['Prompt', 'Prompt panel']],
+      cases: [
+        { label: 'portable', input: { cardRef: PROMPT } },
+        { label: 'native body with an extension field', input: { cardRef: NATIVE } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))
+      ]
+    },
+    {
+      component: 'PromptVariables',
+      regions: [['Prompt', 'Variables table']],
+      cases: [{ label: 'derived variables', input: { cardRef: PROMPT } }, ...states({ cardRef: PROMPT })]
+    },
+    {
+      component: 'UsedBy',
+      regions: [['Prompt', 'Used by table']],
+      cases: [{ label: 'one Agent behind a Service', input: { cardRef: PROMPT } }, ...states({ cardRef: PROMPT })]
+    },
+    {
+      component: 'VersionDiff',
+      regions: [['Prompt', 'Changes from the previous version']],
+      cases: [{ label: '1.0.0 → 1.1.0', input: { cardRef: PROMPT } }, { label: 'only one version', input: { cardRef: PROMPT }, state: 'empty' }, ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))]
+    },
+    {
+      component: 'VerifierDefinition',
+      regions: [],
+      note: 'Reference: the approved verification mock, exact Verifier page (description, Graph panel, inspector). Definition only: no execution colour. Select a node, use the arrow keys, zoom and Fit.',
+      cases: [
+        { label: 'parallel steps, fan-in, gate, retries and both requirement positions', input: { cardRef: VERIFIER } },
+        { label: 'requirements only: a compact panel', input: { cardRef: { ...VERIFIER, version: '1.0.0' } } },
+        { label: 'session judgment over group sources', input: { cardRef: SESSION_VERIFIER } },
+        { label: 'drift check over samples', input: { cardRef: DRIFT_VERIFIER } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: VERIFIER }, state })),
+        { label: 'narrow: the graph pans', input: { cardRef: VERIFIER }, narrow: true }
+      ]
+    },
+    {
+      component: 'VerificationExecution',
+      regions: [],
+      note: 'Reference: the approved verification mock, exact execution page. Status and verdict are separate; each node carries its recorded state as a glyph and word; the inspector follows the selection.',
+      cases: [
+        { label: 'running: a retried step, one in flight, nothing judged', input: { executionId: EXECUTIONS.running, node: 'step:score' } },
+        { label: 'settled: a failed requirement with evidence', input: { executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true } },
+        { label: 'a directory output of one invocation', input: { executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output: 'tree' } },
+        { label: 'all retained outputs', input: { executionId: EXECUTIONS.settled, node: 'outputs' } },
+        { label: 'session: ordered members of one source', input: { executionId: EXECUTIONS.session, node: 'input:outcomes' } },
+        { label: 'drift: every feature, drifted first', input: { executionId: EXECUTIONS.drift, node: 'req:latency-stable' } },
+        ...STATES.filter((state) => state !== 'empty' ).map((state) => ({ label: state, input: { executionId: EXECUTIONS.settled }, state })),
+        { label: 'narrow', input: { executionId: EXECUTIONS.settled, node: 'step:score' }, narrow: true }
+      ]
+    },
+    {
+      component: 'RunsOn',
+      regions: [],
+      note: 'Reference: the approved verification mock, exact Verifier page, Runs on rail.',
+      cases: [{ label: 'a Service binding itself and one component', input: { cardRef: VERIFIER } }, ...states({ cardRef: VERIFIER })]
+    },
+    {
+      component: 'RepositoryIndex',
+      regions: [],
+      note: 'Reference: the approved verification mock, Repositories. Registration, GitHub access and automatic verification are separate columns.',
+      cases: [
+        { label: 'ready, access removed, empty policy and no Card', input: {} },
+        { label: 'Show: not verifying', input: { show: 'inactive' } },
+        { label: 'search with no match', input: { query: 'nothing' } },
+        { label: 'installation access lost', input: {}, executor: connectionExecutor({ state: 'suspended' }) },
+        { label: 'GitHub not connected', input: {}, executor: connectionExecutor({ state: 'not_connected' }) },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: {}, state })),
+        { label: 'narrow', input: {}, narrow: true }
+      ]
+    },
+    {
+      component: 'RepositoryPolicy',
+      regions: [],
+      note: 'Reference: the approved verification mock, Repository Card detail. The viewed version is separate from the selected policy.',
+      cases: [
+        { label: 'selected version, access granted', input: { cardRef: REPOSITORY } },
+        { label: 'older version, viewing only · wyrd.toml projection', input: { cardRef: { ...REPOSITORY, version: '1.3.0' }, declaration: 'toml' } },
+        { label: 'access removed on GitHub', input: { cardRef: { ...REPOSITORY, name: 'ledger', version: '1.1.0' } } },
+        { label: 'selected policy binds nothing', input: { cardRef: { ...REPOSITORY, name: 'docs-site', version: '0.3.0' } } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: REPOSITORY }, state })),
+        { label: 'narrow', input: { cardRef: REPOSITORY }, narrow: true }
+      ]
+    },
+    {
+      component: 'RepositoryDeclare',
+      regions: [],
+      note: 'Reference: the approved verification mock, a GitHub repository with no Repository Card.',
+      cases: [
+        { label: 'reachable, not declared', input: { repositoryId: '741660215' } },
+        { label: 'an id the connection does not reach', input: { repositoryId: '999' } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { repositoryId: '741660215' }, state }))
+      ]
+    },
+    {
+      component: 'GithubIntegration',
+      regions: [],
+      note: 'Reference: the approved verification mock, Settings, GitHub. Disconnect opens a confirmation first.',
+      cases: [
+        { label: 'connected', input: {} },
+        { label: 'not connected', input: {}, executor: connectionExecutor({ state: 'not_connected' }) },
+        { label: 'installation access lost', input: {}, executor: connectionExecutor({ state: 'suspended' }) },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: {}, state })),
+        { label: 'narrow', input: {}, narrow: true }
+      ]
+    },
+    {
       component: 'FacetRail',
       regions: [['Main', 'left facet column'], ['Spans', 'left facet column'], ['Logs', 'left facet column']],
       cases: [
         { label: 'traces · a value in WHERE', input: { signal: 'traces', facets: ['workload_card_uid', 'subject_card_uid', 'service_name', 'status_code'], where: [{ column: 'service_name', value: 'agent-api' }] } },
         { label: 'spans · more values than shown', input: { signal: 'spans', facets: ['name', 'service_name', 'status_code'] } },
         { label: 'logs', input: { signal: 'logs', facets: ['severity_text', 'workload_card_uid', 'service_name'] } },
+        { label: 'executions · no recorded verdict is counted apart', input: { signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'] } },
         ...states({ signal: 'traces', facets: ['service_name'] }),
         { label: 'narrow', input: { signal: 'spans', facets: ['name', 'status_code'] }, narrow: true }
       ]
@@ -100,6 +249,8 @@
         { label: 'spans · grouped by duration: two values that read "1ms" stay apart', input: { signal: 'spans', groupBy: 'duration_nano' } },
         { label: 'logs · 120 read, paged, wrap and columns', input: { signal: 'logs', limit: 120 } },
         { label: 'metrics · null is not zero', input: { signal: 'metrics' } },
+        { label: 'executions · status and verdict apart, no terminal record', input: { signal: 'executions' } },
+        { label: 'executions · grouped by session', input: { signal: 'executions', groupBy: 'group_id' } },
         { label: 'authored SQL · aliases keep their returned meaning', input: { sql: AUTHORED_SQL } },
         ...states({ signal: 'logs' }),
         { label: 'narrow', input: { signal: 'spans' }, narrow: true }
@@ -206,7 +357,7 @@
         <Chart input={timeseries} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} {actions} {onaction} />
       </div>
 
-      <h2>Observe</h2>
+      <h2>Catalog components</h2>
       {#each views[mode] as checkpoint (checkpoint.component)}
         <section class="checkpoint" aria-label="{checkpoint.component} checkpoint">
           <h3>{checkpoint.component}</h3>

@@ -93,8 +93,11 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   expect(otherTab.status).toBe(200);
   const home = await otherTab.text();
   expect(home).toMatch(/Signed in as <strong[^>]*>Jordan Reyes<\/strong>/);
-  expect(home).toContain('name="tenantKey" value="research"');
-  expect(home).toContain('Sign out');
+  // Switching and signing out live on Your account, which the name block opens.
+  expect(home).toContain('href="/t/acme/settings/account"');
+  const account = await (await fetch(`${origin}/t/acme/settings/account`, { headers: { cookie } })).text();
+  expect(account).toContain('name="tenantKey" value="research"');
+  expect(account).toContain('Sign out');
   expect(home).not.toMatch(/Recent changes|Recently viewed Cards|checkout/);
   const logoSource = home.match(/<img src="([^"]+)"/)![1];
   const logo = await fetch(new URL(logoSource, origin));

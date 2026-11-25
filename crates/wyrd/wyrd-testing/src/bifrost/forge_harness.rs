@@ -1737,7 +1737,6 @@ async fn scribe_append_and_seal(
         wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
         wyrd_runtime::principal::PrincipalKind::User,
         tenant,
-        Vec::new(),
         wyrd_runtime::PermissionSet::new(),
     );
     scribe

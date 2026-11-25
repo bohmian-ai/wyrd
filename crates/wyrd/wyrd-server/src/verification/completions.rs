@@ -79,6 +79,9 @@ pub(super) struct Completions {
     /// Queue the flush tasks drain. Its length is bounded by the runner's
     /// execution slots, since each queued run holds one until it is answered.
     queue: mpsc::UnboundedSender<Waiting>,
+    /// Test-only crash switch the flush tasks check after taking runs.
+    #[cfg(feature = "test-support")]
+    crash: Arc<std::sync::OnceLock<super::CapabilityCrash>>,
 }
 
 /// One flush task's dependencies and its share of the queue.
@@ -90,6 +93,9 @@ struct Flusher {
     /// The queue every flush task takes from; the task holding the lock waits
     /// for the next run and takes everything queued with it.
     waiting: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Waiting>>>,
+    /// Test-only crash switch checked after taking runs.
+    #[cfg(feature = "test-support")]
+    crash: Arc<std::sync::OnceLock<super::CapabilityCrash>>,
 }
 
 impl Completions {
@@ -100,15 +106,30 @@ impl Completions {
     pub(super) fn new(postgres: &WyrdPostgres, queue: VerifierExecutionQueue) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let waiting = Arc::new(tokio::sync::Mutex::new(receiver));
+        #[cfg(feature = "test-support")]
+        let crash = Arc::new(std::sync::OnceLock::new());
         for _ in 0..FLUSHERS {
             let flusher = Flusher {
                 postgres: postgres.clone(),
                 queue,
                 waiting: Arc::clone(&waiting),
+                #[cfg(feature = "test-support")]
+                crash: Arc::clone(&crash),
             };
             tokio::spawn(flusher.run());
         }
-        Self { queue: sender }
+        Self {
+            queue: sender,
+            #[cfg(feature = "test-support")]
+            crash,
+        }
+    }
+
+    /// Let `crash` panic a flush task after it takes queued runs. Only the
+    /// first switch armed takes effect.
+    #[cfg(feature = "test-support")]
+    pub(super) fn arm_crash(&self, crash: super::CapabilityCrash) {
+        let _ = self.crash.set(crash);
     }
 
     /// Complete one run of `tenant` in a group commit with the other
@@ -163,11 +184,19 @@ impl Flusher {
     /// The lock is held only while waiting for and taking runs, so the other
     /// tasks flush meanwhile. A panic ends only this task; the runs it held
     /// get no reply and settle alone.
+    ///
+    /// # Panics
+    /// Panics after taking queued runs when a test armed a completion flush
+    /// crash through `CapabilityCrash::crash_next_completion_flush`.
     async fn run(self) {
         let mut batch = Vec::with_capacity(BATCH);
         loop {
             if self.waiting.lock().await.recv_many(&mut batch, BATCH).await == 0 {
                 return;
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(crash) = self.crash.get() {
+                crash.check_completion_flush();
             }
             batch.sort_by_key(|waiting| waiting.tenant);
             while let Some(tenant) = batch.last().map(|waiting| waiting.tenant) {

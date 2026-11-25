@@ -36,7 +36,7 @@ const SDK_VERIFY: &str = "sdk.verify";
 use crate::authoring::NativeAuthored;
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::verification::{NativeSubmission, NativeVerifierInput};
-use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
+use crate::{NativeAbort, NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
 #[napi]
@@ -378,6 +378,9 @@ impl NativeCards {
 
     /// Lists metadata-only Card summaries for one serialized list request.
     ///
+    /// Aborting `abort` before the page arrives drops the pending request, so
+    /// the server sees it closed, and resolves `null`.
+    ///
     /// # Errors
     ///
     /// Returns a napi error only when the page cannot be serialized; a
@@ -387,17 +390,25 @@ impl NativeCards {
         &self,
         env: &'env Env,
         request_json: String,
-    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        abort: Option<&NativeAbort>,
+    ) -> napi::Result<PromiseRaw<'env, Option<NativeLifecycleResult>>> {
         let cards = self.cards.clone();
+        let aborted = NativeAbort::watch(abort);
         crate::trace::spawn(env, async move {
-            let result = match serde_json::from_str::<ListCardsRequest>(&request_json) {
-                Ok(request) => cards.list(request).await,
-                Err(error) => Err(WyrdError::Validation {
-                    message: error.to_string(),
-                    details: serde_json::json!({ "field": "request" }),
-                }),
+            let list = async move {
+                match serde_json::from_str::<ListCardsRequest>(&request_json) {
+                    Ok(request) => cards.list(request).await,
+                    Err(error) => Err(WyrdError::Validation {
+                        message: error.to_string(),
+                        details: serde_json::json!({ "field": "request" }),
+                    }),
+                }
             };
-            NativeLifecycleResult::outcome(result)
+            aborted
+                .or_run(list)
+                .await
+                .map(NativeLifecycleResult::outcome)
+                .transpose()
         })
     }
 

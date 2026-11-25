@@ -24,7 +24,7 @@
 //! publications that execution's steps accepted, which workspaces stage the
 //! same way through `steps.<id>.publications` references.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -40,7 +40,7 @@ use vala_verify::blocks::{
 };
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
 use wyrd_runtime::resources::{ByteCharge, ByteLedger, Workload};
-use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::auth::{CardPermissionScope, Sha256Hex};
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
@@ -60,6 +60,7 @@ use super::registry::refusal;
 use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
+use crate::components::cards::service::require_object;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
 use crate::verification::state::RunState;
@@ -534,7 +535,17 @@ impl TenantEvidence {
         let key = (card.identity_key(), card.uid.clone());
         let known = lock(&self.artifacts).get(&key).cloned();
         if let Some(inventory) = known {
-            authorize_card_ref(&self.state, &self.caller, card).map_err(|error| refusal(&error))?;
+            let objects = authorize_card_ref(&self.state, &self.caller, card)
+                .map_err(|error| refusal(&error))?;
+            require_object(
+                objects.as_deref(),
+                &CardPermissionScope::version(
+                    card.kind.clone(),
+                    card.name.clone(),
+                    inventory.uid.clone(),
+                ),
+            )
+            .map_err(|error| refusal(&error))?;
             return Ok(inventory);
         }
         let (resolved, files) = get_card_objects_by_ref_for(&self.state, &self.caller, card)
@@ -813,41 +824,40 @@ impl EvidenceReader for TenantEvidence {
         Ok((media, Box::new(charge)))
     }
 
-    /// Keep each citation whose slot is reachable and pinned and whose
-    /// locator names a location in that slot's extraction; each cited slot
-    /// is read and extracted once per call.
+    /// Check that each citation names a location in its slot's pinned
+    /// extraction; each cited slot is read and extracted once per call.
     ///
     /// # Errors
-    /// Returns [`BlockError::Retryable`] when cited evidence cannot be read
-    /// now.
-    async fn cited(
-        &self,
-        reachable: &BTreeSet<SlotName>,
-        citations: Vec<Citation>,
-    ) -> Result<Vec<Citation>, BlockError> {
-        let mut located: BTreeMap<SlotName, Option<Vec<(Locator, String)>>> = BTreeMap::new();
-        let mut valid = Vec::new();
-        let Some(pinned) = lock(&self.slots).upgrade() else {
-            return Ok(valid);
-        };
+    /// Returns [`BlockError::Terminal`] naming the first citation of a slot
+    /// that is not pinned, can never be read, or has no such location, and
+    /// [`BlockError::Retryable`] when cited evidence cannot be read now.
+    async fn validate(&self, citations: &[&Citation]) -> Result<(), BlockError> {
+        let pinned = lock(&self.slots).upgrade();
+        let mut located: BTreeMap<&SlotName, Option<Vec<(Locator, String)>>> = BTreeMap::new();
         for citation in citations {
             let Some(declaration) = pinned
-                .get(&citation.slot)
-                .filter(|_| reachable.contains(&citation.slot))
+                .as_ref()
+                .and_then(|pinned| pinned.get(&citation.slot))
             else {
-                continue;
+                return Err(terminal(&format!(
+                    "invalid citation: slot {} is not pinned evidence of this execution",
+                    citation.slot
+                )));
             };
             if !located.contains_key(&citation.slot) {
                 let units = self.located(declaration).await?;
-                located.insert(citation.slot.clone(), units);
+                located.insert(&citation.slot, units);
             }
-            if let Some(Some(units)) = located.get(&citation.slot)
-                && locates(units, &citation.locator)
+            if !matches!(located.get(&citation.slot), Some(Some(units)) if locates(units, &citation.locator))
             {
-                valid.push(citation);
+                return Err(terminal(&format!(
+                    "invalid citation: slot {} has no location {}",
+                    citation.slot,
+                    serde_json::to_string(&citation.locator).unwrap_or_default()
+                )));
             }
         }
-        Ok(valid)
+        Ok(())
     }
 }
 

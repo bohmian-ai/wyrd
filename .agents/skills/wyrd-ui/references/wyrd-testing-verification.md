@@ -1,35 +1,44 @@
-# Wyrd Testing And Verification
+# Wyrd UI Testing and Verification
 
-## Choosing the check
+Run `pnpm` commands from `crates/wyrd/wyrd-server/wyrd-ui`. `check`, `test`, `build`,
+and `dev` build `wyrd-ai-ui` first and need the `wyrd-ai` addon built (`mise run ts:build`).
 
-- Pure utilities: add unit tests.
-- Components with interaction: use component tests when the test harness exists.
-- Routes and server helpers: test parsing, auth/session branches, and error normalization.
-- Visual changes: run build/checks and inspect the UI manually in relevant modes.
+| Changed | Run |
+|---|---|
+| Any `.svelte` or `.ts` file | `mise run ui:check` (the CI `ui` job) |
+| Fast iteration, addon already built | `pnpm check`, `pnpm test` |
+| A single test | `pnpm exec vitest run src/lib/<file>.test.ts -t '<name>'` |
+| `brand/palette.json` or `gen-theme.mjs` | `pnpm tokens`, then `mise run codegen:check` |
+| `packages/ui/src/lib/schemas.ts` or the Rust error catalog | `pnpm --filter wyrd-ai-ui catalog`, then `mise run codegen:check` |
+| Sign-in, sessions, tenant routing, BFF routes | `mise run test:identity:journey:suite` (needs Postgres, Keycloak, Dex) |
+| Production BFF journey against Keycloak and Dex | `mise run test:identity:ui` |
+| Real-server UI tests (`*.integration.test.ts`) | see Tests below |
+| Bundle or adapter | `pnpm build` |
 
-## Verification commands
+## Tests
 
-From `crates/wyrd/wyrd-server/wyrd-ui`:
+- Shared components are tested in `src/lib/ui-library.test.ts`, pages in
+  `src/lib/ui-pages.test.ts` (vitest, jsdom, Testing Library). Component data comes from
+  `ui-fixtures.ts`; don't invent shapes.
+- `ui-library.integration.test.ts` (hosts and built artifacts) and
+  `ui-pages.integration.test.ts` (production BFF in Chromium) run against a real server
+  and are skipped unless `WYRD_UI_INTEGRATION=1`. They need `mise run ts:build`,
+  `ts:build:testing` and `build:server` first. Run from the repository root:
 
-```bash
-pnpm check
-pnpm build
-```
+  ```bash
+  mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 \
+    pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t '<name>'
+  ```
+- Node-lifetime behavior is tested in TypeScript. A user-facing capability also needs
+  its journey test (see `TESTING.md`).
 
-Run both when changing route data, TypeScript contracts, Svelte components, or shared styling. For tiny copy-only changes, use judgment.
+## Manual visual check
 
-## Manual UI checks
+`mise run dev:frontend`, then open `/_gallery` and the affected route in both modes.
+For a page with an approved mock, compare as `SKILL.md` § Matching an approved mock
+says. Confirm:
 
-- Text fits inside buttons, nav items, cards, and narrow mobile layouts.
-- Focus is visible.
-- Loading, empty, and error states are reachable.
-- Theme tokens resolve correctly in both light and dark modes when theme support exists.
-- Evidence Thread rules hold: 2px radius, 1px rules, no decorative elevation, no color-only meaning.
-- Controls do not shift layout when labels, counts, or icons change.
-
-## Performance checks
-
-- Large lists use bounded payloads and virtualization when needed.
-- Filters do not trigger unbounded request bursts.
-- Charts and editors clean up observers and subscriptions.
-- Components avoid expensive work during every render.
+- text fits, focus is visible, and no layout shifts when counts or labels change
+- empty, loading, error, and unauthorized states are reachable
+- 1px rules and 2px radius, no elevation, no color-only meaning
+- a narrow viewport scrolls dense data instead of clipping it

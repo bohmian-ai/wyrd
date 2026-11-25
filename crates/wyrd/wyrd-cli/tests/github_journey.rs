@@ -712,7 +712,7 @@ mod pg_tests {
     /// `wyrd execution approve` and the same execution passes.
     ///
     /// `wyrd execution status` lists the pending `signoff` occurrence. Once
-    /// CI publishes `ci`, a viewer's approval is refused; an editor's prints
+    /// CI publishes `ci`, a viewer's approval is refused; an approver's prints
     /// the durable receipt and replays, and a later rejection of the decided
     /// occurrence is refused as not pending. The passed execution then
     /// reaches GitHub as one `success` Check on the head commit, and the MCP
@@ -769,10 +769,15 @@ mod pg_tests {
             &decide("approve", viewer).await,
             "WYRD_PERMISSION_403_DENIED_RBAC",
         );
-        let editor = key(&waiting.server, "signoff_cli_editor", &["editor"]).await;
+        let approver = key(
+            &waiting.server,
+            "signoff_cli_approver",
+            &["approver", "viewer"],
+        )
+        .await;
         let receipt = json(
             "execution approve",
-            &decide("approve", editor.clone()).await,
+            &decide("approve", approver.clone()).await,
         );
         assert_eq!(receipt["approval_id"], approval.as_str());
         assert_eq!(receipt["status"], "approved");
@@ -780,14 +785,14 @@ mod pg_tests {
         assert_eq!(
             json(
                 "execution approve again",
-                &decide("approve", editor.clone()).await
+                &decide("approve", approver.clone()).await
             ),
             receipt,
             "the same decision replays its receipt"
         );
         failed_with(
             "a rejection after the approval",
-            &decide("reject", editor).await,
+            &decide("reject", approver).await,
             "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING",
         );
         let completed = waiting.until("completed").await;

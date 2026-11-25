@@ -32,6 +32,8 @@ designed but not yet built.
 - Every color and geometry value is a token in `palette.json`. Never hardcode a hex in a
   consumer — use `var(--token)` (or the workbench's Tailwind `bg-*`/`text-*`/`border-*`
   utilities, which resolve per mode). No consumer owns a second palette.
+- The one exception is a fixed provider mark (`$lib/Mark.svelte`): Google's "G" keeps its
+  official colours and the GitHub mark follows `currentColor`.
 - Regenerate after any token edit: `node brand/gen-theme.mjs` (from
   `crates/wyrd/wyrd-server/wyrd-ui`). `mise run codegen:check` runs the generator tests and
   fails on any projection drift. Never hand-edit a generated file.
@@ -171,8 +173,8 @@ reason rather than hiding the exception.
 Status hues can collapse under colour-vision deficiency, so **every meaning carries a second,
 non-chromatic channel**:
 
-- **Status carries a glyph and a word.** `Badge` renders `✓` / `!` / `✕` / `●` before its
-  label; state blocks write the state out.
+- **Status carries a glyph and a word.** `StatusPill` renders `✓` / `!` / `✕` / `●` before its
+  label; `EmptyState` writes the state out.
 - **Thresholds carry a tick.** A threshold is a labeled dashed rule plus a positional tick.
 - **Chart series carry a dash and marker.** Series use `--declare`, `--observe`, `--series-3`,
   `--series-4`, `--series-5` in that order with distinct dash patterns and markers, mirrored in
@@ -211,9 +213,11 @@ selected detail appears only after selection. Empty space is preferable to fille
 - Shared shell and controls repeat. Page composition follows the work being performed.
 - Add only controls backed by the current workflow.
 
-The authenticated desktop shell: a full-height sidebar owns the mark and `Wyrd` wordmark;
-the topbar owns the product pill, breadcrumbs/context, tenant identity, principal menu, and
-theme control. The sidebar exposes Home, Cards, Observe, Changes, and Query. Contextual
+The authenticated desktop shell: a full-height sidebar owns the mark and `Wyrd` wordmark,
+the destinations, Settings, and the identity menu (tenant switch, Account, theme, Sign out).
+The sidebar exposes Home and Cards, then Observe, Verify, and Query; deferred work is not
+listed. The approved verification mock adds a topbar for breadcrumbs and the theme control
+(`Topbar`, `status: "spec"`). Contextual
 navigation stays inside the active workspace. Use a drawer when the selected record needs
 substantial inspection; it preserves page context under a restrained scrim.
 
@@ -249,17 +253,19 @@ not just these surfaces.
 
 The server sends `value: 0.79, threshold: 0.8, pass: false`; the UI decides the value
 renders as a failure. Typed-domain components take raw semantic values and humanize them
-via `src/lib/format.ts`. `KpiTile` is the deliberate exception: its caller formats the
-heterogeneous `value`.
+via `packages/ui/src/lib/format.ts`.
 
 ---
 
 ## Building a new component
 
-1. Add its contract to `components.json` with `status: "spec"` (anatomy, tokens, variants,
-   altitude, rules).
-2. Build it against the tokens (no hardcoded hex; 1px rules; 2px radius; no elevation).
-3. Flip its contract `status` to `built` and write a test.
+1. Add its contract to `components.json` with `status: "spec"` (props, tokens, altitude,
+   rules).
+2. Build it in `packages/ui/src/lib/components/` against the tokens (no hardcoded hex; 1px
+   rules; 2px radius; no elevation) and export it from `index.ts`.
+3. Flip its contract `status` to `built`, set `catalog` to whether `catalog.json` lists it,
+   and write a test. `brand/gen-theme.test.mjs` fails when the contracts, the exports, and
+   the catalog disagree.
 
 ---
 

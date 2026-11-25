@@ -41,6 +41,9 @@ pub struct PlatformOidcConnectionRow {
     pub jwks_ttl_secs: i64,
     /// Sealed client secret: a 12-byte AES-GCM nonce prepended to ciphertext.
     pub client_secret_enc: Option<Vec<u8>>,
+    /// Advances on every install or replacement; platform browser sessions
+    /// and browser logins anchor to it.
+    pub revision: i64,
 }
 
 /// A platform principal's federated identity, pinned or awaiting first login.
@@ -65,7 +68,7 @@ pub async fn platform_oidc_connection(
 ) -> Result<Option<PlatformOidcConnectionRow>, SqlError> {
     sqlx::query_as::<_, PlatformOidcConnectionRow>(
         "SELECT issuer_url, jwks_uri, client_id, client_auth,
-                claim_mapping, jwks_ttl_secs, client_secret_enc
+                claim_mapping, jwks_ttl_secs, client_secret_enc, revision
          FROM platform.oidc_connection",
     )
     .fetch_optional(pool.pool())
@@ -77,7 +80,9 @@ pub async fn platform_oidc_connection(
 ///
 /// An upsert on the singleton key rather than a delete-and-insert, so two
 /// operators configuring the connection at once converge on one row instead of
-/// racing to leave the plane unconfigured.
+/// racing to leave the plane unconfigured. A replacement advances the
+/// revision, which ends every platform browser session and browser login
+/// begun through the earlier connection.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the write fails, including when
@@ -109,6 +114,7 @@ pub async fn upsert_platform_oidc_connection(
              claim_mapping     = EXCLUDED.claim_mapping,
              jwks_ttl_secs     = EXCLUDED.jwks_ttl_secs,
              client_secret_enc = EXCLUDED.client_secret_enc,
+             revision          = platform.oidc_connection.revision + 1,
              updated_at        = now()",
     )
     .bind(issuer_url)
@@ -126,18 +132,41 @@ pub async fn upsert_platform_oidc_connection(
 
 /// Remove the platform OIDC connection.
 ///
-/// Returns whether a connection was present. Removal never touches platform
-/// principals or their grants: federated login is an additional way in, and
-/// taking it away must leave the global credential working.
+/// Returns whether a connection was present. Removing one also deletes every
+/// unfinished platform login and re-authentication, then revokes every
+/// platform browser session it anchored: a reinstall starts again at
+/// revision 1, so the revision alone cannot keep them ended. Revocation is a
+/// second statement on purpose. A callback finishing its login holds that
+/// login's row until it commits its session, so the deletion waits for it,
+/// and the revocation's later snapshot then sees the session it created. Removal
+/// never touches password sessions, platform principals or their grants:
+/// federated login is an additional way in, and taking it away must leave the
+/// global credential working.
 ///
 /// # Errors
-/// Returns [`SqlError::Query`] when the delete fails.
+/// Returns [`SqlError::Query`] when the statement fails.
 pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Result<bool, SqlError> {
-    sqlx::query("DELETE FROM platform.oidc_connection")
+    let removed: bool = sqlx::query_scalar(
+        "WITH removed AS (
+             DELETE FROM platform.oidc_connection RETURNING revision
+         ), logins AS (
+             DELETE FROM platform.login_state WHERE EXISTS (SELECT 1 FROM removed)
+         )
+         SELECT EXISTS (SELECT 1 FROM removed)",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    if removed {
+        sqlx::query(
+            "UPDATE platform.browser_sessions SET revoked_at = statement_timestamp()
+              WHERE connection_revision IS NOT NULL AND revoked_at IS NULL",
+        )
         .execute(&mut **conn.transaction())
         .await
-        .map(|done| done.rows_affected() > 0)
-        .map_err(SqlError::from)
+        .map_err(SqlError::from)?;
+    }
+    Ok(removed)
 }
 
 /// Compare-and-swap of the platform connection's sealed secret.
@@ -166,8 +195,42 @@ pub async fn swap_platform_sealed_secret_tx(
         .map_err(SqlError::from)
 }
 
+/// What a platform browser login state is bound to, beyond the API-token
+/// login's state key.
+#[derive(Debug, Clone, Copy)]
+pub struct PlatformLoginBinding<'a> {
+    /// SHA-256 of the browser binding cookie the callback must present.
+    pub browser_binding_hash: &'a [u8],
+    /// The platform browser session a same-operator re-authentication
+    /// refreshes; `None` for a sign-in.
+    pub session_id: Option<Uuid>,
+    /// The connection revision the login began against.
+    pub connection_revision: i64,
+}
+
+/// One single-use platform login state to persist.
+#[derive(Debug, Clone, Copy)]
+pub struct NewPlatformLoginState<'a> {
+    /// The opaque state key the provider returns.
+    pub state: &'a str,
+    /// The PKCE verifier.
+    pub code_verifier: &'a str,
+    /// The nonce the ID token must carry.
+    pub nonce: &'a str,
+    /// The issuer the login begins against.
+    pub issuer: &'a str,
+    /// The redirect URI the code is bound to.
+    pub redirect_uri: &'a str,
+    /// How long the login may take; `PostgreSQL` derives the expiry.
+    pub ttl: Duration,
+    /// `None` for an API-token login; otherwise the browser binding of a
+    /// sign-in or, when it names a session, a same-operator
+    /// re-authentication.
+    pub binding: Option<PlatformLoginBinding<'a>>,
+}
+
 /// Persist one single-use login state row whose expiry `PostgreSQL` derives from
-/// `ttl`.
+/// its `ttl`.
 ///
 /// The caller binds a lifetime, never an absolute instant, so the row's expiry
 /// and the consume predicate that evaluates it share one clock.
@@ -177,25 +240,34 @@ pub async fn swap_platform_sealed_secret_tx(
 /// state key.
 pub async fn insert_platform_login_state(
     pool: &OperatorPool,
-    state: &str,
-    code_verifier: &str,
-    nonce: &str,
-    issuer: &str,
-    redirect_uri: &str,
-    ttl: Duration,
+    login: NewPlatformLoginState<'_>,
 ) -> Result<(), SqlError> {
+    let binding = login.binding;
+    let purpose = match binding {
+        None => "token",
+        Some(PlatformLoginBinding {
+            session_id: None, ..
+        }) => "login",
+        Some(_) => "reauth",
+    };
     sqlx::query(
         "INSERT INTO platform.login_state
-             (state, code_verifier, nonce, issuer, redirect_uri, expires_at)
+             (state, code_verifier, nonce, issuer, redirect_uri, expires_at,
+              purpose, browser_binding_hash, session_id, connection_revision)
          VALUES ($1, $2, $3, $4, $5,
-                 statement_timestamp() + ($6 * interval '1 second'))",
+                 statement_timestamp() + ($6 * interval '1 second'),
+                 $7, $8, $9, $10)",
     )
-    .bind(state)
-    .bind(code_verifier)
-    .bind(nonce)
-    .bind(issuer)
-    .bind(redirect_uri)
-    .bind(ttl.as_secs_f64())
+    .bind(login.state)
+    .bind(login.code_verifier)
+    .bind(login.nonce)
+    .bind(login.issuer)
+    .bind(login.redirect_uri)
+    .bind(login.ttl.as_secs_f64())
+    .bind(purpose)
+    .bind(binding.map(|binding| binding.browser_binding_hash))
+    .bind(binding.and_then(|binding| binding.session_id))
+    .bind(binding.map(|binding| binding.connection_revision))
     .execute(pool.pool())
     .await
     .map(|_| ())
@@ -213,35 +285,92 @@ pub struct PlatformLoginStateRow {
     pub issuer: String,
     /// Redirect URI the authorization code was bound to.
     pub redirect_uri: String,
-    /// Whether `PostgreSQL` judged the row still live when it deleted it.
+    /// Whether `PostgreSQL` judged the row still live when it was taken.
     pub live: bool,
+    /// The browser session a re-authentication refreshes.
+    pub session_id: Option<Uuid>,
+    /// The connection revision a browser login began against.
+    pub connection_revision: Option<i64>,
 }
 
-/// Consume a login state row exactly once.
+/// Take a login state row exactly once.
 ///
-/// Deletion and read are one statement, so a replayed callback finds nothing
-/// rather than racing a second consumer: the second caller deletes zero rows.
-/// An expired row is still deleted, then reported absent — the same outcome a
-/// forged state key gets, so a caller learns nothing from the difference.
+/// Taking and reading are one statement, so a replayed callback finds nothing
+/// rather than racing a second consumer. An expired row is still taken, then
+/// reported absent — the same outcome a forged state key gets, so a caller
+/// learns nothing from the difference.
+///
+/// Without `browser_binding_hash` only an API-token login's row is taken,
+/// and taking deletes it. With it, only a browser login's row bound to
+/// exactly that digest is taken, and taking only claims it: its PKCE
+/// verifier is cleared, so it cannot be taken again, and the row stays until
+/// [`finish_platform_login_state_tx`] deletes it with the session it grants.
+/// Removing the connection meanwhile deletes it, which ends that login even
+/// while its provider is still answering. A row of the other kind, or another
+/// browser's, is left untouched and reported absent.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the statement fails.
 pub async fn take_platform_login_state(
     pool: &OperatorPool,
     state: &str,
+    browser_binding_hash: Option<&[u8]>,
 ) -> Result<Option<PlatformLoginStateRow>, SqlError> {
-    let row = sqlx::query_as::<_, PlatformLoginStateRow>(
-        "DELETE FROM platform.login_state
-         WHERE state = $1
-         RETURNING code_verifier, nonce, issuer, redirect_uri,
-                   expires_at > statement_timestamp() AS live",
-    )
-    .bind(state)
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)?;
+    let query = match browser_binding_hash {
+        None => sqlx::query_as::<_, PlatformLoginStateRow>(
+            "DELETE FROM platform.login_state
+             WHERE state = $1 AND purpose = 'token'
+             RETURNING code_verifier, nonce, issuer, redirect_uri,
+                       expires_at > statement_timestamp() AS live,
+                       session_id, connection_revision",
+        )
+        .bind(state),
+        Some(hash) => sqlx::query_as::<_, PlatformLoginStateRow>(
+            "UPDATE platform.login_state l SET code_verifier = ''
+               FROM (SELECT state, code_verifier FROM platform.login_state
+                      WHERE state = $1 AND browser_binding_hash = $2
+                        AND code_verifier <> ''
+                        FOR UPDATE) taken
+              WHERE l.state = taken.state
+             RETURNING taken.code_verifier, l.nonce, l.issuer, l.redirect_uri,
+                       l.expires_at > statement_timestamp() AS live,
+                       l.session_id, l.connection_revision",
+        )
+        .bind(state)
+        .bind(hash),
+    };
+    let row = query
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(SqlError::from)?;
 
     Ok(row.filter(|row| row.live))
+}
+
+/// Delete the browser login state `state` that
+/// [`take_platform_login_state`] claimed, on the transaction that grants
+/// its session. Returns `false` when it is gone, because removing the
+/// connection deleted it.
+///
+/// The deletion holds the row until the grant commits, so a concurrent
+/// connection removal either deleted it first or waits and then revokes the
+/// session this transaction created.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the delete fails.
+pub async fn finish_platform_login_state_tx(
+    conn: &mut TenantConn<'_>,
+    state: &str,
+) -> Result<bool, SqlError> {
+    sqlx::query(
+        "DELETE FROM platform.login_state
+          WHERE state = $1 AND purpose <> 'token' AND code_verifier = ''",
+    )
+    .bind(state)
+    .execute(&mut **conn.transaction())
+    .await
+    .map(|done| done.rows_affected() == 1)
+    .map_err(SqlError::from)
 }
 
 /// Delete every login-state row that has expired.

@@ -1284,12 +1284,19 @@ mod tests {
                  gate exit; passed exit",
                 fixture.display()
             ),
-            "exit 0",
+            // The ownership probe's last call passes `probe`, so the clock
+            // moves past its 240 s allowance only once Docker has answered.
+            "[ \"$1\" = network ] && passed probe; exit 0",
         );
         let (record, launched, returned) = paused(stepped(
             &sweep,
             root.path(),
-            &[(500.0, "teardown"), (520.0, "record"), (530.0, "exit")],
+            &[
+                (0.0, "probe"),
+                (500.0, "teardown"),
+                (520.0, "record"),
+                (530.0, "exit"),
+            ],
         ));
         assert_eq!(launched, 1);
         assert_eq!(

@@ -65,7 +65,11 @@ use wyrd_spec::verification::execution::{
     ExecutedOutcome, ExecutedRequirement, InputDeclaration, RequirementDetail, RequirementOutcome,
     RequirementResult,
 };
-use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
+use wyrd_spec::verification::state::ApprovalOccurrence;
+use wyrd_spec::verification::{
+    DriftReport, DriftVerdict, DriftWindow, VerificationError, VerificationVerdict,
+};
+use wyrd_sql::queries::verifier_executions::TerminalStatus;
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::listener_stall::ListenerStallProxy;
@@ -808,7 +812,7 @@ impl<'a> ResultLayoutJourney<'a> {
                 inner: Arc::clone(&scribe),
                 straddle,
             }),
-            None,
+            Some(self.server.pg_fixture().wyrd_postgres().clone()),
         );
         outbox.stage(
             self.tenant,
@@ -1004,22 +1008,7 @@ async fn query_texts(
     .await?;
     let mut rows = Vec::new();
     for batch in &batches {
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|column| arrow::compute::cast(column, &DataType::Utf8))
-            .collect::<Result<Vec<_>, _>>()?;
-        for row in 0..batch.num_rows() {
-            let mut values = Vec::with_capacity(columns.len());
-            for column in &columns {
-                let text = column
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or("a cast column is not text")?;
-                values.push(text.is_valid(row).then(|| text.value(row).to_owned()));
-            }
-            rows.push(values);
-        }
+        rows.extend(batch_texts(batch)?);
     }
     Ok(rows)
 }
@@ -2841,8 +2830,11 @@ impl TypedPayloadJourney {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 self.gateway.tenant,
-                Vec::new(),
-                PermissionSet::from_iter([permission.clone(), Permission::gateway_payload_read()]),
+                PermissionSet::from_iter([
+                    permission.clone(),
+                    Permission::gateway_payload_read(),
+                    Permission::executions_read_any(),
+                ]),
             ),
             self.gateway.tenant,
             RequestId::now_v7(),
@@ -3003,7 +2995,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
             &[
                 Permission::card_read(),
                 Permission::verifier_run_any(),
-                Permission::verifier_read_any(),
+                Permission::executions_read_any(),
             ],
         )
         .await?;
@@ -3339,6 +3331,644 @@ async fn cancel_and_revocation_fence_unfinished_work() -> Result<(), ServerJourn
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     server.shutdown().await?;
+    Ok(())
+}
+
+/// Role a status journey's submitter holds: it enqueues, inspects, and
+/// cancels queued work and reads the retained status rows.
+const STATUS_RUNNER: &str = "status_runner";
+
+/// Every status event of one execution, as Verify reads the newest: the
+/// newest row per execution with `event = 'status'`, by `occurred_at`.
+const NEWEST_STATUS_SQL: &str = "SELECT e.execution_id, e.status \
+     FROM bifrost.verification.execution_events e \
+     JOIN (SELECT execution_id, max(occurred_at) AS occurred_at \
+             FROM bifrost.verification.execution_events \
+            WHERE event = 'status' GROUP BY execution_id) l \
+       ON e.execution_id = l.execution_id AND e.occurred_at = l.occurred_at \
+    WHERE e.event = 'status'";
+
+/// One queued-status journey: a bound server, a Service submitter whose SDK
+/// client runs the assertion Verifier against a Service subject over the
+/// public routes, and an administrator who may revoke the submitter and who
+/// reads the recorded status, so a read still answers once the submitter is
+/// revoked.
+struct StatusJourney {
+    /// The bound server.
+    server: WyrdTestServer,
+    /// The tenant's verification fixture.
+    seed: VerificationFixture,
+    /// The assertion Verifier every execution runs.
+    verifier: CardUid,
+    /// The Service every execution judges.
+    subject: CardUid,
+    /// The submitting Service.
+    submitter: Bootstrap,
+    /// The submitter's SDK client, acting as the subject's workload.
+    client: wyrd_client::WyrdClient,
+    /// The administrator's SDK client.
+    admin: wyrd_client::WyrdClient,
+}
+
+impl StatusJourney {
+    /// Start a bound server and provision the journey's Cards and
+    /// principals, each named after `name`.
+    ///
+    /// # Errors
+    /// Returns server, fixture, or client errors.
+    async fn start(name: &str) -> Result<Self, ServerJourneyError> {
+        let server = WyrdTestServer::builder().start_bound().await?;
+        let seed = VerificationFixture::provision(server.state(), server.data_tenant_id()).await?;
+        let (subject, _) = seed.service(&format!("{name}-subject")).await?;
+        let verifier = assert_verifier(&seed, &format!("{name}-assert")).await?;
+        server
+            .seed_role(
+                STATUS_RUNNER,
+                &[
+                    Permission::card_read(),
+                    Permission::verifier_run_any(),
+                    Permission::executions_read_any(),
+                    Permission::bifrost_query_read(),
+                ],
+            )
+            .await?;
+        server
+            .seed_role(
+                PRINCIPAL_ADMIN,
+                &[
+                    Permission::service_accounts_write(),
+                    Permission::executions_read_any(),
+                    Permission::bifrost_query_read(),
+                ],
+            )
+            .await?;
+        let submitter = server
+            .bootstrap_service(&format!("{name}-submitter"), &[STATUS_RUNNER])
+            .await?;
+        let admin = server
+            .bootstrap_service(&format!("{name}-admin"), &[PRINCIPAL_ADMIN])
+            .await?;
+        let client = super::query::client_for(
+            &server,
+            submitter
+                .api_key()
+                .ok_or("the submitter carries an API key")?,
+        )?
+        .for_workload(subject.clone());
+        let admin = super::query::client_for(
+            &server,
+            admin
+                .api_key()
+                .ok_or("the administrator carries an API key")?,
+        )?;
+        Ok(Self {
+            server,
+            seed,
+            verifier,
+            subject,
+            submitter,
+            client,
+            admin,
+        })
+    }
+
+    /// A runtime with one execution slot over `script`.
+    ///
+    /// # Errors
+    /// Returns a description when the runtime does not compose.
+    fn runtime(&self, script: &EngineScript) -> Result<VerificationRuntime, ServerJourneyError> {
+        Ok(VerificationRuntime::builder(self.server.state())
+            .limits(RuntimeLimits {
+                execution_slots: 1,
+                lease: Duration::from_secs(3),
+                poll_interval: Duration::from_millis(100),
+                ..RuntimeLimits::default()
+            })
+            .engine_script(script.clone())
+            .build()
+            .ok_or("the runtime did not compose")?)
+    }
+
+    /// Enqueue one assertion over the public route and wait until it is
+    /// queued.
+    ///
+    /// # Errors
+    /// Returns route or fixture errors.
+    async fn enqueue(&self) -> Result<ExecutionId, ServerJourneyError> {
+        let accepted: Value = self
+            .client
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&enqueue_body(
+                    &self.verifier,
+                    &self.subject,
+                    json!({ "x": { "kind": "json", "value": true } }),
+                )),
+            )
+            .await?;
+        await_queued(&self.seed, &accepted).await
+    }
+
+    /// Cancel `execution` over the public route and return the status it
+    /// answers.
+    ///
+    /// # Errors
+    /// Returns route errors.
+    async fn cancel(&self, execution: ExecutionId) -> Result<Value, ServerJourneyError> {
+        let answered: Value = self
+            .client
+            .request_json(
+                reqwest::Method::POST,
+                &format!("/v1/verification/executions/{execution}/cancel"),
+                None::<&Value>,
+            )
+            .await?;
+        Ok(answered["status"].clone())
+    }
+
+    /// The status the public execution view answers for `execution`.
+    ///
+    /// # Errors
+    /// Returns route errors.
+    async fn inspected(&self, execution: ExecutionId) -> Result<Value, ServerJourneyError> {
+        let state: Value = self
+            .admin
+            .request_json(
+                reqwest::Method::GET,
+                &format!("/v1/verification/executions/{execution}"),
+                None::<&Value>,
+            )
+            .await?;
+        Ok(state["status"].clone())
+    }
+
+    /// Revoke the submitter through the public principal route.
+    ///
+    /// # Errors
+    /// Returns route errors.
+    async fn revoke_submitter(&self) -> Result<(), ServerJourneyError> {
+        Principals::connect_with(&self.admin)
+            .await?
+            .revoke_principal(
+                &self.submitter.id(),
+                &RevokePrincipalRequest {
+                    principal_kind: PrincipalKindTag::Service,
+                    reason: "the submitter retires".to_owned(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every row of `sql`, each cell as text, read through the
+    /// administrator's SDK Bifrost query.
+    ///
+    /// # Errors
+    /// Returns the query or cast error.
+    async fn texts(&self, sql: String) -> Result<Vec<Vec<Option<String>>>, ServerJourneyError> {
+        let mut stream = Bifrost::query_only(&self.admin)
+            .query(&BifrostQueryRequest {
+                params: Vec::new(),
+                sql,
+                deadline_ms: Some(30_000),
+            })
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            rows.extend(batch_texts(&batch)?);
+        }
+        Ok(rows)
+    }
+
+    /// How many published results `bifrost.verification.results` holds for
+    /// `execution`.
+    ///
+    /// # Errors
+    /// Returns the query error.
+    async fn results(&self, execution: ExecutionId) -> Result<usize, ServerJourneyError> {
+        Ok(self
+            .texts(format!(
+                "SELECT CAST(result_id AS VARCHAR) FROM bifrost.verification.results \
+                  WHERE CAST(execution_id AS VARCHAR) = '{execution}'"
+            ))
+            .await?
+            .len())
+    }
+
+    /// The recorded status words of `execution`, oldest first.
+    ///
+    /// # Errors
+    /// Returns the query error.
+    async fn history(&self, execution: ExecutionId) -> Result<Vec<String>, ServerJourneyError> {
+        Ok(self
+            .texts(format!(
+                "SELECT status FROM bifrost.verification.execution_events \
+                 WHERE event = 'status' AND execution_id = '{execution}' ORDER BY occurred_at"
+            ))
+            .await?
+            .into_iter()
+            .map(|row| row.into_iter().flatten().collect())
+            .collect())
+    }
+
+    /// The newest recorded status of each of `executions`, read with the
+    /// query shape Verify lists them by.
+    ///
+    /// # Errors
+    /// Returns the query error.
+    async fn newest(
+        &self,
+        executions: &[ExecutionId],
+    ) -> Result<BTreeMap<String, String>, ServerJourneyError> {
+        let ids = executions
+            .iter()
+            .map(|execution| format!("'{execution}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut newest = BTreeMap::new();
+        for row in self
+            .texts(format!("{NEWEST_STATUS_SQL} AND e.execution_id IN ({ids})"))
+            .await?
+        {
+            if let [Some(execution), Some(status)] = row.as_slice() {
+                newest.insert(execution.clone(), status.clone());
+            }
+        }
+        Ok(newest)
+    }
+
+    /// Wait until `execution`'s newest status is `status`, as Verify lists
+    /// it.
+    ///
+    /// # Errors
+    /// Returns the query error, or a description when it is not within
+    /// [`WAIT`].
+    async fn await_newest(
+        &self,
+        execution: ExecutionId,
+        status: &str,
+    ) -> Result<(), ServerJourneyError> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let newest = self.newest(&[execution]).await?;
+            if newest.get(&execution.to_string()).map(String::as_str) == Some(status) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{execution} never listed {status}: {newest:?}, history {:?}",
+                    self.history(execution).await?
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until every write staged so far reached Scribe, then require
+    /// `execution`'s recorded status words to be exactly `expected`.
+    ///
+    /// # Errors
+    /// Returns the query error, or a description when the history differs.
+    async fn assert_history(
+        &self,
+        execution: ExecutionId,
+        expected: &[&str],
+    ) -> Result<(), ServerJourneyError> {
+        self.server
+            .state()
+            .bifrost
+            .scribe_outbox()
+            .settle(std::time::Instant::now() + WAIT)
+            .await;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let history = self.history(execution).await?;
+            if history == expected {
+                return Ok(());
+            }
+            if history.len() > expected.len() || tokio::time::Instant::now() >= deadline {
+                return Err(format!("{execution} recorded {history:?}, not {expected:?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// Each row of `batch`, each cell cast to text.
+///
+/// # Errors
+/// Returns the cast error.
+fn batch_texts(batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>, ServerJourneyError> {
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| arrow::compute::cast(column, &DataType::Utf8))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let text = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("a cast column is not text")?;
+            values.push(text.is_valid(row).then(|| text.value(row).to_owned()));
+        }
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
+/// Cancelling pending queued work records its `cancelled` status
+/// (REQ-015, AC-010).
+///
+/// With no runner, a Service enqueues one assertion over the public route
+/// and cancels it over the public route. Verify's newest-status query lists
+/// it `cancelled`; its one status row carries `sequence` 0, the execution's
+/// Verifier and stored subject and actor, and no other content or
+/// correlation; the public execution view agrees. Cancelling it again answers `cancelled` and records
+/// no second row.
+///
+/// # Errors
+/// Returns server, route, query, or fixture errors, or a description of the
+/// first row that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn pending_cancellation_records_cancelled_status() -> Result<(), ServerJourneyError> {
+    let journey = StatusJourney::start("pending-status").await?;
+    let execution = journey.enqueue().await?;
+    if journey.cancel(execution).await? != "cancelled" {
+        return Err("the pending execution was not cancelled".into());
+    }
+    journey.await_newest(execution, "cancelled").await?;
+
+    let mut conn = journey
+        .server
+        .tenant_conn_for(journey.server.data_tenant_id())
+        .await?;
+    let (subject, actor): (String, String) = sqlx::query_as(
+        "SELECT sub_principal_id::text, act_principal_id::text \
+           FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await?;
+    drop(conn);
+    let rows = journey
+        .texts(format!(
+            "SELECT sequence, verifier_card_uid, {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, \
+                    step_id, item_index, iteration_index, attempt, publication_name, \
+                    publication_kind, size_bytes, file_count, sha256, reason, \
+                    CAST(workload_card_uid AS VARCHAR), CAST(subject_card_uid AS VARCHAR), \
+                    run_id, value IS NULL \
+               FROM bifrost.verification.execution_events \
+              WHERE event = 'status' AND execution_id = '{execution}'"
+        ))
+        .await?;
+    let mut expected = vec![
+        Some("0".to_owned()),
+        Some(journey.verifier.to_string()),
+        Some(subject),
+        Some(actor),
+    ];
+    expected.extend(std::iter::repeat_n(None, 11));
+    expected.extend([Some(journey.subject.to_string()), None]);
+    expected.push(Some("true".to_owned()));
+    expect_eq("the cancelled status row", &rows, &vec![expected])?;
+    if journey.inspected(execution).await? != "cancelled" {
+        return Err("the execution view disagrees with the listed status".into());
+    }
+
+    if journey.cancel(execution).await? != "cancelled" {
+        return Err("a repeated cancel changed the settled status".into());
+    }
+    journey.assert_history(execution, &["cancelled"]).await?;
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// The runner records each lifecycle transition it commits (REQ-015,
+/// AC-010).
+///
+/// One runtime with one execution slot takes scripted outcomes. A completed
+/// execution records `running` then `completed`; an errored and a timed out
+/// one record their terminal word. A deferred one is released `pending` and
+/// then completes. A retried one lists `retrying` while its backoff holds,
+/// then completes. One held in the engine lists `running` until it is
+/// released. Executions parked on an unpublished deferred input and on an
+/// undecided approval list `waiting`, a word the queue never stores.
+///
+/// # Errors
+/// Returns server, route, runtime, query, or fixture errors, or a
+/// description of the first history that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn runner_transitions_record_lifecycle_status() -> Result<(), ServerJourneyError> {
+    let journey = StatusJourney::start("runner-status").await?;
+    let script = EngineScript::default();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(journey.runtime(&script)?.run(stop.clone()));
+    let failure = |code: &str| VerificationError {
+        code: code.to_owned(),
+        message: format!("the scripted attempt failed with {code}"),
+    };
+
+    script.push_unheld(EngineOutcome::Completed(drift_outcome(None)?));
+    let completed = journey.enqueue().await?;
+    journey.await_newest(completed, "completed").await?;
+    journey
+        .assert_history(completed, &["running", "completed"])
+        .await?;
+
+    for (status, word) in [
+        (TerminalStatus::Errored, "errored"),
+        (TerminalStatus::TimedOut, "timed_out"),
+    ] {
+        script.push_unheld(EngineOutcome::Terminal(status, failure(word)));
+        let ended = journey.enqueue().await?;
+        journey.await_newest(ended, word).await?;
+        journey.assert_history(ended, &["running", word]).await?;
+    }
+
+    script.push_unheld(EngineOutcome::Deferred(failure("backpressure")));
+    let deferred = journey.enqueue().await?;
+    journey.await_newest(deferred, "completed").await?;
+    journey
+        .assert_history(deferred, &["running", "pending", "running", "completed"])
+        .await?;
+
+    script.hold();
+    script.push(EngineOutcome::Completed(drift_outcome(None)?));
+    let held = journey.enqueue().await?;
+    journey.await_newest(held, "running").await?;
+    script.release();
+    journey.await_newest(held, "completed").await?;
+
+    script.push_unheld(EngineOutcome::Parked(
+        [SlotName::new("late").map_err(|error| format!("slot name: {error}"))?].into(),
+        Vec::new(),
+    ));
+    let input = journey.enqueue().await?;
+    journey.await_newest(input, "waiting").await?;
+    script.push_unheld(EngineOutcome::Parked(
+        std::collections::BTreeSet::new(),
+        vec![ApprovalOccurrence {
+            step: TaskId::new("approve").map_err(|error| format!("task id: {error}"))?,
+            item: None,
+            iteration: None,
+            message: "ship it?".to_owned(),
+        }],
+    ));
+    let approval = journey.enqueue().await?;
+    journey.await_newest(approval, "waiting").await?;
+    journey
+        .assert_history(input, &["running", "waiting"])
+        .await?;
+    journey
+        .assert_history(approval, &["running", "waiting"])
+        .await?;
+    if journey.seed.execution(input).await?.status == "waiting" {
+        return Err("the queue stored the display-only waiting word".into());
+    }
+
+    script.push_unheld(EngineOutcome::Retry(failure("transient")));
+    let retried = journey.enqueue().await?;
+    journey.await_newest(retried, "retrying").await?;
+    journey.await_newest(retried, "completed").await?;
+    journey
+        .assert_history(retried, &["running", "retrying", "running", "completed"])
+        .await?;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// Cancelling running work and revoking its principal record `cancelled`
+/// for every affected execution, and a fenced worker records nothing
+/// (REQ-015, AC-010).
+///
+/// One runtime with one execution slot holds a running execution, which is
+/// cancelled over the public route: it lists `cancelled`, and once a probe
+/// execution has completed in the freed slot, its released worker has
+/// recorded no status. Another is then held running with a third pending
+/// behind it, and an administrator revokes the submitter through the public
+/// principal route: both list `cancelled`, and once the runtime has drained,
+/// the released worker again recorded nothing. Neither fenced worker
+/// published a result; the probe published one.
+///
+/// # Errors
+/// Returns server, route, runtime, query, or fixture errors, or a
+/// description of the first history that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn running_cancellation_and_revocation_record_cancelled_status()
+-> Result<(), ServerJourneyError> {
+    let journey = StatusJourney::start("fenced-status").await?;
+    let script = EngineScript::default();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(journey.runtime(&script)?.run(stop.clone()));
+
+    script.hold();
+    script.push(EngineOutcome::Completed(drift_outcome(None)?));
+    let stopped = journey.enqueue().await?;
+    journey.await_newest(stopped, "running").await?;
+    if journey.cancel(stopped).await? != "cancelled" {
+        return Err("the running execution was not cancelled".into());
+    }
+    journey.await_newest(stopped, "cancelled").await?;
+    script.release();
+    // The one slot runs the probe only after the released worker settles.
+    script.push_unheld(EngineOutcome::Completed(drift_outcome(None)?));
+    let probe = journey.enqueue().await?;
+    journey.await_newest(probe, "completed").await?;
+    if journey.seed.execution(stopped).await?.status != "cancelled" {
+        return Err("the cancelled execution committed late work".into());
+    }
+    journey
+        .assert_history(stopped, &["running", "cancelled"])
+        .await?;
+
+    script.hold();
+    script.push(EngineOutcome::Completed(drift_outcome(None)?));
+    let active = journey.enqueue().await?;
+    journey.await_newest(active, "running").await?;
+    let waiting = journey.enqueue().await?;
+    journey.revoke_submitter().await?;
+    for execution in [active, waiting] {
+        journey.await_newest(execution, "cancelled").await?;
+    }
+    script.release();
+    // Stopping the runtime waits for the released worker to settle.
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    if journey.seed.execution(active).await?.status != "cancelled" {
+        return Err("the revoked execution committed late work".into());
+    }
+    journey
+        .assert_history(active, &["running", "cancelled"])
+        .await?;
+    journey.assert_history(waiting, &["cancelled"]).await?;
+    journey.server.flush_bifrost().await?;
+    if journey.results(probe).await? != 1 {
+        return Err("the completed probe published no result".into());
+    }
+    for execution in [stopped, active] {
+        if journey.results(execution).await? != 0 {
+            return Err(format!("the fenced worker of {execution} published a result").into());
+        }
+    }
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// A submission admitted after its submitter was revoked is cancelled by
+/// the admission's principal fence and records `cancelled` (REQ-015,
+/// AC-010).
+///
+/// The submission's input write is held at Scribe, so the route has
+/// accepted its authority but nothing is queued yet. An administrator then
+/// revokes the submitter through the public principal route, and the held
+/// write is released: the admission that queues the execution cancels it in
+/// the same transaction, and its one status row is `cancelled`.
+///
+/// # Errors
+/// Returns server, route, query, or fixture errors, or a description of the
+/// first expectation that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn admission_after_revocation_records_cancelled_status() -> Result<(), ServerJourneyError> {
+    let journey = StatusJourney::start("admission-fence").await?;
+    let held = journey
+        .server
+        .stall_next_bifrost_write_into(EXECUTION_INPUTS)?;
+    let fenced = {
+        let submitted = journey.enqueue();
+        tokio::pin!(submitted);
+        tokio::select! {
+            biased;
+            answered = &mut submitted => {
+                return Err(format!("a held submission is answered before admission: {answered:?}").into());
+            }
+            () = held.wait_entered() => {}
+        }
+        if !journey.seed.executions().await?.is_empty() {
+            return Err(
+                "the submission was queued before its held input write was released".into(),
+            );
+        }
+        journey.revoke_submitter().await?;
+        held.release();
+        submitted.await?
+    };
+    journey.await_newest(fenced, "cancelled").await?;
+    journey.assert_history(fenced, &["cancelled"]).await?;
+    if journey.seed.execution(fenced).await?.status != "cancelled" {
+        return Err("the admission did not fence the revoked submitter".into());
+    }
+    journey.server.shutdown().await?;
     Ok(())
 }
 
@@ -6078,7 +6708,7 @@ async fn visible_trace_spans_preserve_binding_ownership() -> Result<(), ServerJo
             .flatten()
             .all(|requirement| requirement["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("lacks BifrostQuery/Read"))),
+                .is_some_and(|reason| reason.contains("query forbidden"))),
         "the ordinary query refusal decides: {denied}"
     );
 

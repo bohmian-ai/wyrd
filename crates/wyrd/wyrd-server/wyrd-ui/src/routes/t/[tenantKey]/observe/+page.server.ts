@@ -10,8 +10,10 @@ import type { Actions, PageServerLoad } from './$types';
  * selected span, or the exact log record. Only the record's own params are
  * read, so opening, switching or closing a record reloads nothing else. Each
  * input passes its catalog schema; a malformed id is refused with no read.
+ * In-app navigation streams the reads, so the drawer opens at once in its
+ * loading state; a direct load renders them complete on the server.
  */
-export const load: PageServerLoad = async ({ locals, url, request }) => {
+export const load: PageServerLoad = async ({ locals, url, request, isDataRequest }) => {
   const [trace, span, log] = DETAIL_PARAMS.map((name) => url.searchParams.get(name));
   if (!trace && !log) return {};
   const session = locals.browserSession ?? reject('unauthenticated');
@@ -23,13 +25,15 @@ export const load: PageServerLoad = async ({ locals, url, request }) => {
     } catch {
       // The catalog schema refuses the malformed key below.
     }
-    return { record: (await loadPanel('RecordDetail', { log: key }, context)) as RecordDetailProps | Problem };
+    const record = loadPanel('RecordDetail', { log: key }, context) as Promise<RecordDetailProps | Problem>;
+    return { record: isDataRequest ? record : await record };
   }
-  const [waterfall, record] = (await Promise.all([
-    loadPanel('TraceWaterfall', { traceId: trace, ...(span ? { spanId: span } : {}) }, context),
-    span ? loadPanel('RecordDetail', { traceId: trace, spanId: span }, context) : undefined
-  ])) as [TraceWaterfallProps | Problem, RecordDetailProps | Problem | undefined];
-  return { waterfall, record };
+  const waterfall = loadPanel('TraceWaterfall', { traceId: trace, ...(span ? { spanId: span } : {}) }, context) as Promise<TraceWaterfallProps | Problem>;
+  const record = span ? (loadPanel('RecordDetail', { traceId: trace, spanId: span }, context) as Promise<RecordDetailProps | Problem>) : undefined;
+  if (isDataRequest) return { waterfall, record };
+  // Awaited together, so neither read rejects unobserved while the other runs.
+  const [opened, selected] = await Promise.all([waterfall, record]);
+  return { waterfall: opened, record: selected };
 };
 
 export const actions: Actions = {

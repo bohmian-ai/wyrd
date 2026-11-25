@@ -686,6 +686,12 @@ mod pg_tests {
         assert_eq!(me["principal_id"], user.to_string(), "{me}");
         assert_eq!(me["username"], "keeper", "{me}");
         assert_eq!(me["authentication"], "password", "{me}");
+        assert_eq!(me["display_name"], JsonValue::Null, "a password User: {me}");
+        assert_eq!(
+            me["email"],
+            JsonValue::Null,
+            "this local User has no email: {me}"
+        );
         assert_eq!(
             me["permissions"],
             serde_json::json!(["personal_credentials:read", "personal_credentials:write"])
@@ -820,6 +826,477 @@ mod pg_tests {
         assert_eq!(revoked["revoked"], true, "{revoked}");
         client.cancel().await?;
         assert!(server.exchange_api_key(&key).await.is_err());
+        Ok(())
+    }
+
+    /// An agent holding viewer at one Verifier family lists and reads only
+    /// that family over MCP; the other family's Card is the same not-found an
+    /// absent Card is.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, declaration, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    /// Panics when the list names another family or the hidden read is not
+    /// the registry's not-found.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn a_family_bound_agent_reads_only_that_family() -> Result<(), McpJourneyError> {
+        use wyrd_client::cards::Cards;
+        use wyrd_client::principals::{
+            CreateServicePrincipalRequest, PermissionScope, Principals, ScopedRoleAssignment,
+        };
+        use wyrd_spec::auth::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let server = WyrdTestServer::start_bound().await?;
+        let admin = server
+            .bootstrap_service("mcp-scope-admin", &["admin"])
+            .await?;
+        let admin_key = ResolvedCredential::ApiKey(
+            admin
+                .api_key()
+                .ok_or("a bootstrapped service carries a machine key")?
+                .expose_secret()
+                .to_owned()
+                .into(),
+        );
+        let admin_client = crate::connectivity::client(&server, admin_key)?;
+        let cards = Cards::connect_with(&admin_client).await?;
+        let mut declared = Vec::new();
+        for fixture in ["code-review.yaml", "unrelated.yaml"] {
+            let path = format!(
+                "{}/../../../fixtures/cards/repository_declaration/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            declared.push(Box::pin(cards.declare_from_path(path)).await?.root);
+        }
+        let created = Principals::connect_with(&admin_client)
+            .await?
+            .create_service_principal(&CreateServicePrincipalRequest {
+                name: "mcp-payments-reader".to_owned(),
+                description: None,
+                assignments: vec![ScopedRoleAssignment {
+                    role: "viewer".to_owned(),
+                    scope: PermissionScope::Card(CardPermissionScope::family(
+                        CardKind::Verifier,
+                        CardName::new("code-review")?,
+                    )),
+                }],
+                workload_restriction: None,
+            })
+            .await?;
+        let agent = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(created.credential.expose().to_owned().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+
+        let listed = structured(
+            agent
+                .call_tool(call(
+                    "cards.list",
+                    serde_json::json!({ "kind": "Verifier" }),
+                )?)
+                .await?,
+        )?;
+        let names: Vec<&str> = listed["items"]
+            .as_array()
+            .ok_or("items")?
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        assert_eq!(names, ["code-review"], "{listed}");
+        let [payments, other] = declared.as_slice() else {
+            return Err("two Cards declared".into());
+        };
+        let read = structured(
+            agent
+                .call_tool(call(
+                    "cards.get",
+                    serde_json::json!({ "card_ref": payments }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(read["card"]["metadata"]["name"], "code-review", "{read}");
+        let hidden = refusal(
+            agent
+                .call_tool(call("cards.get", serde_json::json!({ "card_ref": other }))?)
+                .await,
+        )?;
+        assert!(
+            hidden.contains("WYRD_REGISTRY_404_CARD_NOT_FOUND"),
+            "another family reads as absent: {hidden}"
+        );
+        // A name no Card has, and the readable Card's reference beside the
+        // hidden Card's UID, are refused in the same words as the hidden
+        // Card.
+        let mut absent = serde_json::to_value(other)?;
+        absent["name"] = "no-such-check".into();
+        absent["uid"] = serde_json::Value::Null;
+        let mut mismatched = serde_json::to_value(payments)?;
+        mismatched["uid"] = serde_json::to_value(&other.uid)?;
+        for card_ref in [absent, mismatched] {
+            let refused = refusal(
+                agent
+                    .call_tool(call(
+                        "cards.get",
+                        serde_json::json!({ "card_ref": card_ref }),
+                    )?)
+                    .await,
+            )?;
+            assert_eq!(refused, hidden);
+        }
+
+        agent.cancel().await?;
+        Ok(())
+    }
+
+    /// An administrative agent reads and administers scoped access over MCP:
+    /// it defines a custom role, binds it to a local group at one Card
+    /// family, reads the member's resulting access and the binding list, and
+    /// takes every piece down again. A viewer agent is offered the read tools
+    /// but not the write tools, and the operations refuse it either way:
+    /// reads need principal administration and writes tenant administration.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, MCP transport, or tool-call
+    /// failures.
+    ///
+    /// # Panics
+    /// Panics when the catalog or any answer differs from the access the
+    /// calls established.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn an_agent_administers_scoped_access() -> Result<(), McpJourneyError> {
+        const READS: [&str; 4] = [
+            "principals.access",
+            "principals.list_roles",
+            "principals.list_bindings",
+            "principals.list_groups",
+        ];
+        const WRITES: [&str; 8] = [
+            "principals.put_role",
+            "principals.delete_role",
+            "principals.bind",
+            "principals.unbind",
+            "principals.create_group",
+            "principals.delete_group",
+            "principals.add_group_member",
+            "principals.remove_group_member",
+        ];
+        let server = WyrdTestServer::start_bound().await?;
+        let key = |principal: &wyrd_testing::Bootstrap| -> Result<String, McpJourneyError> {
+            Ok(principal
+                .api_key()
+                .ok_or("a service bootstraps with a machine key")?
+                .expose_secret()
+                .to_owned())
+        };
+        let admin = server
+            .bootstrap_service("mcp-access-admin", &["admin"])
+            .await?;
+        let viewer = server
+            .bootstrap_service("mcp-access-viewer", &["viewer"])
+            .await?;
+        let member = server
+            .bootstrap_service("mcp-access-member", &["workload"])
+            .await?;
+        let connect = async |key: String| {
+            ().serve_with_lifecycle(
+                transport(&server, ResolvedCredential::ApiKey(key.into()), None)?,
+                discover(),
+            )
+            .await
+            .map_err(McpJourneyError::from)
+        };
+        let agent = connect(key(&admin)?).await?;
+        let reader = connect(key(&viewer)?).await?;
+
+        let names = |tools: Vec<rmcp::model::Tool>| -> BTreeSet<String> {
+            tools
+                .into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect()
+        };
+        let offered = names(agent.list_all_tools().await?);
+        for tool in READS.iter().chain(&WRITES) {
+            assert!(
+                offered.contains(*tool),
+                "the administrator is offered {tool}"
+            );
+        }
+        let offered = names(reader.list_all_tools().await?);
+        for tool in READS {
+            assert!(offered.contains(tool), "the viewer is offered {tool}");
+        }
+        for tool in WRITES {
+            assert!(!offered.contains(tool), "the viewer is not offered {tool}");
+        }
+        let refused = refusal(
+            reader
+                .call_tool(call(
+                    "principals.create_group",
+                    serde_json::json!({ "name": "viewers-own" }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            refused.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "the viewer's write is refused: {refused}"
+        );
+        let refused = refusal(
+            reader
+                .call_tool(call(
+                    "principals.access",
+                    serde_json::json!({ "principal_id": member.id().to_string() }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            refused.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "an offered read still needs principal administration: {refused}"
+        );
+
+        let role = structured(
+            agent
+                .call_tool(call(
+                    "principals.put_role",
+                    serde_json::json!({
+                        "role": "payments_reader",
+                        "operations": [{ "resource": "cards", "action": "read" }],
+                        "description": "Reads payment Verifiers",
+                    }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(role["builtin"], false);
+        assert_eq!(role["description"], "Reads payment Verifiers");
+        assert_eq!(role["member_count"], 0);
+        let builtin = refusal(
+            agent
+                .call_tool(call(
+                    "principals.put_role",
+                    serde_json::json!({
+                        "role": "viewer",
+                        "operations": [{ "resource": "cards", "action": "read" }],
+                        "description": "Mine now",
+                    }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            builtin.contains("WYRD_SPEC_400_VALIDATION"),
+            "a built-in Role is read-only: {builtin}"
+        );
+        let roles = structured(
+            agent
+                .call_tool(call("principals.list_roles", serde_json::json!({}))?)
+                .await?,
+        )?;
+        let role_names: BTreeSet<&str> = roles["roles"]
+            .as_array()
+            .ok_or("roles is a list")?
+            .iter()
+            .filter_map(|role| role["name"].as_str())
+            .collect();
+        assert!(role_names.contains("payments_reader") && role_names.contains("viewer"));
+
+        let group = structured(
+            agent
+                .call_tool(call(
+                    "principals.create_group",
+                    serde_json::json!({ "name": "payments-readers" }),
+                )?)
+                .await?,
+        )?;
+        let group_id = group["id"]
+            .as_str()
+            .ok_or("the group has an id")?
+            .to_owned();
+        let membership = serde_json::json!({
+            "group_id": group_id,
+            "principal_id": member.id().to_string(),
+        });
+        let joined = structured(
+            agent
+                .call_tool(call("principals.add_group_member", membership.clone())?)
+                .await?,
+        )?;
+        assert_eq!(
+            joined["members"][0]["principal_id"],
+            member.id().to_string()
+        );
+        let scope = serde_json::json!({
+            "card": { "family": { "kind": "Verifier", "name": "payments" } }
+        });
+        let binding = structured(
+            agent
+                .call_tool(call(
+                    "principals.bind",
+                    serde_json::json!({
+                        "subject": { "group": { "id": group_id } },
+                        "role": "payments_reader",
+                        "scope": scope,
+                    }),
+                )?)
+                .await?,
+        )?;
+        let binding_id = binding["id"]
+            .as_str()
+            .ok_or("the binding has an id")?
+            .to_owned();
+        let unknown = refusal(
+            agent
+                .call_tool(call(
+                    "principals.bind",
+                    serde_json::json!({
+                        "subject": { "group": { "id": group_id } },
+                        "role": "no_such_role",
+                        "scope": "all",
+                    }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            unknown.contains("WYRD_SPEC_400_VALIDATION"),
+            "an unknown role is refused by the shared validation: {unknown}"
+        );
+
+        let access = structured(
+            agent
+                .call_tool(call(
+                    "principals.access",
+                    serde_json::json!({ "principal_id": member.id().to_string() }),
+                )?)
+                .await?,
+        )?;
+        let grant = access["grants"]
+            .as_array()
+            .ok_or("grants is a list")?
+            .iter()
+            .find(|grant| grant["role"] == "payments_reader")
+            .ok_or("the member holds the group's grant")?;
+        assert_eq!(grant["scope"], scope);
+        assert_eq!(grant["source"]["kind"], "group");
+        let listed = |roles: &JsonValue, name: &str| -> Result<JsonValue, McpJourneyError> {
+            Ok(roles["roles"]
+                .as_array()
+                .ok_or("roles is a list")?
+                .iter()
+                .find(|role| role["name"] == name)
+                .ok_or("the role is listed")?
+                .clone())
+        };
+        let roles = structured(
+            agent
+                .call_tool(call("principals.list_roles", serde_json::json!({}))?)
+                .await?,
+        )?;
+        let custom = listed(&roles, "payments_reader")?;
+        assert_eq!(custom["member_count"], 1, "the Group member counts once");
+        assert_eq!(custom["description"], "Reads payment Verifiers");
+        assert_eq!(
+            listed(&roles, "viewer")?["description"],
+            "Read Cards, executions, artifacts and tables"
+        );
+        let cleared = structured(
+            agent
+                .call_tool(call(
+                    "principals.put_role",
+                    serde_json::json!({
+                        "role": "payments_reader",
+                        "operations": [{ "resource": "cards", "action": "read" }],
+                    }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(
+            cleared["description"],
+            JsonValue::Null,
+            "omitting it clears"
+        );
+        assert_eq!(cleared["member_count"], 1);
+        let bound = |listing: &JsonValue| -> Result<usize, McpJourneyError> {
+            Ok(listing["bindings"]
+                .as_array()
+                .ok_or("bindings is a list")?
+                .len())
+        };
+        let listing = structured(
+            agent
+                .call_tool(call(
+                    "principals.list_bindings",
+                    serde_json::json!({ "group_id": group_id }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(bound(&listing)?, 1);
+        assert_eq!(listing["bindings"][0]["id"], binding_id.as_str());
+        let groups = structured(
+            agent
+                .call_tool(call("principals.list_groups", serde_json::json!({}))?)
+                .await?,
+        )?;
+        assert_eq!(groups["groups"][0]["name"], "payments-readers");
+
+        structured(
+            agent
+                .call_tool(call(
+                    "principals.unbind",
+                    serde_json::json!({ "binding_id": binding_id }),
+                )?)
+                .await?,
+        )?;
+        let listing = structured(
+            agent
+                .call_tool(call(
+                    "principals.list_bindings",
+                    serde_json::json!({ "group_id": group_id }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(bound(&listing)?, 0);
+        let left = structured(
+            agent
+                .call_tool(call("principals.remove_group_member", membership)?)
+                .await?,
+        )?;
+        assert_eq!(left["members"], serde_json::json!([]));
+        structured(
+            agent
+                .call_tool(call(
+                    "principals.delete_group",
+                    serde_json::json!({ "group_id": group_id }),
+                )?)
+                .await?,
+        )?;
+        structured(
+            agent
+                .call_tool(call(
+                    "principals.delete_role",
+                    serde_json::json!({ "role": "payments_reader" }),
+                )?)
+                .await?,
+        )?;
+        let groups = structured(
+            agent
+                .call_tool(call("principals.list_groups", serde_json::json!({}))?)
+                .await?,
+        )?;
+        assert_eq!(groups["groups"], serde_json::json!([]));
+
+        agent.cancel().await?;
+        reader.cancel().await?;
         Ok(())
     }
 }

@@ -260,12 +260,183 @@ async fn direct_verification_avoids_execution_coordination() {
     assistant.deployment.shutdown().await;
 }
 
+/// A direct execution keeps its retained status after its subject Card is
+/// deleted, and again after its Verifier is deleted: the administrator and a
+/// reader of the subject's family read the same outcome and its details, and
+/// a reader of another family still cannot tell it from an unknown
+/// execution.
+///
+/// # Panics
+/// Panics when a verify, flush or delete fails, the retained execution stops
+/// reading back, or the other family's refusal is not `EXECUTION_NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lane"]
+async fn a_direct_execution_survives_deleting_its_cards() {
+    use wyrd_ai::cards::CardSelector;
+
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let result = assistant
+        .state()
+        .await
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify("answer-check", json!("yes"))
+        .await
+        .expect("the answer is judged");
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let reader = |family: String| async move {
+        let grants = [
+            json!({"resource": "executions", "action": "read", "scope": {"card": {
+                "family": {"kind": "Agent", "name": family}
+            }}}),
+        ];
+        let key = deployment
+            .granted_key(&format!("retained_{family}").replace('-', "_"), &grants)
+            .await;
+        deployment.client(&key)
+    };
+    let family = reader(assistant.agent.name.to_string()).await;
+    let unrelated = reader("unrelated-agent".to_owned()).await;
+    let cards = deployment.cards().await;
+    // The assistant Service references the Agent, so it goes first.
+    cards
+        .delete(CardSelector::Exact(assistant.service.clone()))
+        .await
+        .expect("the referencing Service deletes");
+
+    for deleted in [assistant.agent.clone(), assistant.answer_check.clone()] {
+        cards
+            .delete(CardSelector::Exact(deleted.clone()))
+            .await
+            .expect("the Card deletes");
+        for client in [deployment.admin(), family.clone()] {
+            let retained = Execution::connect_with(result.execution_id, &client)
+                .await
+                .expect("the retained execution connects");
+            let read = retained.wait(WAIT).await.expect("its outcome reads back");
+            assert_eq!(read, result, "after deleting {}", deleted.name);
+            retained.details().await.expect("its details read back");
+        }
+        let hidden = Execution::connect_with(result.execution_id, &unrelated)
+            .await
+            .expect("the handle connects")
+            .status()
+            .await;
+        assert_eq!(
+            refused(hidden),
+            "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+            "after deleting {}",
+            deleted.name
+        );
+    }
+    assistant.deployment.shutdown().await;
+}
+
 /// The `code` of a refused call.
 ///
 /// # Panics
 /// Panics when the call succeeded.
 fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String {
     result.expect_err("the call is refused").code().to_owned()
+}
+
+/// A reader of a Repository family downloads the publication of an execution
+/// whose trusted parent is that Repository, and a reader of another
+/// Repository family cannot tell the same download from an unknown one.
+///
+/// # Panics
+/// Panics when the family reader's download plan differs from the manifest
+/// or the other family's refusal is not `EXECUTION_NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lane"]
+async fn a_repository_family_reader_downloads_its_execution_publications() {
+    use wyrd_ai::verify::{PublicationContent, PublicationName, PublicationSelector, TaskId};
+    use wyrd_testing::verification::Published;
+
+    let deployment = crate::support::Deployment::start().await;
+    let server = deployment.server();
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let repository = fixture
+        .declare("Repository", "payments", &json!({"repository_id": "41"}))
+        .await
+        .expect("the Repository registers");
+    fixture
+        .declare("Repository", "ledger", &json!({"repository_id": "42"}))
+        .await
+        .expect("another Repository registers");
+    let verifier = fixture.drift_verifier("downloads").await.expect("verifier");
+    fixture
+        .submit(&verifier, &repository, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let id = fixture
+        .publish(
+            server.state(),
+            &[("draft", "report", Published::File(b"# Report\n".to_vec()))],
+        )
+        .await
+        .expect("the held execution publishes");
+
+    let step = TaskId::new("draft").expect("step");
+    let name = PublicationName::new("report").expect("name");
+    let attempt = PublicationSelector {
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        path: None,
+    };
+    let reader = |family: &'static str| {
+        let deployment = &deployment;
+        async move {
+            let grants = [
+                json!({"resource": "executions", "action": "read", "scope": {"card": {
+                    "family": {"kind": "Repository", "name": family}
+                }}}),
+            ];
+            let key = deployment
+                .granted_key(&format!("downloads_{family}"), &grants)
+                .await;
+            Execution::connect_with(id, &deployment.client(&key))
+                .await
+                .expect("the execution handle connects")
+        }
+    };
+    let payments = reader("payments").await;
+    let PublicationContent::File { manifest } = payments
+        .publication(&step, &name, &attempt)
+        .await
+        .expect("the Repository-family reader reads the publication")
+        .content
+    else {
+        panic!("the report is a file publication");
+    };
+    let planned = payments
+        .download(&step, &name, &attempt)
+        .await
+        .expect("the Repository-family reader downloads");
+    let digest = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(manifest.files[0].sha256.as_bytes())
+    };
+    assert_eq!(
+        (planned.size_bytes, planned.sha256),
+        (manifest.files[0].size_bytes, digest)
+    );
+
+    let ledger = reader("ledger").await;
+    assert_eq!(
+        refused(ledger.download(&step, &name, &attempt).await),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    );
+    deployment.shutdown().await;
 }
 
 /// A queued execution's invocations and publications read back as stable,
@@ -279,8 +450,10 @@ fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String 
 /// refused. Each publication reads back with its value or manifest, a file
 /// and a listed directory file plan their downloads with the manifest's size
 /// and digest, and a JSON or unlisted download, a path on a read, and
-/// another attempt are refused. A caller with `cards:read` but no `verifier:read`, or
-/// with it for another Verifier only, is refused; one scoped to this Verifier reads.
+/// another attempt are refused. Tenant-wide `cards:read` reads; a caller holding only
+/// `verifier:run` is refused, and one holding `executions:read` on another subject
+/// Card only reads and downloads it as unknown; one scoped to this execution's
+/// subject Card version reads, and one scoped to its family also downloads.
 /// Another tenant sees no such execution. A viewer cannot cancel; the
 /// administrator's cancel and its repeat both answer `cancelled`, and the
 /// publications stay listed. The `wyrd execution` command lists, reads,
@@ -305,10 +478,10 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         .expect("the tenant provisions");
     let (subject, _) = fixture.service("pages-subject").await.expect("service");
     let verifier = fixture.drift_verifier("pages").await.expect("verifier");
-    let other = fixture
-        .drift_verifier("pages-other")
+    let (other, _) = fixture
+        .service("pages-other-subject")
         .await
-        .expect("verifier");
+        .expect("service");
     fixture
         .submit(&verifier, &subject, std::collections::BTreeMap::new())
         .await
@@ -554,7 +727,11 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND"
     );
 
-    let grant = |uid: &dyn std::fmt::Display| json!({"resource": "verifier", "action": "read", "scope": {"verifier": uid.to_string()}});
+    let grant = |name: &str, uid: &dyn std::fmt::Display| {
+        json!({"resource": "executions", "action": "read", "scope": {"card": {"version": {
+            "kind": "Service", "name": name, "uid": uid.to_string()
+        }}}})
+    };
     let session = &deployment;
     let as_key = |key: String| async move {
         Execution::connect_with(id, &session.client(&key))
@@ -562,24 +739,34 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
             .expect("the execution handle connects")
     };
     let cards_only = json!({"resource": "cards", "action": "read", "scope": "all"});
-    let nobody = as_key(deployment.granted_key("pages_cards", &[cards_only]).await).await;
+    let reader = as_key(deployment.granted_key("pages_cards", &[cards_only]).await).await;
+    assert!(
+        reader
+            .invocations(&ExecutionPageQuery::default())
+            .await
+            .is_ok(),
+        "tenant-wide Card read includes every parent's executions"
+    );
+    let run_only = json!({"resource": "verifier", "action": "run", "scope": "all"});
+    let nobody = as_key(deployment.granted_key("pages_run", &[run_only]).await).await;
     assert_eq!(
         refused(nobody.invocations(&ExecutionPageQuery::default()).await),
         "WYRD_PERMISSION_403_DENIED_RBAC"
     );
     let elsewhere = as_key(
         deployment
-            .granted_key("pages_elsewhere", &[grant(&other)])
+            .granted_key("pages_elsewhere", &[grant("pages-other-subject", &other)])
             .await,
     )
     .await;
+    // Without the parent the execution reads as unknown.
     assert_eq!(
         refused(elsewhere.publications(&ExecutionPageQuery::default()).await),
-        "WYRD_PERMISSION_403_DENIED_RBAC"
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
     );
     let exact = as_key(
         deployment
-            .granted_key("pages_exact", &[grant(&verifier)])
+            .granted_key("pages_exact", &[grant("pages-subject", &subject)])
             .await,
     )
     .await;
@@ -587,9 +774,38 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         exact
             .publications(&ExecutionPageQuery::default())
             .await
-            .expect("an exact verifier:read grant reads")
+            .expect("an exact executions:read grant reads")
             .items,
         publications
+    );
+    // A family grant reads and downloads exactly as the exact grant does;
+    // another family's reader cannot tell the download from an unknown one.
+    let family = as_key(
+        deployment
+            .granted_key(
+                "pages_family",
+                &[json!({"resource": "executions", "action": "read", "scope": {"card": {"family": {
+                    "kind": "Service", "name": "pages-subject"
+                }}}})],
+            )
+            .await,
+    )
+    .await;
+    let planned = family
+        .download(&step("draft"), &name("report"), &attempt(None))
+        .await
+        .expect("a family executions:read grant downloads");
+    assert_eq!(
+        (planned.size_bytes, planned.sha256),
+        (file.files[0].size_bytes, digest(&file.files[0]))
+    );
+    assert_eq!(
+        refused(
+            elsewhere
+                .download(&step("draft"), &name("report"), &attempt(None))
+                .await
+        ),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
     );
     let foreign = as_key(deployment.other_tenant_admin("pages-foreign").await).await;
     assert_eq!(

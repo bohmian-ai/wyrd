@@ -4,9 +4,9 @@
 //! 8693 delegation each verify their own grant-specific evidence, then call
 //! [`TenantTokenIssuer::issue`]. That owner alone loads the current tenant and
 //! principal, refuses an inactive one, resolves the principal's current grants
-//! to one [`PermissionSet`], signs the five-minute token, and records the
-//! issuance audit — so a grant change or suspension governs the very next
-//! token on every path, and no path can drift from the others.
+//! from its scoped bindings, signs a five-minute identity token carrying only
+//! restrictive ceilings, and records the issuance audit. The token never
+//! carries grants: every request re-resolves current authority on the server.
 //!
 //! The tenant SYSTEM principal is an attribution identity only: no path here
 //! mints a token for it, and every public grant refuses it as inactive.
@@ -20,7 +20,9 @@ use uuid::Uuid;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken};
 use wyrd_runtime::audit::AuditStage;
-use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef, UnrepresentableIntersection};
+use wyrd_runtime::{
+    EffectivePermissions, Permission, PermissionSet, PrincipalId, UnrepresentableIntersection,
+};
 use wyrd_spec::auth::{
     Attribution, CardAccess, ExchangeTokenType, FamilyRestriction, PrincipalKindTag, SecretBearer,
     TokenResponse, TokenType, WorkloadFamily,
@@ -32,22 +34,25 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditDelegationStep;
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::queries::auth::{
-    ApiKeyOwner, RoleRow, api_key_owner, human_connection_is_active, insert_human_refresh_token,
-    list_service_account_roles, list_user_roles, lock_human_connection_slot, lock_refresh_family,
-    refresh_issuance_instant, roles_by_name, service_account_by_id, user_by_id,
+    ApiKeyOwner, api_key_owner, human_connection_is_active, insert_human_refresh_token,
+    local_credential_for_update, lock_human_connection_slot, lock_refresh_family,
+    refresh_issuance_instant, service_account_by_id, user_by_id,
 };
+use wyrd_sql::queries::auth::{SocialAnchor, login_policy};
+use wyrd_sql::queries::platform::social::{login_settings, social_provider};
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
-use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
-use wyrd_sql::{SqlError, TenantConn};
+use wyrd_sql::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
+use crate::authority::{AuthorityError, TenantAuthority};
 use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
     resolve_workload_scope, stage_scope_mint_success_audit,
 };
 use crate::error::{auth_error_to_wyrd, store_error};
-use crate::exchange_api_key::{principal_kind_wire, role_refs};
+use crate::exchange_api_key::principal_kind_wire;
 use wyrd_auth_issue::hash_secret;
 
 /// Tenant token lifetimes.
@@ -165,10 +170,9 @@ pub enum TenantGrant {
         /// The subject being acted for, from its verified access token; boxed
         /// to keep the grant enum small.
         subject: Box<TokenPrincipalRef>,
-        /// The subject's roles; informational metadata only.
-        subject_roles: Vec<RoleRef>,
-        /// The subject's verified permissions. The token carries only the
-        /// actor's current permissions that this set also covers, so
+        /// The subject's current authority, flattened from its own token's
+        /// server-resolved view. The delegated token's ceiling is the
+        /// actor's current authority that this set also covers, so
         /// delegation can narrow authority but never amplify either party.
         subject_permissions: PermissionSet,
         /// The subject's signed Card limit, intersected with the actor's
@@ -272,15 +276,17 @@ impl TenantGrant {
         }
     }
 
-    /// Build the signed-token contents for `issued`, whose current `roles`,
-    /// `permissions`, and own Card `access` were just resolved.
+    /// Build the signed-token contents for `issued`, whose current authority
+    /// `permissions` (grants bounded by its credential's `ceiling`) and own
+    /// Card `access` were just resolved.
     ///
-    /// Every grant but a delegation names `issued` with its own authority,
-    /// its selected root, and the `wyrd` audience. A delegation names the
-    /// subject instead, keeps the subject's root, carries only the exact
-    /// intersections of `issued`'s permissions and Card access with the
-    /// subject's, and records `issued` — with its root and credential
-    /// provenance — as the outermost actor over any earlier actors.
+    /// Every grant but a delegation names `issued`, signs only its
+    /// credential's restrictive `ceiling`, its selected root, and the `wyrd`
+    /// audience. A delegation names the subject instead, keeps the subject's
+    /// root, signs the exact intersection of `issued`'s current authority with
+    /// the subject's as its ceiling, intersects Card access, and records
+    /// `issued` — with its root and credential provenance — as the outermost
+    /// actor over any earlier actors.
     ///
     /// # Errors
     /// Returns [`IssuanceError::UnrepresentableDelegation`] when a
@@ -291,8 +297,8 @@ impl TenantGrant {
     fn into_access_grant(
         self,
         issued: TokenPrincipalRef,
-        roles: Vec<RoleRef>,
-        permissions: PermissionSet,
+        permissions: &EffectivePermissions,
+        ceiling: Option<PermissionSet>,
         access: CardAccess,
     ) -> Result<AccessGrant, IssuanceError> {
         let credential_id = self.credential_id();
@@ -300,7 +306,6 @@ impl TenantGrant {
         Ok(match self {
             Self::Delegation {
                 subject,
-                subject_roles,
                 subject_permissions,
                 subject_card_access,
                 subject_workload_uid,
@@ -310,8 +315,9 @@ impl TenantGrant {
                 actor_credential_id,
             } => AccessGrant {
                 principal: *subject,
-                roles: subject_roles,
-                permissions: permissions.intersection(&subject_permissions)?,
+                permission_ceiling: Some(
+                    permissions.flatten()?.intersection(&subject_permissions)?,
+                ),
                 card_access: subject_card_access
                     .intersection(&access)
                     .ok_or_else(subject_context_required)?,
@@ -328,8 +334,7 @@ impl TenantGrant {
             },
             _ => AccessGrant {
                 principal: issued,
-                roles,
-                permissions,
+                permission_ceiling: ceiling,
                 card_access: access,
                 workload_uid,
                 credential_id,
@@ -352,10 +357,10 @@ fn subject_context_required() -> IssuanceError {
 struct ResolvedPrincipal {
     /// The account reference the token names.
     principal: TokenPrincipalRef,
-    /// Current role assignments.
-    roles: Vec<RoleRef>,
-    /// Union of the roles' current permissions.
-    permissions: PermissionSet,
+    /// Current grants, bounded by the presented credential's ceiling.
+    permissions: EffectivePermissions,
+    /// The presented credential's restrictive ceiling, signed into the token.
+    ceiling: Option<PermissionSet>,
     /// The account's durable restriction; `None` when unrestricted or human.
     restriction: Option<WorkloadFamily>,
 }
@@ -444,8 +449,10 @@ pub async fn select_request_root(
             .principal
             .clone()
             .with_card_access(access, Some(root.clone())),
+        permission_ceiling: verified.permission_ceiling.clone(),
         delegation_chain: verified.delegation_chain.clone(),
         exp: verified.exp,
+        iat: verified.iat,
     }))
 }
 
@@ -566,6 +573,10 @@ pub struct TenantTokenIssuer {
     settings: TokenExchangeSettings,
     /// Process audit stage every grant decision is staged on.
     audit: Arc<dyn AuditStage>,
+    /// Platform store holding the operator's password and social provider
+    /// settings; `None` when the deployment has none, so no social
+    /// credential exists and password sign-in keeps its default.
+    operator: Option<OperatorPool>,
 }
 
 impl std::fmt::Debug for TenantTokenIssuer {
@@ -589,7 +600,48 @@ impl TenantTokenIssuer {
             issuing_key,
             settings,
             audit,
+            operator: None,
         }
+    }
+
+    /// This issuer, rechecking the operator's method settings in `operator`
+    /// whenever a password or social credential is used or renewed.
+    #[must_use]
+    pub fn with_operator(mut self, operator: Option<OperatorPool>) -> Self {
+        self.operator = operator;
+        self
+    }
+
+    /// Whether the operator still offers the method a credential was created
+    /// through: password sign-in for `password`, and exactly the enabled
+    /// provider revision for `social`. A credential of a method no longer
+    /// offered is refused at use and renewal; it never switches methods.
+    ///
+    /// # Errors
+    /// Returns [`IssuanceError::Wyrd`] when the platform store fails.
+    pub async fn method_still_offered(
+        &self,
+        password: bool,
+        social: Option<SocialAnchor>,
+    ) -> Result<bool, IssuanceError> {
+        let Some(operator) = &self.operator else {
+            return Ok(true);
+        };
+        if password
+            && !login_settings(operator)
+                .await
+                .map_err(store_error)?
+                .password_enabled
+        {
+            return Ok(false);
+        }
+        let Some(anchor) = social else {
+            return Ok(true);
+        };
+        Ok(social_provider(operator, anchor.provider.as_str())
+            .await
+            .map_err(store_error)?
+            .is_some_and(|row| row.enabled && row.revision == anchor.provider_revision))
     }
 
     /// The process audit stage shared by every grant built on this issuer.
@@ -660,8 +712,8 @@ impl TenantTokenIssuer {
             .issue_access_token(
                 grant.into_access_grant(
                     principal.principal,
-                    principal.roles,
-                    principal.permissions,
+                    &principal.permissions,
+                    principal.ceiling,
                     context.access,
                 )?,
                 self.settings.access_ttl,
@@ -720,13 +772,23 @@ impl TenantTokenIssuer {
         grant: TenantGrant,
     ) -> Result<VerifiedToken, IssuanceError> {
         let (principal, context) = self.authorize(conn, principal_id, &grant).await?;
+        let authority = principal.permissions.clone();
+        let delegated = matches!(grant, TenantGrant::Delegation { .. });
         let access = grant.into_access_grant(
             principal.principal,
-            principal.roles,
-            principal.permissions,
+            &principal.permissions,
+            principal.ceiling,
             context.access,
         )?;
-        self.verified(access)
+        let mut verified = self.verified(access, authority)?;
+        if delegated {
+            verified.principal.effective_permissions = verified
+                .permission_ceiling
+                .clone()
+                .map(EffectivePermissions::from)
+                .unwrap_or_default();
+        }
+        Ok(verified)
     }
 
     /// Resolve the fresh authority a scheduled run of the exact `root` is
@@ -751,16 +813,18 @@ impl TenantTokenIssuer {
         let principal = self.resolve(conn, account, false).await?;
         let context =
             ResolvedContext::resolve(conn, Some(root), principal.restriction.as_ref()).await?;
-        self.verified(AccessGrant {
-            principal: principal.principal,
-            roles: principal.roles,
-            permissions: principal.permissions,
-            card_access: context.access,
-            workload_uid: Some(root.clone()),
-            credential_id: None,
-            act: None,
-            audience: TokenAudience::Wyrd,
-        })
+        self.verified(
+            AccessGrant {
+                principal: principal.principal,
+                permission_ceiling: None,
+                card_access: context.access,
+                workload_uid: Some(root.clone()),
+                credential_id: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
+            },
+            principal.permissions,
+        )
     }
 
     /// Resolve the fresh authority of `principal_id`, a User or Service
@@ -790,28 +854,38 @@ impl TenantTokenIssuer {
             resolved => resolved?,
         };
         let context = ResolvedContext::resolve(conn, None, principal.restriction.as_ref()).await?;
-        self.verified(AccessGrant {
-            principal: principal.principal,
-            roles: principal.roles,
-            permissions: principal.permissions,
-            card_access: context.access,
-            workload_uid: None,
-            credential_id: None,
-            act: None,
-            audience: TokenAudience::Wyrd,
-        })
+        self.verified(
+            AccessGrant {
+                principal: principal.principal,
+                permission_ceiling: None,
+                card_access: context.access,
+                workload_uid: None,
+                credential_id: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
+            },
+            principal.permissions,
+        )
     }
 
-    /// Shape `access` into the [`VerifiedToken`] its signed token would yield.
+    /// Shape `access` into the [`VerifiedToken`] its signed token would
+    /// yield, with `authority` — resolved in the caller's transaction —
+    /// attached as the principal's current authority.
     ///
     /// # Errors
     /// [`IssuanceError::Issue`] when the claims are unrepresentable and
     /// [`IssuanceError::Wyrd`] when they do not convert.
-    fn verified(&self, access: AccessGrant) -> Result<VerifiedToken, IssuanceError> {
+    fn verified(
+        &self,
+        access: AccessGrant,
+        authority: EffectivePermissions,
+    ) -> Result<VerifiedToken, IssuanceError> {
         let claims = self
             .issuing_key
             .access_claims(access, self.settings.access_ttl)?;
-        Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
+        let mut verified = claims.into_verified().map_err(auth_error_to_wyrd)?;
+        verified.principal.effective_permissions = authority;
+        Ok(verified)
     }
 
     /// Resolve `principal_id` and the Card context `grant` selects, recording
@@ -839,7 +913,8 @@ impl TenantTokenIssuer {
         };
         let (human, ceiling) = match owner {
             Some(ApiKeyOwner::User { permission_ceiling }) => (true, Some(permission_ceiling)),
-            _ => (grant.is_human(), None),
+            Some(ApiKeyOwner::Account { permission_ceiling }) => (false, permission_ceiling),
+            None => (grant.is_human(), None),
         };
         let mut principal = self.resolve(conn, principal_id, human).await?;
         if let Some(ceiling) = ceiling {
@@ -848,7 +923,10 @@ impl TenantTokenIssuer {
                 .map(|expression| expression.parse::<Permission>())
                 .collect::<Result<PermissionSet, _>>()
                 .map_err(|_| sqlx::Error::Decode("stored permission ceiling".into()))?;
-            principal.permissions = principal.permissions.intersection(&ceiling)?;
+            principal.permissions = principal
+                .permissions
+                .restricted_by(Arc::new(ceiling.clone()));
+            principal.ceiling = Some(ceiling);
         }
         let root = grant.selected_root();
         let context = ResolvedContext::resolve(conn, root, principal.restriction.as_ref()).await?;
@@ -876,7 +954,7 @@ impl TenantTokenIssuer {
         if !tenant_admits_credentials(conn, tenant).await? {
             return Err(IssuanceError::TenantNotAdmitting);
         }
-        let (principal, restriction, role_names) = if human {
+        let (principal, restriction) = if human {
             let user = user_by_id(conn, principal_id)
                 .await?
                 .filter(|user| user.status == "active")
@@ -886,10 +964,11 @@ impl TenantTokenIssuer {
                 kind: PrincipalKindTag::User,
                 tenant_id: tenant,
             };
-            (principal, None, list_user_roles(conn, user.id).await?)
+            (principal, None)
         } else {
             let row = service_account_by_id(conn, principal_id)
                 .await?
+                .filter(|row| row.status == "active")
                 .ok_or(IssuanceError::PrincipalInactive)?;
             let kind =
                 principal_kind_wire(&row.principal_kind).ok_or(IssuanceError::PrincipalInactive)?;
@@ -898,27 +977,23 @@ impl TenantTokenIssuer {
                 kind,
                 tenant_id: tenant,
             };
-            let restriction = row.workload_family()?;
-            (
-                principal,
-                restriction,
-                list_service_account_roles(conn, row.id).await?,
-            )
+            (principal, row.workload_family()?)
         };
-        let roles = role_refs(role_names).map_err(|error| IssuanceError::RoleCorrupt {
-            role: error.to_string(),
-        })?;
-        let mut permissions = resolve_permissions(conn, &roles).await?;
-        if human {
-            // Every real User may read and manage its own credentials;
-            // ownership is enforced where the capability is checked.
-            permissions.insert(Permission::personal_credentials_read());
-            permissions.insert(Permission::personal_credentials_write());
-        }
+        let refusal = |error| match error {
+            AuthorityError::Database(error) => IssuanceError::Database(error),
+            AuthorityError::Corrupt { role } => IssuanceError::RoleCorrupt { role },
+        };
+        let authority = TenantAuthority::load(conn).await.map_err(refusal)?;
+        authority.check(principal.id).map_err(refusal)?;
+        let grants = authority
+            .account(principal.id)
+            .ok_or(IssuanceError::PrincipalInactive)?
+            .grants
+            .clone();
         Ok(ResolvedPrincipal {
             principal,
-            roles,
-            permissions,
+            permissions: EffectivePermissions::new(grants),
+            ceiling: None,
             restriction,
         })
     }
@@ -941,7 +1016,7 @@ impl TenantTokenIssuer {
     ) -> Result<Option<PermissionSet>, IssuanceError> {
         for human in [true, false] {
             match self.resolve(conn, principal_id, human).await {
-                Ok(resolved) => return Ok(Some(resolved.permissions)),
+                Ok(resolved) => return Ok(Some(resolved.permissions.grants().clone())),
                 Err(IssuanceError::PrincipalInactive) => {}
                 Err(error) => return Err(error),
             }
@@ -976,13 +1051,7 @@ impl TenantTokenIssuer {
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
         let access = self
-            .issue_human_access(
-                conn,
-                principal_id,
-                rotated_from,
-                session.connection,
-                request_id,
-            )
+            .issue_human_access(conn, principal_id, rotated_from, session.anchor, request_id)
             .await?;
         let lifetime = self.settings.refresh_ttl;
         // One PostgreSQL instant, sampled in the caller's transaction, feeds both
@@ -1013,101 +1082,75 @@ impl TenantTokenIssuer {
     }
 
     /// Mint a human access token from [`Self::issue`] for a session bound to
-    /// `connection`, without a refresh token.
+    /// `anchor`, without a refresh token.
     ///
-    /// [`Self::issue_human_session`] builds every new refresh token on it. `refresh_row` is the refresh row presented, if any: it makes
-    /// the grant a refresh and attributes the access token to it; `None` is
-    /// a login. Before anything is read or minted this takes the User's
+    /// [`Self::issue_human_session`] builds every new refresh token on it.
+    /// `refresh_row` is the refresh row presented, if any: it makes the grant
+    /// a refresh and attributes the access token to it; `None` is a login.
+    /// Before anything is read or minted this takes the User's
     /// tenant-qualified refresh-family lock — the lock rotation and
     /// administrative User revocation hold through their commits — so login
     /// and renewal alike either commit before a revocation, whose family
     /// snapshot then retires the new row, or wait for it and re-read the User
-    /// as suspended. The lock is transaction-scoped and held until the
-    /// caller's commit or rollback; the owning transaction reacquires it
-    /// without waiting. It then takes the tenant's connection slot lock — the
-    /// lock every lifecycle mutation takes — and requires that exact revision
-    /// to still be Active, so replacement, deactivation, or removal committed
-    /// on any replica cuts the session off: once the mutation commits no
-    /// token can be minted, and a mutation waiting on the lock commits only
-    /// after this transaction does.
+    /// as suspended. The lock is transaction-scoped.
+    ///
+    /// A provider anchor then takes the tenant's connection slot lock — the
+    /// lock every connection lifecycle mutation takes — and requires that
+    /// exact revision to still be Active. A local anchor locks the User's
+    /// password row and requires its revision unchanged, the tenant not to
+    /// require company SSO and the operator to still offer password sign-in,
+    /// so a password change or reset, or a policy or setting change,
+    /// committed on any replica cuts the session off.
     ///
     /// # Errors
-    /// Returns [`IssuanceError::ConnectionInactive`] when the bound connection
-    /// revision is no longer Active, every [`Self::issue`] error, and
+    /// Returns [`IssuanceError::ConnectionInactive`] when the anchor is no
+    /// longer current, every [`Self::issue`] error, and
     /// [`IssuanceError::Wyrd`] when a lock fails. Nothing is committed here.
     pub async fn issue_human_access(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
         refresh_row: Option<Uuid>,
-        connection: HumanConnectionBinding,
+        anchor: HumanLoginAnchor,
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
         lock_refresh_family(conn, "user", principal_id)
             .await
             .map_err(store_error)?;
-        lock_human_connection_slot(conn)
-            .await
-            .map_err(store_error)?;
-        let active = human_connection_is_active(
-            conn,
-            connection.connection_id,
-            connection.connection_revision,
-        )
-        .await
-        .map_err(store_error)?;
-        if !active {
+        let current = match anchor {
+            HumanLoginAnchor::Connection(connection) => {
+                lock_human_connection_slot(conn)
+                    .await
+                    .map_err(store_error)?;
+                human_connection_is_active(
+                    conn,
+                    connection.connection_id,
+                    connection.connection_revision,
+                )
+                .await
+                .map_err(store_error)?
+            }
+            HumanLoginAnchor::Password(revision) => {
+                local_credential_for_update(conn, principal_id)
+                    .await
+                    .map_err(store_error)?
+                    .is_some_and(|credential| credential.password_revision == revision)
+                    && !login_policy::requires_company_sso(conn)
+                        .await
+                        .map_err(store_error)?
+                    && self.method_still_offered(true, None).await?
+            }
+        };
+        if !current {
             return Err(IssuanceError::ConnectionInactive);
         }
-        let grant = match refresh_row {
-            Some(consumed) => TenantGrant::Refresh { consumed },
-            None => TenantGrant::OidcLogin,
+        let grant = match (refresh_row, anchor) {
+            (Some(consumed), _) => TenantGrant::Refresh { consumed },
+            (None, HumanLoginAnchor::Connection(_)) => TenantGrant::OidcLogin,
+            (None, HumanLoginAnchor::Password(_)) => TenantGrant::PasswordLogin,
         };
         self.issue(conn, principal_id, grant, request_id).await
     }
-}
-
-/// Resolve role references to the union of their stored permissions.
-///
-/// A role name with no stored row contributes nothing, so a deleted role
-/// simply stops granting.
-///
-/// # Errors
-/// Returns [`IssuanceError::Database`] when the read fails and
-/// [`IssuanceError::RoleCorrupt`] when a stored permission document does not
-/// decode.
-pub(crate) async fn resolve_permissions(
-    conn: &mut TenantConn<'_>,
-    roles: &[RoleRef],
-) -> Result<PermissionSet, IssuanceError> {
-    if roles.is_empty() {
-        return Ok(PermissionSet::new());
-    }
-    let names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
-    permission_set_from_rows(roles_by_name(conn, &names).await?)
-}
-
-/// Decode and merge stored role permission documents into one set.
-///
-/// Decoding is the only validation a stored grant gets before it becomes JWT
-/// authority, so a document the [`Permission`] schema rejects — an unknown
-/// action, a scope-less Bifrost grant, a Bifrost object scope on a non-read
-/// action — fails the whole issuance naming the corrupt role instead of being
-/// skipped.
-///
-/// # Errors
-/// Returns [`IssuanceError::RoleCorrupt`] naming the first role whose
-/// permission document does not decode.
-fn permission_set_from_rows(rows: Vec<RoleRow>) -> Result<PermissionSet, IssuanceError> {
-    let mut permissions = PermissionSet::new();
-    for row in rows {
-        let granted: Vec<Permission> = serde_json::from_value(row.permissions)
-            .map_err(|_| IssuanceError::RoleCorrupt { role: row.name })?;
-        for permission in granted {
-            permissions.insert(permission);
-        }
-    }
-    Ok(permissions)
 }
 
 /// Build the canonical token-exchange audit event for one issuance.
@@ -1178,180 +1221,25 @@ fn exchange_audit_event(
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-    use uuid::Uuid;
-    use wyrd_runtime::{
-        Action, BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope, Resource,
-    };
-    use wyrd_sql::queries::auth::RoleRow;
-
-    use super::{IssuanceError, permission_set_from_rows};
-
-    /// Build one stored role row with `permissions` as its JSONB document.
-    fn role(name: &str, permissions: serde_json::Value) -> RoleRow {
-        RoleRow {
-            id: Uuid::nil(),
-            name: name.to_owned(),
-            permissions,
-        }
-    }
-
-    /// Builds one Bifrost query-read permission at the supplied object scope.
-    fn scoped_query_read(scope: PermissionScope) -> Permission {
-        Permission {
-            resource: Resource::BifrostQuery,
-            action: Action::Read,
-            scope,
-        }
-    }
-
-    /// Assert that decoding `rows` fails naming `name` as the corrupt role.
-    fn assert_corrupt(rows: Vec<RoleRow>, name: &str) {
-        match permission_set_from_rows(rows) {
-            Err(IssuanceError::RoleCorrupt { role }) => assert_eq!(role, name),
-            other => panic!("expected {name} to be reported corrupt, got {other:?}"),
-        }
-    }
-
-    /// Several roles merge into one set, with the wildcard subsuming the rest.
-    #[test]
-    fn decodes_and_merges_permissions_from_role_rows() {
-        let set = permission_set_from_rows(vec![
-            role(
-                "viewer",
-                json!([
-                    { "resource": "cards", "action": "read", "scope": "all" },
-                    { "resource": "artifacts", "action": "read", "scope": "all" }
-                ]),
-            ),
-            role(
-                "admin",
-                json!([{ "resource": "wildcard", "action": "wildcard", "scope": "all" }]),
-            ),
-        ])
-        .expect("role permissions decode");
-
-        assert_eq!(set.len(), 1);
-        assert!(set.contains(&Permission::wildcard()));
-        assert!(set.contains(&Permission::card_read()));
-    }
-
-    /// An undecodable document fails issuance naming the role.
-    #[test]
-    fn reports_role_name_for_malformed_permissions() {
-        assert_corrupt(
-            vec![role(
-                "bad_role",
-                json!([{ "resource": "cards", "action": "unknown", "scope": "all" }]),
-            )],
-            "bad_role",
-        );
-    }
-
-    /// Stored scoped Bifrost grants decode to exactly their object scopes, and
-    /// a scope-less row is surfaced as a corrupt role.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the scoped rows fail to decode, the set is not exactly the
-    /// `logs` schema and `traces` table grants, it holds unscoped Bifrost query
-    /// read, or the scope-less row is not reported as role `unscoped`.
-    #[test]
-    fn decodes_scoped_bifrost_grants_and_rejects_unscoped_rows() {
-        let uid = Uuid::now_v7();
-        let set = permission_set_from_rows(vec![role(
-            "analyst",
-            json!([
-                {
-                    "resource": "bifrost_query",
-                    "action": "read",
-                    "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
-                },
-                {
-                    "resource": "bifrost_query",
-                    "action": "read",
-                    "scope": {"bifrost": {"table": {
-                        "catalog": "bifrost",
-                        "schema": "traces",
-                        "table_uid": uid.to_string(),
-                    }}}
-                }
-            ]),
-        )])
-        .expect("scoped role permissions decode");
-
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(&scoped_query_read(PermissionScope::Bifrost(
-            BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "bifrost".to_owned(),
-                schema: "logs".to_owned(),
-                table_uid: Uuid::now_v7(),
-            })
-        ))));
-        assert!(set.contains(&scoped_query_read(PermissionScope::Bifrost(
-            BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "bifrost".to_owned(),
-                schema: "traces".to_owned(),
-                table_uid: uid,
-            })
-        ))));
-        assert!(!set.contains(&Permission::bifrost_query_read()));
-
-        assert_corrupt(
-            vec![role(
-                "unscoped",
-                json!([{ "resource": "bifrost_query", "action": "read" }]),
-            )],
-            "unscoped",
-        );
-    }
-
-    /// A Bifrost object scope on a non-read action is corrupt, never read
-    /// authority. `wildcard` is the dangerous case: it would otherwise cover
-    /// the required read while inheriting one schema's narrow scope.
-    #[test]
-    fn rejects_bifrost_scope_on_a_non_read_action() {
-        for action in [
-            json!("write"),
-            json!("wildcard"),
-            json!({"any_of": ["read", "write"]}),
-        ] {
-            assert_corrupt(
-                vec![role(
-                    "corrupt_analyst",
-                    json!([{
-                        "resource": "bifrost_query",
-                        "action": action,
-                        "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
-                    }]),
-                )],
-                "corrupt_analyst",
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod pg_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
     use secrecy::SecretString;
-    use serde_json::json;
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenAudience, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
         public_key_from_pem,
     };
+    use wyrd_dev_fixtures::pg::bind_test_permissions;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{
-        Attribution, CardAccess, FamilyRestriction, OAuthClientId, PrincipalKindTag, RoleSource,
+        Attribution, CardAccess, FamilyRestriction, OAuthClientId, PrincipalKindTag,
     };
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
     use wyrd_spec::envelope::CardKind;
@@ -1360,15 +1248,16 @@ mod pg_tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        grant_role_to_service_account, grant_role_to_user, insert_role, insert_service_account,
-        insert_user, provision_system_principal, revoke_role_from_service_account,
-        suspend_service_account_principal, suspend_user_principal,
+        SubjectColumns, advance_authorization_revision, insert_service_account, insert_user,
+        provision_system_principal, suspend_service_account_principal, suspend_user_principal,
     };
 
     use wyrd_sql::queries::verification::{
         BindingActivation, FrozenTarget, NewBinding, project_bindings,
     };
-    use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
+    use wyrd_sql::row_types::auth::{
+        HumanConnectionBinding, HumanLoginAnchor, HumanSessionBinding,
+    };
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
     use crate::audit::test_audit::RecordedAudit;
@@ -1380,15 +1269,15 @@ mod pg_tests {
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
-    /// The test signing key, shared by the issuer and the verifier.
     /// A `wyrd-cli` session bound to `connection`.
     fn cli(connection: HumanConnectionBinding) -> HumanSessionBinding {
         HumanSessionBinding {
-            connection,
+            anchor: HumanLoginAnchor::Connection(connection),
             client: OAuthClientId::WyrdCli,
         }
     }
 
+    /// The test signing key, shared by the issuer and the verifier.
     fn issuing_key() -> Arc<IssuingKey> {
         Arc::new(
             IssuingKey::from_ed_pem(
@@ -1424,19 +1313,19 @@ mod pg_tests {
         TokenVerifier::new(keys, "wyrd", WyrdAuthVerifySettings::default())
     }
 
-    /// Seed a role granting exactly `card:read`, returning its id.
-    async fn seed_card_reader_role(conn: &mut TenantConn<'_>) -> Uuid {
-        let role_id = Uuid::new_v4();
-        insert_role(
-            conn,
-            role_id,
-            "card_reader",
-            &json!([{ "resource": "cards", "action": "read", "scope": "all" }]),
-            false,
-        )
-        .await
-        .expect("role seeds");
-        role_id
+    /// Grant `subject` exactly `card:read` at tenant scope.
+    async fn bind_card_read(conn: &mut TenantConn<'_>, subject: SubjectColumns) {
+        bind_test_permissions(conn, subject, &[Permission::card_read()])
+            .await
+            .expect("card read binds");
+    }
+
+    /// The binding subject of Service account `id`.
+    fn service(id: Uuid) -> SubjectColumns {
+        SubjectColumns {
+            service_account_id: Some(id),
+            ..SubjectColumns::default()
+        }
     }
 
     /// Seed an active human user, returning its id.
@@ -1471,36 +1360,51 @@ mod pg_tests {
         id
     }
 
-    /// Verify `token` for `tenant` and return whether it carries `card:read`.
-    fn grants_card_read(token: &SecretString, tenant: DataTenantId) -> bool {
-        verifier()
+    /// The verified principal `token` acts as under `conn`'s current
+    /// authorization state, as the server's authority cache resolves it.
+    async fn current(
+        conn: &mut TenantConn<'_>,
+        token: &SecretString,
+        tenant: DataTenantId,
+    ) -> Option<wyrd_runtime::Principal> {
+        let verified = verifier()
             .verify(token, &tenant)
-            .expect("issued token verifies")
-            .principal
-            .effective_permissions
-            .contains(&Permission::card_read())
+            .expect("issued token verifies");
+        crate::authority::TenantAuthority::load(conn)
+            .await
+            .expect("authority loads")
+            .authorize(&verified)
     }
 
-    /// The token's authority is the principal's current grants, resolved at
-    /// issuance: a grant withdrawn between two issuances is absent from the
-    /// second token without any request-time lookup.
+    /// Whether `token` holds `card:read` under current state.
+    async fn grants_card_read(
+        conn: &mut TenantConn<'_>,
+        token: &SecretString,
+        tenant: DataTenantId,
+    ) -> bool {
+        current(conn, token, tenant).await.is_some_and(|principal| {
+            principal
+                .effective_permissions
+                .contains(&Permission::card_read())
+        })
+    }
+
+    /// A token signs identity only, so its authority is the principal's
+    /// current bindings: a binding withdrawn after issuance is gone from the
+    /// same token without reissuing it.
     ///
     /// # Panics
-    /// Panics when the fixture, seeding, role grant or revoke, or either
-    /// issuance fails, or `card:read` is missing from the first token or
-    /// present in the second.
+    /// Panics when a seed, issuance, or withdrawal fails, the token signs a
+    /// ceiling, or `card:read` survives the withdrawn binding.
     #[tokio::test]
-    async fn issue_signs_current_grants_and_follows_grant_changes() {
+    async fn issued_authority_follows_current_bindings() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let role_id = seed_card_reader_role(&mut conn).await;
         let creator = seed_user(&mut conn).await;
         let principal = seed_automation(&mut conn, creator).await;
-        grant_role_to_service_account(&mut conn, principal, role_id)
-            .await
-            .expect("role grants");
+        bind_card_read(&mut conn, service(principal)).await;
 
         let granted = issuer(&audit)
             .issue(
@@ -1511,23 +1415,26 @@ mod pg_tests {
             )
             .await
             .expect("issuance succeeds");
-        assert!(grants_card_read(&granted.access_token, tenant));
-
-        revoke_role_from_service_account(&mut conn, principal, role_id)
-            .await
-            .expect("role revokes");
-        let withdrawn = issuer(&audit)
-            .issue(
-                &mut conn,
-                principal,
-                TenantGrant::JwtBearer { workload_uid: None },
-                "req-withdrawn",
-            )
-            .await
-            .expect("issuance succeeds");
         assert!(
-            !grants_card_read(&withdrawn.access_token, tenant),
-            "the next token carries only the grants the principal holds now"
+            verifier()
+                .verify(&granted.access_token, &tenant)
+                .expect("issued token verifies")
+                .permission_ceiling
+                .is_none(),
+            "a workload token signs no grants"
+        );
+        assert!(grants_card_read(&mut conn, &granted.access_token, tenant).await);
+
+        sqlx::query("DELETE FROM wyrd.auth_role_bindings")
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("binding withdraws");
+        advance_authorization_revision(&mut conn)
+            .await
+            .expect("revision advances");
+        assert!(
+            !grants_card_read(&mut conn, &granted.access_token, tenant).await,
+            "the same token holds only the bindings the principal holds now"
         );
     }
 
@@ -1577,7 +1484,6 @@ mod pg_tests {
                 machine,
                 TenantGrant::Delegation {
                     subject: Box::new(subject),
-                    subject_roles: Vec::new(),
                     subject_permissions: wyrd_runtime::PermissionSet::new(),
                     subject_card_access: CardAccess::AnyRegistered,
                     subject_workload_uid: None,
@@ -1745,7 +1651,6 @@ mod pg_tests {
                 bound,
                 TenantGrant::Delegation {
                     subject: Box::new(subject),
-                    subject_roles: Vec::new(),
                     subject_permissions: PermissionSet::new(),
                     subject_card_access: CardAccess::AnyRegistered,
                     subject_workload_uid: None,
@@ -1800,14 +1705,11 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = seed_user(&mut conn).await;
-        let role_id = seed_card_reader_role(&mut conn).await;
         let family = service_family("checkout");
         let account = insert_test_service_account(&mut conn, creator, Some(&family)).await;
         let automation = seed_automation(&mut conn, creator).await;
         for principal in [account, automation] {
-            grant_role_to_service_account(&mut conn, principal, role_id)
-                .await
-                .expect("role grants");
+            bind_card_read(&mut conn, service(principal)).await;
         }
         let release_1 = named_service_card_ref("checkout");
         let release_2 = CardRef {
@@ -1846,9 +1748,7 @@ mod pg_tests {
                 .principal;
             assert_eq!(verified.id.as_uuid(), principal, "identity never changes");
             assert!(
-                verified
-                    .effective_permissions
-                    .contains(&Permission::card_read()),
+                grants_card_read(&mut conn, &token.access_token, tenant).await,
                 "grants never change with context"
             );
             assert_eq!(verified.card_access, card_access);
@@ -1922,10 +1822,7 @@ mod pg_tests {
             .expect("family root selects")
             .expect("rootless bearer narrows");
         assert_eq!(selected.principal.id, rootless.principal.id);
-        assert_eq!(
-            selected.principal.effective_permissions,
-            rootless.principal.effective_permissions
-        );
+        assert_eq!(selected.permission_ceiling, rootless.permission_ceiling);
         assert_eq!(
             selected.principal.card_access,
             CardAccess::Scoped {
@@ -1954,18 +1851,22 @@ mod pg_tests {
         assert_eq!(activity(&mut conn, account, &r1).await.0, None);
     }
 
-    /// A human session carries the user's current grants and a refresh token.
+    /// A human session acts with the user's current grants and renews.
     #[tokio::test]
     async fn a_human_session_carries_current_grants_and_a_refresh_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let role_id = seed_card_reader_role(&mut conn).await;
         let user = seed_user(&mut conn).await;
-        grant_role_to_user(&mut conn, user, role_id, RoleSource::Idp)
-            .await
-            .expect("role grants");
+        bind_card_read(
+            &mut conn,
+            SubjectColumns {
+                user_id: Some(user),
+                ..SubjectColumns::default()
+            },
+        )
+        .await;
 
         let binding = seed_active_human_connection(&mut conn)
             .await
@@ -1976,7 +1877,7 @@ mod pg_tests {
             .await
             .expect("session issues");
 
-        assert!(grants_card_read(&session.access_token, tenant));
+        assert!(grants_card_read(&mut conn, &session.access_token, tenant).await);
         assert!(session.refresh_token.is_some(), "a human session renews");
     }
 
@@ -2008,7 +1909,6 @@ mod pg_tests {
             TenantGrant::JwtBearer { workload_uid: None },
             TenantGrant::Delegation {
                 subject: Box::new(subject),
-                subject_roles: Vec::new(),
                 subject_permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
                 subject_card_access: CardAccess::AnyRegistered,
                 subject_workload_uid: None,

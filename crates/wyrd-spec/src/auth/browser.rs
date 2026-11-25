@@ -11,16 +11,28 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::DataTenantId;
-use crate::auth::{AbsoluteUrl, PrincipalId, PrincipalKindTag, SecretBearer};
+use crate::auth::{AbsoluteUrl, PrincipalId, PrincipalKindTag, SecretBearer, SocialProvider};
 use crate::ids::TenantSlug;
 
-/// Body of `POST /auth/browser/login`: begin tenant SSO in this browser.
+/// Body of `POST /auth/browser/login`: begin a tenant provider sign-in in
+/// this browser, through the tenant's company SSO or, when `provider` names
+/// one, the deployment's shared social provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserLoginRequest {
     /// The tenant's route key; pre-login routing context only.
     pub tenant: TenantSlug,
+    /// The enabled shared social provider to sign in with; absent for
+    /// company SSO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<SocialProvider>,
+    /// The code of the invitation link being redeemed: the provider identity
+    /// becomes a new User holding exactly the invitation's assignments.
+    /// Absent for a returning sign-in; requires `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub invitation_code: Option<SecretBearer>,
 }
 
 /// Response of `POST /auth/browser/login`.
@@ -33,6 +45,207 @@ pub struct BrowserLoginRequest {
 pub struct BrowserLoginResponse {
     /// The tenant provider's authorization URL to send the browser to.
     pub authorization_url: AbsoluteUrl,
+}
+
+/// Body of `POST /auth/signup`: begin creating a workspace by proving, in
+/// this browser, a mailbox through Wyrd email or a shared social provider
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SignupBeginRequest {
+    /// Prove the mailbox `email` with a Wyrd email link; the creator then
+    /// chooses a tenant-local username and password.
+    Email {
+        /// The address to prove, as typed.
+        email: String,
+    },
+    /// Prove an identity at an enabled shared provider; the creator signs in
+    /// with it and holds no password.
+    Social {
+        /// The enabled shared social provider.
+        provider: SocialProvider,
+    },
+}
+
+/// Body of `POST /auth/signup/complete`: create the workspace the proven
+/// identity will administer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupCompleteRequest {
+    /// The new workspace's route key, unique across the deployment.
+    pub slug: TenantSlug,
+    /// The new workspace's human-readable name.
+    pub display_name: String,
+    /// The tenant-local administrator an email proof creates. Required for
+    /// an email proof and refused for a social one, whose creator signs in
+    /// with the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_credentials: Option<LocalCredentials>,
+    /// The Turnstile token the signup page's widget produced; required when
+    /// the deployment configures a challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_token: Option<String>,
+}
+
+/// The username and password of a workspace's first local administrator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LocalCredentials {
+    /// The tenant-local username.
+    pub username: String,
+    /// The password, 15–128 characters after NFC normalization.
+    pub password: SecretBearer,
+}
+
+/// Response of `POST /auth/signup/complete`: the created workspace, whose
+/// session cookie the response sets for its creator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupCompleteResponse {
+    /// The created workspace's route key.
+    pub tenant: TenantSlug,
+}
+
+/// Where an email proof stands, as `POST /auth/signup` and
+/// `POST /auth/signup/verify` report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ProofStatus {
+    /// A message was sent; open its link, or paste its proof, in this
+    /// browser.
+    CheckEmail,
+    /// The mailbox is proven; this browser holds the completion cookie.
+    Proven,
+}
+
+/// Response of an email proof step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProofStatusResponse {
+    /// Where the proof stands.
+    pub status: ProofStatus,
+}
+
+/// How a live signup proof was made: a mailbox, or a shared provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SignupProofMethod {
+    /// A mailbox proof; completion needs `local_credentials`.
+    Email,
+    /// A Google proof; completion refuses `local_credentials`.
+    Google,
+    /// A GitHub proof; completion refuses `local_credentials`.
+    Github,
+}
+
+/// Response of `GET /auth/signup/proof`: how this browser's live completion
+/// proof was made, so the workspace form asks only for what completion
+/// needs. It names no address or identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupProofResponse {
+    /// The proof's method.
+    pub method: SignupProofMethod,
+}
+
+/// Body of `POST /auth/signup/verify`: the proof an email signup message
+/// carried, presented by the browser that began it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupVerifyRequest {
+    /// The proof from the message's link fragment, or pasted.
+    pub proof: SecretBearer,
+}
+
+/// Body of `POST /auth/browser/email/request`: send a proof to the
+/// recovery address the signed-in User wants verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ContactRequest {
+    /// The tenant's route key whose session asks.
+    pub tenant: TenantSlug,
+    /// The address to verify, as typed.
+    pub email: String,
+}
+
+/// Body of `POST /auth/browser/email/verify`: the proof a contact message
+/// carried, presented by the session and browser that asked for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ContactVerifyRequest {
+    /// The tenant's route key whose session verifies.
+    pub tenant: TenantSlug,
+    /// The proof from the message's link fragment, or pasted.
+    #[schemars(with = "String")]
+    pub proof: SecretBearer,
+}
+
+/// Body of `POST /auth/browser/workspaces/request`: mail a discovery proof to
+/// an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryRequest {
+    /// The address whose workspaces to find, as typed.
+    pub email: String,
+}
+
+/// Body of `POST /auth/browser/workspaces/verify`: the proof a discovery
+/// message carried, presented by the browser that asked for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryVerifyRequest {
+    /// The proof from the message's link fragment, or pasted.
+    #[schemars(with = "String")]
+    pub proof: SecretBearer,
+}
+
+/// Query of `GET /auth/browser/workspaces`: the next page of a discovery the
+/// browser's read cookie already holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryQuery {
+    /// The `next_cursor` of the previous page.
+    pub cursor: String,
+}
+
+/// One workspace a verified address may sign in to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveredWorkspace {
+    /// The workspace's route key.
+    pub tenant: TenantSlug,
+    /// The workspace's display name.
+    pub display_name: String,
+    /// The workspace's fixed same-origin sign-in page.
+    pub login_url: String,
+}
+
+/// One bounded page of the workspaces a verified address may sign in to.
+/// An empty page is a normal result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryPage {
+    /// Workspaces in route-key order, each once.
+    pub workspaces: Vec<DiscoveredWorkspace>,
+    /// Present when more workspaces may follow; pass it as `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Body of `POST /auth/browser/api-key`: recover tenant access with an API
@@ -102,8 +315,24 @@ pub struct PasswordChangeRequest {
     pub new_password: SecretBearer,
 }
 
-/// Body of `POST /auth/browser/password/reset`: choose a new password with an
-/// operator-issued one-time reset code.
+/// Body of `POST /auth/browser/password/reset/request`: ask for a reset code
+/// to be mailed to the named User's verified recovery address.
+///
+/// Every admitted request gets the same answer whether or not the
+/// workspace, User or address exists, so the request names the account by
+/// workspace and username, never by email.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswordResetCodeRequest {
+    /// The tenant's route key.
+    pub tenant: TenantSlug,
+    /// The local username, canonicalized by the server.
+    pub username: String,
+}
+
+/// Body of `POST /auth/browser/password/reset`: choose a new password with a
+/// one-time reset code, operator-issued or mailed to a verified contact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -151,6 +380,8 @@ pub enum BrowserCredential {
     ApiKey,
     /// A Wyrd-owned local username and password signed the person in.
     Password,
+    /// A shared social provider, such as Google, signed the person in.
+    Social,
 }
 
 /// Safe metadata of one live tenant browser session.

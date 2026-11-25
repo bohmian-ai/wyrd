@@ -37,7 +37,7 @@ use wyrd_gateway::{
     MediaAnswer, ProviderAttempt, ProviderDispatch, ProviderSecret, ResponseBody, ResponseCapture,
 };
 use wyrd_runtime::{
-    Action, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, Resource, RoleRef,
+    Action, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, Resource,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -232,7 +232,6 @@ fn invoker(
             principal(n),
             PrincipalKind::User,
             tenant,
-            Vec::<RoleRef>::new(),
             PermissionSet::from_iter(permissions),
         ),
         request_id: RequestId::now_v7(),
@@ -4122,7 +4121,6 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
             principal(2),
             PrincipalKind::Service,
             tenant,
-            Vec::<RoleRef>::new(),
             PermissionSet::from_iter([open_access()]),
         )
         .with_card_access(

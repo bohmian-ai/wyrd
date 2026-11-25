@@ -505,7 +505,6 @@ mod pg_tests {
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::TenantAdmin,
             fixture.data_tenant_id(),
-            Vec::new(),
             permissions,
         );
         let principal = tenant.id;

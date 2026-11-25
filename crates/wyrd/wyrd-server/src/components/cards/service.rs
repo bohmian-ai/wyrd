@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::auth::{CardPermissionScope, PLATFORM_AUDIT_PRINCIPAL};
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
@@ -79,6 +79,7 @@ use wyrd_storage::service::{reconcile_upload, upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 use wyrd_types::json_schema_to_fieldspec;
 
+use crate::audit;
 use crate::bifrost::service::register_table;
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{
@@ -88,6 +89,7 @@ use crate::components::cards::resolve::{
     EffectiveSpecs, GroupSite, ResolvedRefs, ambiguous_source, bind_card_references,
     sibling_identities, site_subjects, source_binding, validate_and_collect_refs,
 };
+use crate::components::cards::routes::authorize_card_at;
 use crate::components::github::service::GithubConnections;
 use crate::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
@@ -245,7 +247,8 @@ pub async fn get_latest_card(
     .await
 }
 
-/// List versions in one card identity line, excluding deleted rows.
+/// List versions in one card identity line, excluding deleted rows and,
+/// for a scoped reader, every version outside `visible`.
 ///
 /// The line is the caller tenant's flat `kind`/`name`; the read runs in one
 /// tenant transaction that commits before the response is built.
@@ -260,15 +263,19 @@ pub async fn list_card_versions(
     kind: CardKind,
     name: CardName,
     include_prerelease: bool,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<ListVersionsResponse, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let versions = list_versions(&mut conn, kind, &name, include_prerelease).await?;
+    let versions = list_versions(&mut conn, kind, &name, include_prerelease, visible).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(ListVersionsResponse { versions })
 }
 
 /// List metadata-only Cards with deterministic tenant-scoped keyset pagination.
 ///
+/// `visible` limits a scoped reader to its granted families and exact
+/// versions inside the query, so pages and cursors never count a hidden
+/// Card.
 /// A `Deleted` status filter answers empty without a read. Otherwise one
 /// tenant transaction reads the page and commits before each row is projected
 /// through [`summary_from_row`].
@@ -284,6 +291,7 @@ pub async fn list_cards(
     state: &AppState,
     caller: &Caller,
     request: ListCardsRequest,
+    visible: Option<Vec<CardPermissionScope>>,
 ) -> Result<ListCardsResponse, WyrdError> {
     if request.status == Some(CardLifecycleStatus::Deleted) {
         return Ok(ListCardsResponse {
@@ -308,6 +316,7 @@ pub async fn list_cards(
         status: request.status.map(sql_status),
         filter: request.filter,
         include_prerelease: request.include_prerelease,
+        visible,
     };
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let page = query_cards(&mut conn, &query, cursor).await?;
@@ -321,7 +330,8 @@ pub async fn list_cards(
     Ok(ListCardsResponse { items, next_cursor })
 }
 
-/// Return the server-authoritative artifact inventory for one Card.
+/// Return the server-authoritative artifact inventory for one Card, which
+/// a scoped reader sees only when `visible` reaches it.
 ///
 /// # Errors
 /// Returns the registry not-found or unavailable errors of the Card read and
@@ -330,13 +340,16 @@ pub async fn list_card_artifacts(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<ArtifactInventoryResponse, WyrdError> {
-    let manifests = card_manifests(state, caller, card_uid).await?;
+    let manifests = card_manifests(state, caller, card_uid, visible).await?;
     let artifacts = card_files(&manifests)?.into_values().collect();
     Ok(ArtifactInventoryResponse { artifacts })
 }
 
 /// Resolve one completed file of a Card from its manifest.
+///
+/// A Card outside a scoped reader's `visible` objects is not found.
 ///
 /// Card listing, downloads, verification evidence, and baseline fitting
 /// share this one bounded lookup after their own Card authorization.
@@ -351,8 +364,9 @@ pub async fn card_file(
     caller: &Caller,
     card_uid: &CardUid,
     relative_path: &str,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<StoredArtifactEntry, WyrdError> {
-    let manifests = card_manifests(state, caller, card_uid).await?;
+    let manifests = card_manifests(state, caller, card_uid, visible).await?;
     card_files(&manifests)?
         .remove(relative_path)
         .ok_or_else(|| {
@@ -375,12 +389,51 @@ async fn card_manifests(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<Vec<CardManifestCompletionRow>, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let _ = sql_get_card_by_uid(&mut conn, card_uid).await?;
+    let row = sql_get_card_by_uid(&mut conn, card_uid).await?;
+    require_object(
+        visible,
+        &CardPermissionScope::version(row.kind, row.name, card_uid.clone()),
+    )?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(manifests)
+}
+
+/// Refuse the Card `required` names as not found when it is outside a scoped
+/// reader's `objects`; `None` reaches every Card.
+///
+/// # Errors
+/// Returns [`WyrdError::RegistryCardNotFound`] for a hidden Card.
+pub(crate) fn require_object(
+    objects: Option<&[CardPermissionScope]>,
+    required: &CardPermissionScope,
+) -> Result<(), WyrdError> {
+    match objects {
+        Some(objects) if !objects.iter().any(|scope| scope.covers(required)) => {
+            Err(no_visible_card())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The one answer every Card read gives when it finds no Card its reader
+/// may see: a hidden Card, an absent one, a UID of another kind and a UID
+/// beside another identity all read alike.
+pub(crate) fn no_visible_card() -> WyrdError {
+    WyrdError::registry_card_not_found("no such Card is visible to this principal")
+}
+
+/// Rewrite any not-found `error` of a Card read to [`no_visible_card`], so a
+/// reader cannot tell a hidden Card from an absent one. Every other error,
+/// an unavailable registry included, passes through unchanged.
+pub(crate) fn conceal_absence(error: WyrdError) -> WyrdError {
+    match error {
+        WyrdError::RegistryCardNotFound { .. } => no_visible_card(),
+        other => other,
+    }
 }
 
 /// A Card's completed files by Card-relative path.
@@ -421,7 +474,8 @@ fn card_files(manifests: &[CardManifestCompletionRow]) -> Result<CardFiles, Wyrd
 /// registry row and completed files, then overlays server-derived state: inbound
 /// relationships and `status`, whose `verification.binding_ids` lists the
 /// owner's projected bindings and is omitted when the Card owns none, and
-/// whose `repository` is a Repository's selection view.
+/// whose `prompt` carries a Prompt Card's compiled variables and whose
+/// `repository` is a Repository's selection view.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active,
@@ -477,11 +531,16 @@ async fn hydrate_card(
             alias: None,
         })
         .collect();
+    let prompt = match &card.spec {
+        Spec::Prompt(spec) => Some(spec.status()),
+        _ => None,
+    };
     card.status = Some(Status {
         phase: row.status.as_db_str().to_owned(),
         message: None,
         updated_at: Some(row.updated_at),
         verification,
+        prompt,
         repository,
     });
     Ok(GetCardResponse {
@@ -747,10 +806,13 @@ pub async fn declare_card(
 /// name already established for that repository id, or on first
 /// registration by the name inferred from the connection's `owner/name`, so
 /// a provider rename keeps the family. An explicit name must equal the
-/// established one, and no other repository may own the name.
+/// established one, and no other repository may own the name. For a caller
+/// without tenant-wide `cards:write`, a settled inferred name is then
+/// authorized on its family before anything is written.
 ///
 /// # Errors
-/// Returns the refusals of [`GithubConnections::verify_repository`],
+/// Returns the public permission error for an uncovered inferred family,
+/// the refusals of [`GithubConnections::verify_repository`],
 /// `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` when the name and the
 /// repository identity disagree with an established family,
 /// `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an undecodable spec, and
@@ -797,6 +859,14 @@ async fn resolve_repositories(
                 .unwrap_or_else(|| submission.metadata.name.clone()),
             (_, false) => submission.metadata.name.clone(),
         };
+        if infer_name
+            && !caller
+                .principal
+                .effective_permissions
+                .contains(&Permission::card_write())
+        {
+            authorize_family_write(state, caller, &CardKind::Repository, &name)?;
+        }
         admit_repository_family(&mut conn, &name, &repository_id).await?;
         conn.commit().await.map_err(registry_db_error)?;
         spec.host = Some(host);
@@ -925,6 +995,68 @@ fn declared_tables(submissions: &[CardSubmission]) -> Result<Vec<RegisterTableRe
         }
     }
     Ok(tables)
+}
+
+/// Audit operation of a Card declaration's family decisions.
+const DECLARE: &str = "card.declaration.create";
+
+/// Authorize and audit `cards:write` on the family of every submitted Card,
+/// before the idempotency key is read or anything is resolved or persisted.
+///
+/// A caller holding `cards:write` tenant-wide is allowed, and one holding it
+/// at no scope refused, by one tenant-wide decision. Otherwise each distinct
+/// family is decided separately, so a family or exact-version
+/// editor can declare only the graph members its grants cover and one
+/// uncovered member refuses the whole graph. A Repository whose name the
+/// server infers is decided by [`resolve_repositories`] once the name is
+/// settled.
+///
+/// # Errors
+/// Returns the public permission error for the first uncovered family.
+pub(crate) fn authorize_declared_families(
+    state: &AppState,
+    caller: &Caller,
+    request: &DeclareCardRequest,
+) -> Result<(), WyrdError> {
+    let required = Permission::card_write();
+    let held = &caller.principal.effective_permissions;
+    if held.contains(&required) || !held.covers_operation(&required.resource, &required.action) {
+        return audit::authorize(state, caller, &required, DECLARE, "cards");
+    }
+    let inferred = request
+        .repository
+        .as_ref()
+        .is_some_and(|hint| hint.infer_name);
+    let mut decided: Vec<(&CardKind, &CardName)> = Vec::new();
+    for submission in &request.submissions {
+        let family = (&submission.kind, &submission.metadata.name);
+        if (inferred && submission.kind == CardKind::Repository) || decided.contains(&family) {
+            continue;
+        }
+        decided.push(family);
+        authorize_family_write(state, caller, &submission.kind, &submission.metadata.name)?;
+    }
+    Ok(())
+}
+
+/// Decide and audit `cards:write` on Card family `kind`/`name`.
+///
+/// # Errors
+/// Returns the public permission error when no grant covers the family.
+fn authorize_family_write(
+    state: &AppState,
+    caller: &Caller,
+    kind: &CardKind,
+    name: &CardName,
+) -> Result<(), WyrdError> {
+    authorize_card_at(
+        state,
+        caller,
+        &Permission::card_write(),
+        DECLARE,
+        &format!("card:{}/{name}", kind.wire_name()),
+        CardPermissionScope::family(kind.clone(), name.clone()),
+    )
 }
 
 /// Whether any submitted verification binding names an `on_failure` Operator.
@@ -2571,7 +2703,6 @@ pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
             PLATFORM_AUDIT_PRINCIPAL,
             PrincipalKind::User,
             tenant_id,
-            Vec::new(),
             PermissionSet::new(),
         ),
         request_id: RequestId::now_v7(),
@@ -3617,6 +3748,7 @@ mod tests {
             message: None,
             updated_at: None,
             verification: None,
+            prompt: None,
             repository: None,
         });
         card.relationships.inbound = vec!["different-live-edge".to_owned()];
@@ -3667,6 +3799,20 @@ mod tests {
 
         assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
         assert!(error.to_string().contains("artifact hash"));
+    }
+
+    /// Every not-found of a Card read becomes the hidden Card's answer; an
+    /// unavailable registry stays what it is.
+    #[test]
+    fn a_card_read_conceals_absence_and_keeps_operational_errors() {
+        let absent = super::conceal_absence(super::WyrdError::registry_card_not_found(
+            "no card with uid x",
+        ));
+        assert_eq!(absent.to_string(), super::no_visible_card().to_string());
+
+        let down = super::conceal_absence(super::WyrdError::registry_unavailable("pool closed"));
+        assert_eq!(down.code(), "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE");
+        assert!(down.to_string().contains("pool closed"));
     }
 }
 

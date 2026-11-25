@@ -11,10 +11,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { NativeWyrdTestServer } from "@wyrd/testing";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import { Cards, type VerificationResult, type VerifierInput, WyrdClient, WyrdState } from "wyrd-ai";
 
 import { declared, fixture, runtimeAccount, serverTest } from "../support/server.js";
+
+vi.setConfig({ testTimeout: 120_000 });
 
 /** The direct deadline every story here runs under. */
 const VERIFY_TIMEOUT_MS = 2_000;
@@ -27,6 +29,9 @@ const REQUEST_BYTES = 256 << 10;
 
 /** How long a story waits for a queued execution or a waiter to appear. */
 const WAIT_MS = 60_000;
+
+/** How long a queued execution is watched staying unfinished under held memory. */
+const DEFERRED_MS = 5_000;
 
 /** A fresh deployment hosting Python Verifiers under a short deadline, with `capacity-desk` hydrated as its own key. */
 const test = serverTest({ verificationRuntime: true, verifyTimeoutMs: VERIFY_TIMEOUT_MS, perTest: true }).extend<{
@@ -74,6 +79,10 @@ test("submit_under_hosted_memory_is_accepted_then_passes", async ({ server, stat
   if (accepted.kind !== "queued") {
     throw new Error("Run evidence queues an execution");
   }
+  // A claim refused capacity returns the execution to the queue: it neither completes nor fails.
+  await expect(accepted.execution.wait({ timeoutMs: DEFERRED_MS })).rejects.toMatchObject({
+    code: "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT",
+  });
   held.release();
   expect((await accepted.execution.wait({ timeoutMs: WAIT_MS })).outcome.verdict).toBe("passed");
 });

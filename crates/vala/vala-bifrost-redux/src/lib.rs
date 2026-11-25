@@ -104,7 +104,6 @@ pub(crate) mod test_support {
             wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
             wyrd_runtime::PrincipalKind::Service,
             tenant(),
-            Vec::new(),
             permissions,
         )
         .with_card_access(wyrd_spec::auth::CardAccess::Scoped { cards }, root)

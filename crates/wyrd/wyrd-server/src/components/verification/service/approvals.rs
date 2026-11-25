@@ -173,7 +173,7 @@ impl VerificationControl<'_> {
         let accepted = custody
             .accept(
                 caller.attribution(),
-                (execution_id, &verifier),
+                (execution_id, &verifier, &subject),
                 &receipt,
                 deadline,
             )
@@ -270,7 +270,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 PermissionSet::default(),
             ),
             request_id: wyrd_spec::request_id::RequestId::now_v7(),

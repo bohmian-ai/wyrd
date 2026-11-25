@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use wyrd_testing::principal::within_propagation;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Run the shipped CLI with one named credential and a scrubbed ambient
@@ -161,9 +162,10 @@ pub(crate) async fn machine_token(server: &WyrdTestServer, bootstrap: &Bootstrap
 /// An administrator revokes a principal through the CLI, against a real server.
 ///
 /// Revocation suspends the principal: its API key can no longer mint a token,
-/// while the token it already holds is a five-minute snapshot that keeps
-/// working until expiry. The pre-revocation probe proves the CLI really
-/// authenticated, so the refused exchange is the revocation's doing.
+/// and the token it already holds spends current authority, so it is refused
+/// once the change propagates, within the five-second bound. The
+/// pre-revocation probe proves the CLI really authenticated, so both refusals
+/// are the revocation's doing.
 #[tokio::test]
 async fn principal_revoke_cli_journey() {
     let (server, base_url, shutdown, serve_handle) = start_served("principal revoke").await;
@@ -214,9 +216,13 @@ async fn principal_revoke_cli_journey() {
         "the revoked principal cannot mint another token"
     );
     assert_eq!(
-        v1_status(&server, &target_token).await,
-        StatusCode::OK,
-        "a token minted before revocation is a snapshot that lapses at expiry"
+        within_propagation(&StatusCode::UNAUTHORIZED, || v1_status(
+            &server,
+            &target_token
+        ))
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a token minted before revocation is refused within the propagation bound"
     );
 
     stop_served(server, shutdown, serve_handle).await;
@@ -347,7 +353,11 @@ async fn stable_account_context_cli_journey() {
     // family's runtime account. A credential administrator cannot do the latter.
     let free = principal_id(&succeeded(
         &run(
-            &[&create[..], &["--name", "cli-free", "--role", "viewer"]].concat(),
+            &[
+                &create[..],
+                &["--name", "cli-free", "--grant", "viewer:all"],
+            ]
+            .concat(),
             &admin_token,
         )
         .await,
@@ -527,8 +537,8 @@ async fn principal_user_cli_journey() {
                     "create",
                     "--username",
                     "development",
-                    "--role",
-                    "admin",
+                    "--grant",
+                    "admin:all",
                     "--server",
                     &base_url,
                 ])
@@ -541,7 +551,7 @@ async fn principal_user_cli_journey() {
                 .expect("wyrd command runs");
             std::io::Write::write_all(
                 &mut child.stdin.take().expect("stdin is piped"),
-                b"development\n",
+                b"quartz heron 150\n",
             )
             .expect("password is written");
             child.wait_with_output().expect("wyrd command exits")
@@ -559,7 +569,8 @@ async fn principal_user_cli_journey() {
     );
     assert!(stdout.contains("username: development"), "{stdout}");
     assert!(
-        !stdout.contains("development\ndevelopment"),
+        !stdout.contains("quartz heron 150")
+            && !String::from_utf8_lossy(&created.stderr).contains("quartz heron 150"),
         "the password is never printed"
     );
 
@@ -569,8 +580,12 @@ async fn principal_user_cli_journey() {
                 "principal".to_owned(),
                 "user".to_owned(),
                 "invite".to_owned(),
-                "--role".to_owned(),
-                "editor".to_owned(),
+                "--recipient".to_owned(),
+                "ada@example.test".to_owned(),
+                "--recipient".to_owned(),
+                "grace@example.test".to_owned(),
+                "--grant".to_owned(),
+                "editor:all".to_owned(),
                 "--server".to_owned(),
                 base_url.clone(),
             ],
@@ -584,12 +599,19 @@ async fn principal_user_cli_journey() {
         "{}",
         String::from_utf8_lossy(&invited.stderr)
     );
-    let code = stdout
+    let links: Vec<&str> = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("invitation_code: "))
-        .expect("the code is printed");
-    assert_eq!(code.len(), 43);
-    assert!(stdout.contains("/signup"), "{stdout}");
+        .filter_map(|line| line.strip_prefix("invitation_link: "))
+        .collect();
+    assert_eq!(links.len(), 2, "one link per recipient: {stdout}");
+    assert!(links[0] != links[1], "{stdout}");
+    for link in links {
+        let (page, code) = link.split_once("#invitation=").expect("code in fragment");
+        assert!(page.ends_with("/signup"), "{link}");
+        assert_eq!(code.len(), 43);
+    }
+    assert!(stdout.contains("recipient: grace@example.test"), "{stdout}");
+    assert!(stdout.contains("delivery: not_emailed"), "{stdout}");
 
     for refused in [
         create(viewer_token.clone())

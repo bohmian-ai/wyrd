@@ -74,7 +74,7 @@ Declare and pull the Service, then create the account its schedule runs as:
 ```bash
 wyrd declare checkout-alerts.yaml
 wyrd pull --kind Service --name checkout-alerts --version 1.0.0 --output-dir .wyrd-bundle
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout-alerts
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout-alerts
 export CHECKOUT_KEY=<credential>
 ```
 

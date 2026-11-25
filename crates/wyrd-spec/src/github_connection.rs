@@ -4,19 +4,23 @@
 //! under `/v1/integrations/github`. [`GithubConnectResponse`] begins a one-use
 //! connection transaction, GitHub's setup and OAuth callback redirects
 //! ([`GithubSetupQuery`], [`GithubCallbackQuery`]) complete it, and
-//! [`GithubConnectionView`] is the only read shape. No request carries a
-//! tenant id, App key or provider host, and no view carries a code, token,
-//! secret or signing material.
+//! [`GithubConnectionView`] is the only read shape. No connection request
+//! carries a tenant id, App key or provider host, and no view carries a
+//! code, token, secret or signing material.
+//! [`GithubPullRequestReviewRequest`] requests a fresh review of one
+//! connected pull request.
 //!
 //! [`GithubConnectResponse`]: crate::github_connection::GithubConnectResponse
 //! [`GithubSetupQuery`]: crate::github_connection::GithubSetupQuery
 //! [`GithubCallbackQuery`]: crate::github_connection::GithubCallbackQuery
 //! [`GithubConnectionView`]: crate::github_connection::GithubConnectionView
+//! [`GithubPullRequestReviewRequest`]: crate::github_connection::GithubPullRequestReviewRequest
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AbsoluteUrl;
+use crate::ids::{ExecutionId, RepositoryId};
 
 /// `POST /v1/integrations/github/connect` body.
 ///
@@ -112,6 +116,43 @@ pub struct GithubConnectionView {
     /// Last change to the association or its access; `None` when not
     /// connected.
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /v1/integrations/github/pull-requests/reviews` body: request a
+/// fresh review of one pull request by its selected Repository's whole
+/// `pull_request` binding set, under the `Idempotency-Key` header.
+///
+/// The tenant and caller come from authentication. The server resolves the
+/// connected repository, the PR's current open source, the selected policy,
+/// its members and their execution authority; a caller never supplies them.
+/// A distinct key admits a new generation even at an unchanged head, and a
+/// retry of the same key for the same pull request returns that generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GithubPullRequestReviewRequest {
+    /// The configured GitHub web host, such as `github.com`, as the
+    /// connection view reports it.
+    pub host: String,
+    /// Stable GitHub id of the pull request's base repository.
+    pub repository_id: RepositoryId,
+    /// Pull request number in that repository.
+    pub number: u64,
+}
+
+/// `POST /v1/integrations/github/pull-requests/reviews` response: the
+/// accepted generation and every member execution, refused members
+/// included, once each member is durably admitted or settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GithubPullRequestReviewResponse {
+    /// The admission every member shares, as each execution's
+    /// `pull_request.generation` records it.
+    pub generation: uuid::Uuid,
+    /// Every member execution in binding order, as each execution's
+    /// `pull_request.members` records it.
+    pub executions: Vec<ExecutionId>,
 }
 
 /// `GET /v1/integrations/github/setup` query: GitHub's redirect after an

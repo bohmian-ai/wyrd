@@ -76,6 +76,21 @@ test('public browser-session operations carry the Wyrd session cookies and nothi
   expect(await new Response(calls[1].init.body).text()).toBe('{"tenant":"acme"}');
 });
 
+test('a CLI login approval carries the Wyrd session cookies so a signed-in person approves without a provider', async () => {
+  const { calls, fetcher } = upstream(() => new Response('ok'));
+  const device = new URL('http://ui.example/auth/device');
+  await forwardAuth(
+    new Request(device, {
+      method: 'POST',
+      headers: { cookie: 'wyrd_session_acme=a.1; theme=dark', origin: 'http://ui.example', 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'tenant=acme&user_code=ABCD-EFGH&decision=approve'
+    }),
+    device,
+    fetcher
+  );
+  expect(new Headers(calls[0].init.headers).get('cookie')).toBe('wyrd_session_acme=a.1');
+});
+
 test('auth forwarding returns redirects, cookies, and errors unchanged without following', async () => {
   const redirect = upstream(() => {
     const headers = new Headers({ location: 'https://idp.example/authorize?state=s' });

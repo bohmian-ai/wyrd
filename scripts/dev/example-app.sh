@@ -2,22 +2,24 @@
 # Prepare and run the canonical wyrd-example-py application for `dev:full`.
 #
 #   example-app.sh prepare   pinned checkout + this checkout's production wheel
-#   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy
+#   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy, the Cards board's fixtures,
+#                            the reusable code-review Verifier
+#   example-app.sh register  wait for the GitHub connection to cover the demo repository, then
+#                            declare its Repository bound to that Verifier (scripts/dev/review_repository.py)
 #   example-app.sh serve     the API on 127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}
 #   example-app.sh batch ARGS   one bounded workload batch (scripts/batch.py)
 #   example-app.sh test ARGS    the app's pytest suite with the testing-enabled wheel,
 #                               in an environment kept apart from the development one
 #
-# The checkout at target/dev/wyrd-example-py is the pinned upstream commit
-# (wyrd-example-py's dev-workload branch). A checkout holding uncommitted
-# changes is refused, never overwritten. The wheel is built from this repository
+# The checkout at target/dev/wyrd-example-py is the pinned upstream commit.
+# A checkout holding uncommitted changes is refused, never overwritten. The wheel is built from this repository
 # without the testing feature, is the only file in the app's vendor index, and
 # the installed native module must match its digest.
 set -Eeuo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo=https://github.com/bohmian-ai/wyrd-example-py
-readonly base=ee83b2559fb66a89b673786d3bcbe7e65cd26c17
+readonly base=3222cf1359f4a2e43081127e6d8b1089eaeebd67
 readonly app="$root/target/dev/wyrd-example-py"
 readonly port=${WYRD_EXAMPLE_PORT:-8000}
 
@@ -61,7 +63,7 @@ wheel() {
     && uv pip install --quiet --no-deps --reinstall "$built")
   local installed
   installed=$(cd "$app" && uv run --no-sync python -c 'import wyrd._wyrd as m; print(m.__file__)')
-  if [[ $(unzip -p "$built" "wyrd/$(basename "$installed")" | sha256sum | cut -d' ' -f1) != $(sha256sum "$installed" | cut -d' ' -f1) ]]; then
+  if [[ $(unzip -p "$built" "wyrd/$(basename "$installed")" | shasum -a 256 | cut -d' ' -f1) != $(shasum -a 256 "$installed" | cut -d' ' -f1) ]]; then
     echo "the app imports $installed, not the native module of $built" >&2
     exit 1
   fi
@@ -71,7 +73,7 @@ wheel() {
   fi
   printf 'wyrd-example-py %s, source tree %s, wheel %s (sha256 %s)\n' \
     "$base" "$(worktree_tree)" \
-    "$(basename "$built")" "$(sha256sum "$built" | cut -c1-12)"
+    "$(basename "$built")" "$(shasum -a 256 "$built" | cut -c1-12)"
 }
 
 # Point the tenant's `openai` deployment at MockServer with a placeholder key,
@@ -83,6 +85,17 @@ setup() {
  "deployments": [{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}]}
 JSON
   uv run --no-sync python -m scripts.deploy
+  # The pull request reviewer `register` binds once GitHub is connected.
+  uv run --no-sync wyrd declare review/code-review.yaml >/dev/null
+  # The Cards board's representative registry: a Model with a file, two
+  # versions of one Prompt, the Agent using the newer one, and a Service
+  # bound to multi-step Verifiers.
+  local card
+  for card in declare_and_pull/support-model.yaml ui_cards/support-reply-1.0.0.yaml \
+    ui_cards/support-reply-1.1.0.yaml ui_cards/reply-agent.yaml \
+    verifier_building_blocks/policy-desk.yaml; do
+    uv run --no-sync wyrd declare "$root/fixtures/cards/$card" >/dev/null
+  done
 }
 
 # The app's tests start a WyrdTestServer, which only the testing wheel has.
@@ -105,6 +118,9 @@ case ${1:-} in
     cd "$app"
     exec uv run --no-sync python -m pytest "$@" ;;
   setup) setup ;;
+  register)
+    cd "$app"
+    exec uv run --no-sync python "$root/scripts/dev/review_repository.py" ;;
   serve)
     cd "$app"
     # Export metrics every 5 s instead of every 60 s so a short batch sees them.
@@ -114,5 +130,5 @@ case ${1:-} in
     shift
     cd "$app"
     exec uv run --no-sync python -m scripts.batch --base-url "http://127.0.0.1:$port" "$@" ;;
-  *) echo "usage: $0 prepare|setup|serve|batch [--requests N --concurrency N]|test [PYTEST ARGS]" >&2; exit 2 ;;
+  *) echo "usage: $0 prepare|setup|register|serve|batch [--requests N --concurrency N]|test [PYTEST ARGS]" >&2; exit 2 ;;
 esac

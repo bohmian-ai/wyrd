@@ -19,6 +19,7 @@
 //! the runs Wyrd starts itself.
 
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, ServedSubject};
 use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_auth::issuance::{IssuanceError, TenantTokenIssuer};
@@ -58,8 +59,12 @@ pub enum SystemReadAuthorityError {
 ///
 /// The principal is credentialless and role-free, carries an empty Card
 /// scope, and holds one `bifrost_query:read` grant per input table the tenant
-/// has registered, scoped to that table's UID. It never carries a general
-/// query grant or any write scope, and it is never issued as a token.
+/// has registered, scoped to that table's UID. When a table is a managed
+/// `bifrost.verification` table it also holds tenant-wide execution read,
+/// the parent visibility those rows require; a caller-facing read checks the
+/// caller's own access to the execution's parent before this read. It never
+/// carries a general query grant or any write scope, and it is never issued
+/// as a token.
 #[derive(Debug, Clone)]
 pub struct SystemReadAuthority {
     /// The SYSTEM principal's authorized query context for one tenant.
@@ -111,11 +116,18 @@ impl SystemReadAuthority {
                 })),
             });
         }
+        // Managed verification rows are visible only through their trusted
+        // parent; a fixed SYSTEM read of them reads every provable parent.
+        if tables
+            .iter()
+            .any(|table| table.namespace == BifrostNamespace::Verification)
+        {
+            grants.push(Permission::executions_read_any());
+        }
         let principal = Principal::new(
             principal,
             PrincipalKind::System,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter(grants),
         );
         let context = AuthorizedQueryContext::try_new(
@@ -324,10 +336,12 @@ impl BackgroundAuthority {
         resolved: Result<wyrd_auth_verify::VerifiedToken, IssuanceError>,
     ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
         match resolved {
-            Ok(verified) => Ok(Ok(ExecutionAuthority::background(
-                AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
-                system,
-            ))),
+            Ok(verified) => Ok(AcceptedAuthority::new(
+                &verified.principal,
+                &verified.delegation_chain,
+            )
+            .map(|accepted| ExecutionAuthority::background(accepted, system))
+            .map_err(|error| AuthorityRefusal::Rejected(WyrdError::from(error)))),
             Err(IssuanceError::Store(error)) => Err(error),
             Err(IssuanceError::Database(error)) => Err(SqlError::Query(error)),
             Err(
@@ -373,7 +387,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 kind,
                 tenant,
-                Vec::new(),
                 PermissionSet::default(),
             )
         };
@@ -390,7 +403,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::System,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter([grant]),
         );
         let context = AuthorizedQueryContext::try_new(
@@ -409,7 +421,7 @@ mod tests {
         let chain = vec![DelegationStep {
             principal: PrincipalRef::from_principal(&b),
         }];
-        let accepted = AcceptedAuthority::new(&a, &chain);
+        let accepted = AcceptedAuthority::new(&a, &chain).expect("representable");
 
         let served = SystemReadAuthority { context }
             .serving(&accepted)

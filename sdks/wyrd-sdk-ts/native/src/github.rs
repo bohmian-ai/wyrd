@@ -7,7 +7,7 @@
 use napi::Env;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
-use wyrd_client::github::GithubConnection;
+use wyrd_client::github::{GithubConnection, GithubPullRequestReviewRequest, RepositoryId};
 
 use crate::client::NativeWyrdClient;
 use crate::{NativeLifecycleResult, NativeWyrdError};
@@ -114,6 +114,48 @@ impl NativeGithubConnection {
         let connection = self.connection.clone();
         crate::trace::spawn(env, async move {
             NativeLifecycleResult::outcome(connection.disconnect().await)
+        })
+    }
+
+    /// Requests a fresh review of one connected pull request under
+    /// `idempotency_key` and returns the accepted generation and members.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; an
+    /// invalid repository id or a server refusal is returned in the result.
+    #[napi]
+    pub fn review_pull_request<'env>(
+        &self,
+        env: &'env Env,
+        host: String,
+        repository_id: String,
+        number: u32,
+        idempotency_key: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let connection = self.connection.clone();
+        crate::trace::spawn(env, async move {
+            let repository_id = match RepositoryId::new(repository_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    return NativeLifecycleResult::outcome::<()>(Err(
+                        wyrd_client::github::WyrdError::Validation {
+                            message: format!("repository_id is invalid: {error}"),
+                            details: serde_json::json!({ "field": "repository_id" }),
+                        },
+                    ));
+                }
+            };
+            let request = GithubPullRequestReviewRequest {
+                host,
+                repository_id,
+                number: u64::from(number),
+            };
+            NativeLifecycleResult::outcome(
+                connection
+                    .review_pull_request(&request, &idempotency_key)
+                    .await,
+            )
         })
     }
 }

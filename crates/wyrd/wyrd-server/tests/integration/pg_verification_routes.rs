@@ -25,9 +25,10 @@ use wyrd_runtime::Permission;
 use wyrd_server::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
 };
-use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex, TokenAudience};
+use wyrd_spec::auth::{Attribution, PermissionScope, PrincipalId, Sha256Hex, TokenAudience};
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
 use wyrd_spec::reference::CardRef;
+use wyrd_sql::queries::cards::card_scopes;
 use wyrd_testing::verification::{Published, VerificationFixture};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -341,6 +342,35 @@ async fn user(server: &WyrdTestServer, name: &str, roles: &[&str]) -> (Uuid, Str
     }
 }
 
+/// `id` as a bound account, for [`bind_at`].
+fn as_user(id: Uuid, jwt: &str) -> Bootstrap {
+    Bootstrap::User {
+        id: PrincipalId::new(id),
+        jwt: jwt.to_owned(),
+    }
+}
+
+/// Bind `role` to `principal` at the exact registered scope of `card`.
+///
+/// # Panics
+/// Panics when `card` is not registered or the binding fails.
+async fn bind_at(server: &WyrdTestServer, principal: &Bootstrap, role: &str, card: &CardUid) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let scope = card_scopes(&mut conn, std::slice::from_ref(card))
+        .await
+        .expect("the Card scope reads")
+        .remove(card)
+        .expect("the Card is registered");
+    conn.commit().await.expect("read commits");
+    server
+        .grant_role_at(principal, role, &PermissionScope::Card(scope))
+        .await
+        .expect("the role binds");
+}
+
 /// Exchange a bootstrapped machine principal's API key for an access token
 /// rooted at the Card it acts as.
 ///
@@ -538,7 +568,11 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 ///
 /// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
 /// unwritten, and so unacknowledged, and hold the whole reserved share (two
-/// of three slots) deterministically.
+/// of three slots) deterministically. The keyed request waits until a probe
+/// reservation is refused, which is when both fills hold their slots;
+/// `pending()` cannot say so, because it also counts each fill's unreserved
+/// permission audit. A probe is taken and returned with no await between, so
+/// on this single-threaded runtime it never holds a slot a fill needs.
 ///
 /// Both counts are ordered after the requests before them through
 /// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
@@ -569,7 +603,7 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
     };
     let refusal = async {
         stall.wait_entered().await;
-        while outbox.pending() < 2 {
+        while outbox.reserve(1).is_ok() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let refused = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
@@ -719,37 +753,25 @@ async fn enqueue_is_authorized_by_rbac_alone() {
     let fixture = Fixture::seed(&server).await;
     let body = fixture.request(&fixture.assertion, json!(1));
     server
-        .seed_role(
-            "vq_exact_verifier",
-            &[
-                Permission::card_read(),
-                Permission::verifier_run(fixture.assertion.clone()),
-                Permission::verifier_read(fixture.assertion.clone()),
-            ],
-        )
+        .seed_role("vq_cards", &[Permission::card_read()])
         .await
         .expect("role seeds");
     server
-        .seed_role(
-            "vq_other_verifier",
-            &[
-                Permission::card_read(),
-                Permission::verifier_run(fixture.drift.clone()),
-                Permission::verifier_read(fixture.drift.clone()),
-            ],
-        )
+        .seed_role("vq_run", &[Permission::verifier_run_any()])
         .await
         .expect("role seeds");
 
     let owner = server
-        .credential_registered_service(&fixture.subject_ref(), &["vq_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &["vq_cards"])
         .await
         .expect("subject Service is credentialed");
+    bind_at(&server, &owner, "vq_run", &fixture.assertion).await;
     let owner_jwt = machine_jwt(&server, &owner).await;
     let foreign = server
-        .bootstrap_service("vq-foreign-service", &["vq_exact_verifier"])
+        .bootstrap_service("vq-foreign-service", &["vq_cards"])
         .await
         .expect("unrelated Card-bound Service bootstraps");
+    bind_at(&server, &foreign, "vq_run", &fixture.assertion).await;
     let foreign_jwt = machine_jwt(&server, &foreign).await;
     let actor = server
         .bootstrap_service("vq-editor-actor", &["editor"])
@@ -780,9 +802,10 @@ async fn enqueue_is_authorized_by_rbac_alone() {
     );
 
     let other = server
-        .bootstrap_service("vq-other-verifier", &["vq_other_verifier"])
+        .bootstrap_service("vq-other-verifier", &["vq_cards"])
         .await
         .expect("other-Verifier Service bootstraps");
+    bind_at(&server, &other, "vq_run", &fixture.drift).await;
     let (status, problem) =
         enqueue(&server, &machine_jwt(&server, &other).await, &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
@@ -1361,16 +1384,15 @@ async fn file_upload_authority_and_validation_are_preserved() {
         .await
         .expect("document Verifier registers");
     server
-        .seed_role(
-            "ve_exact_verifier",
-            &[
-                Permission::card_read(),
-                Permission::verifier_run(document.clone()),
-            ],
-        )
+        .seed_role("ve_cards", &[Permission::card_read()])
         .await
         .expect("role seeds");
-    let (exact, exact_jwt) = user(&server, "ve-exact", &["ve_exact_verifier"]).await;
+    server
+        .seed_role("ve_run", &[Permission::verifier_run_any()])
+        .await
+        .expect("role seeds");
+    let (exact, exact_jwt) = user(&server, "ve-exact", &["ve_cards"]).await;
+    bind_at(&server, &as_user(exact, &exact_jwt), "ve_run", &document).await;
     let (_, editor_jwt) = user(&server, "ve-editor", &["editor"]).await;
     let code = |problem: &Value| problem["code"].as_str().map(str::to_owned);
 
@@ -1599,7 +1621,7 @@ async fn file_upload_authority_and_validation_are_preserved() {
 }
 
 /// A binding status read authorizes and audits `cards:read` and an execution
-/// status read `verifier:read`: a viewer is allowed and stages one allowed
+/// status read `executions:read` on its trusted parent: a viewer is allowed and stages one allowed
 /// decision per read, while a principal with no role is refused with the
 /// stable RBAC code and stages one denied decision per read, before any
 /// lookup.
@@ -1640,7 +1662,7 @@ async fn status_reads_audit_their_decisions() {
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", reader).await,
-        decision("verifier:read", "allowed")
+        decision("executions:read", "allowed")
     );
 
     let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
@@ -1661,7 +1683,7 @@ async fn status_reads_audit_their_decisions() {
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", outsider).await,
-        decision("verifier:read", "denied")
+        decision("executions:read", "denied")
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1925,18 +1947,44 @@ async fn direct_execution_refusals_are_stable() {
         decisions(&server, "verification.execute", reader).await,
         vec![run_decision("denied")]
     );
-    for (role, permission) in [
-        ("vx_operators_only", Permission::operator_invoke()),
+    // A caller without run authority learns nothing about a target it names:
+    // an unregistered one is refused exactly as a registered one is.
+    let (status, problem) = execute(
+        &server,
+        &reader_jwt,
+        fixture.request(&unregistered, json!(1)).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        decisions(&server, "verification.execute", reader).await,
+        vec![run_decision("denied"), run_decision("denied")]
+    );
+    server
+        .seed_role("vx_cards", &[Permission::card_read()])
+        .await
+        .expect("role seeds");
+    for (role, permission, card) in [
+        ("vx_operators_only", Permission::operator_invoke(), None),
         (
             "vx_other_verifier",
-            Permission::verifier_run(fixture.drift.clone()),
+            Permission::verifier_run_any(),
+            Some(&fixture.drift),
         ),
     ] {
         server
-            .seed_role(role, &[Permission::card_read(), permission])
+            .seed_role(role, &[permission])
             .await
             .expect("role seeds");
-        let (denied, denied_jwt) = user(&server, &format!("{role}-user"), &[role]).await;
+        let (denied, denied_jwt) = match card {
+            None => user(&server, &format!("{role}-user"), &["vx_cards", role]).await,
+            Some(card) => {
+                let (id, jwt) = user(&server, &format!("{role}-user"), &["vx_cards"]).await;
+                bind_at(&server, &as_user(id, &jwt), role, card).await;
+                (id, jwt)
+            }
+        };
         let (status, problem) = execute(&server, &denied_jwt, allowed.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {problem}");
         assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
@@ -1947,16 +1995,14 @@ async fn direct_execution_refusals_are_stable() {
         );
     }
     server
-        .seed_role(
-            "vx_exact_verifier",
-            &[Permission::verifier_run(fixture.assertion.clone())],
-        )
+        .seed_role("vx_exact_verifier", &[Permission::verifier_run_any()])
         .await
         .expect("role seeds");
     let machine = server
-        .credential_registered_service(&fixture.subject_ref(), &["vx_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &[])
         .await
         .expect("subject Service is credentialed");
+    bind_at(&server, &machine, "vx_exact_verifier", &fixture.assertion).await;
     let machine_token = machine_jwt(&server, &machine).await;
     let (status, judged) = execute(&server, &machine_token, allowed).await;
     assert_eq!(status, StatusCode::OK, "{judged}");
@@ -2653,13 +2699,14 @@ async fn custom_verdict_data_is_tenant_isolated() {
 }
 
 /// A local publication download plan is redeemed through its Verifier's own
-/// content route, under `verifier:read` on that Verifier and nothing else.
+/// content route, under `executions:read` on the execution's trusted parent,
+/// its subject Card, and nothing else.
 ///
 /// The fixture holds the execution's lease and publishes a file and a
-/// directory. A caller holding only `verifier:read` on the execution's
-/// Verifier plans both downloads, and each plan's root-relative URL answers
-/// exactly the published bytes. A grant on another Verifier, or `cards:read`
-/// alone, is refused at that URL.
+/// directory. A caller holding only `executions:read` on the subject plans
+/// both downloads, and each plan's root-relative URL answers exactly the
+/// published bytes. The same grant on the execution's Verifier, which is not
+/// its parent, or `cards:read` on another Card, reads it as unknown there.
 ///
 /// # Panics
 /// Panics when a plan, its URL, its bytes, or a refusal differs.
@@ -2699,8 +2746,7 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
         .await
         .expect("the held execution publishes");
     for (role, permission) in [
-        ("lp_exact", Permission::verifier_read(verifier)),
-        ("lp_elsewhere", Permission::verifier_read(other)),
+        ("lp_executions", Permission::executions_read_any()),
         ("lp_cards", Permission::card_read()),
     ] {
         server
@@ -2708,9 +2754,24 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
             .await
             .expect("role seeds");
     }
-    let (_, exact) = user(&server, "lp-exact", &["lp_exact"]).await;
-    let (_, elsewhere) = user(&server, "lp-elsewhere", &["lp_elsewhere"]).await;
-    let (_, cards) = user(&server, "lp-cards", &["lp_cards"]).await;
+    let (exact_id, exact) = user(&server, "lp-exact", &[]).await;
+    bind_at(
+        &server,
+        &as_user(exact_id, &exact),
+        "lp_executions",
+        &subject,
+    )
+    .await;
+    let (elsewhere_id, elsewhere) = user(&server, "lp-elsewhere", &[]).await;
+    bind_at(
+        &server,
+        &as_user(elsewhere_id, &elsewhere),
+        "lp_executions",
+        &verifier,
+    )
+    .await;
+    let (cards_id, cards) = user(&server, "lp-cards", &[]).await;
+    bind_at(&server, &as_user(cards_id, &cards), "lp_cards", &other).await;
 
     for (name, selector, bytes) in [
         ("report", "attempt=1", b"# Report\n".as_slice()),
@@ -2751,13 +2812,14 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
             "{}",
             String::from_utf8_lossy(&fetched)
         );
+        // Without the parent the execution's content reads as unknown.
         for refused in [&elsewhere, &cards] {
             let (status, problem) = get(&server, refused, url).await;
             assert_eq!(
                 (status, problem["code"].as_str()),
                 (
-                    StatusCode::FORBIDDEN,
-                    Some("WYRD_PERMISSION_403_DENIED_RBAC")
+                    StatusCode::NOT_FOUND,
+                    Some("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND")
                 ),
                 "{name}"
             );
@@ -3036,7 +3098,7 @@ async fn details_report_absence_when_retained_records_are_missing() {
 
 /// Details are readable exactly where the execution status is. An unknown
 /// execution is not found, as is another tenant's. A reader holding
-/// `verifier:read` on the execution's Verifier reads them, and that decision
+/// `executions:read` on the execution's trusted parent reads them, and that decision
 /// is audited under the details operation; a caller without it, including one holding only
 /// `verifier:run`, is refused as it is refused the status, and each refusal
 /// is audited as denied.
@@ -3086,14 +3148,14 @@ async fn details_preserve_visibility_and_read_authority() {
     assert_eq!((status, &read), (StatusCode::OK, &details));
     assert_eq!(
         decisions(&server, "verification.execution.details.read", reader).await,
-        vec![("verifier:read".to_owned(), "allowed".to_owned())]
+        vec![("executions:read".to_owned(), "allowed".to_owned())]
     );
 
     server
         .seed_role("vr_run_only", &[Permission::verifier_run_any()])
         .await
         .expect("run-only role seeds");
-    let denied = vec![("verifier:read".to_owned(), "denied".to_owned())];
+    let denied = vec![("executions:read".to_owned(), "denied".to_owned())];
     for (name, roles) in [
         ("vr-visibility-outsider", &[][..]),
         ("vr-visibility-runner", &["vr_run_only"][..]),

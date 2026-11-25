@@ -81,7 +81,7 @@ The function must return the requirement's [verdict](/reference/verifier-card/#v
 | `reason` | One sentence shown in the result |
 | `citations` | Where in the evidence the decision rests, as `{slot, locator}` |
 
-Any other shape, or an exception, makes the requirement `inconclusive`, and so does a `passed` outcome without a citation. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
+Any other shape, an exception, or a citation that does not locate evidence the check reaches makes the requirement `inconclusive`. A valid verdict counts as returned, including a `passed` outcome with no citations. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
 
 Tickets come from the agent, so bind this Verifier to the agent component rather than the whole Service:
 

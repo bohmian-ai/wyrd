@@ -66,6 +66,18 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::auth::browser::password_login))
         .routes(routes!(crate::auth::browser::password_change))
         .routes(routes!(crate::auth::browser::password_reset))
+        .routes(routes!(crate::auth::browser::password_reset_request))
+        .routes(routes!(crate::auth::browser::contact_request))
+        .routes(routes!(crate::auth::browser::contact_verify))
+        .routes(routes!(crate::auth::browser::discovery_request))
+        .routes(routes!(crate::auth::browser::discovery_verify))
+        .routes(routes!(crate::auth::browser::discovery_next))
+        .routes(routes!(crate::auth::social::methods))
+        .routes(routes!(crate::auth::social::callback))
+        .routes(routes!(crate::auth::social::signup))
+        .routes(routes!(crate::auth::social::signup_verify))
+        .routes(routes!(crate::auth::social::signup_proof))
+        .routes(routes!(crate::auth::social::signup_complete))
         .routes(routes!(callback))
         .routes(routes!(token))
 }
@@ -506,9 +518,24 @@ async fn callback(
     )
     .await?;
     match completed {
-        LoginCompletion::SignedIn(created) => signed_in(&state, &origin, &created).await,
+        LoginCompletion::SignedIn(created) => {
+            signed_in(
+                &state,
+                &origin,
+                &created,
+                crate::auth::browser::LOGIN_COOKIE_PATH,
+            )
+            .await
+        }
         LoginCompletion::Refused { tenant_id, error } => {
-            login_refused(&state, &origin, tenant_id, error).await
+            login_refused(
+                &state,
+                &origin,
+                tenant_id,
+                error,
+                crate::auth::browser::LOGIN_COOKIE_PATH,
+            )
+            .await
         }
         LoginCompletion::DeviceApproved => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
         LoginCompletion::ConnectionTested => {
@@ -559,7 +586,7 @@ fn bad_subject_token_format() -> WyrdError {
 mod tests {
     use base64::Engine;
     use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef};
-    use wyrd_runtime::{PermissionSet, PrincipalId};
+    use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
 
@@ -586,14 +613,14 @@ mod tests {
             .parse()
             .expect("static principal id is valid");
         let claims = AccessTokenClaims {
+            version: wyrd_auth_verify::ACCESS_TOKEN_VERSION,
             sub: principal_id.to_string(),
             principal: TokenPrincipalRef {
                 id: principal_id,
                 kind: PrincipalKindTag::User,
                 tenant_id,
             },
-            roles: vec![],
-            permissions: PermissionSet::default(),
+            permission_ceiling: None,
             workload_uid: None,
             card_access: CardAccess::AnyRegistered,
             act: None,

@@ -837,7 +837,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert wyrd("declare", str(agent)).returncode == 0
                 issued = wyrd(
                     *("principal", "credential", "create-principal"),
-                    *("--name", "ask-agent-runtime", "--role", "workload"),
+                    *("--name", "ask-agent-runtime", "--grant", "workload:all"),
                     *("--workload-name", "other-agents"),
                     *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
                 )
@@ -1433,7 +1433,7 @@ def test_failed_verification_pages_on_call_across_restart(
             )
             issued = wyrd(
                 *("principal", "credential", "create-principal", "--name", "checkout-runtime"),
-                *("--role", "workload", "--workload-name", "checkout-alerts"),
+                *("--grant", "workload:all", "--workload-name", "checkout-alerts"),
             )
             runtime_key = next(
                 line.split()[1] for line in issued.splitlines() if line.startswith("credential:")

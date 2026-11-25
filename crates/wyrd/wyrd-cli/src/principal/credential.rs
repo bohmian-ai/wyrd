@@ -89,10 +89,11 @@ pub struct CreateArgs {
     /// Operator-facing name for the principal.
     #[arg(long, value_name = "NAME")]
     pub name: String,
-    /// Roles to grant, repeated. A principal with none can authenticate and
-    /// do nothing, which is a deliberate and useful starting point.
-    #[arg(long = "role", value_name = "ROLE")]
-    pub roles: Vec<String>,
+    /// `ROLE:SCOPE` to bind, repeated, such as `workload:Service/checkout`.
+    /// A principal with none can authenticate and do nothing, which is a
+    /// deliberate and useful starting point.
+    #[arg(long = "grant", value_name = "ROLE:SCOPE", value_parser = crate::principal::access::parse_assignment)]
+    pub grants: Vec<wyrd_spec::auth::ScopedRoleAssignment>,
     /// Optional description recorded with the principal.
     #[arg(long, value_name = "TEXT")]
     pub description: Option<String>,
@@ -168,7 +169,7 @@ async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
         .await?
         .create_service_principal(&CreateServicePrincipalRequest {
             name: args.name,
-            roles: args.roles,
+            assignments: args.grants,
             description: args.description,
             workload_restriction: Some(args.family.restriction()),
         })
@@ -298,7 +299,7 @@ mod tests {
         let CredentialCommand::CreatePrincipal(args) = parsed.command else {
             panic!("create parsed as another verb");
         };
-        assert!(args.roles.is_empty());
+        assert!(args.grants.is_empty());
     }
 
     /// Retiring a credential names the owning principal, so a credential id

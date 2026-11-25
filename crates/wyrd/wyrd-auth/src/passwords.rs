@@ -28,17 +28,17 @@ use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    BrowserCredential, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
-    PasswordSignupRequest, RoleSource, SecretBearer, Sha256Hex,
+    BrowserCredential, INVITATION_RECIPIENTS_MAX, PasswordChangeRequest, PasswordLoginRequest,
+    PasswordResetRequest, PasswordSignupRequest, ScopedRoleAssignment, SecretBearer, Sha256Hex,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    AttemptScope, BrowserSessionAuthority, InvitationRow, PasswordResetRow, attempt_refusal,
-    consume_invitation, consume_password_reset, grant_role_to_user, insert_invitation,
+    AttemptScope, BrowserSessionAuthority, InvitationRow, PasswordResetRow, SubjectColumns,
+    attempt_refusal, consume_invitation, consume_password_reset, insert_invitation,
     insert_local_user, insert_password_reset, local_credential_by_username,
-    local_credential_for_update, record_attempt_failure, role_by_id, role_by_name,
-    set_password_hash,
+    local_credential_for_update, record_attempt_failure, reissue_invitation, set_password_hash,
+    verified_contact_for_update,
 };
 
 use crate::browser_sessions::{
@@ -47,13 +47,15 @@ use crate::browser_sessions::{
 };
 use crate::error::store_error;
 use crate::issuance::TenantGrant;
+use crate::mail::{ApplicationMail, EmailAddress};
+use crate::roles::{bind_assignments, validate_assignments};
 
 /// Largest raw password or code input accepted, in bytes, before any costly
 /// processing.
 pub const PASSWORD_INPUT_MAX_BYTES: usize = 1024;
 
 /// Fewest characters in a new password, after NFC normalization.
-pub const PASSWORD_MIN_CHARS: usize = 8;
+pub const PASSWORD_MIN_CHARS: usize = 15;
 
 /// Most characters in a new password, after NFC normalization.
 pub const PASSWORD_MAX_CHARS: usize = 128;
@@ -141,7 +143,7 @@ pub fn new_password(raw: &SecretString, field: &str) -> Result<SecretString, Wyr
     let text = password.expose_secret();
     let chars = text.chars().count();
     if !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&chars) {
-        return Err(refuse("password must be 8-128 characters"));
+        return Err(refuse("password must be 15-128 characters"));
     }
     if text.chars().any(char::is_control) {
         return Err(refuse("password must not contain control characters"));
@@ -223,6 +225,20 @@ async fn check_password(
         Ok(PasswordCheck::Matched { rehash })
     })
     .await?
+}
+
+/// Whether `password` matches `verifier`, costing one bounded derivation
+/// against a dummy verifier when there is none, so an unknown account and a
+/// wrong password cost the same.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when derivation cannot run.
+pub(crate) async fn password_matches(
+    password: SecretString,
+    verifier: Option<String>,
+) -> Result<bool, WyrdError> {
+    let check = check_password(capacity().await?, password, verifier).await?;
+    Ok(matches!(check, PasswordCheck::Matched { .. }))
 }
 
 /// Run one derivation under a process permit on the blocking pool.
@@ -309,7 +325,7 @@ const ONE_TIME_CODE_CHARS: usize = 43;
 /// # Errors
 /// Returns [`WyrdError::OneTimeCodeInvalid`] for any value that is not 43
 /// base64url characters, before any lookup or derivation.
-fn code_hash(code: &SecretBearer) -> Result<Sha256Hex, WyrdError> {
+pub(crate) fn code_hash(code: &SecretBearer) -> Result<Sha256Hex, WyrdError> {
     let code = code.expose();
     let well_formed = code.len() == ONE_TIME_CODE_CHARS
         && code
@@ -344,120 +360,154 @@ fn enrollment_error(error: sqlx::Error) -> WyrdError {
 }
 
 /// Create an active local User named by the canonical `username` with the
-/// verifier of `password`, holding the direct Roles named `roles`, on `conn`;
-/// returns the new User id.
+/// verifier of `password`, holding direct bindings for `assignments`, on
+/// `conn`; returns the new User id.
 ///
 /// The administrator's direct creation path. The caller owns authority for
 /// the grants and commits `conn`.
 ///
 /// # Errors
 /// Returns [`WyrdError::Validation`] for a taken username or an empty,
-/// repeated or missing Role, and [`WyrdError::AuthVerifyUnavailable`] when
-/// the store fails.
+/// missing, invalid or inapplicable assignment, and
+/// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
 pub async fn create_local_user(
     conn: &mut TenantConn<'_>,
     username: &str,
     verifier: &str,
-    roles: &[String],
+    assignments: &[ScopedRoleAssignment],
 ) -> Result<Uuid, WyrdError> {
-    let role_ids = role_ids(conn, roles).await?;
     let user_id = Uuid::now_v7();
-    insert_local_user(conn, user_id, username, verifier)
+    insert_local_user(conn, user_id, username, verifier, None)
         .await
         .map_err(enrollment_error)?;
-    grant_roles(conn, user_id, &role_ids).await?;
+    bind_assignments(conn, user_subject(user_id), assignments).await?;
     Ok(user_id)
 }
 
-/// The ids of the existing tenant Roles named `roles`, in order.
-///
-/// # Errors
-/// Returns [`WyrdError::Validation`] for an empty or repeated list or a name
-/// that is no Role in this tenant, and [`WyrdError::AuthVerifyUnavailable`]
-/// when the store fails.
-async fn role_ids(conn: &mut TenantConn<'_>, roles: &[String]) -> Result<Vec<Uuid>, WyrdError> {
-    let mut distinct = roles.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    if roles.is_empty() || distinct.len() != roles.len() {
-        return Err(WyrdError::Validation {
-            message: "roles must be a nonempty list of distinct Role names".to_owned(),
-            details: json!({ "field": "roles" }),
-        });
+/// The binding subject columns of User `id`.
+fn user_subject(id: Uuid) -> SubjectColumns {
+    SubjectColumns {
+        user_id: Some(id),
+        ..SubjectColumns::default()
     }
-    let mut ids = Vec::with_capacity(roles.len());
-    for role in roles {
-        let Some(row) = role_by_name(conn, role).await.map_err(store_error)? else {
-            return Err(WyrdError::Validation {
-                message: "a Role does not exist in this tenant".to_owned(),
-                details: json!({ "role": role }),
-            });
-        };
-        ids.push(row.id);
-    }
-    Ok(ids)
 }
 
-/// Grant `user_id` each existing Role in `role_ids` directly.
+/// Whether `address` is a plausible bare email address: at most 254 bytes, a
+/// non-empty local part and a dotted domain, without whitespace, control
+/// characters or display-name punctuation.
+#[must_use]
+pub fn is_email_address(address: &str) -> bool {
+    address.len() <= 254
+        && address.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.contains('@')
+                && domain.split('.').count() > 1
+                && domain.split('.').all(|label| !label.is_empty())
+        })
+        && !address
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "<>,;:\\\"()[]".contains(c))
+}
+
+/// The trimmed invitation `recipients`, refused as a whole unless there are 1
+/// to [`INVITATION_RECIPIENTS_MAX`] distinct plausible email addresses.
+///
+/// An address only names whom an invitation is for and where it is emailed,
+/// so the check is a shape check: one `@` between a nonempty local part and a
+/// dotted domain, at most 254 characters, with no whitespace, control
+/// characters or SMTP-header punctuation. Repeats compare case-insensitively.
 ///
 /// # Errors
-/// Returns [`WyrdError::Validation`] for a Role id that names no Role, and
+/// Returns [`WyrdError::Validation`] naming the first unusable entry.
+pub fn invitation_recipients(recipients: &[String]) -> Result<Vec<String>, WyrdError> {
+    let refuse = |message: String| WyrdError::Validation {
+        message,
+        details: json!({ "field": "recipients" }),
+    };
+    if recipients.is_empty() || recipients.len() > INVITATION_RECIPIENTS_MAX {
+        return Err(refuse(format!(
+            "invite 1 to {INVITATION_RECIPIENTS_MAX} recipients per request"
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    recipients
+        .iter()
+        .map(|raw| {
+            let address = raw.trim();
+            if !is_email_address(address) {
+                return Err(refuse(format!("{address:?} is not an email address")));
+            }
+            if !seen.insert(address.to_ascii_lowercase()) {
+                return Err(refuse(format!("{address:?} is listed more than once")));
+            }
+            Ok(address.to_owned())
+        })
+        .collect()
+}
+
+/// Record one one-use enrollment invitation per recipient for the scoped
+/// `assignments`, issued by `issuer`, on `conn`; returns each with its code,
+/// shown once, in recipient order.
+///
+/// Recipients come from [`invitation_recipients`]. Every assignment is
+/// validated as enrollment will bind it, and enrollment revalidates them
+/// against current roles and the issuer's current authority. The caller has
+/// authorized the issuer and commits.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] for an empty list or a missing,
+/// invalid or inapplicable assignment, and
 /// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-async fn grant_roles(
-    conn: &mut TenantConn<'_>,
-    user_id: Uuid,
-    role_ids: &[Uuid],
-) -> Result<(), WyrdError> {
-    for role_id in role_ids {
-        if role_by_id(conn, *role_id)
-            .await
-            .map_err(store_error)?
-            .is_none()
-        {
-            return Err(WyrdError::Validation {
-                message: "a Role does not exist in this tenant".to_owned(),
-                details: json!({ "role_id": role_id }),
-            });
-        }
-        grant_role_to_user(conn, user_id, *role_id, RoleSource::Direct)
-            .await
-            .map_err(store_error)?;
-    }
-    Ok(())
-}
-
-/// Record a one-use enrollment invitation for the existing Roles named
-/// `roles`, issued by `issuer`, on `conn`; returns it with its code, shown
-/// once.
-///
-/// The caller has authorized the issuer to grant those Roles and commits.
-///
-/// # Errors
-/// Returns [`WyrdError::Validation`] for an empty, repeated or missing Role,
-/// and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-pub async fn issue_invitation(
+pub async fn issue_invitations(
     conn: &mut TenantConn<'_>,
     issuer: Uuid,
-    roles: &[String],
-) -> Result<(InvitationRow, SecretBearer), WyrdError> {
-    let mut distinct = role_ids(conn, roles).await?;
-    distinct.sort_unstable();
+    recipients: &[String],
+    assignments: &[ScopedRoleAssignment],
+) -> Result<Vec<(InvitationRow, SecretBearer)>, WyrdError> {
+    validate_assignments(conn, assignments).await?;
+    let mut issued = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let code = SecretBearer::new(random_secret());
+        let row = insert_invitation(
+            conn,
+            Uuid::now_v7(),
+            &Sha256Hex::digest(code.expose().as_bytes()),
+            issuer,
+            recipient,
+            assignments,
+        )
+        .await
+        .map_err(store_error)?;
+        issued.push((row, code));
+    }
+    Ok(issued)
+}
+
+/// Replace the code of the pending invitation `id` on `conn`, voiding its
+/// previous link; returns it with the new code, shown once. `None` when it
+/// was consumed, revoked, purged or never existed. The caller has authorized
+/// the issuer and commits.
+///
+/// # Errors
+/// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+pub async fn reissue(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<Option<(InvitationRow, SecretBearer)>, WyrdError> {
     let code = SecretBearer::new(random_secret());
-    let row = insert_invitation(
-        conn,
-        Uuid::now_v7(),
-        &Sha256Hex::digest(code.expose().as_bytes()),
-        issuer,
-        &distinct,
-    )
-    .await
-    .map_err(store_error)?;
-    Ok((row, code))
+    let row = reissue_invitation(conn, id, &Sha256Hex::digest(code.expose().as_bytes()))
+        .await
+        .map_err(store_error)?;
+    Ok(row.map(|row| (row, code)))
 }
 
 /// Record a one-use password reset for the local User `user_id`, issued by
 /// `issuer`, on `conn`; returns it with its code, shown once. `None` when the
-/// id names no local password User.
+/// id names no local password User, so a reset never adds a password.
+///
+/// A code to mail to the User's verified contact passes that contact's
+/// `contact_revision`: it replaces the User's earlier mailed codes and
+/// stops working once the contact is replaced. An operator passes `None`.
 ///
 /// # Errors
 /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
@@ -465,6 +515,7 @@ pub async fn issue_password_reset(
     conn: &mut TenantConn<'_>,
     issuer: Uuid,
     user_id: Uuid,
+    contact_revision: Option<i64>,
 ) -> Result<Option<(PasswordResetRow, SecretBearer)>, WyrdError> {
     let Some(user) = local_credential_for_update(conn, user_id)
         .await
@@ -480,6 +531,7 @@ pub async fn issue_password_reset(
         user.id,
         user.password_revision,
         issuer,
+        contact_revision,
     )
     .await
     .map_err(store_error)?;
@@ -519,28 +571,50 @@ impl BrowserSessions {
         let verifier = hash_password(password).await?;
         let mut conn = postgres.tenant_conn(tenant).await.map_err(store_error)?;
         let user_id = Uuid::now_v7();
-        insert_local_user(&mut conn, user_id, &username, &verifier)
+        insert_local_user(&mut conn, user_id, &username, &verifier, None)
             .await
             .map_err(enrollment_error)?;
-        let invitation = consume_invitation(&mut conn, &code, user_id)
+        self.redeem_invitation(&mut conn, &code, user_id).await?;
+        let created = self.password_session(&mut conn, user_id, 0).await?;
+        conn.commit().await.map_err(store_error)?;
+        self.stage_login(&created.session, request_id);
+        Ok(created)
+    }
+
+    /// Consume the invitation whose code digest is `code` for the new User
+    /// `user_id` on `conn` and grant that User its assignments.
+    ///
+    /// Exactly one of two concurrent redemptions of a code consumes it. The
+    /// invitation's issuer must still hold tenant administration and every
+    /// assignment must still apply; otherwise nothing is granted and the
+    /// caller must drop `conn` uncommitted, which also discards the User.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OneTimeCodeInvalid`] for an unknown, spent,
+    /// revoked, superseded or expired invitation, a former issuer, or an
+    /// inapplicable assignment, and [`WyrdError::AuthVerifyUnavailable`] when
+    /// the store fails.
+    pub(crate) async fn redeem_invitation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        code: &Sha256Hex,
+        user_id: Uuid,
+    ) -> Result<(), WyrdError> {
+        let invitation = consume_invitation(conn, code, user_id)
             .await
             .map_err(store_error)?
             .ok_or_else(one_time_code_invalid)?;
         let issuer_permissions = self
             .issuer
-            .current_permissions(&mut conn, invitation.issuer_principal_id)
+            .current_permissions(conn, invitation.issuer_principal_id)
             .await?;
         if !issuer_permissions.is_some_and(|held| held.contains(&Permission::wildcard())) {
             tracing::info!("invitation issuer no longer holds tenant administration");
             return Err(one_time_code_invalid());
         }
-        grant_roles(&mut conn, user_id, &invitation.role_ids)
+        bind_assignments(conn, user_subject(user_id), &invitation.assignments.0)
             .await
-            .map_err(|_| one_time_code_invalid())?;
-        let created = self.password_session(&mut conn, user_id, 0).await?;
-        conn.commit().await.map_err(store_error)?;
-        self.stage_login(&created.session, request_id);
-        Ok(created)
+            .map_err(|_| one_time_code_invalid())
     }
 
     /// Sign a local User in with username and password.
@@ -691,20 +765,29 @@ impl BrowserSessions {
         conn.commit().await.map_err(store_error)
     }
 
-    /// Set a local User's password with a one-use operator reset code.
+    /// Set a local User's password with a one-use reset code, operator-issued
+    /// or mailed to the User's verified contact.
     ///
     /// The code is checked for shape and the new password for policy before
     /// any lookup or derivation. One transaction then consumes the code and
     /// requires it to name an active local User whose password revision is
-    /// still the one it was issued at; success advances the revision,
-    /// ending every local session and spending every other reset code. Reset
-    /// never signs the browser in.
+    /// still the one it was issued at, and a mailed code's contact revision to
+    /// be the User's current one; success advances the password revision,
+    /// ending every local session and CLI renewal and spending every other
+    /// reset code, and leaves API keys alone. Reset never signs the browser
+    /// in. After the commit the User's verified contact, if any, is told
+    /// through `mail`; a notice that cannot be sent is logged and changes
+    /// nothing.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for a new password outside policy,
     /// [`WyrdError::OneTimeCodeInvalid`] for an unknown tenant or an unusable
     /// code, and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-    pub async fn password_reset(&self, request: PasswordResetRequest) -> Result<(), WyrdError> {
+    pub async fn password_reset(
+        &self,
+        request: PasswordResetRequest,
+        mail: Option<&ApplicationMail>,
+    ) -> Result<(), WyrdError> {
         let code = code_hash(&request.reset_code)?;
         let replacement = new_password(&request.new_password.into_secret_string(), "new_password")?;
         let postgres = self.connections.postgres();
@@ -728,10 +811,26 @@ impl BrowserSessions {
         if !current {
             return Err(one_time_code_invalid());
         }
+        let contact = verified_contact_for_update(&mut conn, reset.user_id)
+            .await
+            .map_err(store_error)?;
+        if reset
+            .contact_revision
+            .is_some_and(|bound| contact.as_ref().map(|c| c.revision) != Some(bound))
+        {
+            return Err(one_time_code_invalid());
+        }
         set_password_hash(&mut conn, reset.user_id, &verifier, true)
             .await
             .map_err(store_error)?;
-        conn.commit().await.map_err(store_error)
+        conn.commit().await.map_err(store_error)?;
+        if let (Some(mail), Some(contact)) = (mail, contact)
+            && let Ok(to) = EmailAddress::parse(&contact.address, "email")
+            && let Err(error) = mail.send_password_reset_done(&to).await
+        {
+            tracing::warn!(error = %error, "the password reset notice was not sent");
+        }
+        Ok(())
     }
 
     /// Create a password session for `user_id` at `revision` on `conn`.
@@ -763,10 +862,8 @@ struct Windows {
 
 impl Windows {
     /// The windows for `username` from `source`.
-    ///
-    /// ponytail: the source is the TCP peer, so behind the UI's server it
-    /// aggregates every browser that server forwards; a trusted-proxy
-    /// setting would key it by the forwarded client.
+    /// `source` is the request's trusted source, keyed as every per-source
+    /// window keys it.
     fn new(username: &str, source: Option<IpAddr>) -> Self {
         Self {
             account: if username.is_empty() {
@@ -774,7 +871,7 @@ impl Windows {
             } else {
                 username.to_owned()
             },
-            source: source.map(|ip| ip.to_string()),
+            source: source.map(crate::admission::source_key),
         }
     }
 
@@ -828,8 +925,46 @@ mod tests {
 
     use super::{
         KDF, KDF_PERMITS, PasswordCheck, bounded, canonical_username, capacity, check_password,
-        hash_password, new_password,
+        hash_password, invitation_recipients, new_password,
     };
+
+    /// Recipient lists are trimmed and refused as a whole for an empty or
+    /// oversized list, a repeat in any case, or an entry that cannot be an
+    /// email address or would break an SMTP header.
+    ///
+    /// # Panics
+    /// Panics when a list is accepted or refused wrongly.
+    #[test]
+    fn invitation_recipients_are_distinct_addresses() {
+        let list = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            invitation_recipients(&list(&[" ada@example.test ", "b.c+d@mail.example.org"]))
+                .expect("valid"),
+            list(&["ada@example.test", "b.c+d@mail.example.org"])
+        );
+        let too_many: Vec<String> = (0..=100).map(|n| format!("p{n}@example.test")).collect();
+        for refused in [
+            list(&[]),
+            too_many,
+            list(&["ada@example.test", "ADA@example.test"]),
+            list(&["no-at-sign"]),
+            list(&["@example.test"]),
+            list(&["ada@localhost"]),
+            list(&["ada@example..test"]),
+            list(&["a@b@example.test"]),
+            list(&["ada lovelace@example.test"]),
+            list(&["ada@example.test\r\nBcc: x@example.test"]),
+            list(&["Ada <ada@example.test>"]),
+        ] {
+            assert!(
+                matches!(
+                    invitation_recipients(&refused),
+                    Err(WyrdError::Validation { .. })
+                ),
+                "{refused:?}"
+            );
+        }
+    }
 
     /// Cancelling the callers of running derivations keeps their capacity held
     /// until the derivations themselves finish.
@@ -913,8 +1048,12 @@ mod tests {
         let composed = ok("Tr0ub4dor & e\u{301}xtra").unwrap();
         assert!(composed.expose_secret().contains('\u{e9}'));
         assert!(ok("Correct Horse Battery").is_ok());
+        assert!(ok("amber kestrel94").is_ok());
+        assert!(ok(&"\u{436}".repeat(128)).is_ok());
         for bad in [
             "short",
+            "amber kestrel9",
+            "amber kestrel\u{65}\u{301}",
             &"x".repeat(129),
             "fifteen chars\u{7}ok",
             "Password123456789",
@@ -1000,9 +1139,17 @@ mod pg_tests {
         crate::seed::seed_builtin_roles_for_tenant(&mut conn, fixture.data_tenant_id())
             .await
             .expect("builtin roles seed");
-        create_local_user(&mut conn, "queued", &verifier, &["viewer".to_owned()])
-            .await
-            .expect("user creates");
+        create_local_user(
+            &mut conn,
+            "queued",
+            &verifier,
+            &[wyrd_spec::auth::ScopedRoleAssignment {
+                role: "viewer".to_owned(),
+                scope: wyrd_spec::auth::PermissionScope::All,
+            }],
+        )
+        .await
+        .expect("user creates");
         conn.commit().await.expect("user commits");
         let audit = RecordedAudit::new();
         let sessions = BrowserSessions::new(

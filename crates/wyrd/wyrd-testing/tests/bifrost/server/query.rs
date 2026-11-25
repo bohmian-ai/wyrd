@@ -48,8 +48,7 @@ pub(super) fn scheduled_context(
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
-        PermissionSet::from_iter([permission.clone()]),
+        PermissionSet::from_iter([permission.clone(), Permission::executions_read_any()]),
     );
     Ok(AuthorizedQueryContext::try_new(
         principal,
@@ -1295,7 +1294,7 @@ async fn service_b_acts_for_service_a_with_only_a_table_authority() {
 /// # Panics
 ///
 /// Panics when the delegated token's claims are wrong (subject, single outer
-/// actor, audience, or permissions), a refused
+/// actor, audience, or a carried permissions claim), a refused
 /// call returns the wrong code, B's registration is not `Created`, the table
 /// holds other than B's one row, or an exchange, read, or native-write audit
 /// row names the wrong principal, actor, permission, credential, or outcome.
@@ -1386,12 +1385,10 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     );
     assert!(claims["act"].get("act").is_none(), "one actor: {claims}");
     assert_eq!(claims["aud"], "bifrost", "Bifrost audience: {claims}");
-    let permissions: PermissionSet = serde_json::from_value(claims["permissions"].clone())?;
     assert!(
-        permissions.contains(&spans_read),
-        "exact-table read: {claims}"
+        claims.get("permissions").is_none(),
+        "the token carries no authority; the server reads A's current grants: {claims}"
     );
-    assert!(!permissions.contains(&write), "no write: {claims}");
 
     accepts(&delegated, TRACES_SQL).await?;
     let register = wyrd_spec::vala::api::RegisterTableRequest {

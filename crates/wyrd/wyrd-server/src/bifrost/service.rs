@@ -289,7 +289,6 @@ mod pg_tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 tenant,
-                vec![],
                 PermissionSet::from_iter(permissions),
             ),
             request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())

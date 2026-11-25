@@ -64,6 +64,8 @@ import type {
   GithubConnectResponse,
   GithubConnectionState,
   GithubConnectionView,
+  GithubPullRequestReviewRequest,
+  GithubPullRequestReviewResponse,
   GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
@@ -81,7 +83,7 @@ import type {
   PrincipalKindTag as PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
-  PrincipalRoles,
+  PrincipalStatusCounts,
   PrincipalSummary,
   ProviderAdapter,
   ProviderAuth,
@@ -99,9 +101,25 @@ import type {
   RegisteredServiceCard,
   RegisteredVerifierCard,
   DeclarationReceipt,
+  AccessGrant,
+  AccessSummary,
+  BindingSubject,
+  CreateGroupRequest,
+  CreateRoleBindingRequest,
+  GrantSource,
+  GroupList,
+  GroupMember,
+  GroupView,
+  Operation as AccessOperation,
+  PermissionScope,
+  PutRoleRequest,
+  RoleBindingList,
+  RoleBindingQuery,
+  RoleBindingView,
+  RoleList,
+  RoleView,
+  ScopedRoleAssignment,
   RevokePrincipalRequest,
-  RoleAssignment,
-  RoleAssignmentChange,
   RoleSource,
   RunningQueryLifecycleState,
   RunningQuerySummary,
@@ -129,6 +147,7 @@ import type {
 } from "./card-types.js";
 
 import type {
+  NativeAbort,
   NativeBifrostQueryStream,
   NativeLifecycleResult,
   NativeQueryStep,
@@ -233,6 +252,8 @@ export type {
   GithubConnectResponse,
   GithubConnectionState,
   GithubConnectionView,
+  GithubPullRequestReviewRequest,
+  GithubPullRequestReviewResponse,
   GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
@@ -249,7 +270,7 @@ export type {
   PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
-  PrincipalRoles,
+  PrincipalStatusCounts,
   PrincipalSummary,
   ProviderAdapter,
   ProviderAuth,
@@ -259,9 +280,25 @@ export type {
   QueryParam,
   QueryTerminal,
   DeclarationReceipt,
+  AccessGrant,
+  AccessSummary,
+  BindingSubject,
+  CreateGroupRequest,
+  CreateRoleBindingRequest,
+  GrantSource,
+  GroupList,
+  GroupMember,
+  GroupView,
+  AccessOperation,
+  PermissionScope,
+  PutRoleRequest,
+  RoleBindingList,
+  RoleBindingQuery,
+  RoleBindingView,
+  RoleList,
+  RoleView,
+  ScopedRoleAssignment,
   RevokePrincipalRequest,
-  RoleAssignment,
-  RoleAssignmentChange,
   RoleSource,
   SortKey,
   TableEntry,
@@ -504,6 +541,32 @@ function nativeHandle<T>(value: T | null | undefined, error: NativeErrorMetadata
     );
   }
   return value;
+}
+
+/**
+ * Run one native call `signal` may stop. Aborted while the call is pending,
+ * the native side drops its request, so the server sees it closed, and this
+ * throws the signal's reason. An answer that arrived first is returned; the
+ * caller owns closing it.
+ */
+async function abortable<T>(
+  signal: AbortSignal | undefined,
+  call: (abort?: NativeAbort) => Promise<T | null | undefined>,
+): Promise<T> {
+  signal?.throwIfAborted();
+  const abort = signal && new nativeBinding.NativeAbort();
+  const stop = () => abort?.abort();
+  signal?.addEventListener("abort", stop, { once: true });
+  try {
+    const answer = await call(abort);
+    // Native answers nothing only for a call its abort stopped.
+    if (answer === null || answer === undefined) {
+      throw signal?.reason;
+    }
+    return answer;
+  } finally {
+    signal?.removeEventListener("abort", stop);
+  }
 }
 
 function runningQuery(wire: RunningQuerySummary): RunningQuery {
@@ -1407,33 +1470,41 @@ export class Bifrost {
    * @param query - One SELECT statement.
    * @param params - Values bound to `$1..$n`, in order.
    * @param options - `deadlineMs`, the query deadline from 1 to 4294967295
-   * milliseconds; omitted, the server's default deadline applies.
+   * milliseconds; omitted, the server's default deadline applies. `signal`
+   * stops a query still starting by closing its request. Once the stream is
+   * returned, close it with `return()`.
    * @returns The running stream.
    * @throws {@link WyrdError} for an invalid request, a refused or
    * unauthorized query, or a transport failure when the query starts; later
-   * failures throw during iteration.
+   * failures throw during iteration. The signal's reason once it aborts
+   * before the stream starts.
    */
   async stream(
     query: string,
     params?: readonly QueryParam[],
-    options: { readonly deadlineMs?: number } = {},
+    options: { readonly deadlineMs?: number; readonly signal?: AbortSignal } = {},
   ): Promise<BifrostQueryStream> {
-    const start = await this.#native.query({
-      sql: query,
-      deadlineMs: options.deadlineMs,
-      params: params?.map((value) => {
-        switch (typeof value) {
-          case "boolean":
-            return { kind: "boolean", bool: value };
-          case "number":
-            return { kind: "number", number: value };
-          case "string":
-            return { kind: "string", string: value };
-          default:
-            return { kind: value === null ? "null" : typeof value };
-        }
-      }),
-    });
+    const start = await abortable(options.signal, (abort) =>
+      this.#native.query(
+        {
+          sql: query,
+          deadlineMs: options.deadlineMs,
+          params: params?.map((value) => {
+            switch (typeof value) {
+              case "boolean":
+                return { kind: "boolean", bool: value };
+              case "number":
+                return { kind: "number", number: value };
+              case "string":
+                return { kind: "string", string: value };
+              default:
+                return { kind: value === null ? "null" : typeof value };
+            }
+          }),
+        },
+        abort,
+      ),
+    );
     const error = projectedError(start);
     if (error !== undefined) {
       throw error;
@@ -1936,12 +2007,19 @@ export class Cards {
    * List metadata-only Card summaries.
    *
    * @param request - Optional filters, page size, and cursor.
+   * @param options - `signal` stops the list while its page is still
+   * pending by closing its request.
    * @returns One page of summaries and the next page's cursor.
    * @throws {@link WyrdError} for a malformed filter or a transport or
-   * authorization failure.
+   * authorization failure; the signal's reason once it aborts first.
    */
-  async list(request: ListCardsRequest = {}): Promise<ListCardsResponse> {
-    return lifecycleValue<ListCardsResponse>(await this.#native.list(JSON.stringify(request)));
+  async list(
+    request: ListCardsRequest = {},
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<ListCardsResponse> {
+    return lifecycleValue<ListCardsResponse>(
+      await abortable(options.signal, (abort) => this.#native.list(JSON.stringify(request), abort)),
+    );
   }
 
   /**
@@ -2090,7 +2168,8 @@ export class OperatorConnections {
 /**
  * Tenant GitHub connection client over the shared Rust handle.
  *
- * Connects, reads, and disconnects the deployment's configured GitHub App.
+ * Connects, reads, and disconnects the deployment's configured GitHub App,
+ * and requests fresh reviews of its connected pull requests.
  * The server verifies, associates, authorizes, and audits; every response is
  * the redacted {@link GithubConnectionView} or the transaction receipt, and
  * failures throw a structured {@link WyrdError}.
@@ -2120,7 +2199,7 @@ export class GithubConnection {
   }
 
   /**
-   * Begin a connection transaction; requires `identity_connections:write`.
+   * Begin a connection transaction; requires `github_connections:write`.
    * Open `authorization_url` in a browser signed in to Wyrd as the same
    * principal to complete it.
    *
@@ -2133,7 +2212,7 @@ export class GithubConnection {
   }
 
   /**
-   * Read the tenant's connection; requires `identity_connections:write`.
+   * Read the tenant's connection; requires `github_connections:read`.
    *
    * @returns The redacted connection view, `not_connected` when none.
    * @throws {@link WyrdError} `WYRD_GITHUB_503_NOT_CONFIGURED` when the
@@ -2144,7 +2223,7 @@ export class GithubConnection {
   }
 
   /**
-   * Release the tenant's installation; requires `identity_connections:write`.
+   * Release the tenant's installation; requires `github_connections:write`.
    *
    * @returns The released, `not_connected` view.
    * @throws {@link WyrdError} `WYRD_GITHUB_404_NOT_CONNECTED` when no
@@ -2153,6 +2232,34 @@ export class GithubConnection {
    */
   async disconnect(): Promise<GithubConnectionView> {
     return lifecycleValue<GithubConnectionView>(await this.#native.disconnect());
+  }
+
+  /**
+   * Request a fresh review of one connected pull request by its selected
+   * Repository's whole `pull_request` binding set, even at an unchanged head;
+   * requires `cards:read`, and `verifier:read` and `verifier:run` on every
+   * selected Verifier. Members run under the Repository declaration's
+   * authority.
+   *
+   * @param request - The connection's `host`, GitHub's numeric
+   * `repository_id` and the pull request `number`.
+   * @param idempotencyKey - Names the request: a retry with the same key for
+   * the same pull request returns the same generation and members; a new key
+   * admits a new generation and supersedes the older one.
+   * @returns The accepted generation and every member execution ID in
+   * binding order, refused members included.
+   * @throws {@link WyrdError} `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE`
+   * (`details.reason` `not_found`, `closed`, `draft` or `no_bindings`) accepting
+   * nothing, `WYRD_PERMISSION_403_DENIED_RBAC` without the permissions above,
+   * or `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE`, retryable under the same key.
+   */
+  async reviewPullRequest(
+    request: GithubPullRequestReviewRequest,
+    idempotencyKey: string,
+  ): Promise<GithubPullRequestReviewResponse> {
+    return lifecycleValue<GithubPullRequestReviewResponse>(
+      await this.#native.reviewPullRequest(request.host, request.repository_id, request.number, idempotencyKey),
+    );
   }
 }
 
@@ -2293,40 +2400,140 @@ export class Principals {
   }
 
   /**
-   * A principal's Role assignments; requires `service_accounts:write`.
+   * One account's current access: each binding, its source, and the scoped
+   * permissions it compiles to; requires `service_accounts:write`.
    *
-   * @param principalId - The principal to read.
-   * @returns Its assignments ordered by Role and source.
-   * @throws {@link WyrdError} for a principal that is not assignable, or a transport or authorization failure.
+   * @param principalId - The account to read.
+   * @returns Its grants and their combined permissions.
+   * @throws {@link WyrdError} for an account that is not assignable, or a transport or authorization failure.
    */
-  async roles(principalId: string): Promise<PrincipalRoles> {
-    return lifecycleValue(await this.#native.roles(principalId));
+  async access(principalId: string): Promise<AccessSummary> {
+    return lifecycleValue(await this.#native.access(principalId));
   }
 
   /**
-   * Idempotently grant a direct Role; requires tenant administration.
+   * Every role and the operations it bundles; requires `service_accounts:write`.
    *
-   * @param principalId - The principal to grant to.
-   * @param role - The Role name.
-   * @returns Whether the call changed anything and the resulting assignments.
-   * @throws {@link WyrdError} for an unknown Role, a principal that is not
-   * assignable, or a transport or authorization failure.
+   * @returns The roles ordered by name.
+   * @throws {@link WyrdError} for a transport or authorization failure.
    */
-  async grantRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
-    return lifecycleValue(await this.#native.grantRole(principalId, role));
+  async roles(): Promise<RoleList> {
+    return lifecycleValue(await this.#native.roles());
   }
 
   /**
-   * Idempotently revoke a direct Role; identity-provider assignments stay.
+   * Create or replace a custom role; requires tenant administration. Built-in roles are read-only.
    *
-   * @param principalId - The principal to revoke from.
-   * @param role - The Role name.
-   * @returns Whether the call changed anything and the resulting assignments.
-   * @throws {@link WyrdError} for an unknown Role, a principal that is not
-   * assignable, or a transport or authorization failure.
+   * @param role - The custom role name.
+   * @param request - The operations the role bundles.
+   * @returns The stored role.
+   * @throws {@link WyrdError} for a built-in or empty role, or a transport or authorization failure.
    */
-  async revokeRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
-    return lifecycleValue(await this.#native.revokeRole(principalId, role));
+  async putRole(role: string, request: PutRoleRequest): Promise<RoleView> {
+    return lifecycleValue(await this.#native.putRole(role, JSON.stringify(request)));
+  }
+
+  /**
+   * Delete a custom role no binding uses; requires tenant administration.
+   *
+   * @param role - The custom role name.
+   * @returns The deleted role.
+   * @throws {@link WyrdError} for a built-in, unknown, or still-bound role, or a transport or authorization failure.
+   */
+  async deleteRole(role: string): Promise<RoleView> {
+    return lifecycleValue(await this.#native.deleteRole(role));
+  }
+
+  /**
+   * Bindings, optionally for one account, group, or role; requires `service_accounts:write`.
+   *
+   * @param query - Exact filters.
+   * @returns The matching bindings.
+   * @throws {@link WyrdError} for an invalid filter or a transport or authorization failure.
+   */
+  async bindings(query: RoleBindingQuery = {}): Promise<RoleBindingList> {
+    return lifecycleValue(await this.#native.bindings(JSON.stringify(query)));
+  }
+
+  /**
+   * Idempotently bind a role at an explicit scope to an account or group;
+   * requires tenant administration.
+   *
+   * @param request - The subject, role, and scope.
+   * @returns The binding; granting the same binding again returns it unchanged.
+   * @throws {@link WyrdError} for an unknown role, an inapplicable scope, an
+   * account that is not assignable, or a transport or authorization failure.
+   */
+  async bind(request: CreateRoleBindingRequest): Promise<RoleBindingView> {
+    return lifecycleValue(await this.#native.bind(JSON.stringify(request)));
+  }
+
+  /**
+   * Remove one directly administered binding; requires tenant administration.
+   * Authority another binding still grants remains.
+   *
+   * @param bindingId - The binding to remove.
+   * @returns The removed binding.
+   * @throws {@link WyrdError} for an unknown or provider binding, or a transport or authorization failure.
+   */
+  async unbind(bindingId: string): Promise<RoleBindingView> {
+    return lifecycleValue(await this.#native.unbind(bindingId));
+  }
+
+  /**
+   * Every local group and its members; requires `service_accounts:write`.
+   *
+   * @returns The groups ordered by name.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
+  async groups(): Promise<GroupList> {
+    return lifecycleValue(await this.#native.groups());
+  }
+
+  /**
+   * Create a local group; requires tenant administration.
+   *
+   * @param request - The tenant-unique group name.
+   * @returns The new, empty group.
+   * @throws {@link WyrdError} for a taken name, or a transport or authorization failure.
+   */
+  async createGroup(request: CreateGroupRequest): Promise<GroupView> {
+    return lifecycleValue(await this.#native.createGroup(JSON.stringify(request)));
+  }
+
+  /**
+   * Delete a local group with its memberships and bindings; requires tenant administration.
+   *
+   * @param groupId - The group to delete.
+   * @returns The deleted group.
+   * @throws {@link WyrdError} for an unknown group, or a transport or authorization failure.
+   */
+  async deleteGroup(groupId: string): Promise<GroupView> {
+    return lifecycleValue(await this.#native.deleteGroup(groupId));
+  }
+
+  /**
+   * Add an account to a local group; requires tenant administration.
+   *
+   * @param groupId - The group.
+   * @param principalId - The account to add.
+   * @returns The group with its members.
+   * @throws {@link WyrdError} for an unknown group or account, or a transport or authorization failure.
+   */
+  async addGroupMember(groupId: string, principalId: string): Promise<GroupView> {
+    return lifecycleValue(await this.#native.addGroupMember(groupId, principalId));
+  }
+
+  /**
+   * Remove an account from a local group; requires tenant administration.
+   *
+   * @param groupId - The group.
+   * @param principalId - The account to remove.
+   * @returns The group with its members.
+   * @throws {@link WyrdError} for an unknown group or account, or a transport or authorization failure.
+   */
+  async removeGroupMember(groupId: string, principalId: string): Promise<GroupView> {
+    return lifecycleValue(await this.#native.removeGroupMember(groupId, principalId));
   }
 }
 

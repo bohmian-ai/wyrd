@@ -505,18 +505,17 @@
                 "enum": [
                   "Data",
                   "Model",
+                  "Artifact",
                   "Experiment",
                   "Prompt",
                   "Agent",
-                  "Verifier",
-                  "Service",
-                  "Policy",
                   "Mcp",
+                  "Service",
                   "Audit",
-                  "Artifact",
+                  "Verifier",
                   "Trigger",
                   "Operator",
-                  "Source"
+                  "Repository"
                 ]
               },
               "name": {
@@ -600,18 +599,17 @@
                     "enum": [
                       "Data",
                       "Model",
+                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Verifier",
-                      "Service",
-                      "Policy",
                       "Mcp",
+                      "Service",
                       "Audit",
-                      "Artifact",
+                      "Verifier",
                       "Trigger",
                       "Operator",
-                      "Source"
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -683,18 +681,1854 @@
                     "enum": [
                       "Data",
                       "Model",
+                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Verifier",
-                      "Service",
-                      "Policy",
                       "Mcp",
+                      "Service",
                       "Audit",
-                      "Artifact",
+                      "Verifier",
                       "Trigger",
                       "Operator",
-                      "Source"
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "CardInventory": {
+      "description": "Every registered Card version cards.list returns, in registration order: kind, name, version, status, uid and update time, filtered by kind, lifecycle status, prerelease and a name or metadata query (labels., annotations.), paged by server cursor.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "Data",
+              "Model",
+              "Artifact",
+              "Experiment",
+              "Prompt",
+              "Agent",
+              "Mcp",
+              "Service",
+              "Audit",
+              "Verifier",
+              "Trigger",
+              "Operator",
+              "Repository"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "pending",
+              "deprecated",
+              "failed",
+              "expired"
+            ]
+          },
+          "include_prerelease": {
+            "type": "boolean"
+          },
+          "pages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          }
+        },
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "cards.filter",
+          "description": "Read the inventory again under these filters, from its first page.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Data",
+                  "Model",
+                  "Artifact",
+                  "Experiment",
+                  "Prompt",
+                  "Agent",
+                  "Mcp",
+                  "Service",
+                  "Audit",
+                  "Verifier",
+                  "Trigger",
+                  "Operator",
+                  "Repository"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "pending",
+                  "deprecated",
+                  "failed",
+                  "expired"
+                ]
+              },
+              "include_prerelease": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "cards.more",
+          "description": "Show one more page, following the last page's server cursor.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pages": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 20
+              }
+            },
+            "required": [
+              "pages"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "CardFacts": {
+      "description": "An exact Card's server-managed facts (uid, status, hashes, labels, annotations, origin), or the whole returned Card as YAML.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Data",
+                  "Model",
+                  "Artifact",
+                  "Experiment",
+                  "Prompt",
+                  "Agent",
+                  "Mcp",
+                  "Service",
+                  "Audit",
+                  "Verifier",
+                  "Trigger",
+                  "Operator",
+                  "Repository"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "yaml": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "RelationshipList": {
+      "description": "An exact Card's server-derived relationships: each exact outbound and inbound Card reference.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Data",
+                  "Model",
+                  "Artifact",
+                  "Experiment",
+                  "Prompt",
+                  "Agent",
+                  "Mcp",
+                  "Service",
+                  "Audit",
+                  "Verifier",
+                  "Trigger",
+                  "Operator",
+                  "Repository"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "ArtifactTable": {
+      "description": "The files registration recorded for one exact Card version: relative path, size, SHA-256 digest and content type.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Data",
+                  "Model",
+                  "Artifact",
+                  "Experiment",
+                  "Prompt",
+                  "Agent",
+                  "Mcp",
+                  "Service",
+                  "Audit",
+                  "Verifier",
+                  "Trigger",
+                  "Operator",
+                  "Repository"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "PromptMessages": {
+      "description": "An exact Prompt as authored: provider, model and response format, then the portable system text and messages, or the native format's body unchanged.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Prompt"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "PromptVariables": {
+      "description": "The text and media variables the server's Prompt compiler derived from an exact Prompt (status.prompt).",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Prompt"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "UsedBy": {
+      "description": "The Agents whose spec references an exact Prompt, from its server-derived inbound relationships, with each Agent's execution route.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Prompt"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "VersionDiff": {
+      "description": "The authored differences between two registered versions of one Prompt: provider, model, system text, messages, settings, response format and derived variables.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Prompt"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "otherVersion": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "prompt.compare",
+          "description": "Compare the Prompt with this other registered version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "other_version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              }
+            },
+            "required": [
+              "other_version"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "VerifierDefinition": {
+      "description": "An exact Verifier as declared: its description, the read-only graph of its inputs, steps, attached and whole-Verifier requirements with their declared dependencies, and the authored declaration of the selected node. No execution state.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Verifier"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "RunsOn": {
+      "description": "The Services and Agents whose bindings pin an exact Verifier version, from its server-derived inbound relationships, with each binding's subject and when it runs.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Verifier"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RepositoryIndex": {
+      "description": "Repository Cards joined to the GitHub repositories the tenant's connection reaches, by provider repository id: registration, GitHub access and automatic verification as separate facts, with search and a Show choice.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "show": {
+            "type": "string",
+            "enum": [
+              "all",
+              "ready",
+              "inactive",
+              "undeclared"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "repository.filter",
+          "description": "Replace the search text and Show choice.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "show": {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "ready",
+                  "inactive",
+                  "undeclared"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "repository.declare",
+          "description": "Show how to declare a Repository Card for this reachable GitHub repository.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "repository_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "repository_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "connection.open",
+          "description": "Open the tenant's GitHub connection settings.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RepositoryPolicy": {
+      "description": "One exact Repository Card version: whether it is the selected policy, GitHub access, automatic verification, its exact Verifier bindings and its read-only declaration as Card YAML or a wyrd.toml projection.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Repository"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "declaration": {
+            "type": "string",
+            "enum": [
+              "yaml",
+              "toml"
+            ]
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.version",
+          "description": "View another exact version of this Repository; selection does not change.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "repository.declaration",
+          "description": "Show the declaration as Card YAML or as a wyrd.toml projection.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "declaration": {
+                "type": "string",
+                "enum": [
+                  "yaml",
+                  "toml"
+                ]
+              }
+            },
+            "required": [
+              "declaration"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "connection.open",
+          "description": "Open the tenant's GitHub connection settings.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RepositoryDeclare": {
+      "description": "One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "repositoryId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "repositoryId"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "GithubIntegration": {
+      "description": "The tenant's one GitHub App connection: state, installation, App and host, the repositories it reaches beside their Repository Cards, connect, manage access on GitHub, and a confirmed disconnect.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "github.connect",
+          "description": "Start connecting this tenant to GitHub; the host continues on GitHub.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
+          "name": "github.disconnect",
+          "description": "Disconnect this tenant from GitHub, after the reader confirmed.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "repository.declare",
+          "description": "Show how to declare a Repository Card for this reachable GitHub repository.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "repository_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "repository_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "VerificationExecution": {
+      "description": "One exact verification execution: its lifecycle status and verdict, the graph of the Verifier it ran coloured by recorded state, and an inspector for the selected step, requirement, input, session member or retained output. Every part is read and refused on its own.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "executionId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "node": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "producer": {
+            "type": "object",
+            "properties": {
+              "item_index": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "iteration_index": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "attempt"
+            ],
+            "additionalProperties": false
+          },
+          "output": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "details": {
+            "type": "boolean"
+          },
+          "invocations": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "publications": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "executionId"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "execution.select",
+          "description": "Show this node, invocation attempt, output and details; absent fields clear that part of the selection.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "producer": {
+                "type": "object",
+                "properties": {
+                  "item_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "iteration_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "attempt": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "attempt"
+                ],
+                "additionalProperties": false
+              },
+              "output": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "details": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "execution.page",
+          "description": "Read the page after the one shown, following the server's opaque cursor.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "invocations": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "invocations"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "publications": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "publications"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "execution.open",
+          "description": "Open another exact execution, such as a session member.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "execution.cancel",
+          "description": "Cancel this execution through the existing cancel operation; the host reports the outcome and reads the status again.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
+          "name": "publication.download",
+          "description": "Download one retained file of a publication through the host.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "step_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "producer": {
+                "type": "object",
+                "properties": {
+                  "item_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "iteration_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "attempt": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "attempt"
+                ],
+                "additionalProperties": false
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "step_id",
+              "name",
+              "producer"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.open",
+          "description": "Open the exact trace an input names, read with the viewer's current permissions.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -878,7 +2712,8 @@
               "traces",
               "spans",
               "logs",
-              "metrics"
+              "metrics",
+              "executions"
             ]
           },
           "where": {
@@ -988,7 +2823,8 @@
                   "traces",
                   "spans",
                   "logs",
-                  "metrics"
+                  "metrics",
+                  "executions"
                 ]
               },
               "column": {
@@ -1019,7 +2855,7 @@
       ]
     },
     "RecordTable": {
-      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.",
+      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs, metric points, or Verifier executions with their retained status and recorded verdict) or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.",
       "input": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "anyOf": [
@@ -1032,7 +2868,8 @@
                   "traces",
                   "spans",
                   "logs",
-                  "metrics"
+                  "metrics",
+                  "executions"
                 ]
               },
               "where": {
@@ -1251,7 +3088,7 @@
       "emits": [
         {
           "name": "record.open",
-          "description": "Open one trace or span, or one log record by its exact identity.",
+          "description": "Open one trace or span, one log record by its exact identity, or one exact Verifier execution.",
           "input": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "anyOf": [
@@ -1301,6 +3138,20 @@
                 },
                 "required": [
                   "log"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "execution_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "required": [
+                  "execution_id"
                 ],
                 "additionalProperties": false
               }
@@ -1587,7 +3438,8 @@
                   "traces",
                   "spans",
                   "logs",
-                  "metrics"
+                  "metrics",
+                  "executions"
                 ]
               },
               "column": {

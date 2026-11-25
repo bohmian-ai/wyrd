@@ -3399,7 +3399,6 @@ pub(crate) async fn ingest_at(
         wyrd_spec::auth::PrincipalId::new(tenant.as_uuid()),
         wyrd_runtime::principal::PrincipalKind::User,
         tenant,
-        Vec::new(),
         wyrd_runtime::PermissionSet::new(),
     );
     scribe

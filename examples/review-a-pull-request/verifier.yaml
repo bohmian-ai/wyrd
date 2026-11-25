@@ -21,12 +21,19 @@ spec:
       check:
         kind: code
         entrypoint: judge
-        inputs: {report: steps.review.output}  # the code_review report
+        inputs: {report: steps.review.output, pr: steps.pr.output.pr}  # the code_review report and the pinned pull request
         source:
           inline: |
-            def judge(report):
+            # `pull_request` is the extraction's own source slot: these cite the
+            # reviewed head commit and the commit the review compared from.
+            CITATIONS = [
+                {"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}},
+                {"slot": "pull_request", "locator": {"json_pointer": "/review/comparison_base"}},
+            ]
+
+            def judge(report, pr):
                 if not report["coverage"]["complete"]:
-                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": []}
+                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": CITATIONS}
                 if any(f["severity"] in ("critical", "high") for f in report["findings"]):
-                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": []}
-                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": []}
+                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": CITATIONS}
+                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": CITATIONS}

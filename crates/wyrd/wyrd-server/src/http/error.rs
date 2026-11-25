@@ -150,8 +150,11 @@ pub fn wyrd_error_response_from_parts(
 ) -> Response {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let retry_after = match &error {
-        // An exhausted password window says exactly when it ends.
-        WyrdError::PasswordAttempts { details, .. } => details
+        // An exhausted admission window says exactly when it ends.
+        WyrdError::PasswordAttempts { details, .. }
+        | WyrdError::SignupAttempts { details, .. }
+        | WyrdError::SignInAttempts { details, .. }
+        | WyrdError::EmailAttempts { details, .. } => details
             .get("retry_after_seconds")
             .and_then(serde_json::Value::as_u64)
             .map(|seconds| seconds.to_string()),

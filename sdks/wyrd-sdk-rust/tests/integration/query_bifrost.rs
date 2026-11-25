@@ -223,7 +223,9 @@ async fn stream_yields_arrow_batches_and_a_terminal() {
     deployment.shutdown().await;
 }
 
-/// A caller holding only `cards:read` cannot query Bifrost.
+/// A caller holding only `cards:read` reaches the query surface for its
+/// Cards' managed verification rows, but an ordinary table its grants do not
+/// name is refused as forbidden with no rows.
 ///
 /// # Panics
 /// Panics when the query succeeds or is refused with another code.
@@ -245,7 +247,7 @@ async fn caller_without_bifrost_read_is_refused() {
 
     assert_eq!(
         WyrdError::from(refused).code(),
-        "WYRD_PERMISSION_403_DENIED_RBAC"
+        "WYRD_VALA_403_QUERY_FORBIDDEN"
     );
     deployment.shutdown().await;
 }
@@ -821,7 +823,7 @@ async fn predicates_are_typed_bounded_and_tenant_scoped() {
                 .await
                 .expect_err("refused")
         ),
-        "WYRD_PERMISSION_403_DENIED_RBAC"
+        "WYRD_VALA_403_QUERY_FORBIDDEN"
     );
 
     let other = Bifrost::connect_with(

@@ -167,7 +167,8 @@ services.
     the managed `sub_principal_id`/`act_principal_id` pair. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action, scope }` on
-      the handler, stateless pubkey verify of the access token. Answers "is this
+      the handler, local signature verification and current cached account grants
+      bounded by signed restrictions. Answers "is this
       principal allowed to hit this Wyrd route, and to reach this object?" This
       covers data-plane ingest (e.g. `bifrost_record:write`) exactly like any
       other route. Wyrd RBAC is the standard operation/object model: `resource`
@@ -178,13 +179,15 @@ services.
       inside `Permission` is the sanctioned model — see
       [Permission model](wyrd-security-posture.md#permission-model).
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
-    tenant_id, roles, effective_permissions, credential_id, card_access,
+    tenant_id, effective_permissions, credential_id, card_access,
     workload_uid }`. `PrincipalId`
     is a `Uuid` newtype; no string-prefix encoding (no `user:`, `sa:`,
     `agent:`) — discrimination lives on the kind. The closed wire set is
     `PrincipalKindTag`: `GlobalAdmin`, `TenantAdmin`, `User`, `Service`,
     `System`, serialized as `global_admin`, `tenant_admin`, `user`,
-    `service`, `system`. A `GlobalAdmin` is a platform-plane principal
+    `service`, `system`. Managed tenant accounts are User and Service; admin
+    is role authority, not another assignable account type. Existing bootstrap
+    and internal tags retain their separate lifecycle. A `GlobalAdmin` is a platform-plane principal
     and has no tenant,
     carried at runtime as `PlatformPrincipal { id, kind,
     effective_permissions, credential_id }`; a platform-plane human is a
@@ -241,8 +244,9 @@ services.
     whose outermost layer is the current actor; a single delegated token
     carries both sides of an invoke. Service B obtains it with
     `WyrdClient::on_behalf_of(A token, audience)`, presenting A's token as
-    `subject_token` and its own as `actor_token`; its permissions are the
-    exact intersection of both. If the existing scopes cannot represent the
+    `subject_token` and its own as `actor_token`; the signed ceiling retains the
+    exact intersection of both authorities and inherited restrictions. Requests
+    also require current subject and actor grants. If the existing scopes cannot represent the
     complete intersection, exchange is refused without issuing a token;
     permissions are never widened or silently dropped to make issuance work.
     On cross-service calls the SDK puts that delegated
@@ -523,7 +527,9 @@ spec:
 ### Prompt
 A Prompt is authored once, in exactly one of two forms, and is stored,
 hashed, returned, and hydrated in that form. Variables, media variables, and
-the response type are derived, never authored.
+the response type are derived, never authored. A Card read serves the compiled
+variables as read-only `status.prompt: { variables, media_variables }`, so
+clients display them without re-parsing the spec.
 ```yaml
 # Portable form: compiled by the shared Skald compiler for its provider.
 spec:
@@ -537,7 +543,7 @@ spec:
 spec:
   provider: ProviderName
   model: string
-  format: chat_completion | responses | messages | generate_content | system_one
+  format: chat_completion | responses | messages | generate_content | system_one | decisions
   body: { ... }                    # that protocol's request body, extension options preserved
   response_format?: verdict | { kind: verdict, data?: JsonSchema } | code_review
 ```
@@ -555,8 +561,8 @@ validation is Wyrd's either way. A `data` schema is JSON Schema
 resource so its local references resolve as they do standalone. The card keeps and hashes the
 authored form, never the expanded provider settings. On a native body the
 named format is lowered into that protocol's structured-output settings; a
-body that also sets its own response settings, or a `system_one` body, is
-refused. Skald owns the
+body that also sets its own response settings, or a `system_one` or `decisions`
+body, is refused. Skald owns the
 compiler but no format names: Wyrd resolves `verdict` and `code_review` when
 it compiles a Prompt, and an unresolved named format cannot render.
 
@@ -575,6 +581,17 @@ custom name is an OpenAI-compatible Chat provider. It never names a gateway
 deployment: the Agent's `execution_route` chooses where the call executes.
 An Agent's inline Prompt takes the same two forms and declares as the
 Agent's own `<agent-name>-prompt` Prompt Card (doctrine 17).
+
+Native decision Prompts use `provider: jev, format: system_one` with shared
+`state` and keyed `questions`, or `provider: google, format: decisions` with
+shared `input` and keyed `questions`. Existing placeholder/media binding renders
+these typed native bodies. Text placeholders preserve strings verbatim and
+serialize other JSON context as JSON text. Jev state remains a string. Google Decisions admits its native text,
+Content and Content-array inputs, including media. These fixed-contract calls
+execute once without streaming or a tool loop; unsupported generation settings
+and incompatible providers are refused before invocation. The gateway's
+`decisions` operation/capability serves `/v1/decisions` and forwards through
+Google's existing auth and transport owners to `/v1beta/decisions`.
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -717,11 +734,17 @@ in the tenant; a second live account for the same family conflicts. Setting a
 family restriction, at creation or later, additionally requires
 tenant-administrative wildcard permission; a role name never proves it.
 Restrictions grant no operation authority and do not filter unrelated
-registry or table operations.
+registry or table operations. Retain WorkloadRestriction and WorkloadFamily: the
+family restriction answers which Service family the account may run as, while
+CardPermissionScope answers which target family/version an operation grant may
+reach. Neither supplies the other. The same principal and credential run every
+release; the SDK supplies its exact workload_uid for attribution. A retained
+authorization parent never replaces that root, its owning Card or subject/actor
+identity.
 
 | Operation | Surface | What it does |
 |---|---|---|
-| Create account | `POST /v1/principals`, `wyrd principal credential create-principal` | Atomically creates the account, its roles, optional restriction, and first credential, returned once. |
+| Create account | `POST /v1/principals`, `wyrd principal credential create-principal` | Atomically creates the account, its scoped role bindings, optional restriction, and first credential, returned once. |
 | Replace restriction | `PUT /v1/principals/{principal_id}/workload-restriction`, `wyrd principal credential set-restriction` | Service only; idempotent for an unchanged value; atomically releases and acquires the family association. Id, roles, and credentials are unchanged. |
 | Rotate credentials | `POST`/`GET`/`DELETE /v1/principals/{principal_id}/credentials[/{credential_id}]` | Issue, verify, deploy, then revoke the old key; overlap is allowed and releases never require rotation. |
 | Register a release | `wyrd declare service.yaml` | Writes Card versions; no principal and no secret. |
@@ -839,8 +862,12 @@ no client-supplied tenant header is accepted. The exchange takes an optional
 `workload_uid` naming the exact Service root the account runs as; it
 selects context only and never changes the account, permissions, or tenant.
 The JWT carries the account as the top-level `principal` claim
-(`{id, kind, tenant_id}`, no Card), the `permissions` resolved from its current
-grants at issuance as its only operation authority, an optional `workload_uid`
+(`{id, kind, tenant_id}`, no Card), an explicit token-contract version,
+validated issuer/audience/subject/time/token identity and credential/delegation
+provenance. It carries no `permissions` or `roles`. Optional signed
+`permission_ceiling` restricts current server-cached grants; it never grants
+access. Ordinary human and unrestricted Service-key tokens add no ceiling;
+restricted keys and delegation retain theirs. It also carries an optional `workload_uid`
 root, and a required `card_access` limit: `any_registered` for a rootless
 User, administrator, or unrestricted Service; `root_required` with the family
 snapshot for a rootless family-restricted Service, which permits generic
@@ -887,22 +914,41 @@ Env vars in deployed services:
 
 #### Human sign-in
 
-Human federation is optional per tenant. A tenant has at most one active OIDC
+Company SSO is optional per tenant. A tenant has at most one active OIDC
 connection, administered through `/v1/identity/oidc/*`; Wyrd is an OpenID
 Connect relying party of that provider (`openidconnect`) and the OAuth 2.0
 authorization server for its own clients. The provider authenticates the
 person; Wyrd resolves the tenant `User` by verified `(issuer, subject)`, maps
-provider groups only to that tenant's roles, and issues Wyrd tokens. Provider
-tokens are never Wyrd authority.
+provider groups only to source-qualified scoped bindings in that tenant, and
+issues Wyrd tokens. Local User/password login works without any IdP. Provider
+tokens are never Wyrd authority. Operator-configured Google/GitHub social
+providers sit beside the tenant company connection. Social login only resolves
+a previously attached tenant-local identity; admission requires an addressed
+invitation or enabled signup that creates a new tenant with its creator as admin.
+Explicit fresh-proof linking attaches methods to the same User without merging
+accounts. The [security posture](wyrd-security-posture.md#social-admission-account-linking-and-application-mail)
+owns provider onboarding, purpose binding, signup, linking, company-SSO policy
+and application-mail safeguards.
 
 | Client | OAuth client | Grant | Session holder |
 |---|---|---|---|
-| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
+| Web app | First-party browser session, not a separate OAuth client | Rust-owned company OIDC/social login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
+
+CLI device approval accepts a human signed in through an allowed password, company
+OIDC or social method and requires explicit user-code approval. Device approval
+and its rotating
+refresh family retain exactly one original authentication anchor: local User and
+password revision, company OIDC connection ID and revision, or social provider
+ID/revision and linked identity, plus CLI client binding.
+Invalidated anchors refuse renewal without switching methods; local login creates
+no synthetic provider connection. Unapproved device records carry no principal
+or anchor; expiry, one-use, replay, polling and browser-origin controls remain.
 
 Rust owns browser login transactions, callbacks, session creation, validation,
 expiry and revocation. Node renders the UI and forwards its selected tenant
-cookie to Rust; it does not redeem an OAuth code, retain a refresh token/API key,
+cookie to Rust; the platform console uses a separately scoped platform cookie.
+It does not redeem an OAuth code, retain a refresh token/API key,
 or encrypt a credential cookie. No UI-specific client secret, encryption key,
 environment variable, secret provisioning step, session service or sticky
 routing is required. Replicas resolve sessions through the existing Postgres.
@@ -919,32 +965,81 @@ tokens, the RFC 8628 §3.2 device response, an empty RFC 7009 revocation
 `GET /auth/browser/session` returns only live browser-safe session metadata,
 optionally filtered by tenant route key; and `POST /auth/browser/logout`
 revokes the selected session. They use typed Rust contracts and Wyrd errors.
-The shared `GET /auth/callback` completes a bound provider login; browser
+The shared `GET /auth/callback` completes a bound company-provider login; browser
 completion creates the session and redirects to the fixed tenant page, while
 device and provider-test completions retain their own behavior. There is no
 separate Node `/login/callback` OAuth-code exchange or UI refresh-token flow.
+Operator social providers use provider-specific Rust callbacks and the same
+transaction/session ownership.
 Deployed Services and Agents keep their own API keys or workload assertions;
 human SSO never replaces or disables them.
 
 Local password sign-in is the provider-free human path. An administrator
 holding User management and tenant administration creates a User directly
-(`POST /v1/principals/users`: username, password and Role names; `wyrd
-principal user create`), provisions an invitation by Role names (`POST
-/v1/principals/users/invitations`, 24-hour single-use code returned once;
-`wyrd principal user invite`) and, for recovery, a reset code (`POST
-/v1/principals/users/{principal_id}/password-reset`, 15 minutes); codes are
-delivered out of band and never appear in URLs. `POST
+(`POST /v1/principals/users`: username, password and explicit role/scope
+assignments; `wyrd principal user create`), provisions recipient-addressed
+invitations with explicit role/scope
+assignments (`POST
+/v1/principals/users/invitations`, one 24-hour single-use link per recipient,
+returned once for copying; `wyrd principal user invite`) and, for recovery, a reset code (`POST
+/v1/principals/users/{principal_id}/password-reset`, 15 minutes). Reset codes
+are delivered out of band and never appear in URLs. When the operator configures SMTP, Wyrd
+also emails each link after the invitation commits and reports per-recipient
+relay acceptance/failure; pending/resend/revoke handling follows the security
+posture. Without SMTP, administrators deliver the copied links themselves. `POST
 /auth/browser/password/signup` redeems an invitation into a tenant User with
 a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
 replace or reset the password. Rust stores only an Argon2id verifier,
 bounds failures per account and per source, and ends every local session of
 the User on change or reset; reset never signs in. `wyrd-server setup`
-creates no User. SSO-only Users have no password and are never linked to a
-local account by email or username. There is no OAuth password grant and no
-email delivery.
+requires a named tenant-local human admin (`--admin-username` and hidden password
+prompt or `--admin-password-stdin`, optional unverified `--admin-email`) before
+claiming the tenant. It reuses human-owner provisioning, retains its separate
+automation/recovery credential result and returns login URL/username, never the
+password. Completed reruns never reset a password or duplicate an admin;
+interrupted operator-authorized recovery cannot activate ownerless. Provider-only Users initially have no password; adding one
+requires fresh current-method proof. Accounts are never linked by email or username. There is
+no OAuth password grant. Verified-email/password and Google/GitHub public signup,
+when usable, reuse tenant provisioning with a human administrator instead of a
+platform principal or bootstrap key. Passwords use one 15–128-character NFC
+validator for setup, creation, invitation, change, reset and password-add, with
+blocklist and Argon2id; permit paste/managers without composition or rotation rules.
+
+Private defaults enable password but disable signup, with no SMTP/providers.
+Local public signup requires signup/password enabled plus SMTP: email proof first,
+then username/password and workspace confirmation. Public social creation also
+requires a verified contact, from validated provider proof or a bound Wyrd email
+challenge; returning login and invitation acceptance do not. Invitation possession
+never verifies its recipient address. Local creation yields a verified contact and
+password-anchored session; social creation need not add a password. Rust advertises
+returning and acquisition methods separately and rechecks them at start/completion;
+root/login/invitation/device pages offer only those advertised capabilities.
+
+At root, verified-email workspace discovery is available with SMTP alongside direct
+workspace URL/key entry and existing live-session enumeration. Generic requests
+disclose nothing; browser-bound proof permits bounded deduplicated active login
+links, never User IDs, sessions or membership authority. A minimal platform HMAC
+email projection points to tenant-qualified Users/contact revisions; validate the
+live tenant, User and current verified contact through their owners before revealing
+a link. Stale/unavailable validation fails closed; projection lag may omit links.
+Every workspace still requires its own allowed authentication. No global person
+account or email-based linking is introduced.
+
+A freshly authenticated User can separately verify/replace a recovery contact;
+setup and invitation remain usable offline without it. With SMTP and password
+allowed, a workspace + username reset request returns generic `202` for all
+accounts and sends only to eligible existing password Users' verified contacts.
+Codes are manual input, never URLs; expiry, one-use redemption and password-revision
+invalidation remain. Reset never signs in, adds a password or bypasses company SSO;
+notify on success and keep API keys unchanged. Without SMTP/contact use admin-issued
+codes. Proofs are purpose/browser-bound; email proofs last fifteen minutes and
+completion/discovery-read cookies five minutes. The security posture owns replay,
+contact/projection RLS, enumeration resistance and bounded transient mail sends. Shared provider and SMTP setup is
+operator administration; tenant admins manage company SSO and tenant login policy.
 
 `GET /v1/principals/me` returns the calling User's safe profile: principal,
-tenant, username, authentication method and effective permissions. Users
+tenant, username, display name, the User's own email, authentication method and
+effective permissions. It never returns another principal's email. Users
 list, create and revoke their own keys through the existing
 `/v1/principals/{principal_id}/credentials` routes under
 `personal_credentials:read|write`; creation requires a human login in the last
@@ -955,13 +1050,16 @@ exposes own-key metadata and revoke but never issues a secret.
 
 Browser session cookies contain only random identifiers. Records store their
 digests, tenant/principal, absolute expiry/revocation and exactly one anchor,
-not recoverable credentials: the exact human-connection revision of an SSO
-session, the recovery-credential reference of a recovery session, or the
-local User's password revision of a password session. Recovery logout revokes
+not recoverable credentials: the exact company-connection revision of an SSO
+session, social provider ID/revision and linked identity, the recovery-credential
+reference of a recovery session, or the local User's password revision of a password session. Recovery logout revokes
 only its browser session. Rust checks current authority on browser requests
-against that anchor; only SSO sessions check the connection. Existing tenant
-access-token snapshot semantics remain unchanged. Login transactions expire in five minutes and
-sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
+against that anchor and current allowed-method policy. Social sessions require
+an enabled exact provider revision and live identity; company SSO requires the
+exact Active connection. Requiring company SSO also refuses password/social
+browser sessions and CLI renewal; existing API-key and recovery policy remains.
+Current grant and token-ceiling semantics remain unchanged. Login transactions
+expire in five minutes and tenant sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
 HTTP APIs accept exactly one selected browser cookie through the existing
 principal/permission/audit boundary; ambiguous multiple session cookies are
 refused. Only metadata enumeration accepts multiple tenant sessions. Other
@@ -977,6 +1075,29 @@ no-store POST action result and is never in the initial page load, history,
 storage, URLs, logs, telemetry, captures or cookies. Store failure is unavailable,
 not anonymous success. Prior credential-bearing UI cookies require re-login;
 no plaintext-cookie compatibility path is retained.
+
+The human platform console is `/platform`, headed **Platform admin**; tenant
+administrators remain **workspace admin**. Existing tenantless platform principals,
+`PlatformLogin` and `PlatformLoginRequest` own platform SSO, restricted to
+pre-registered operators pinned to issuer/subject. Installs without an IdP use
+platform-user passwords under the shared 15-character minimum. The Rust
+first-party browser-session owner supplies a distinct host-only Secure, HttpOnly,
+SameSite=Lax platform cookie scoped to `/platform`, with 15-minute idle and
+eight-hour absolute expiry. Platform and tenant sessions never cross planes.
+Fresh same-operator re-authentication precedes destructive console actions;
+platform MFA belongs to the IdP. Detailed anchors, invalidation, persistence and
+freshness are owned by the
+[security posture](wyrd-security-posture.md#platform-console-browser-sessions).
+The global/bootstrap administrative key remains CLI/API break-glass and never
+enters the browser or Node.
+
+Same-origin hosting reserves exact `/platform` and `/platform/ui` plus its subtree
+for SvelteKit console pages/actions. Other `/platform/*` paths remain Rust HTTP
+APIs, including browser operations under `/platform/browser/*`. Nginx exact matches for `/platform` and `/platform/ui` and a `^~` prefix
+for `/platform/ui/` take precedence over the existing API regex; no API is renamed, no
+`admin` alias is introduced and no Accept-header routing is used. The Node BFF
+forwards the platform cookie to Rust, which owns login/callback exchange,
+re-authentication, session resolution and management authorization.
 
 #### GitHub App association
 
@@ -1012,8 +1133,10 @@ principal. `/mcp`, `/v1` management, and Bifrost do not gain it. The JWT
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
 Wyrd token: its top-level `principal` identifies the subject being acted
 for, and its `act` chain identifies the actor(s) acting for it, the
-outermost being the calling Service. Its `permissions` are the
-exact intersection of the actor's and the subject's; `act` is attribution only.
+outermost being the calling Service. Its signed `permission_ceiling` freezes the
+exact intersection of actor/subject authority and inherited restrictions at
+exchange; each request also checks current grants for every participant. The
+`act` chain preserves attribution and identifies those constrained actors.
 An exchange whose complete intersection cannot be represented by the existing
 token scopes is refused before signing, without silent attenuation or new
 authority. Mixed broad and explicit input grants alone are not a refusal:
@@ -1651,9 +1774,23 @@ aggregation are unchanged.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | An Agent, with its declared tools and optional `workspace` as in a step, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
+| `agent` | An Agent returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus declared `data`; alternatively, an explicit `verdict_transform` converts a supported fixed native decision response to that Verdict. Tools and optional `workspace` remain subject to the selected provider contract |
 | `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
+
+`verdict_transform` belongs only to Agent checks and is part of the versioned
+Verifier. It explicitly selects question keys and declares Choice outcome
+mapping, Noul probability thresholds/polarity, or a scalar Score comparison.
+A flat, nonempty `all` combines unique selected questions from one invocation:
+failure wins, then inconclusive, then pass. Every selected answer is validated;
+an invalid selected answer follows the existing check-error path even when
+another answer fails. Unselected answers do not affect the judgment. Skald owns
+native decoding; Vala applies the policy in memory, without another model call
+or IO. Generated reasons state the observed answer and policy, citations may be
+empty, and confidence never implicitly overrides policy. Selected native
+answers and aggregate question outcomes use the existing captured `actual`
+field, context-capture controls, provenance and asynchronous result recording.
+Omitting the transform preserves the direct-Verdict check contract.
 
 An `approval` step (`action: {kind: approval, message}`) makes its Verifier
 queued-only. Each time the step is reached, including each fanout item and
@@ -1667,8 +1804,9 @@ cancellation expires it. `POST
 status, actor_id, decided_at, reason}` only after the decision is durable. The
 first decision is final: the same actor, decision, and reason replay the
 receipt, and anything else refuses
-`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding needs only
-`verifier:approve` on the exact Verifier. The same `ExecutionId`
+`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding requires
+`verifier:approve` on the exact Verifier and read access to the retained
+execution parent; approval authority does not grant that parent implicitly. The same `ExecutionId`
 continues after the decision. A rejection is data: the step succeeds with the receipt (`status:
 rejected`) as `steps.<id>.output`, and a requirement over it fails the verdict.
 
@@ -1742,18 +1880,34 @@ ordinary call; a mismatch is `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the
 requirement with the data root's empty `path` (a deeper path could hold a
 returned dictionary key), and never reruns or changes the result.
 
-A citation names an original input slot, or a fixed workspace file's
-`attachment_<n>` slot as the `fs.*` tools report it in `sources`, and a typed
-locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`);
-workspace paths map back to their slots, and `/work` scratch is never a
-source. Before an Agent check runs, a `verdict`-format Prompt's citation
-slots are narrowed on that invocation's copy to the bare slots its bound
-inputs and workspace reach, so the provider request and the Agent's
-validation admit the same slots and a wrong or `inputs.`-prefixed slot is
-repaired; with no reachable source the slots are left open. The Card and
-concurrent invocations are unchanged. The server validates every citation
-against the pinned evidence, and a passed Agent check without a valid
-citation becomes inconclusive.
+A citation names an original input slot, a fixed workspace file's
+`attachment_<n>` slot as the `fs.*` tools report it in `sources`, or the
+engine-owned original source of a retained `pull_request` extraction, with a
+typed locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`). The
+PR source identifies the accepted provider repository and pinned comparison/head
+commits; JSON pointers resolve against that execution's retained extraction.
+Its documented source slot is available to check authors without a caller input,
+cannot collide with caller slots, and cannot be supplied or replaced by callers.
+Workspace paths and derived outputs preserve reachability to their original
+sources; `/work` scratch is never a source. Before an Agent check runs, a
+`verdict`-format Prompt's citation slots are narrowed on that invocation's copy
+to the bare slots its bound inputs and workspace reach, so the provider request
+and the Agent's validation admit the same slots and a wrong or `inputs.`-prefixed
+slot is repaired; with no reachable source the slots are left open. The Card
+and concurrent invocations are unchanged.
+
+The server validates every supplied citation against reachable pinned evidence.
+Invalid output or a supplied citation that does not validate is an explicit
+check validation error, following the existing check-error path; citations are
+not silently discarded. That path may record an inconclusive error result with
+the validation reason, not an accepted and rewritten authored verdict. Existing
+schema and declared-data validation remain unchanged. A valid Agent or code check verdict is preserved,
+including a pass with no citations. The engine never changes an accepted verdict
+to enforce an implicit citation requirement. An authored requirement may demand
+particular evidence. Requirement aggregation and provider/infrastructure error
+handling remain as defined above. A clean PR review may cite the reviewed PR
+source even when it has no findings or inline source anchors. Retained source
+custody, access, and recovery remain with their existing owners.
 
 Verifiers judge one of two evidence modes, fixed at declaration; mixing them
 is refused.
@@ -1931,7 +2085,7 @@ execution; scheduled executions have no `run_id`.
 | `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path`. A cloud backend's plan is presigned; the local backend's points at `.../content` |
 | `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content` | The local backend's bytes of that same file, selected and authorized as its download plan is |
 | `POST /v1/verification/executions/{execution_id}/cancel` | `{ execution_id, status }` after the cancellation fence commits; settled work keeps its status |
-| `GET /v1/verification/executions/{execution_id}/details` | `200 VerificationDetails` once the execution's complete records are visible; otherwise `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, including unknown, not-yet-recorded, and no-longer-readable executions; the same `verifier:read` on the execution's Verifier, audited as its own read |
+| `GET /v1/verification/executions/{execution_id}/details` | `200 VerificationDetails` once the execution's complete records are visible; otherwise `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, including unknown, not-yet-recorded, and no-longer-readable executions; read on the retained execution parent with sensitive-content checks, audited as its own read |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -1974,20 +2128,21 @@ input-File discovery or authorize caller-supplied storage paths.
 
 
 Execution reads — status, invocation and publication pages, publication
-reads, download plans, and local publication content — check `verifier:read` against the execution's
-exact Verifier UID, and cancellation checks `verifier:run`; neither falls back
-to `cards:read`. A caller with no grant of the action at any scope is refused
-before the execution is looked up, and an absent or other-tenant execution is
-not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
+reads, download plans, and local publication content — check current read access
+on the trusted retained parent with sensitive-content controls. Repository read
+includes its member executions without separate Verifier read. Cancellation
+requires its distinct `verifier:run` action; read alone never permits mutation.
+An inaccessible, absent or other-tenant execution is not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
 its listing's insertion-sequence cut and is bound to the tenant, execution,
 and listing, so a page neither skips nor repeats entries while the execution
 progresses. Execution status reads its records through the tenant's SYSTEM
 read authority granted only `execution_inputs`, `results`, and
-`execution_outputs`; public Bifrost SQL keeps the caller's own table grants.
+`execution_outputs`; caller-visible results still enforce parent visibility.
+Public Bifrost SQL keeps caller source authority and managed-row visibility.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
-Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
-every Verifier in the tenant. Permission is checked before execution and the
+Card UID. `PermissionScope::Card` names a Verifier family or exact validated
+version; `All` covers every Verifier in the tenant for that operation. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
 The engine loads the executing Verifier's exact Agent and Prompt Cards under
 the same audited `verifier:run`, never `cards:read`; a referenced definition
@@ -2195,9 +2350,17 @@ loading reconstructs logical progress rather than replaying engine instructions.
 Unknown IDs are not found only after an authoritative read; unavailable required
 sources cause retryable failure. Existing result payload meanings stay unchanged.
 
-Dedicated execution reads retain exact Verifier/repository feature authorization using
-current caller grants and recorded immutable identities, without requiring source Card
-retrieval or leftover queue rows. The server reads accepted/recovered execution
+Dedicated execution reads check current caller grants on the trusted retained
+authorization parent, plus explicit sensitive-content controls, without requiring
+source Card retrieval or leftover queue rows. At acceptance, the parent is the
+subject Card for ordinary verification, the Verifier for subjectless direct work,
+and the Repository for PR work and all members. Exact and family identity survive
+with inputs, outputs, events, results, evidence and approvals. Unknown/inaccessible
+objects are indistinguishable; unprovable parents remain hidden even from admins.
+Parent visibility governs reads/downloads/lists/search/counts before aggregation
+or pagination, including SQL and peer reads. Opening another Card definition
+requires its own grant. Parent identity never changes owning workload, exact
+Verifier, subject or actor attribution. The server reads accepted/recovered execution
 state and exact references; clients
 do not choose a backend. Ordinary registry/principal control-plane reads retain
 their owners. A publication file is stored by the storage owner's validated
@@ -2208,9 +2371,11 @@ acceptance onward. External File uploads keep their upload-session contract.
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
 delegated caller B acting for A records A/B. A queued execution stores the
-accepted authority and delegation, without credentials, through the
-acknowledgment handoff and its row, and keeps it across claim, retry, and
-restart; caller submission never switches to binding-owner or SYSTEM
+accepted frozen permission ceiling, identity and delegation, without credentials,
+through the acknowledgment handoff and its row, and keeps them across claim, retry,
+and restart. Downstream checks require current grants within that ceiling; later
+grants cannot enlarge accepted authority, and principal revocation still cancels
+unfinished work; caller submission never switches to binding-owner or SYSTEM
 authority. A scheduled execution runs with its binding owner's accepted
 authority. Wyrd performs model calls, tool calls, input reads, and result
 writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
@@ -2642,12 +2807,35 @@ access (repository removal, suspension, uninstall or disconnect) cancel with
 `pull_request_closed`, `pull_request_draft` and `repository_access_lost`. Settled history keeps its pins, and a policy
 re-declaration affects only later generations.
 
+An authenticated Wyrd PR-wide fresh-review operation, available through HTTP,
+the SDKs and explicitly write-scoped MCP, is the additional admission input.
+It takes host, repository id, PR number and an idempotency key; tenant and caller
+are authenticated. The caller needs current `cards:read`, `verifier:read` and `verifier:run` on
+every selected member before acceptance. The same admission owner rechecks
+connected access and current open, non-draft source under the per-PR lock and
+connection fence. A distinct request creates a new generation at an unchanged
+head under the selected policy, retaining the declaration's accountable
+execution authority and existing refusal/supersession semantics. Caller-supplied
+policy, membership, source or execution authority is not accepted. No selected
+PR bindings means no fresh set. A retry of the same tenant/PR/key returns its
+accepted generation and members across restart and later source/policy changes,
+never reactivating obsolete work. Retained verification admission records hold
+that identity; ordinary source-event replay remains unchanged. This operation
+does not add GitHub Check rerequest hooks or a UI rerun control.
+
 The reserved executions then follow the same Scribe hand-off and outbox as
 `submit`, keyed by execution so a replay stages identical rows, and become
 due only when the outbox commits them. A delivery is answered 2xx only after
 every execution of its generation is due, or after durable obsolete or
 refusal settlement establishes that no work is owed; a refusal settles as an
 `errored` execution, and an unavailable authority store answers non-2xx. A
+retained admission records the exact generation, source, selected policy and
+full member identities, including terminal refusals that never become runnable.
+Interrupted handoff must remain distinguishable from complete retained membership;
+neither an observed subset nor delayed older records can define a complete or
+newer current set. The existing verification input/event family retains these
+facts under existing tenant/Card/Verifier/payload read authorization, without
+a new SQL evidence ledger or history service. A
 redelivery of an accepted generation that is still current and not
 deactivated re-stages the stored pins, never a newer policy; a newer source
 is admitted under the selected policy instead, and a closed or draft pull
@@ -2657,9 +2845,10 @@ owner scans the App's delivery log and asks GitHub to redeliver each delivery
 without a 2xx attempt until a bounded number of redeliveries is logged;
 replicas scanning at once may each ask, and shutdown abandons a scan still
 waiting on GitHub. Reading a pull request's execution, or its progress and
-publications, needs `cards:read` in addition to `verifier:read` on its exact
-Verifier, decided from the queue row or, once that is gone, the accepted
-input record's origin.
+publications, needs read on its retained Repository authorization parent,
+without separate exact-Verifier read or GitHub configuration access. The trusted
+parent survives in accepted records independently of the queue row; apply
+sensitive-content checks before returning membership or counts.
 
 A `pull_request` execution's results reach GitHub in the background once the
 runner settles or parks it, and again for every current pull request
@@ -2849,6 +3038,22 @@ registration takes its Card name from the provider repository name; later
 declarations keep that family through a provider rename, and declaring the
 same `repository_id` under a second name is refused with
 `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT`.
+
+Repository Card grants address tenant + kind + Card family name, or one exact
+version UID. Family read includes current/future versions and retained reviews,
+review sets, member executions and evidence, including for custom roles; it does
+not require separate referenced-Verifier read or GitHub connection permission.
+Starting fresh work, policy authoring and approvals require their own action
+grants; approvals also require parent visibility. Opening a referenced Card's
+definition requires independent read. Sensitive-content controls still apply.
+
+The connected provider repository determines what Wyrd can fetch, not who can
+read retained Wyrd data. Connection configuration pages, installation inventory
+and UI/HTTP operations require admin or explicit GitHub-configuration permission
+in Rust. That permission confers neither OIDC administration nor data read;
+Repository grants confer no connection administration. Retained reads require no
+GitHub request and survive disconnect; new PR work retains provider availability,
+selected declaration authority and webhook checks.
 
 `status.repository` projects the server-managed `full_name`, whether this
 version is `selected`, and the family's `selected_version`. Adding repository
@@ -3061,15 +3266,20 @@ original Prompt (`openai_chat` in Rust, `Prompt.openai_chat` in Python,
 `Prompt.openaiChat` in TypeScript) at an Agent's `prompt`, and in Python
 `ComparisonOperator`, `ExecutionRoute`, and `AgentRunConfig`; the Prompt's
 `ResponseFormat.verdict(data=...)` extends the canonical Verdict with typed
-`data`. Authoring converts these to the canonical form and adds no validation
-of its own. A setter consumes the value and replaces its whole field, together
+`data`. Authoring converts these to the canonical form and adds no independent
+validation rules. A setter consumes the value and replaces its whole field, together
 with everything that field referenced; an `add_*` method appends one entry in
 place. A Service binds each Component's own Verifiers through
 `Component::verified_by`; Model verification belongs on its Component.
 
-Construction and editing do no domain validation, file reads, or network IO,
-so incomplete values and forward references are allowed. An attempted
-duplicate add is kept, not dropped, and refused when validated. A Card value
+Except for typed decision values, construction and editing do no domain
+validation, file reads, or network IO, so incomplete values and forward references
+are allowed. Typed decision-question and verdict-transform values validate their
+fields and self-contained constraints at construction through their shared owners. The assembled graph's `validate()`
+checks locally resolvable question selection, transform compatibility, Choice
+coverage and duplicate selections; unresolved registered references are validated
+authoritatively at registration. Cross-object checks do not run after each edit.
+An attempted duplicate add is kept, not dropped, and refused when validated. A Card value
 at a reference position contributes a sibling definition, captured by value,
 whose sibling reference carries the Card's version only when it has one; an
 exact `CardRef` stays an external reference. A local Artifact is referenced

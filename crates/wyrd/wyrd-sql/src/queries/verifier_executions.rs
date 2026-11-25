@@ -27,7 +27,7 @@ use sqlx::types::{Json, Uuid};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, CardPermissionScope};
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS};
 use wyrd_spec::card::verifier::SourceText;
 use wyrd_spec::error::WyrdError;
@@ -41,7 +41,7 @@ use wyrd_spec::verification::execution::{
 };
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
-    VerificationError, VerificationVerdict, VerifierReadiness,
+    VerificationError, VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -595,7 +595,8 @@ const TERMINATE_SQL: &str = r"
 ";
 
 /// Return a leased execution to the queue, refunding its attempt; `$3` is the
-/// delay in milliseconds before it is due again.
+/// delay in milliseconds before it is due again. Returns the status it is
+/// returned to.
 const RELEASE_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
@@ -603,6 +604,7 @@ const RELEASE_SQL: &str = r"
            next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+    RETURNING status
 ";
 
 /// Cancel one unfinished execution; a settled one is left as it is.
@@ -617,7 +619,8 @@ const CANCEL_SQL: &str = r"
      WHERE execution_id = $1 AND status IN ('pending', 'retrying', 'running')
 ";
 
-/// Cancel every unfinished execution a principal submitted or accepted.
+/// Cancel every unfinished execution a principal submitted or accepted,
+/// returning each cancelled execution's identity and attribution.
 const CANCEL_PRINCIPAL_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = 'cancelled', error = $2, lease_expires_at = NULL,
@@ -625,6 +628,7 @@ const CANCEL_PRINCIPAL_SQL: &str = r"
            updated_at = statement_timestamp()
      WHERE (sub_principal_id = $1 OR act_principal_id = $1)
        AND status IN ('pending', 'retrying', 'running')
+    RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id
 ";
 
 /// Which of principals `$1` are no longer active, read once every listed
@@ -648,12 +652,20 @@ const INACTIVE_PRINCIPALS_SQL: &str = r"
 
 /// Read one execution's control-plane status.
 const STATUS_SQL: &str = r"
-    SELECT execution_id, status, sub_principal_id, act_principal_id,
-           verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, deployment_environment, pull_request,
-           lease_token IS NOT NULL AS claimed
-      FROM wyrd.verifier_executions
-     WHERE execution_id = $1
+    SELECT e.execution_id, e.status, e.sub_principal_id, e.act_principal_id,
+           e.verifier_card_uid, e.card_uid, e.result_id, e.error,
+           e.group_id, e.owner_card_uid, e.deployment_environment, e.pull_request,
+           e.lease_token IS NOT NULL AS claimed,
+           CASE WHEN v.card_uid IS NOT NULL THEN jsonb_build_object('version',
+                jsonb_build_object('kind', v.kind, 'name', v.name, 'uid', v.card_uid))
+           END AS verifier_scope,
+           CASE WHEN s.card_uid IS NOT NULL THEN jsonb_build_object('version',
+                jsonb_build_object('kind', s.kind, 'name', s.name, 'uid', s.card_uid))
+           END AS card_scope
+      FROM wyrd.verifier_executions e
+      LEFT JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
+      LEFT JOIN wyrd.cards s ON s.card_uid = e.card_uid
+     WHERE e.execution_id = $1
 ";
 
 /// Read one execution's dispatches in identity order.
@@ -993,6 +1005,82 @@ impl EnqueueRefusal {
             code: error.code().to_owned(),
             message: message.to_owned(),
         }
+    }
+}
+
+/// One execution a principal cancellation settled `cancelled`, as
+/// [`CANCEL_PRINCIPAL_SQL`] returns it: what its committing owner needs to
+/// record the transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledExecution {
+    /// The cancelled execution.
+    pub execution_id: ExecutionId,
+    /// The Verifier that would have run it.
+    pub verifier_card_uid: CardUid,
+    /// The Card it would have verified, its records' trusted read parent.
+    pub card_uid: CardUid,
+    /// Its subject and accepting actor.
+    pub attribution: Attribution,
+}
+
+/// The executions cancelled by one [`CANCEL_PRINCIPAL_SQL`] statement.
+#[derive(sqlx::FromRow)]
+struct CancelledRow {
+    /// Execution identity.
+    execution_id: Uuid,
+    /// Frozen Verifier Card UID.
+    verifier_card_uid: Uuid,
+    /// Frozen subject Card UID.
+    card_uid: Uuid,
+    /// Submitting subject.
+    sub_principal_id: Uuid,
+    /// Accepting actor.
+    act_principal_id: Uuid,
+}
+
+impl CancelledRow {
+    /// Decode the returned identities.
+    ///
+    /// # Errors
+    /// Returns [`SqlxError::Decode`] when a stored identity is malformed.
+    fn decode(self) -> Result<CancelledExecution, SqlxError> {
+        Ok(CancelledExecution {
+            execution_id: stored(ExecutionId::new(self.execution_id))?,
+            verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
+            card_uid: stored(CardUid::from_uuid(self.card_uid))?,
+            attribution: Attribution::new(
+                PrincipalId::new(self.sub_principal_id),
+                PrincipalId::new(self.act_principal_id),
+            ),
+        })
+    }
+}
+
+/// An admission's outcome and the executions its principal fence cancelled
+/// before the caller's commit, which the caller records once it commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admitted<T> {
+    /// What the admission answers.
+    pub outcome: T,
+    /// Every execution, this admission's or earlier, whose subject or
+    /// accepting actor was no longer active; empty when every principal is.
+    pub cancelled: Vec<CancelledExecution>,
+}
+
+impl<T> Admitted<T> {
+    /// An admission that fenced nothing, answering `outcome`.
+    const fn settled(outcome: T) -> Self {
+        Self {
+            outcome,
+            cancelled: Vec::new(),
+        }
+    }
+}
+
+impl Admitted<EnqueueOutcome> {
+    /// An admission refused with `refusal`, which wrote and fenced nothing.
+    const fn refused(refusal: EnqueueRefusal) -> Self {
+        Self::settled(EnqueueOutcome::Refused(refusal))
     }
 }
 
@@ -1696,6 +1784,13 @@ pub struct ExecutionStatus {
     pub verifier_card_uid: CardUid,
     /// Exact Card verified.
     pub card_uid: CardUid,
+    /// The Verifier's exact scope from its registered Card, which authorizes
+    /// running and cancelling; `None` once the Card is gone.
+    pub verifier_scope: Option<CardPermissionScope>,
+    /// The verified Card's exact scope from its registered Card: the trusted
+    /// parent that authorizes reading the execution; `None` once it is gone,
+    /// which hides the execution from ordinary reads.
+    pub card_scope: Option<CardPermissionScope>,
     /// Result pointer of a completed execution.
     pub result_id: Option<VerificationResultId>,
     /// The deployment environment tag the execution was accepted with;
@@ -1829,7 +1924,7 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
         submissions: &[Submission],
         refusals: &HashMap<(Uuid, Uuid), EnqueueRefusal>,
-    ) -> Result<Vec<SubmissionOutcome>, SqlxError> {
+    ) -> Result<Admitted<Vec<SubmissionOutcome>>, SqlxError> {
         timed("accept", async {
             let ids: Vec<Uuid> = submissions
                 .iter()
@@ -1856,8 +1951,11 @@ impl VerifierExecutionQueue {
                 }
                 outcomes.push(Self::decide(submission, refusals, &mut holders, &mut rows));
             }
-            self.insert_submissions(conn, &rows).await?;
-            Ok(outcomes)
+            let cancelled = self.insert_submissions(conn, &rows).await?;
+            Ok(Admitted {
+                outcome: outcomes,
+                cancelled,
+            })
         })
         .await
     }
@@ -1972,7 +2070,8 @@ impl VerifierExecutionQueue {
     }
 
     /// Insert a batch's new rows in one statement; each is `pending` when
-    /// its `error` is `None`, otherwise settled `errored` with it.
+    /// its `error` is `None`, otherwise settled `errored` with it. Returns
+    /// what [`Self::fence_principals`] then cancelled.
     ///
     /// # Errors
     /// Returns the database error when the insert fails, or an encode error
@@ -1981,9 +2080,9 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
         rows: &[NewSubmission<'_>],
-    ) -> Result<(), SqlxError> {
+    ) -> Result<Vec<CancelledExecution>, SqlxError> {
         if rows.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let attributions: Vec<Attribution> = rows
             .iter()
@@ -2083,7 +2182,8 @@ impl VerifierExecutionQueue {
     /// [`INACTIVE_PRINCIPALS_SQL`], then cancels the unfinished executions of
     /// any no longer active, exactly as their revocation does, so a revoked
     /// principal's delayed admission never commits runnable work. Every
-    /// submitted, scheduled, and group admission calls it after its insert.
+    /// submitted, scheduled, group, and pull request admission calls it after
+    /// its insert and returns what it cancelled in its [`Admitted`].
     ///
     /// # Errors
     /// Returns the database error when the lock, read, or cancellation fails.
@@ -2091,7 +2191,7 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
         attributions: impl IntoIterator<Item = Attribution>,
-    ) -> Result<(), SqlxError> {
+    ) -> Result<Vec<CancelledExecution>, SqlxError> {
         let ids: Vec<Uuid> = attributions
             .into_iter()
             .flat_map(|attribution| {
@@ -2105,11 +2205,14 @@ impl VerifierExecutionQueue {
             .bind(&ids)
             .fetch_all(&mut **conn.transaction())
             .await?;
+        let mut cancelled = Vec::new();
         for principal in inactive {
-            self.cancel_principal(conn, PrincipalId::new(principal))
-                .await?;
+            cancelled.extend(
+                self.cancel_principal(conn, PrincipalId::new(principal))
+                    .await?,
+            );
         }
-        Ok(())
+        Ok(cancelled)
     }
 
     /// Prepare one occurrence of a scheduled binding for acknowledged
@@ -2175,7 +2278,7 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
         admission: &ScheduledAdmission,
-    ) -> Result<EnqueueOutcome, SqlxError> {
+    ) -> Result<Admitted<EnqueueOutcome>, SqlxError> {
         timed("accept_scheduled", async {
             let target = &admission.target;
             let attribution = admission.authority.attribution();
@@ -2202,9 +2305,10 @@ impl VerifierExecutionQueue {
                 .bind(admission.max_attempts)
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
+            let mut cancelled = Vec::new();
             let outcome = match inserted {
                 Some(execution_id) => {
-                    self.fence_principals(conn, [attribution]).await?;
+                    cancelled = self.fence_principals(conn, [attribution]).await?;
                     EnqueueOutcome::Enqueued(stored(ExecutionId::new(execution_id))?)
                 }
                 None => {
@@ -2213,7 +2317,7 @@ impl VerifierExecutionQueue {
                     {
                         Some(existing) => EnqueueOutcome::AlreadyEnqueued(existing),
                         None => {
-                            return Ok(EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound));
+                            return Ok(Admitted::refused(EnqueueRefusal::BindingNotFound));
                         }
                     }
                 }
@@ -2226,7 +2330,7 @@ impl VerifierExecutionQueue {
                     .execute(&mut **conn.transaction())
                     .await?;
             }
-            Ok(outcome)
+            Ok(Admitted { outcome, cancelled })
         })
         .await
     }
@@ -2246,14 +2350,16 @@ impl VerifierExecutionQueue {
         binding_id: BindingId,
         window: DriftWindow,
         authority: &ExecutionAuthority,
-    ) -> Result<EnqueueOutcome, SqlxError> {
+    ) -> Result<Admitted<EnqueueOutcome>, SqlxError> {
         match self
             .prepare_scheduled(conn, binding_id, window, authority, None)
             .await?
         {
             Prepared::Candidate(admission) => self.accept_scheduled(conn, &admission).await,
-            Prepared::Existing(existing) => Ok(EnqueueOutcome::AlreadyEnqueued(existing)),
-            Prepared::Refused(refusal) => Ok(EnqueueOutcome::Refused(refusal)),
+            Prepared::Existing(existing) => {
+                Ok(Admitted::settled(EnqueueOutcome::AlreadyEnqueued(existing)))
+            }
+            Prepared::Refused(refusal) => Ok(Admitted::refused(refusal)),
         }
     }
 
@@ -2452,19 +2558,23 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
         due: DueBinding,
         authority: Option<ExecutionAuthority>,
-    ) -> Result<ScheduleTick, SqlxError> {
+    ) -> Result<Admitted<ScheduleTick>, SqlxError> {
         let admission = match self.settle_due(conn, due, authority).await? {
-            DueSettlement::Settled(tick) => return Ok(tick),
+            DueSettlement::Settled(tick) => return Ok(Admitted::settled(tick)),
             DueSettlement::Candidate(admission) => admission,
         };
-        let outcome = match self.accept_scheduled(conn, &admission).await? {
+        let Admitted { outcome, cancelled } = self.accept_scheduled(conn, &admission).await?;
+        let outcome = match outcome {
             EnqueueOutcome::Enqueued(id) => ScheduleOutcome::Enqueued(id),
             EnqueueOutcome::AlreadyEnqueued(id) => ScheduleOutcome::AlreadyEnqueued(id),
             EnqueueOutcome::Refused(refusal) => {
                 ScheduleOutcome::Skipped(ScheduleSkip::Refused(refusal))
             }
         };
-        Ok(admission.tick(outcome))
+        Ok(Admitted {
+            outcome: admission.tick(outcome),
+            cancelled,
+        })
     }
 
     /// Store a claimed binding's next cursor.
@@ -2728,7 +2838,7 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
         admission: &GroupedAdmission,
-    ) -> Result<EnqueueOutcome, SqlxError> {
+    ) -> Result<Admitted<EnqueueOutcome>, SqlxError> {
         timed("accept_grouped", async {
             let target = &admission.target;
             let attribution = admission.authority.attribution();
@@ -2755,9 +2865,10 @@ impl VerifierExecutionQueue {
                 .bind(admission.max_attempts)
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
+            let mut cancelled = Vec::new();
             let outcome = match inserted {
                 Some(execution_id) => {
-                    self.fence_principals(conn, [attribution]).await?;
+                    cancelled = self.fence_principals(conn, [attribution]).await?;
                     EnqueueOutcome::Enqueued(stored(ExecutionId::new(execution_id))?)
                 }
                 None => match Self::existing_snapshot(
@@ -2769,7 +2880,7 @@ impl VerifierExecutionQueue {
                 .await?
                 {
                     Some(existing) => EnqueueOutcome::AlreadyEnqueued(existing),
-                    None => return Ok(EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)),
+                    None => return Ok(Admitted::refused(EnqueueRefusal::BindingNotFound)),
                 },
             };
             if let Some(generation) = admission.generation {
@@ -2780,7 +2891,7 @@ impl VerifierExecutionQueue {
                     .execute(&mut **conn.transaction())
                     .await?;
             }
-            Ok(outcome)
+            Ok(Admitted { outcome, cancelled })
         })
         .await
     }
@@ -2800,14 +2911,16 @@ impl VerifierExecutionQueue {
         binding_id: BindingId,
         pinned: &PinnedGroup,
         authority: &ExecutionAuthority,
-    ) -> Result<EnqueueOutcome, SqlxError> {
+    ) -> Result<Admitted<EnqueueOutcome>, SqlxError> {
         match self
             .prepare_group(conn, binding_id, pinned, authority, None)
             .await?
         {
             Prepared::Candidate(admission) => self.accept_grouped(conn, &admission).await,
-            Prepared::Existing(existing) => Ok(EnqueueOutcome::AlreadyEnqueued(existing)),
-            Prepared::Refused(refusal) => Ok(EnqueueOutcome::Refused(refusal)),
+            Prepared::Existing(existing) => {
+                Ok(Admitted::settled(EnqueueOutcome::AlreadyEnqueued(existing)))
+            }
+            Prepared::Refused(refusal) => Ok(Admitted::refused(refusal)),
         }
     }
 
@@ -3148,25 +3261,28 @@ impl VerifierExecutionQueue {
     /// releases with a poll delay so a saturated reader is not reclaimed in a
     /// hot loop. The execution keeps its identity and frozen input, becomes
     /// due `delay` after PostgreSQL's statement time, and does not consume its
-    /// retry budget.
+    /// retry budget. Returns the status it is returned to, `pending` before
+    /// a second attempt and `retrying` after one, or `None` when the lease no
+    /// longer holds it and nothing changed.
     ///
     /// # Errors
-    /// Returns the database error when the update fails.
+    /// Returns the database error when the update fails, or a decode error
+    /// when the stored status is unknown.
     #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.release", execution_id = %lease.execution_id))]
     pub async fn release(
         &self,
         conn: &mut TenantConn<'_>,
         lease: ExecutionLease,
         delay: Duration,
-    ) -> Result<Settlement, SqlxError> {
+    ) -> Result<Option<VerificationExecutionStatus>, SqlxError> {
         timed("release", async {
-            let result = sqlx::query(RELEASE_SQL)
+            let status: Option<String> = sqlx::query_scalar(RELEASE_SQL)
                 .bind(lease.execution_id.as_uuid())
                 .bind(lease.token.0)
                 .bind(delay.num_milliseconds())
-                .execute(&mut **conn.transaction())
+                .fetch_optional(&mut **conn.transaction())
                 .await?;
-            Ok(settlement(result.rows_affected()))
+            status.map(|status| stored(status.parse())).transpose()
         })
         .await
     }
@@ -3212,27 +3328,31 @@ impl VerifierExecutionQueue {
     /// Runs on the revocation's own connection so the suspension and the
     /// cancellations commit together; each settles `cancelled` with the
     /// `principal_revoked` code and fences its worker as [`Self::cancel`]
-    /// does. Returns how many executions were cancelled.
+    /// does. Returns every cancelled execution, which the caller records
+    /// once it commits.
     ///
     /// # Errors
-    /// Returns the database error when the update fails.
+    /// Returns the database error when the update fails, or a decode error
+    /// when a returned identity is malformed.
     #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.cancel_principal", principal_id = %principal))]
     pub async fn cancel_principal(
         &self,
         conn: &mut TenantConn<'_>,
         principal: PrincipalId,
-    ) -> Result<u64, SqlxError> {
+    ) -> Result<Vec<CancelledExecution>, SqlxError> {
         timed("cancel_principal", async {
             let error = VerificationError {
                 code: "principal_revoked".to_owned(),
                 message: "the principal the execution acts for was revoked".to_owned(),
             };
-            let result = sqlx::query(CANCEL_PRINCIPAL_SQL)
+            sqlx::query_as::<_, CancelledRow>(CANCEL_PRINCIPAL_SQL)
                 .bind(principal.as_uuid())
                 .bind(Json(&error))
-                .execute(&mut **conn.transaction())
-                .await?;
-            Ok(result.rows_affected())
+                .fetch_all(&mut **conn.transaction())
+                .await?
+                .into_iter()
+                .map(CancelledRow::decode)
+                .collect()
         })
         .await
     }
@@ -3294,6 +3414,8 @@ impl VerifierExecutionQueue {
                 ),
                 verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
                 card_uid: stored(CardUid::from_uuid(row.card_uid))?,
+                verifier_scope: row.verifier_scope.map(|Json(scope)| scope),
+                card_scope: row.card_scope.map(|Json(scope)| scope),
                 result_id: row
                     .result_id
                     .map(|id| stored(VerificationResultId::new(id)))
@@ -3810,6 +3932,10 @@ struct StatusRow {
     pull_request: Option<Json<PullRequestActivation>>,
     /// Whether any claim ever set the lease token.
     claimed: bool,
+    /// The Verifier's exact registered scope; `None` once its Card is gone.
+    verifier_scope: Option<Json<CardPermissionScope>>,
+    /// The verified Card's exact registered scope; `None` once it is gone.
+    card_scope: Option<Json<CardPermissionScope>>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].

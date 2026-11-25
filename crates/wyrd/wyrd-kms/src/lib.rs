@@ -78,6 +78,15 @@ pub enum SecretPurpose {
     GatewayProviderCredential,
     /// An Operator connection secret.
     OperatorConnection,
+    /// A shared social sign-in provider's OAuth client secret.
+    SocialProvider,
+    /// The application-mail SMTP relay password.
+    ApplicationMail,
+    /// The signup challenge (Turnstile) secret.
+    SignupChallenge,
+    /// The platform derivation key that signup cookies, email proofs and
+    /// keyed pseudonyms derive their per-use keys from.
+    PlatformDerivationKey,
 }
 
 impl SecretPurpose {
@@ -90,6 +99,10 @@ impl SecretPurpose {
             Self::PlatformOidc => "platform_oidc",
             Self::GatewayProviderCredential => "gateway_provider_credential",
             Self::OperatorConnection => "operator_connection",
+            Self::SocialProvider => "social_provider",
+            Self::ApplicationMail => "application_mail",
+            Self::SignupChallenge => "signup_challenge",
+            Self::PlatformDerivationKey => "platform_derivation_key",
         }
     }
 }

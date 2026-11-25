@@ -1510,7 +1510,7 @@ async fn model_verification_benchmark_records_the_complete_local_path() {
         .expect("principals connect");
     let runtime = |family: &wyrd_spec::ids::CardName| CreateServicePrincipalRequest {
         name: format!("{family}-runtime"),
-        roles: vec!["workload".to_owned()],
+        assignments: vec![wyrd_spec::auth::ScopedRoleAssignment::tenant("workload")],
         description: None,
         workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
             kind: WorkloadKind::Service,

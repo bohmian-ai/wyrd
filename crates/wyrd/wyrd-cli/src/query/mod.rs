@@ -29,10 +29,10 @@ pub struct QueryCommand {
     /// `credentials.toml`), never from an argument.
     #[arg(long, env = "WYRD_SERVER_URL")]
     pub server: Option<String>,
-    /// SELECT-only SQL text.
+    /// One SELECT statement, or one `EXPLAIN [ANALYZE]` of it.
     #[arg(long)]
     pub sql: Option<String>,
-    /// Bounded UTF-8 file containing SELECT-only SQL.
+    /// Bounded UTF-8 file containing one SELECT, or one `EXPLAIN [ANALYZE]` of it.
     #[arg(long)]
     pub file: Option<PathBuf>,
     /// Row output encoding written to stdout.

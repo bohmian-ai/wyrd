@@ -4009,7 +4009,6 @@ mod tests {
                 wyrd_runtime::PrincipalId::new(Uuid::now_v7()),
                 wyrd_runtime::PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 wyrd_runtime::permission::PermissionSet::default(),
             ),
             tenant,

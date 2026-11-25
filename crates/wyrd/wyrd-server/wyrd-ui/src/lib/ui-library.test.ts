@@ -4,6 +4,7 @@ import { expect, test } from 'vitest';
 import * as development from '$lib/server/development';
 import TenantLayout from '../routes/t/[tenantKey]/+layout.svelte';
 import SignedIn from '../routes/t/[tenantKey]/+page.svelte';
+import Account from '../routes/t/[tenantKey]/settings/account/+page.svelte';
 
 const tenant = { key: 'acme', name: 'Acme' };
 const session = {
@@ -32,23 +33,48 @@ test('TASK-002: Retained pages without mocks', () => {
   expect(page.container.textContent).not.toMatch(/Recent changes|Recently viewed Cards/);
   page.unmount();
 
-  // The tenant layout keeps tenant switching and sign-out for the current tenant.
+  // The tenant layout's name block opens the person's own account page and carries the mode control.
   const children = createRawSnippet(() => ({ render: () => '<p>child</p>' }));
-  const layout = render(TenantLayout, { data: { tenant, session }, children } as never);
-  const switches = layout.container.querySelectorAll('form[action="/?/switch"] button[name="tenantKey"]');
+  const layout = render(TenantLayout, { data: { tenant, session, me: null }, children } as never);
+  expect(layout.getByRole('link', { name: /Jordan Reyes/ })).toHaveAttribute('href', '/t/acme/settings/account');
+  expect(layout.getByRole('button', { name: /Switch to (light|dark) mode/ })).toBeInTheDocument();
+  expect(layout.getByText('child')).toBeInTheDocument();
+  layout.unmount();
+
+  // The account page keeps workspace switching and sign-out for the current workspace.
+  const account = render(Account, { data: { tenant, session, me: null, profile: null, keys: null, recovery: false, problem: null }, form: null } as never);
+  const switches = account.container.querySelectorAll('form[action="/?/switch"] button[name="tenantKey"]');
   expect([...switches].map((button) => button.getAttribute('value'))).toEqual(['acme', 'research']);
-  const signOut = layout.getByRole('button', { name: 'Sign out' });
+  const signOut = account.getByRole('button', { name: 'Sign out' });
   expect(signOut.closest('form')).toHaveAttribute('action', '/?/logout');
   expect(signOut.closest('form')?.querySelector('input[name="tenantKey"]')).toHaveValue('acme');
-  expect(layout.getByText('child')).toBeInTheDocument();
 });
 
 import { fireEvent, waitFor, within } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { vi } from 'vitest';
 import {
+  ArtifactTable,
+  CardFacts,
   CardHeader,
+  CardInventory,
   CardRefChip,
+  PromptMessages,
+  PromptVariables,
+  RelationshipList,
+  UsedBy,
+  VersionDiff,
+  RunsOn,
+  RepositoryIndex,
+  RepositoryPolicy,
+  RepositoryDeclare,
+  GithubIntegration,
+  VerifierDefinition,
+  VerifierGraph,
+  VerificationExecution,
+  fmtYaml,
+  codeTokens,
+  diffLines,
   Chart,
   Drawer,
   DurationBar,
@@ -70,12 +96,32 @@ import {
 } from 'wyrd-ai-ui';
 import {
   chartParams,
-  facetQuery,
   histogramWindows,
+  inventoryFilter,
+  loadArtifactTable,
+  loadCardFacts,
   loadCardHeader,
+  loadCardInventory,
+  loadPromptMessages,
+  loadPromptVariables,
+  loadRelationshipList,
+  loadUsedBy,
+  loadVersionDiff,
+  definitionGraph,
+  loadRunsOn,
+  loadRepositoryIndex,
+  loadRepositoryPolicy,
+  loadRepositoryDeclare,
+  loadGithubIntegration,
+  loadVerifierDefinition,
+  executionStates,
+  loadExecution,
   loadChart,
+  loadFacetRail,
   loadRecordDetail,
   loadRecordTable,
+  loadStatStrip,
+  loadTraceOverview,
   loadTraceWaterfall,
   parseNanos,
   shapeChart,
@@ -83,7 +129,8 @@ import {
   statQueries,
   validateIntent,
   validatePanel,
-  type ChartInput
+  type ChartInput,
+  type VersionDiffData
 } from 'wyrd-ai-ui/loaders';
 import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
@@ -91,18 +138,40 @@ import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as exampleLoad } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
-import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
+import { Bifrost, GithubConnection, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
+import { STATE_ROOM, layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
+import { CARD_TABS, PROMPT_TABS, readInventory, writeDetail, writeInventory } from '$lib/cards-host';
+import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
 import {
+  AGENT,
+  agent,
+  artifacts,
   AUTHORED_SQL,
   authored,
+  connection,
+  inventory,
+  NATIVE,
+  notFound,
+  PROMPT,
+  prompts,
+  SERVICE,
   bareSpan,
   buckets,
   card,
   costs,
   denied,
+  DRIFT_VERIFIER,
+  driftReport,
+  executionDetails,
+  executionStatus,
+  EXECUTIONS,
   facet,
+  executions,
+  executionsByVerdict,
+  VERIFIER_UIDS,
+  verifierLabels,
   fixtureExecutor,
   LOG,
   logRow,
@@ -110,7 +179,10 @@ import {
   observeAnswer,
   RANGE,
   registered,
+  repositories,
   series,
+  service,
+  SESSION_VERIFIER,
   spanRow,
   spans,
   stateExecutors,
@@ -121,7 +193,9 @@ import {
   trace,
   TRACE,
   traceCounts,
-  traces
+  traces,
+  VERIFIER,
+  verifiers
 } from '$lib/ui-fixtures';
 import { reactive } from '$lib/ui-fixtures.svelte';
 
@@ -134,6 +208,83 @@ function recording(answer: (request: WireRequest) => WireResult | Promise<WireRe
   };
   return { executor, calls };
 }
+
+test('a facet rail reads every facet in one ranked grouping-set aggregate', async () => {
+  const column = (name: string, data_type: string) => ({ name, data_type, nullable: true });
+  const read = recording(() => ({
+    ok: true,
+    value: {
+      columns: [column('facet', 'Int64'), column('f0', 'Utf8'), column('f1', 'Int32'), column('n', 'Int64'), column('severity_number', 'Int32')],
+      rows: [
+        [0, 'ERROR', null, 4, 17],
+        [0, null, null, 1, null],
+        [1, null, 9, 5, 9]
+      ],
+      terminal: { outcome: 'success', row_count: 3, warnings: [] }
+    } as never
+  }));
+  const loaded = await loadFacetRail(
+    { signal: 'logs', facets: ['severity_text', 'severity_number'], where: [{ column: 'service_name', value: 'search' }] },
+    { executor: read.executor, range: RANGE }
+  );
+
+  expect(read.calls).toHaveLength(1);
+  expect(read.calls[0].request).toEqual({
+    op: 'bifrost.query',
+    sql:
+      'SELECT facet, f0, f1, n, severity_number FROM (SELECT facet, f0, f1, n, severity_number, row_number() OVER (PARTITION BY facet ORDER BY n DESC, f0, f1) AS rank FROM ' +
+      '(SELECT CASE WHEN grouping(severity_text) = 0 THEN 0 ELSE 1 END AS facet, severity_text AS f0, severity_number AS f1, count(*) AS n, max(severity_number) AS severity_number ' +
+      'FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND service_name = $3 ' +
+      'GROUP BY GROUPING SETS ((severity_text), (severity_number))) AS grouped) AS ranked WHERE rank <= 11 ORDER BY facet, rank',
+    params: [RANGE.from, RANGE.to, 'search']
+  });
+  // Each facet keeps its own typed value column, its count, and severity only where it names a level.
+  expect(loaded.result).toMatchObject({
+    state: 'populated',
+    data: {
+      facets: [
+        {
+          column: 'severity_text',
+          values: { columns: [column('value', 'Utf8'), column('n', 'Int64'), column('severity_number', 'Int32')], rows: [['ERROR', 4, 17], [null, 1, null]] }
+        },
+        { column: 'severity_number', values: { columns: [column('value', 'Int32'), column('n', 'Int64')], rows: [[9, 5]] } }
+      ]
+    }
+  });
+});
+
+test('the trace overview reads matching spans and roots once each, bucketed and whole-range', async () => {
+  const column = (name: string, data_type = 'Int64') => ({ name, data_type, nullable: true });
+  const read = recording((request) => {
+    const roots = (request as { sql: string }).sql.includes('parent_span_id IS NULL');
+    return {
+      ok: true,
+      value: roots
+        ? { columns: [column('whole', 'Int32'), column('at', 'Timestamp(ns, "+00:00")'), column('p95', 'Float64'), column('p50', 'Float64')], rows: [[0, 'T1', 9, 4], [1, null, 8, 3]], terminal: { outcome: 'success', row_count: 2, warnings: [] } }
+        : {
+            columns: [column('whole', 'Int32'), column('at', 'Timestamp(ns, "+00:00")'), column('spans'), column('errors'), column('traces'), column('error_traces'), column('span_p95_ms', 'Float64')],
+            rows: [[0, 'T1', 12, 2, 5, 1, 7], [1, null, 12, 2, 5, 1, 7]],
+            terminal: { outcome: 'success', row_count: 2, warnings: [] }
+          }
+    } as never;
+  });
+  const overview = await loadTraceOverview({ where: [{ column: 'service_name', value: 'api' }] }, { executor: read.executor, range: RANGE });
+
+  expect(read.calls).toHaveLength(2);
+  const [spans, roots] = read.calls.map((call) => (call.request as { sql: string }).sql);
+  expect(spans).toContain('GROUP BY GROUPING SETS ((at), ())');
+  expect(roots).toContain('parent_span_id IS NULL');
+  expect(overview.spans.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 12]] } });
+  expect(overview.errors.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 2]] } });
+  expect(overview.duration.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 9, 4]] } });
+  // Range totals come from the whole-range grouping set, never summed from buckets.
+  expect(overview.totals).toMatchObject({
+    state: 'populated',
+    data: { columns: ['spans', 'traces', 'error_traces', 'span_p95_ms', 'p95_ms', 'p50_ms'].map((name) => expect.objectContaining({ name })), rows: [[12, 5, 1, 7, 8, 3]] }
+  });
+  // Each chart keeps its own portable SQL for a Chart panel or Query.
+  expect(overview.spans.input.sql).toMatch(/^SELECT date_bin\(\$3::interval, start_time_unix_nano\) AS at, count\(\*\) AS spans FROM/);
+});
 
 test('TASK-003: Validated portable rendering', async () => {
   // Every catalog component and its declared states are generated, with view-document shape.
@@ -327,7 +478,7 @@ test('TASK-003: Validated portable rendering', async () => {
     result: { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } } }
   });
   expect(header.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
-  expect(header.container).toHaveTextContent('Model/ranker@1.4.2');
+  expect(header.container).toHaveTextContent('Model / ranker@1.4.2');
   expect(header.container).toHaveTextContent('✓active');
   expect([...header.container.querySelectorAll('option')].map((option) => option.value)).toEqual(['1.4.2', '1.4.1']);
   expect(header.container).toHaveTextContent('showing the newest 2 versions');
@@ -353,7 +504,7 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(noVersions.container).toHaveTextContent('versions unavailable: Forbidden (WYRD_AUTH_403_FORBIDDEN)');
   expect(noVersions.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
   noVersions.unmount();
-  for (const result of [{ state: 'loading' }, { state: 'denied', problem: denied }, { state: 'error', problem: { code: 'WYRD_REGISTRY_404_NOT_FOUND', title: 'Not found' } }] as const) {
+  for (const result of [{ state: 'loading' }, { state: 'denied', problem: denied }, { state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND', title: 'Not found' } }] as const) {
     const view = render(CardHeader, { input: { cardRef: card }, result });
     expect(view.container.querySelector('.state')).toHaveAttribute('data-state', result.state);
     view.unmount();
@@ -673,6 +824,83 @@ test('Node executor reconnects after a failed connect', async () => {
   } finally {
     connect.mockRestore();
   }
+});
+
+test('execution reads run as the existing SDK, HTTP and MCP operations', async () => {
+  const producer = { step_id: 'draft', attempt: 2, item_index: 1, iteration_index: null };
+  const requests = [
+    { op: 'cards.get_by_uid', kind: 'Verifier', card_uid: 'card_1' },
+    { op: 'verification.get_execution_details', execution_id: 'exec_1' },
+    { op: 'verification.list_invocations', execution_id: 'exec_1', cursor: 'next', limit: 50 },
+    { op: 'verification.list_publications', execution_id: 'exec_1' },
+    { op: 'verification.get_publication', execution_id: 'exec_1', name: 'tree', ...producer }
+  ] as const satisfies readonly WireRequest[];
+
+  // Node: the SDK's execution handle for execution reads; the Card UID read is the existing HTTP operation through the host's authenticated GET.
+  const handle = {
+    details: vi.fn(async () => 'details'),
+    invocations: vi.fn(async () => 'invocations'),
+    publications: vi.fn(async () => 'publications'),
+    publication: vi.fn(async () => 'publication')
+  };
+  const connect = vi.spyOn(verify.Execution, 'connect').mockResolvedValue(handle as never);
+  const get = vi.fn(async (path: string) => (path.endsWith('card_1') ? Response.json({ card: registered }) : Response.json(notFound, { status: 404 })));
+  try {
+    const client = {} as WyrdClient;
+    expect(await nodeExecutor(client, get).run(requests)).toEqual([
+      { ok: true, value: registered },
+      { ok: true, value: 'details' },
+      { ok: true, value: 'invocations' },
+      { ok: true, value: 'publications' },
+      { ok: true, value: 'publication' }
+    ]);
+    expect(get).toHaveBeenCalledWith('/cards/by-uid/Verifier/card_1');
+    expect(connect).toHaveBeenCalledWith('exec_1', { client });
+    expect(handle.invocations).toHaveBeenCalledWith({ cursor: 'next', limit: 50 });
+    expect(handle.publications).toHaveBeenCalledWith({ cursor: undefined, limit: undefined });
+    expect(handle.publication).toHaveBeenCalledWith('draft', 'tree', { attempt: 2, item_index: 1, iteration_index: null, path: undefined });
+    // A refused UID read keeps the server's problem; a UID is never interpolated as a path.
+    expect((await nodeExecutor(client, get).run([{ op: 'cards.get_by_uid', kind: 'Verifier', card_uid: '../x y' }]))[0]).toEqual({ ok: false, problem: { code: notFound.code, title: notFound.title, status: 404, detail: undefined } });
+    expect(get).toHaveBeenLastCalledWith('/cards/by-uid/Verifier/..%2Fx%20y');
+    // Without a host GET the client's own authenticated fetch reads the same route.
+    const httpAuth = vi.fn(async () => Response.json({ card: registered }));
+    expect((await nodeExecutor({ serverUrl: 'http://wyrd.test', httpAuth } as never).run([requests[0]]))[0]).toEqual({ ok: true, value: registered });
+    expect(httpAuth).toHaveBeenCalledWith('http://wyrd.test/v1/cards/by-uid/Verifier/card_1');
+  } finally {
+    connect.mockRestore();
+  }
+
+  // MCP: each read is the existing tool of the same meaning; cards.get takes kind and UID.
+  const app = { callServerTool: vi.fn(async ({ name }: { name: string }) => ({ content: [], structuredContent: name === 'cards.get' ? { card: registered } : { tool: name } })) };
+  expect(await mcpExecutor(app as never).run(requests)).toEqual([
+    { ok: true, value: registered },
+    { ok: true, value: { tool: 'verification.get_execution_details' } },
+    { ok: true, value: { tool: 'verification.list_invocations' } },
+    { ok: true, value: { tool: 'verification.list_publications' } },
+    { ok: true, value: { tool: 'verification.get_publication' } }
+  ]);
+  expect(app.callServerTool.mock.calls.map(([call]) => call)).toEqual([
+    { name: 'cards.get', arguments: { kind: 'Verifier', card_uid: 'card_1' } },
+    { name: 'verification.get_execution_details', arguments: { execution_id: 'exec_1' } },
+    { name: 'verification.list_invocations', arguments: { execution_id: 'exec_1', cursor: 'next', limit: 50 } },
+    { name: 'verification.list_publications', arguments: { execution_id: 'exec_1' } },
+    { name: 'verification.get_publication', arguments: { execution_id: 'exec_1', name: 'tree', ...producer } }
+  ]);
+});
+
+test('the GitHub connection read runs as the existing SDK and MCP operations', async () => {
+  const requests = [{ op: 'github.get_connection' }] as const satisfies readonly WireRequest[];
+  const connect = vi.spyOn(GithubConnection, 'connect').mockResolvedValue({ get: async () => connection } as never);
+  try {
+    const client = {} as WyrdClient;
+    expect(await nodeExecutor(client).run(requests)).toEqual([{ ok: true, value: connection }]);
+    expect(connect).toHaveBeenCalledWith({ client });
+  } finally {
+    connect.mockRestore();
+  }
+  const app = { callServerTool: vi.fn(async (_call: unknown) => ({ content: [], structuredContent: connection })) };
+  expect(await mcpExecutor(app as never).run(requests)).toEqual([{ ok: true, value: connection }]);
+  expect(app.callServerTool.mock.calls[0][0]).toEqual({ name: 'github_connection.get', arguments: {} });
 });
 
 test('Canonical UI problem projections', async () => {
@@ -1173,7 +1401,30 @@ test('TASK-027: Narrow views', async () => {
 
 test('TASK-004: Canonical signal interactions', async () => {
   // The catalog generates every Observe component with its states and typed actions.
-  expect(Object.keys(catalog.components)).toEqual(['Chart', 'CardHeader', 'StatStrip', 'FacetRail', 'RecordTable', 'TraceWaterfall', 'RecordDetail']);
+  expect(Object.keys(catalog.components)).toEqual([
+    'Chart',
+    'CardHeader',
+    'CardInventory',
+    'CardFacts',
+    'RelationshipList',
+    'ArtifactTable',
+    'PromptMessages',
+    'PromptVariables',
+    'UsedBy',
+    'VersionDiff',
+    'VerifierDefinition',
+    'RunsOn',
+    'RepositoryIndex',
+    'RepositoryPolicy',
+    'RepositoryDeclare',
+    'GithubIntegration',
+    'VerificationExecution',
+    'StatStrip',
+    'FacetRail',
+    'RecordTable',
+    'TraceWaterfall',
+    'RecordDetail'
+  ]);
   expect(catalog.components.RecordTable.states).toContain('live');
   expect(catalog.components.RecordDetail.emits.map((action) => action.name)).toEqual(['record.filter', 'record.logs', 'record.open']);
 
@@ -1226,31 +1477,53 @@ test('TASK-004: Canonical signal interactions', async () => {
   await loadTraceWaterfall({ traceId: TRACE, range: RANGE }, { executor: exact.executor, range: RANGE });
   expect(exact.calls[0].request).toMatchObject({ params: [TRACE], max_rows: 10_000 });
   expect((exact.calls[0].request as { sql: string }).sql).not.toContain('$2');
-  // Log detail binds its full key; facets bind the list's WHERE and read one value past the shown ten.
+  // Log detail binds its full key.
   const detail = recording(() => ({ ok: true, value: logRow }));
   await loadRecordDetail({ log: LOG }, { executor: detail.executor });
   expect(detail.calls[0].request).toMatchObject({ params: [LOG.time_unix_nano, LOG.observed_time_unix_nano, LOG.wyrd_request_id] });
-  expect(facetQuery({ signal: 'logs', facets: ['severity_text'], where: [{ column: 'service_name', value: 'search' }] }, 'severity_text', RANGE)).toEqual({
-    sql:
-      'SELECT severity_text AS value, count(*) AS n, max(severity_number) AS severity_number FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ' +
-      'AND service_name = $3 GROUP BY severity_text ORDER BY n DESC, value LIMIT 11',
-    params: [RANGE.from, RANGE.to, 'search']
-  });
-  // Cost is summed per recorded currency, scoped by a bound Card uid.
-  expect(statQueries('cost', { stats: ['cost'], scope: { column: 'workload_card_uid', uid: 'card_01HX' } }, RANGE, '5 minutes')[0]).toEqual({
-    sql:
-      'SELECT sum(CAST(cost AS DECIMAL(38, 12))) AS value, currency FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz ' +
-      'AND cost IS NOT NULL AND workload_card_uid = $3 GROUP BY currency ORDER BY currency',
-    params: [RANGE.from, RANGE.to, 'card_01HX']
-  });
+  // Cost is summed per recorded currency, scoped by a bound Card uid, per bucket and over the range.
+  expect(statQueries({ stats: ['cost'], scope: { column: 'workload_card_uid', uid: 'card_01HX' } }, RANGE, '5 minutes')).toEqual([
+    {
+      stats: [0],
+      sql:
+        'SELECT grouping(at) AS whole, at, sum(CAST(cost AS DECIMAL(38, 12))) AS s0, currency FROM (SELECT date_bin($3::interval, started_at) AS at, * FROM bifrost.gateway.calls ' +
+        'WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND cost IS NOT NULL AND workload_card_uid = $4) AS scoped ' +
+        'GROUP BY GROUPING SETS ((at, currency), (currency)) ORDER BY whole, at, currency',
+      params: [RANGE.from, RANGE.to, '5 minutes', 'card_01HX']
+    }
+  ]);
 
   // Tokens are summed from gateway usage entries whose unit is tokens.
-  expect(statQueries('tokens', { stats: ['tokens'] }, RANGE, '5 minutes')[0]).toEqual({
-    sql:
-      "SELECT sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS value FROM (SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage " +
-      "WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens'",
-    params: [RANGE.from, RANGE.to]
+  expect(statQueries({ stats: ['tokens'] }, RANGE, '5 minutes')[0].sql).toBe(
+    "SELECT grouping(at) AS whole, at, sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS s0 FROM (SELECT date_bin($3::interval, started_at) AS at, * FROM " +
+      "(SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens') AS scoped " +
+      'GROUP BY GROUPING SETS ((at), ()) ORDER BY whole, at'
+  );
+
+  // Stats over the same rows share one read; a stat's own filter becomes its aggregate's FILTER.
+  const shared = recording((request) => {
+    const sql = (request as { sql: string }).sql;
+    const c = (name: string, data_type = 'Int64') => ({ name, data_type, nullable: true });
+    const at = c('at', 'Timestamp(ns, "+00:00")');
+    const value =
+      sql.includes('parent_span_id IS NULL') ? { columns: [c('whole', 'Int32'), at, c('s0'), c('s3', 'Float64')], rows: [[0, 'T1', 2, 9e6], [1, null, 2, 9e6]] }
+      : sql.includes('currency') ? { columns: [c('whole', 'Int32'), at, c('s5', 'Decimal128(38, 12)'), c('currency', 'Utf8')], rows: [[0, 'T1', '0.4', 'EUR'], [1, null, '0.4', 'EUR']] }
+      : sql.includes('bifrost.gateway.calls') ? { columns: [c('whole', 'Int32'), at, c('s4')], rows: [[1, null, 0]] }
+      : { columns: [c('whole', 'Int32'), at, c('s1'), c('s2')], rows: [[0, 'T1', 7, 1], [1, null, 7, 1]] };
+    return { ok: true, value: { ...value, terminal: { outcome: 'success', row_count: value.rows.length, warnings: [] } } } as never;
   });
+  const loaded = await loadStatStrip({ stats: ['traces', 'spans', 'errors', 'duration_p95', 'calls', 'cost'] }, { executor: shared.executor, range: RANGE });
+  expect(shared.calls).toHaveLength(4);
+  expect((shared.calls[1].request as { sql: string }).sql).toContain('count(*) AS s1, count(*) FILTER (WHERE status_code = 2) AS s2, count(*) FILTER (WHERE status_code = 2) AS m2 FROM');
+  if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+  expect(loaded.result.data.stats.map(({ stat, total, series }) => [stat, total.columns.map((each) => each.name), total.rows, series.rows])).toEqual([
+    ['traces', ['value'], [[2]], [['T1', 2]]],
+    ['spans', ['value'], [[7]], [['T1', 7]]],
+    ['errors', ['value'], [[1]], [['T1', 1]]],
+    ['duration_p95', ['value'], [[9e6]], [['T1', 9e6]]],
+    ['calls', ['value'], [[0]], []],
+    ['cost', ['value', 'currency'], [['0.4', 'EUR']], [['T1', '0.4', 'EUR']]]
+  ]);
   // Metric structure columns are listable beyond the defaults.
   expect(validatePanel('RecordTable', { signal: 'metrics', columns: ['metric_name', 'bucket_counts', 'explicit_bounds'] })).toMatchObject({ component: 'RecordTable' });
 
@@ -1893,4 +2166,1547 @@ test('Observe canvas colour roles and series composition', async () => {
     ['✕ error', 'var(--danger)']
   ]);
   fall.unmount();
+});
+
+/** A fixture answer, recorded; `override` replaces the answer for the reads it matches. */
+function fixtureRecording(override: (request: WireRequest) => WireResult | undefined = () => undefined) {
+  return recording(async (request) => override(request) ?? (await fixtureExecutor.run([request]))[0]);
+}
+const ops = (calls: { request: WireRequest }[]) => calls.map((call) => call.request.op);
+const failure = { code: 'WYRD_SPEC_500_INTERNAL', title: 'Internal error', status: 500 };
+
+test('card inventory preserves filters cursors and exact references', async () => {
+  // A plain word matches names, escaped and case-insensitive; anything else is the metadata query itself.
+  expect(inventoryFilter('support')).toBe('name =~ "(?i)support"');
+  expect(inventoryFilter(' a.b ')).toBe('name =~ "(?i)a\\\\.b"');
+  expect(inventoryFilter('labels.team = "search"')).toBe('labels.team = "search"');
+  expect(inventoryFilter('exists')).toBe('exists');
+  expect(inventoryFilter('  ')).toBeUndefined();
+
+  // Every page follows the previous server cursor; filters reach cards.list unchanged.
+  const paged = fixtureRecording();
+  const two = await loadCardInventory({ kind: 'Prompt', status: 'active', include_prerelease: true, query: 'support', pages: 2 }, { executor: paged.executor });
+  expect(paged.calls.map((call) => call.request)).toEqual([
+    { op: 'cards.list', limit: 50, cursor: null, filter: 'name =~ "(?i)support"', kind: 'Prompt', status: 'active', include_prerelease: true },
+    { op: 'cards.list', limit: 50, cursor: 'page-2', filter: 'name =~ "(?i)support"', kind: 'Prompt', status: 'active', include_prerelease: true }
+  ]);
+  expect(two.result).toMatchObject({ state: 'populated', data: { items: inventory, more: false, filtered: true } });
+  const first = await loadCardInventory({}, { executor: fixtureExecutor });
+  expect(first.result).toMatchObject({ state: 'populated', data: { items: inventory.slice(0, 3), more: true, filtered: false } });
+  // A refused page is the panel's state, never rows beside a failure; empty says why.
+  const late = recording((request) => ((request as { cursor: string | null }).cursor ? { ok: false, problem: denied } : { ok: true, value: { items: inventory, next_cursor: 'next' } }));
+  expect((await loadCardInventory({ pages: 2 }, { executor: late.executor })).result).toEqual({ state: 'denied', problem: denied });
+  expect((await loadCardInventory({}, { executor: stateExecutors.error })).result.state).toBe('error');
+  expect((await loadCardInventory({}, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'This tenant has no registered Cards.' });
+  expect((await loadCardInventory({ query: 'x' }, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'No Card version matches these filters.' });
+
+  // Only registrable kinds, listable statuses and bounded pages validate.
+  for (const input of [{ kind: 'Policy' }, { kind: 'External' }, { status: 'deleted' }, { pages: 0 }, { pages: 21 }, { cursor: 'x' }])
+    expect(validatePanel('CardInventory', input)).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(catalog.components.CardInventory.emits.map((action) => action.name)).toEqual(['cards.filter', 'cards.more', 'card.open']);
+
+  // The URL round-trips filters and pages; a filter change drops pages, starting a fresh cursor chain.
+  const search = writeInventory({ query: 'support', kind: 'Prompt', status: 'active', include_prerelease: true, pages: 3 });
+  expect(readInventory(new URLSearchParams(search))).toEqual({ query: 'support', kind: 'Prompt', status: 'active', include_prerelease: true, pages: 3 });
+  expect(writeInventory({ query: 'support' })).toBe('?q=support');
+
+  // Rows open their exact reference; filters, kinds and Load more emit validated intents.
+  const onaction = vi.fn();
+  const view = render(CardInventory, { input: { kind: 'Prompt' }, result: first.result, onaction });
+  expect(within(view.container).getAllByRole('row')).toHaveLength(4);
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Open Prompt/support-reply@1.0.0' }));
+  await fireEvent.input(within(view.container).getByRole('textbox'), { target: { value: 'support' } });
+  await fireEvent.submit(within(view.container).getByRole('textbox').closest('form') as HTMLFormElement);
+  await fireEvent.click(within(within(view.container).getByRole('navigation', { name: 'Kind' })).getByRole('button', { name: 'Model' }));
+  await fireEvent.change(within(view.container).getByRole('combobox'), { target: { value: 'deprecated' } });
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Prerelease' }));
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Load more' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.open', input: { card_ref: { kind: 'Prompt', name: 'support-reply', version: '1.0.0', uid: 'card_Prompt_support-reply_1.0.0' } } },
+    { name: 'cards.filter', input: { kind: 'Prompt', query: 'support' } },
+    { name: 'cards.filter', input: { kind: 'Model' } },
+    { name: 'cards.filter', input: { kind: 'Prompt', status: 'deprecated' } },
+    { name: 'cards.filter', input: { kind: 'Prompt', include_prerelease: true } },
+    { name: 'cards.more', input: { pages: 2 } }
+  ]);
+  for (const intent of intents) expect(validateIntent('CardInventory', intent)).toEqual(intent);
+  expect(validateIntent('CardInventory', { name: 'card.open', input: { card_ref: { kind: 'Model', name: 'ranker', version: 'latest' } } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  // A pending action takes no further input.
+  await view.rerender({ input: {}, result: first.result, onaction, actions: { 'cards.more': { state: 'pending' } } });
+  expect(within(view.container).getByRole('button', { name: 'Load more' })).toBeDisabled();
+
+  // Empty, filtered-empty, denied and failed stay distinct.
+  const states = render(CardInventory, { input: { query: 'nothing' }, result: { state: 'empty', data: { items: [], more: false, filtered: true }, reason: 'No Card version matches these filters.' }, onaction });
+  await fireEvent.click(within(states.container).getByRole('button', { name: 'Clear filter' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'cards.filter', input: {} });
+  await states.rerender({ input: {}, result: { state: 'empty', data: { items: [], more: false, filtered: false }, reason: 'This tenant has no registered Cards.' } });
+  expect(states.container).toHaveTextContent('wyrd declare');
+  await states.rerender({ input: { query: 'a ==' }, result: { state: 'error', problem: { code: 'WYRD_QUERY_400_INVALID_SYNTAX', title: 'Invalid query' } } });
+  expect(states.container).toHaveTextContent('WYRD_QUERY_400_INVALID_SYNTAX');
+  await states.rerender({ input: {}, result: { state: 'denied', problem: denied } });
+  expect(states.container).toHaveTextContent("You can't list Cards here");
+
+  // The fixture view document validates and renders through WyrdView.
+  const doc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'cards', component: 'CardInventory', input: { pages: 2 } }] };
+  expect(validateView(doc)).toMatchObject({ panels: [{ component: 'CardInventory' }] });
+  const rendered = render(WyrdView, { doc, executor: fixtureExecutor });
+  await waitFor(() => expect(rendered.container.querySelectorAll('[data-panel="cards"] .row')).toHaveLength(6));
+});
+
+test('exact card detail preserves relationships files and action outcomes', async () => {
+  // A refused Card read issues no dependent read.
+  for (const load of [loadRelationshipList, loadCardFacts]) {
+    const refused = recording(() => ({ ok: false, problem: denied }));
+    expect((await load({ cardRef: AGENT }, { executor: refused.executor })).result).toEqual({ state: 'denied', problem: denied });
+    expect(ops(refused.calls)).toEqual(['cards.get_by_ref']);
+  }
+
+  // Relationships keep the server's exact references and direction.
+  const reads = fixtureRecording();
+  const relationships = await loadRelationshipList({ cardRef: AGENT }, { executor: reads.executor });
+  expect(reads.calls[0].request).toEqual({ op: 'cards.get_by_ref', card_ref: AGENT });
+  expect(relationships.result).toEqual({ state: 'populated', data: { outbound: [{ ref: PROMPT }], inbound: [{ ref: SERVICE }] } });
+  expect((await loadRelationshipList({ cardRef: AGENT }, { executor: stateExecutors.empty })).result.state).toBe('empty');
+
+  // Files come from the registered-file listing of that exact version; none is empty, never a missing Card.
+  const files = fixtureRecording();
+  const populated = await loadArtifactTable({ cardRef: card }, { executor: files.executor });
+  expect(files.calls.map((call) => call.request)).toEqual([{ op: 'cards.list_artifacts', card_ref: card }]);
+  expect(populated.result).toEqual({ state: 'populated', data: artifacts.artifacts });
+  expect((await loadArtifactTable({ cardRef: card }, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'Registration recorded no files for this version.' });
+  expect((await loadArtifactTable({ cardRef: card }, { executor: stateExecutors.denied })).result.state).toBe('denied');
+  expect((await loadArtifactTable({ cardRef: card }, { executor: recording(() => ({ ok: false, problem: failure })).executor })).result).toEqual({ state: 'error', problem: failure });
+  const table = render(ArtifactTable, populated);
+  expect(table.container).toHaveTextContent('weights/model.bin');
+  expect(table.container).toHaveTextContent('4.2 MiB');
+  expect(table.container).toHaveTextContent(artifacts.artifacts[0].sha256);
+  expect(table.container).toHaveTextContent('application/octet-stream');
+  expect(within(table.container).getAllByRole('row')).toHaveLength(3);
+
+  // MCP has no file-listing tool yet: the host's real refusal is the read's outcome.
+  const app = { callServerTool: vi.fn(async () => ({ isError: true, content: [], structuredContent: { code: 'WYRD_MCP_404_TOOL_NOT_FOUND', title: 'Tool not found', status: 404 } })) };
+  const [refusal] = await mcpExecutor(app as never).run([{ op: 'cards.list_artifacts', card_ref: card }]);
+  expect(app.callServerTool).toHaveBeenCalledWith({ name: 'cards.list_artifacts', arguments: { card_ref: card } }, { signal: undefined });
+  expect(refusal).toEqual({ ok: false, problem: { code: 'WYRD_MCP_404_TOOL_NOT_FOUND', title: 'Tool not found', status: 404, detail: undefined } });
+
+  // Facts and YAML show the Card as returned.
+  const facts = await loadCardFacts({ cardRef: PROMPT }, { executor: fixtureExecutor });
+  const shown = render(CardFacts, facts);
+  // The header carries the uid and phase; Metadata keeps labels, hashes and update time.
+  expect(shown.container).toHaveTextContent('sha256:1.1.0');
+  expect(shown.container).toHaveTextContent('team=support');
+  const yaml = render(CardFacts, { ...facts, input: { cardRef: PROMPT, yaml: true } });
+  expect(yaml.container.querySelector('pre')?.textContent).toBe(fmtYaml(prompts['1.1.0']));
+  expect(yaml.container.querySelector('pre [data-token="key"]')).toHaveTextContent('apiVersion');
+  expect(fmtYaml({ apiVersion: 'wyrd/v1', spec: { system: 'a\nb', count: 1, empty: [], tags: ['x', 'true'] } })).toBe(
+    ['apiVersion: wyrd/v1', 'spec:', '  system: |-', '    a', '    b', '  count: 1', '  empty: []', '  tags:', '    - x', '    - "true"'].join('\n')
+  );
+
+  // Following a relationship emits its exact reference; the host reports each outcome beside it.
+  const onaction = vi.fn();
+  const list = render(RelationshipList, { ...relationships, onaction });
+  await fireEvent.click(within(list.container).getByRole('button', { name: `used by ${fmtCardRef(SERVICE)}` }));
+  expect(onaction).toHaveBeenCalledWith({ name: 'card.open', input: { card_ref: SERVICE } });
+  expect(validateIntent('RelationshipList', onaction.mock.calls[0][0])).toEqual(onaction.mock.calls[0][0]);
+  await list.rerender({ ...relationships, onaction, actions: { 'card.open': { state: 'pending' } } });
+  expect(within(list.container).getByRole('button', { name: `used by ${fmtCardRef(SERVICE)}` })).toBeDisabled();
+  await list.rerender({ ...relationships, onaction, actions: { 'card.open': { state: 'denied', problem: denied } } });
+  expect(within(list.container).getByRole('alert')).toHaveTextContent(denied.code);
+  await list.rerender({ ...relationships, onaction: undefined, actions: {} });
+  expect(within(list.container).getByRole('button', { name: `used by ${fmtCardRef(SERVICE)}` })).toBeDisabled();
+
+  // Every kind keeps the Files tab; the detail URL names one exact version and nothing else.
+  expect(CARD_TABS.map((tab) => tab.id)).toEqual(['overview', 'files', 'yaml']);
+  expect(PROMPT_TABS.map((tab) => tab.id)).toEqual(['overview', 'versions', 'files', 'yaml']);
+  expect(writeDetail({ ...PROMPT, uid: 'u 1' }, { tab: 'versions', compare: '1.0.0' })).toBe('?kind=Prompt&name=support-reply&version=1.1.0&uid=u+1&tab=versions&compare=1.0.0');
+  const detail = (search: string) => loadCardDetail({ locals: {}, url: new URL(`http://ui.test/t/acme/cards/detail${search}`), request: new Request('http://ui.test') } as never);
+  for (const search of ['?kind=Model&name=ranker', '?kind=Model&name=ranker&version=latest', '?kind=Policy&name=p&version=1.0.0', '?name=ranker&version=1.0.0'])
+    expect(await detail(search)).toMatchObject({ problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+
+  // A replaced version supersedes its in-flight read; the late old answer never renders.
+  const pending: ((result: WireResult) => void)[] = [];
+  const held = recording(() => new Promise<WireResult>((resolve) => pending.push(resolve)));
+  const doc = (version: string) => ({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'facts', component: 'CardFacts', input: { cardRef: { ...PROMPT, version } } }] });
+  const view = render(WyrdView, { doc: doc('1.0.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(1));
+  await view.rerender({ doc: doc('1.1.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(2));
+  expect(held.calls[0].signal?.aborted).toBe(true);
+  expect(held.calls[1].request).toEqual({ op: 'cards.get_by_ref', card_ref: { ...PROMPT, version: '1.1.0' } });
+  pending[1]({ ok: true, value: prompts['1.1.0'] });
+  await waitFor(() => expect(view.container).toHaveTextContent('sha256:1.1.0'));
+  pending[0]({ ok: true, value: prompts['1.0.0'] });
+  await tick();
+  expect(view.container).not.toHaveTextContent('sha256:1.0.0');
+});
+
+test('prompt definitions and comparisons preserve authored forms', async () => {
+  // Portable and native forms render as authored; nothing reads telemetry.
+  const reads = fixtureRecording();
+  const portable = await loadPromptMessages({ cardRef: PROMPT }, { executor: reads.executor });
+  expect(portable.result).toEqual({ state: 'populated', data: prompts['1.1.0'].spec });
+  const shown = render(PromptMessages, portable);
+  expect(within(shown.container).getByRole('region', { name: 'Message 1' })).toHaveTextContent('1 · user');
+  expect(within(shown.container).getByRole('region', { name: 'System' }).querySelector('.bubble')?.textContent?.trim()).toBe('You answer support tickets.\nCite the policy section you rely on.');
+  expect(shown.container).toHaveTextContent('response · verdict');
+  // A response schema is reference material: a closed row naming its fields, opened on request, never one long line.
+  const authored = (portable.result as Extract<typeof portable.result, { state: 'populated' }>).data;
+  const schema = { type: 'object', properties: { outcome: { type: 'string' }, citations: { type: 'array' } }, required: ['outcome'] };
+  const structured = render(PromptMessages, { ...portable, result: { state: 'populated', data: { ...authored, response_format: schema } } });
+  expect(structured.container.querySelector('.chips')).toHaveTextContent('response · JSON schema');
+  expect(structured.container.querySelector('.chips')).not.toHaveTextContent('required');
+  const row = structured.container.querySelector('details[aria-label="Response format"]') as HTMLDetailsElement;
+  expect(row.open).toBe(false);
+  expect(row.querySelector('summary')).toHaveTextContent('Response format · JSON schema · outcome, citations');
+  expect(row.querySelector('pre')?.textContent).toBe(JSON.stringify(schema, null, 2));
+  // Placeholders are marked as authored, never rewritten.
+  expect([...shown.container.querySelectorAll('.var')].map((part) => part.textContent)).toEqual(['{{ticket}}', '{{tone}}']);
+  const native = await loadPromptMessages({ cardRef: NATIVE }, { executor: reads.executor });
+  const body = render(PromptMessages, native);
+  expect(within(body.container).getByRole('region', { name: 'Native body' }).querySelector('pre')?.textContent).toBe(fmtYaml((native.result as { data: { body: unknown } }).data.body));
+  expect(body.container).toHaveTextContent('future_knob: true');
+  expect(body.container).toHaveTextContent('native responses');
+  // Multimodal and long content stay readable; an absent system message says so.
+  const long = 'x'.repeat(5000);
+  const media = { ...prompts['1.0.0'], spec: { provider: 'anthropic', model: 'claude', messages: [{ role: 'user', content: [{ type: 'text', text: long }, { type: 'image', source: '${media:photo}' }] }] } };
+  const multimodal = render(PromptMessages, await loadPromptMessages({ cardRef: PROMPT }, { executor: recording(() => ({ ok: true, value: media as never })).executor }));
+  expect(multimodal.container).toHaveTextContent('No system message.');
+  expect(within(multimodal.container).getByRole('region', { name: 'Message 1' })).toHaveTextContent('[image] ${media:photo}');
+  expect(within(multimodal.container).getByRole('region', { name: 'Message 1' }).textContent).toContain(long);
+  // Only Prompt references validate; a non-Prompt answer is an error, not a reinterpreted spec.
+  expect(validatePanel('PromptMessages', { cardRef: card })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect((await loadPromptMessages({ cardRef: PROMPT }, { executor: recording(() => ({ ok: true, value: agent })).executor })).result.state).toBe('error');
+
+  // Variables are the server's status.prompt derivation, in its order.
+  const variables = await loadPromptVariables({ cardRef: PROMPT }, { executor: reads.executor });
+  expect(variables.result).toEqual({ state: 'populated', data: [{ name: 'ticket', kind: 'text' }, { name: 'tone', kind: 'text' }] });
+  const withMedia = { ...prompts['1.0.0'], status: { phase: 'active', prompt: { variables: [], media_variables: ['photo'] } } };
+  expect((await loadPromptVariables({ cardRef: PROMPT }, { executor: recording(() => ({ ok: true, value: withMedia as never })).executor })).result).toEqual({ state: 'populated', data: [{ name: 'photo', kind: 'media' }] });
+  expect((await loadPromptVariables({ cardRef: PROMPT }, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'This Prompt renders with no variables.' });
+  expect(within(render(PromptVariables, variables).container).getAllByRole('row')).toHaveLength(3);
+
+  // Used by: inbound Agent relationships, each Agent read for its route; a refused Agent keeps its row.
+  const users = fixtureRecording();
+  const usedBy = await loadUsedBy({ cardRef: PROMPT }, { executor: users.executor });
+  expect(users.calls.map((call) => call.request)).toEqual([{ op: 'cards.get_by_ref', card_ref: PROMPT }, { op: 'cards.get_by_ref', card_ref: AGENT }]);
+  expect(usedBy.result).toEqual({ state: 'populated', data: [{ ref: AGENT, agent: { state: 'populated', data: { route: { kind: 'wyrd_gateway', deployment: 'primary' }, services: [SERVICE] } } }] });
+  const refusedAgent = await loadUsedBy({ cardRef: PROMPT }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.kind === 'Agent' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(refusedAgent.result).toEqual({ state: 'populated', data: [{ ref: AGENT, agent: { state: 'denied', problem: denied } }] });
+  const refusedPrompt = recording(() => ({ ok: false, problem: denied }));
+  expect((await loadUsedBy({ cardRef: PROMPT }, { executor: refusedPrompt.executor })).result.state).toBe('denied');
+  expect(ops(refusedPrompt.calls)).toEqual(['cards.get_by_ref']);
+  const onaction = vi.fn();
+  const table = render(UsedBy, { ...usedBy, onaction });
+  expect(table.container).toHaveTextContent('wyrd_gateway · primary');
+  await fireEvent.click(within(table.container).getByRole('button', { name: `${AGENT.name}@${AGENT.version}` }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'card.open', input: { card_ref: AGENT } });
+  expect(render(UsedBy, refusedAgent).container).toHaveTextContent(denied.code);
+
+  // A comparison pins both versions and shows only the authored differences.
+  const compared = fixtureRecording();
+  const diff = await loadVersionDiff({ cardRef: PROMPT }, { executor: compared.executor });
+  expect(compared.calls.map((call) => call.request)).toEqual([
+    { op: 'cards.get_by_ref', card_ref: PROMPT },
+    { op: 'cards.list', kind: 'Prompt', name: 'support-reply', include_prerelease: true, limit: 100, cursor: null },
+    { op: 'cards.get_by_ref', card_ref: { kind: 'Prompt', name: 'support-reply', version: '1.0.0' } }
+  ]);
+  expect(diff.result).toMatchObject({ state: 'populated', data: { versions: ['1.1.0', '1.0.0'], other: '1.0.0' } });
+  const changes = (diff.result as { data: VersionDiffData }).data.changes;
+  expect(changes.map((change) => change.field)).toEqual(['system', 'messages[0]', 'response_format', 'variables']);
+  expect(changes.find((change) => change.field === 'response_format')).toEqual({ field: 'response_format', to: 'verdict' });
+  expect(changes.find((change) => change.field === 'variables')).toEqual({ field: 'variables', from: ['ticket'], to: ['ticket', 'tone'] });
+  // The first version has nothing before it: no backwards comparison, only the choice of another version.
+  const first = await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' } }, { executor: fixtureExecutor });
+  expect(first.result).toMatchObject({ state: 'empty', data: { versions: ['1.1.0', '1.0.0'], changes: [] }, reason: 'Version 1.0.0 is the first registered version. Choose a version to compare it with.' });
+  expect(within(render(VersionDiff, first).container).getByLabelText('Compare with')).toHaveTextContent('compare with v1.1.0');
+  // One unified list: removed lines above added ones; a long unchanged run is counted, not drawn.
+  const kept = ['a', 'b', 'c', 'd', 'e'].join('\n');
+  expect(diffLines(`${kept}\nold\nz`, `${kept}\nnew\nz`)).toEqual([
+    { kind: 'same', text: 'a' },
+    { kind: 'gap', text: '3 unchanged lines' },
+    { kind: 'same', text: 'e' },
+    { kind: 'removed', text: 'old' },
+    { kind: 'added', text: 'new' },
+    { kind: 'same', text: 'z' }
+  ]);
+  // A field present on one side only is all added or all removed.
+  expect(diffLines(undefined, 'verdict')).toEqual([{ kind: 'added', text: 'verdict' }]);
+  expect(diffLines('a\nb', undefined).map((line) => line.kind)).toEqual(['removed', 'removed']);
+  // A differing middle too long to match line by line is shown whole rather than computed; shared ends stay unchanged.
+  const oversized = (side: string) => ['first', ...Array.from({ length: 600 }, (_, index) => `${side} ${index}`), 'last'].join('\n');
+  const whole = diffLines(oversized('old'), oversized('new')).map((line) => line.kind);
+  expect(whole).toEqual(['same', ...Array.from({ length: 600 }, () => 'removed'), ...Array.from({ length: 600 }, () => 'added'), 'same']);
+  // Identical texts have no changed line, whatever their length.
+  expect(diffLines(oversized('old'), oversized('old')).map((line) => line.kind)).toEqual(['same', 'gap', 'same']);
+  // Each changed field is a section counting its lines; a small change is open, a large one starts closed.
+  const drawn = render(VersionDiff, diff).container;
+  const format = drawn.querySelector('details[aria-label="response_format"]') as HTMLDetailsElement;
+  expect(format.open).toBe(true);
+  expect(format.querySelector('summary')).toHaveTextContent('response_format +1');
+  expect(format.querySelector('[data-line="added"]')).toHaveTextContent('+ verdict');
+  const large = { ...diff, result: { state: 'populated' as const, data: { versions: ['1.1.0', '1.0.0'], other: '1.0.0', changes: [{ field: 'response_format', to: oversized('new') }] } } };
+  expect((render(VersionDiff, large).container.querySelector('details') as HTMLDetailsElement).open).toBe(false);
+  // Any two versions: the older one compared against the newer, in either direction.
+  expect((await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' }, otherVersion: '1.1.0' }, { executor: fixtureExecutor })).result).toMatchObject({ data: { other: '1.1.0' } });
+  expect(validatePanel('VersionDiff', { cardRef: PROMPT, otherVersion: PROMPT.version })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('VersionDiff', { cardRef: PROMPT, otherVersion: 'latest' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect((await loadVersionDiff({ cardRef: PROMPT, otherVersion: '9.9.9' }, { executor: fixtureExecutor })).result).toEqual({ state: 'error', problem: notFound });
+  const single = await loadVersionDiff({ cardRef: NATIVE }, { executor: fixtureExecutor });
+  expect(single.result).toMatchObject({ state: 'empty', reason: 'Only version 1.0.0 is registered.' });
+  expect(render(VersionDiff, single).container).toHaveTextContent('Only version 1.0.0 is registered. Registering a new version shows its message, variable and response-format diff here.');
+  const picker = render(VersionDiff, { ...diff, onaction });
+  expect(within(picker.container).getByRole('group', { name: 'system' }).querySelectorAll('pre')).toHaveLength(1);
+  await fireEvent.change(within(picker.container).getByRole('combobox'), { target: { value: '1.0.0' } });
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
+  expect(validateIntent('VersionDiff', onaction.mock.lastCall?.[0])).toEqual({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
+
+  // A Prompt records no telemetry, so its header offers no Open in Observe.
+  const promptHeader = render(CardHeader, { input: { cardRef: PROMPT }, result: { state: 'populated', data: { card: prompts['1.1.0'], versions: { state: 'populated', data: { items: [], truncated: false } } } }, onaction });
+  expect(within(promptHeader.container).queryByRole('button', { name: /Open in Observe/ })).toBeNull();
+
+  // No Prompt component reads telemetry.
+  expect([...reads.calls, ...users.calls, ...compared.calls].map((call) => call.request.op)).not.toContain('bifrost.query');
+  for (const name of ['PromptMessages', 'PromptVariables', 'UsedBy', 'VersionDiff'] as const)
+    expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'p', component: name, input: { cardRef: PROMPT } }] })).toMatchObject({ panels: [{ component: name }] });
+});
+
+const specOf = (key: string) => verifiers[key].spec as Parameters<typeof definitionGraph>[0];
+
+test('verifier graph projects and lays out the declared topology', () => {
+  // Ordinary: every declared input, step, attached and whole-Verifier requirement, with exact ids.
+  const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  expect(graph.inputs).toEqual([
+    { key: 'input:ticket', id: 'ticket', kind: 'json', detail: 'JSON matching its schema' },
+    { key: 'input:photo', id: 'photo', kind: 'media', detail: 'png, jpeg' }
+  ]);
+  expect(graph.steps.map((step) => [step.id, step.kind, step.detail])).toEqual([
+    ['read-photo', 'extract', 'from inputs.photo'],
+    ['score', 'code', 'score()'],
+    ['classify', 'agent', 'support@1.0.0'],
+    ['summarise', 'code', 'summarise()']
+  ]);
+  expect(graph.steps[2].requirements).toEqual([{ key: 'req:classified', id: 'classified', kind: 'assert', statement: 'The ticket has exactly one label', step: 'classify' }]);
+  expect(graph.requirements.map((each) => [each.id, each.kind, each.step])).toEqual([['policy-followed', 'agent', undefined], ['has-answer', 'assert', undefined]]);
+  // Dependencies come from references, the gate and depends_on; a step output's edge is labelled by the argument it is passed as, else the field read; a step never depends on itself.
+  expect(graph.edges).toEqual([
+    { source: 'input:photo', target: 'step:read-photo' },
+    { source: 'input:ticket', target: 'step:score' },
+    { source: 'input:ticket', target: 'step:classify' },
+    { source: 'step:read-photo', target: 'step:classify', label: 'photo_text' },
+    { source: 'step:classify', target: 'step:summarise', label: 'label' },
+    { source: 'step:score', target: 'step:summarise', label: 'units' },
+    { source: 'step:read-photo', target: 'step:summarise' },
+    { source: 'step:summarise', target: 'req:policy-followed', label: 'summary' },
+    { source: 'input:ticket', target: 'req:has-answer' }
+  ]);
+  expect(graph.steps.map((step) => step.needs)).toEqual([[], [], ['read-photo'], ['classify', 'score', 'read-photo']]);
+  // Declared repetition and gating are chips on the step that declares them.
+  expect(graph.steps.map((step) => step.chips)).toEqual([[], ['↻ ≤ 2 retries'], ['when'], []]);
+
+  // A gate and an attached requirement each add the dependency they read, even when the action reads nothing.
+  const code = { kind: 'code', entrypoint: 'f', source: { inline: '' } };
+  const gated = definitionGraph({
+    inputs: { doc: { type: 'json' } },
+    steps: [
+      { id: 'a', action: code },
+      { id: 'b', action: code, when: { path: 'steps.a.status', operator: 'equals', expected: 'succeeded' }, retries: 1, requirements: [{ id: 'r', statement: 's', check: { kind: 'assert', path: 'inputs.doc.ok', operator: 'is_truthy' } }] }
+    ]
+  } as never);
+  expect(gated.edges).toEqual([{ source: 'step:a', target: 'step:b' }, { source: 'input:doc', target: 'step:b' }]);
+  expect(gated.steps[1].chips).toEqual(['when', '↻ ≤ 1 retry']);
+
+  // A pull request extract and an approval read no inputs; an any-succeeded join depends on each predecessor and says so.
+  const review = definitionGraph({
+    steps: [
+      { id: 'source', action: { kind: 'extract', extractor: 'pull_request' } },
+      { id: 'lint', action: code, depends_on: ['source'] },
+      { id: 'tests', action: code, depends_on: ['source'] },
+      { id: 'approve', action: { kind: 'approval', message: 'Ship it?' }, depends_on: { any_succeeded: ['lint', 'tests'] } }
+    ]
+  } as never);
+  expect(review.steps.map((step) => [step.id, step.detail, step.needs, step.chips])).toEqual([
+    ['source', 'pull_request extractor', [], []],
+    ['lint', 'f()', ['source'], []],
+    ['tests', 'f()', ['source'], []],
+    ['approve', 'Ship it?', ['lint', 'tests'], ['any succeeded']]
+  ]);
+
+  // Session-shaped: group sources are inputs feeding the judgment; drift-shaped: samples feed the drift check. No steps.
+  const session = definitionGraph(specOf('session-quality@1.0.0'));
+  expect(session.inputs).toEqual([
+    { key: 'input:outcomes', id: 'outcomes', kind: 'source', detail: 'verifiers.ticket-policy.requirements.policy-followed.outcome' },
+    { key: 'input:tickets', id: 'tickets', kind: 'source', detail: 'verifiers.ticket-policy.inputs.ticket' }
+  ]);
+  expect(session.edges).toEqual([{ source: 'input:outcomes', target: 'req:all-passed' }]);
+  const drift = definitionGraph(specOf('latency-drift@1.0.0'));
+  expect(drift.inputs).toEqual([{ key: 'input:latency', id: 'latency', kind: 'samples', detail: 'latency_ms' }]);
+  expect(drift.requirements).toEqual([{ key: 'req:latency-stable', id: 'latency-stable', kind: 'drift', statement: 'Latency stays within its fitted baseline' }]);
+  expect(drift.edges).toEqual([{ source: 'input:latency', target: 'req:latency-stable' }]);
+
+  // Layout: columns follow dependency rank, parallel steps share a column, and no two nodes overlap.
+  const laid = layoutDefinition(graph);
+  const at = (key: string) => laid.nodes.find((node) => node.key === key)!;
+  expect(at('step:score').x).toBe(at('step:classify').x);
+  expect(at('input:ticket').x).toBeLessThan(at('step:read-photo').x);
+  expect(at('step:read-photo').x).toBeLessThan(at('step:classify').x);
+  expect(at('step:classify').x).toBeLessThan(at('step:summarise').x);
+  expect(at('step:summarise').x).toBeLessThan(at('req:policy-followed').x);
+  for (const a of laid.nodes)
+    for (const b of laid.nodes)
+      if (a.key < b.key) expect(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y, `${a.key} overlaps ${b.key}`).toBe(true);
+  // Every edge leaves its source's right side and ends on its target's left boundary, in orthogonal segments.
+  for (const edge of laid.edges) {
+    const [first, last] = [edge.points[0], edge.points.at(-1)!];
+    const [source, target] = [at(edge.source), at(edge.target)];
+    expect(first[0], edge.id).toBe(source.x + source.width);
+    expect(last[0], edge.id).toBe(target.x);
+    expect(last[1] > target.y && last[1] < target.y + target.height, edge.id).toBe(true);
+    edge.points.slice(1).forEach((point, index) => expect(point[0] === edge.points[index][0] || point[1] === edge.points[index][1], edge.id).toBe(true));
+  }
+  // A fan-in shares one final run, so its target has one port per producer lane, and each label is drawn once.
+  expect(laid.edges.filter((edge) => edge.labelAt).map((edge) => edge.label).sort()).toEqual(['label', 'photo_text', 'summary', 'units']);
+  expect(laid.stages.map((stage) => stage.text)).toEqual(['Inputs', 'Steps', 'After all steps']);
+  // A simple graph stays compact, and a Verifier without steps names its last stage Requirements.
+  const simple = layoutDefinition(drift);
+  expect(simple.stages.map((stage) => stage.text)).toEqual(['Inputs', 'Requirements']);
+  expect(simple.height).toBeLessThan(100);
+  expect(simple.width).toBeLessThan(laid.width / 2);
+  // A single chain of steps stacks vertically in one column.
+  const chained = layoutDefinition(
+    definitionGraph({ inputs: { doc: { type: 'json' } }, steps: ['a', 'b', 'c'].map((id, index, ids) => ({ id, action: { kind: 'code', entrypoint: id, inputs: { from: index ? `steps.${ids[index - 1]}.output` : 'inputs.doc' }, source: { inline: '' } } })) } as never)
+  );
+  const [a, b, c] = ['step:a', 'step:b', 'step:c'].map((key) => chained.nodes.find((node) => node.key === key)!);
+  expect([b.x, c.x]).toEqual([a.x, a.x]);
+  expect(a.y + a.height).toBeLessThan(b.y);
+  expect(b.y + b.height).toBeLessThan(c.y);
+  // Long text never widens a node past its cap, and an undeclared reference draws no edge.
+  const long = definitionGraph({ inputs: { ['x'.repeat(200)]: { type: 'json' } }, requirements: [{ id: 'r', statement: 'y'.repeat(500), check: { kind: 'assert', path: 'inputs.missing', operator: 'is_null' } }] } as never);
+  expect(long.edges).toEqual([]);
+  expect(Math.max(...layoutDefinition(long).nodes.map((node) => node.width))).toBeLessThanOrEqual(340);
+});
+
+test('verifier graph projects fan-out, repetition and speculative controls on one node per step', () => {
+  const agentStep = (id: string, extra: object) => ({ id, action: { kind: 'agent', agent: AGENT, inputs: { section: 'item' } }, ...extra });
+  const graph = definitionGraph({
+    inputs: { document: { type: 'json' } },
+    steps: [
+      { id: 'read', action: { kind: 'extract', from: 'inputs.document' } },
+      agentStep('sections', { foreach: { items: 'steps.read.output.value.sections', max_items: 5 } }),
+      agentStep('polish', { foreach: { items: 'steps.read.output.value.sections', max_items: 5, concurrency: 2 }, repeat: { max_iterations: 3, until: { path: 'iteration.output.score', operator: 'greater_than_or_equals', expected: 1 } } }),
+      agentStep('votes', { foreach: { count: 3 } }),
+      agentStep('extra', { speculative: true, depends_on: { any_succeeded: ['read'] }, when: { path: 'steps.votes.output.agree', operator: 'equals', expected: false } }),
+      { id: 'summarize', action: { kind: 'agent', agent: './summarizer.yaml', workspace: { '/inputs/accounts': 'steps.sections.publications' } }, repeat: { max_iterations: 1, until: { path: 'iteration.output.done', operator: 'is_truthy' } } }
+    ]
+  } as never);
+  // One node per authored step, however many items or iterations it declares.
+  expect(graph.steps.map((step) => step.id)).toEqual(['read', 'sections', 'polish', 'votes', 'extra', 'summarize']);
+  expect(graph.steps.map((step) => step.chips)).toEqual([
+    [],
+    ['× ≤ 5 items'],
+    ['× ≤ 5 items', '↻ ≤ 3 iterations'],
+    ['× 3 items'],
+    ['when', 'any succeeded', 'speculative'],
+    ['↻ ≤ 1 iteration']
+  ]);
+  // The fanned-out array is a dependency like any other reference; a repeat's own iteration is not.
+  expect(graph.edges).toEqual([
+    { source: 'input:document', target: 'step:read' },
+    { source: 'step:read', target: 'step:sections', label: 'value' },
+    { source: 'step:read', target: 'step:polish', label: 'value' },
+    { source: 'step:votes', target: 'step:extra', label: 'agree' },
+    { source: 'step:read', target: 'step:extra' },
+    { source: 'step:sections', target: 'step:summarize' }
+  ]);
+  // An exact Card a step names is kept as its external reference; a sibling path stays text.
+  expect(graph.steps.map((step) => step.ref)).toEqual([undefined, AGENT, AGENT, AGENT, AGENT, undefined]);
+  expect(graph.steps[5].detail).toBe('./summarizer.yaml');
+  // Layout still gives every step one box and no overlap.
+  const laid = layoutDefinition(graph);
+  expect(laid.nodes.filter((node) => node.key.startsWith('step:'))).toHaveLength(6);
+  for (const a of laid.nodes)
+    for (const b of laid.nodes)
+      if (a.key < b.key) expect(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y, `${a.key} overlaps ${b.key}`).toBe(true);
+});
+
+test('verifier graph is read-only, selectable and keyboard and zoom operable', async () => {
+  const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  const shown = render(VerifierGraph, { graph });
+  const flow = () => shown.container.querySelector('.svelte-flow__viewport') as HTMLElement;
+  await waitFor(() => expect(flow()).toBeInTheDocument());
+  const node = (key: string) => shown.container.querySelector(`[data-node="${key}"]`) as HTMLButtonElement;
+  const positions = () => [...shown.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform);
+  const placed = positions();
+
+  // Stage headings, every node, an arrowhead per dependency and each output label.
+  expect([...shown.container.querySelectorAll('[data-stage]')].map((stage) => stage.textContent)).toEqual(['Inputs', 'Steps', 'After all steps']);
+  expect([...shown.container.querySelectorAll('[data-node]')].map((each) => each.getAttribute('data-node')).sort()).toEqual(
+    [...graph.inputs, ...graph.steps, ...graph.steps.flatMap((step) => step.requirements), ...graph.requirements].map((each) => each.key).sort()
+  );
+  expect(shown.container.querySelectorAll('[data-edge] path.arrow')).toHaveLength(graph.edges.length);
+  expect([...shown.container.querySelectorAll('[data-edge] text')].map((label) => label.textContent).sort()).toEqual(['label', 'photo_text', 'summary', 'units']);
+  expect(node('step:classify')).toHaveTextContent('classifyagent needs read-photo support@1.0.0 when');
+  expect(node('step:score')).toHaveTextContent('↻ ≤ 2 retries');
+  expect(node('req:has-answer')).toHaveTextContent('The ticket carries an answer');
+
+  // Definition only: no execution word, outcome glyph or state attribute anywhere in the drawing.
+  expect(shown.container.textContent).not.toMatch(/passed|failed|running|waiting|skipped|inconclusive|not judged|✓|✕/);
+  expect(shown.container.querySelector('[data-outcome], [data-status], .failed, .dim, .bad')).toBeNull();
+  expect(shown.container).toHaveTextContent('No execution state is shown.');
+
+  // No authoring gesture: nothing is draggable, connectable, reconnectable or selectable for Svelte Flow.
+  expect(shown.container.querySelector('.svelte-flow__node.draggable, .svelte-flow__node.selectable, .svelte-flow__node.connectable, .svelte-flow__handle.connectable, .svelte-flow__edge.selectable, .svelte-flow__edgeupdater')).toBeNull();
+  await fireEvent.click(node('step:classify'));
+  for (const key of ['Delete', 'Backspace']) await fireEvent.keyDown(node('step:classify'), { key });
+  expect(shown.container.querySelectorAll('[data-node]')).toHaveLength(9);
+  expect(shown.container.querySelectorAll('[data-edge]')).toHaveLength(graph.edges.length);
+  expect(positions()).toEqual(placed);
+
+  // Clicking selects one node and marks its own dependencies; layout does not move.
+  expect(node('step:classify')).toHaveAttribute('aria-pressed', 'true');
+  expect(shown.container.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+  const hot = () => [...shown.container.querySelectorAll('[data-edge].hot')].map((edge) => edge.getAttribute('data-edge'));
+  expect(hot()).toEqual(['input:ticket->step:classify', 'step:read-photo->step:classify', 'step:classify->step:summarise']);
+  await fireEvent.click(node('req:classified'));
+  expect(node('req:classified')).toHaveAttribute('aria-pressed', 'true');
+  expect(node('step:classify')).toHaveAttribute('aria-pressed', 'false');
+  expect(positions()).toEqual(placed);
+
+  // Arrow keys move by layout position; the moved-to node is selected and focused.
+  node('input:ticket').focus();
+  await fireEvent.keyDown(node('input:ticket'), { key: 'ArrowRight' });
+  expect(node('step:read-photo')).toHaveAttribute('aria-pressed', 'true');
+  expect(document.activeElement).toBe(node('step:read-photo'));
+  await fireEvent.keyDown(node('step:read-photo'), { key: 'ArrowRight' });
+  expect(document.activeElement).toBe(node('step:classify'));
+  await fireEvent.keyDown(node('step:classify'), { key: 'ArrowDown' });
+  expect(document.activeElement).toBe(node('req:classified'));
+  await fireEvent.keyDown(node('req:classified'), { key: 'ArrowUp' });
+  expect(document.activeElement).toBe(node('step:classify'));
+  await fireEvent.keyDown(node('step:classify'), { key: 'ArrowLeft' });
+  expect(document.activeElement).toBe(node('step:read-photo'));
+  // Clicking the empty canvas clears the selection.
+  await fireEvent.click(shown.container.querySelector('.svelte-flow__pane') as Element);
+  expect(shown.container.querySelector('[aria-pressed="true"]')).toBeNull();
+
+  // Zoom in, out, to 100% and to fit, within 60%–160%; zoom never moves a node.
+  const zoom = within(shown.container).getByRole('group', { name: 'Zoom' });
+  const percent = () => zoom.querySelector('[data-zoom]')?.textContent;
+  expect(percent()).toBe('100%');
+  await fireEvent.click(within(zoom).getByRole('button', { name: 'Zoom in' }));
+  expect(percent()).toBe('120%');
+  await waitFor(() => expect(flow().style.transform).toContain('scale(1.2)'));
+  for (let presses = 0; presses < 3; presses += 1) await fireEvent.click(within(zoom).getByRole('button', { name: 'Zoom in' }));
+  expect(percent()).toBe('160%');
+  expect(within(zoom).getByRole('button', { name: 'Zoom in' })).toBeDisabled();
+  for (let presses = 0; presses < 8; presses += 1) await fireEvent.click(within(zoom).getByRole('button', { name: 'Zoom out' }));
+  expect(percent()).toBe('60%');
+  expect(within(zoom).getByRole('button', { name: 'Zoom out' })).toBeDisabled();
+  await fireEvent.click(within(zoom).getByRole('button', { name: '100%' }));
+  expect(percent()).toBe('100%');
+  await fireEvent.click(within(zoom).getByRole('button', { name: 'Fit' }));
+  await waitFor(() => expect(flow().style.transform).toBe('translate(16px, 12px) scale(1)'));
+  expect(positions()).toEqual(placed);
+  shown.unmount();
+
+  // A narrow screen fits no lower than 60% and pans: moving to an off-screen node brings it into view.
+  const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(360);
+  const narrow = render(VerifierGraph, { graph });
+  await waitFor(() => expect(narrow.container.querySelector('.svelte-flow__viewport')).toBeInTheDocument());
+  const view = narrow.container.querySelector('.svelte-flow__viewport') as HTMLElement;
+  expect(narrow.container.querySelector('[data-zoom]')).toHaveTextContent('60%');
+  expect(view.style.transform).toBe('translate(16px, 12px) scale(0.6)');
+  const far = narrow.container.querySelector('[data-node="step:summarise"]') as HTMLButtonElement;
+  const from = narrow.container.querySelector('[data-node="step:classify"]') as HTMLButtonElement;
+  from.focus();
+  await fireEvent.keyDown(from, { key: 'ArrowRight' });
+  expect(document.activeElement).toBe(far);
+  const panned = Number(/translate\((-?[\d.]+)px/.exec(view.style.transform)?.[1]);
+  const centre = layoutDefinition(graph).targets.find((target) => target.key === 'step:summarise')!.x * 0.6 + panned;
+  expect(centre).toBeGreaterThan(0);
+  expect(centre).toBeLessThan(360);
+  width.mockRestore();
+});
+
+test('verifier definition and bindings stay truthful across hosts and states', async () => {
+  // One exact Card read yields the authored spec and its graph; no other read is planned.
+  const reads = fixtureRecording();
+  const definition = await loadVerifierDefinition({ cardRef: VERIFIER }, { executor: reads.executor });
+  expect(reads.calls.map((call) => call.request)).toEqual([{ op: 'cards.get_by_ref', card_ref: VERIFIER }]);
+  expect(definition.result).toEqual({ state: 'populated', data: { spec: verifiers['ticket-policy@1.1.0'].spec, graph: definitionGraph(specOf('ticket-policy@1.1.0')) } });
+
+  // The page region: description, graph, and the authored declaration of the selected node.
+  const shown = render(VerifierDefinition, definition);
+  await waitFor(() => expect(shown.container.querySelector('[data-node="step:score"]')).toBeInTheDocument());
+  expect(shown.container).toHaveTextContent('A support ticket follows the refund policy.');
+  const declaration = () => within(shown.container).getByRole('region', { name: /Declaration|Input|Step|Requirement/ });
+  expect(declaration()).toHaveTextContent('Select an input, step or requirement in the graph to read its declaration.');
+  const steps = specOf('ticket-policy@1.1.0').steps!;
+  await fireEvent.click(shown.container.querySelector('[data-node="step:score"]') as Element);
+  expect(within(shown.container).getByRole('region', { name: 'Step score' }).querySelector('pre')?.textContent).toBe(fmtYaml(steps[1]));
+  expect(declaration()).toHaveTextContent('retries: 2');
+  await fireEvent.click(shown.container.querySelector('[data-node="req:classified"]') as Element);
+  const attached = within(shown.container).getByRole('region', { name: 'Requirement classified' });
+  expect(attached).toHaveTextContent('judged after step classify');
+  expect(attached.querySelector('pre')?.textContent).toBe(fmtYaml(steps[2].requirements![0]));
+  await fireEvent.click(shown.container.querySelector('[data-node="req:has-answer"]') as Element);
+  expect(within(shown.container).getByRole('region', { name: 'Requirement has-answer' })).toHaveTextContent('judged after every step');
+  await fireEvent.click(shown.container.querySelector('[data-node="input:photo"]') as Element);
+  expect(within(shown.container).getByRole('region', { name: 'Input photo' }).querySelector('pre')?.textContent).toBe(fmtYaml({ photo: { type: 'media', formats: ['png', 'jpeg'] } }));
+  // Nothing on a definition links to results or edits the Verifier.
+  expect(shown.container.querySelector('a, input, textarea, select, [contenteditable]')).toBeNull();
+  expect(shown.container.textContent).not.toMatch(/Results in Verify/);
+
+  // Denied, missing, failed and loading reads say so; another kind of Card is refused, never drawn.
+  for (const state of ['denied', 'error'] as const) {
+    const refused = await loadVerifierDefinition({ cardRef: VERIFIER }, { executor: stateExecutors[state] });
+    expect(refused.result.state).toBe(state);
+    const empty = render(VerifierDefinition, refused);
+    expect(empty.container.querySelector('[data-node]')).toBeNull();
+    expect(empty.container).toHaveTextContent((refused.result as { problem: { code: string } }).problem.code);
+  }
+  expect((await loadVerifierDefinition({ cardRef: { ...VERIFIER, version: '9.9.9' } }, { executor: fixtureExecutor })).result).toEqual({ state: 'error', problem: notFound });
+  expect(render(VerifierDefinition, { input: { cardRef: VERIFIER }, result: { state: 'loading' } }).container).toHaveTextContent('Loading the definition of ticket-policy@1.1.0');
+  const wrongKind = await loadVerifierDefinition({ cardRef: VERIFIER }, { executor: recording(() => ({ ok: true, value: agent })).executor });
+  expect(wrongKind.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION', detail: 'ticket-policy@1.1.0 is a Agent Card, not a Verifier' } });
+  for (const name of ['VerifierDefinition', 'RunsOn'] as const) {
+    expect(validatePanel(name, { cardRef: PROMPT })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+    expect(validatePanel(name, { cardRef: { ...VERIFIER, version: 'latest' } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  }
+
+  // Runs on: inbound owners, each read for the bindings that pin exactly this version.
+  const owners = fixtureRecording();
+  const runsOn = await loadRunsOn({ cardRef: VERIFIER }, { executor: owners.executor });
+  expect(owners.calls.map((call) => call.request)).toEqual([{ op: 'cards.get_by_ref', card_ref: VERIFIER }, { op: 'cards.get_by_ref', card_ref: SERVICE }]);
+  expect(runsOn.result).toEqual({
+    state: 'populated',
+    data: [{ ref: SERVICE, bindings: { state: 'populated', data: [{ when: 'explicit invocation only' }, { subject: 'agent', when: 'schedule 0 * * * * Europe/Berlin' }] } }]
+  });
+  const onaction = vi.fn();
+  const rail = render(RunsOn, { ...runsOn, onaction });
+  expect(rail.container).toHaveTextContent('the whole Card · explicit invocation only');
+  expect(rail.container).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
+  // The Service's binding of the older version is not this version's.
+  expect(rail.container).not.toHaveTextContent('group end');
+  await fireEvent.click(within(rail.container).getByRole('button', { name: `${SERVICE.name}@${SERVICE.version}` }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'card.open', input: { card_ref: SERVICE } });
+  expect(validateIntent('RunsOn', onaction.mock.lastCall?.[0])).toEqual(onaction.mock.lastCall?.[0]);
+  // The older version is bound at group end; a version nothing binds says so.
+  const older = await loadRunsOn({ cardRef: { ...VERIFIER, version: '1.0.0' } }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.version === '1.0.0' && request.card_ref.kind === 'Verifier' ? { ok: true, value: { ...verifiers['ticket-policy@1.0.0'], relationships: { inbound_refs: [{ ref: SERVICE }] } } as never } : undefined)).executor });
+  expect(older.result).toMatchObject({ data: [{ bindings: { data: [{ when: 'group end after 10m' }] } }] });
+  const unbound = await loadRunsOn({ cardRef: SESSION_VERIFIER }, { executor: fixtureExecutor });
+  expect(unbound.result).toEqual({ state: 'empty', data: [], reason: 'No binding runs this exact version.' });
+  expect(render(RunsOn, unbound).container).toHaveTextContent('No binding runs this exact version.');
+  // A refused owner keeps its row; a refused Verifier issues no owner read.
+  const refusedOwner = await loadRunsOn({ cardRef: VERIFIER }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.kind === 'Service' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(refusedOwner.result).toEqual({ state: 'populated', data: [{ ref: SERVICE, bindings: { state: 'denied', problem: denied } }] });
+  expect(render(RunsOn, refusedOwner).container).toHaveTextContent(denied.code);
+  const refusedVerifier = recording(() => ({ ok: false, problem: denied }));
+  expect((await loadRunsOn({ cardRef: VERIFIER }, { executor: refusedVerifier.executor })).result.state).toBe('denied');
+  expect(ops(refusedVerifier.calls)).toEqual(['cards.get_by_ref']);
+  expect(service.spec).toMatchObject({ verified_by: [{}, {}] });
+
+  // The same loader serves an MCP host through the existing cards.get tool, with the same graph.
+  const app = { callServerTool: vi.fn(async () => ({ content: [], structuredContent: { card: verifiers['latency-drift@1.0.0'] } })) };
+  const viaMcp = await loadVerifierDefinition({ cardRef: DRIFT_VERIFIER }, { executor: mcpExecutor(app as never) });
+  expect(app.callServerTool).toHaveBeenCalledWith({ name: 'cards.get', arguments: { card_ref: DRIFT_VERIFIER } }, { signal: undefined });
+  expect(viaMcp.result).toMatchObject({ state: 'populated', data: { graph: definitionGraph(specOf('latency-drift@1.0.0')) } });
+
+  // Both components are placeable in a view document, and the shared renderer draws them from it.
+  const doc = (version: string) => ({
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range: RANGE,
+    panels: [{ id: 'definition', component: 'VerifierDefinition', input: { cardRef: { ...VERIFIER, version } } }, { id: 'runs-on', component: 'RunsOn', input: { cardRef: { ...VERIFIER, version } } }]
+  });
+  expect(validateView(doc('1.1.0'))).toMatchObject({ panels: [{ component: 'VerifierDefinition' }, { component: 'RunsOn' }] });
+  expect(catalog.components.VerifierDefinition.states).toEqual(['populated', 'denied', 'error', 'loading']);
+  expect(catalog.components.RunsOn.emits.map((action) => action.name)).toEqual(['card.open']);
+  const placed = render(WyrdView, { doc: doc('1.1.0'), executor: fixtureExecutor });
+  await waitFor(() => expect(placed.container.querySelector('[data-node="step:summarise"]')).toBeInTheDocument());
+  expect(placed.container).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
+  placed.unmount();
+
+  // A replaced version supersedes its in-flight read; the late old definition never renders.
+  const pending: ((result: WireResult) => void)[] = [];
+  const held = recording(() => new Promise<WireResult>((resolve) => pending.push(resolve)));
+  const one = (version: string) => ({ ...doc(version), panels: [doc(version).panels[0]] });
+  const view = render(WyrdView, { doc: one('1.0.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(1));
+  await view.rerender({ doc: one('1.1.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(2));
+  expect(held.calls[0].signal?.aborted).toBe(true);
+  pending[1]({ ok: true, value: verifiers['ticket-policy@1.1.0'] });
+  await waitFor(() => expect(view.container).toHaveTextContent('A support ticket follows the refund policy.'));
+  pending[0]({ ok: true, value: verifiers['ticket-policy@1.0.0'] });
+  await tick();
+  expect(view.container).not.toHaveTextContent('A support ticket carries an answer.');
+  expect(view.container.querySelector('[data-node="step:summarise"]')).toBeInTheDocument();
+});
+
+/** The text of each cell of each body row. */
+const cells = (table: Element) => [...table.querySelectorAll('tbody tr')].map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent?.trim()));
+const reads = (calls: { request: WireRequest }[]) => calls.map(({ request }) => (request.op === 'bifrost.query' ? `query ${request.sql.split(' FROM ')[0]}` : request.op));
+const partOf = (loaded: Awaited<ReturnType<typeof loadExecution>>) => {
+  if (loaded.result.state !== 'populated') throw new Error(`execution is ${loaded.result.state}`);
+  return loaded.result.data;
+};
+
+test('execution loader reads each part once and keeps refusals apart', async () => {
+  // Running, no result: the Verifier comes from retained metadata and the existing UID Card read; details are never read.
+  const running = fixtureRecording();
+  const live = partOf(await loadExecution({ executionId: EXECUTIONS.running, details: true }, { executor: running.executor }));
+  expect(running.calls.map((call) => call.request)).toEqual([
+    { op: 'verification.get_execution', execution_id: 'exec_running' },
+    { op: 'bifrost.query', sql: 'SELECT verifier_card_uid FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1', params: ['exec_running'], max_rows: 1 },
+    { op: 'cards.get_by_uid', kind: 'Verifier', card_uid: 'card_verifier_ticket-policy_1.1.0' },
+    { op: 'verification.list_invocations', execution_id: 'exec_running', limit: 200 }
+  ]);
+  expect(live.definition).toMatchObject({ state: 'populated', data: { ref: { ...VERIFIER, uid: 'card_verifier_ticket-policy_1.1.0' }, graph: definitionGraph(specOf('ticket-policy@1.1.0')) } });
+  expect(live.details).toEqual({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' });
+  expect(live.status).toBe(executionStatus.exec_running);
+
+  // Settled: the result's exact reference reads the Card; no metadata query; details only when asked for.
+  const settled = fixtureRecording();
+  const compact = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: settled.executor }));
+  // Outputs are read only for the outputs view or a selected step.
+  expect(reads(settled.calls)).toEqual(['verification.get_execution', 'cards.get_by_ref', 'verification.list_invocations']);
+  expect(compact.publications).toBeUndefined();
+
+  // A Verifier without steps reads no progress once its result is recorded.
+  const verifier = verifiers['ticket-policy@1.1.0'];
+  const withoutSteps = { ...verifier, spec: { ...verifier.spec, steps: [] } };
+  const stepless = fixtureRecording((request) => {
+    if (request.op === 'cards.get_by_ref') return { ok: true, value: withoutSteps as never };
+  });
+  const judged = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: stepless.executor }));
+  expect(judged.invocations).toBeUndefined();
+  expect(reads(stepless.calls)).toEqual(['verification.get_execution', 'cards.get_by_ref']);
+
+  // An execution that ran directly has no queued record: the server answers 404 for progress and outputs.
+  const notQueued = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Verification execution not found', status: 404 };
+  const ranDirectly = fixtureRecording((request) => {
+    if (request.op === 'verification.list_invocations' || request.op === 'verification.list_publications') return { ok: false, problem: notQueued };
+  });
+  const direct = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'outputs' }, { executor: ranDirectly.executor }));
+  expect(direct.invocations).toBeUndefined();
+  expect(direct.publications).toEqual({ state: 'empty', reason: 'This execution ran directly and retains no outputs.' });
+
+  expect(settled.calls[1].request).toEqual({ op: 'cards.get_by_ref', card_ref: VERIFIER });
+  expect(compact.details).toBeUndefined();
+  const asked = fixtureRecording();
+  expect(partOf(await loadExecution({ executionId: EXECUTIONS.settled, details: true }, { executor: asked.executor })).details).toEqual({ state: 'populated', data: executionDetails });
+  expect(reads(asked.calls)).toContain('verification.get_execution_details');
+
+  // Unknown, foreign and denied executions end the load with the server's problem and no dependent read; 404 is never "running".
+  for (const [problem, state] of [[{ code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 }, 'error'], [denied, 'denied']] as const) {
+    const refused = recording(() => ({ ok: false, problem }));
+    expect((await loadExecution({ executionId: 'exec_other', node: 'step:score', producer: { attempt: 1 }, output: 'units', details: true }, { executor: refused.executor })).result).toEqual({ state, problem });
+    expect(refused.calls).toHaveLength(1);
+  }
+
+  // A refused metadata query reads no Card; progress and outputs stay readable. Metadata not yet visible says so.
+  const noQuery = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: denied } : undefined));
+  const partial = partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: noQuery.executor }));
+  expect(partial.definition).toEqual({ state: 'denied', problem: denied });
+  expect(reads(noQuery.calls)).not.toContain('cards.get_by_uid');
+  expect(partial.invocations?.state).toBe('populated');
+  const unseen = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: true, value: { columns: [], rows: [], terminal: terminal(0) } } : undefined));
+  expect(partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: unseen.executor })).definition).toEqual({ state: 'empty', reason: 'The Verifier this execution runs is not yet visible in retained metadata. Refresh to read it again.' });
+  expect(reads(unseen.calls)).not.toContain('cards.get_by_uid');
+  // A refused Card or output read is its own part; with no graph to mark and a result recorded, progress is not read.
+  const noCard = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'outputs' }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' || request.op === 'verification.list_publications' ? { ok: false, problem: denied } : undefined)).executor }));
+  expect([noCard.definition.state, noCard.invocations?.state, noCard.publications?.state]).toEqual(['denied', undefined, 'denied']);
+  const wrongKind = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: true, value: agent } : undefined)).executor }));
+  expect(wrongKind.definition).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+
+  // One publication is read by its exact producer; without a producer nothing is read. Cursors pass through opaque.
+  const output = fixtureRecording();
+  const shown = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'step:score', producer: { attempt: 2, item_index: null }, output: 'units', invocations: 'c/1=', publications: 'c/2=' }, { executor: output.executor }));
+  expect(output.calls.map((call) => call.request)).toEqual(
+    expect.arrayContaining([
+      { op: 'verification.get_publication', execution_id: 'exec_settled', step_id: 'score', name: 'units', attempt: 2, item_index: null },
+      { op: 'verification.list_invocations', execution_id: 'exec_settled', limit: 200, cursor: 'c/1=' },
+      { op: 'verification.list_publications', execution_id: 'exec_settled', limit: 200, cursor: 'c/2=' }
+    ])
+  );
+  expect(shown.publication).toMatchObject({ state: 'populated', data: { kind: 'json', value: { units: 3 }, producer: { step_id: 'score', attempt: 2 } } });
+  const unpicked = fixtureRecording();
+  await loadExecution({ executionId: EXECUTIONS.settled, node: 'step:score', output: 'units' }, { executor: unpicked.executor });
+  expect(reads(unpicked.calls)).not.toContain('verification.get_publication');
+
+  // A session source reads its pinned members in recorded order; a member that cannot be read keeps its row.
+  const session = fixtureRecording();
+  const members = partOf(await loadExecution({ executionId: EXECUTIONS.session, node: 'input:outcomes' }, { executor: session.executor })).members!;
+  expect(session.calls.filter((call) => call.request.op === 'verification.get_execution').map((call) => (call.request as { execution_id: string }).execution_id)).toEqual(['exec_session', 'exec_settled', 'exec_m2', 'exec_gone']);
+  expect(members.map((member) => [member.execution_id, member.status?.state])).toEqual([['exec_settled', 'populated'], ['exec_m2', 'populated'], ['exec_gone', 'error']]);
+  expect(reads(session.calls).filter((read) => read.startsWith('query'))).toEqual([]);
+  // An ordinary input reads the accepted value of that input alone.
+  const accepted = fixtureRecording();
+  expect(partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'input:ticket' }, { executor: accepted.executor })).inputs).toEqual({ state: 'populated', data: { answer: 'Refund issued' } });
+  expect(accepted.calls.find((call) => call.request.op === 'bifrost.query')?.request).toMatchObject({ sql: 'SELECT to_json(inputs) AS inputs FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1', params: ['exec_settled'], max_rows: 1 });
+
+  // Drift: the recorded window, then a bounded history of the same binding up to this result, oldest first; nothing is recomputed.
+  const drift = fixtureRecording();
+  const context = partOf(await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: drift.executor })).drift;
+  const queries = drift.calls.map((call) => call.request).filter((request) => request.op === 'bifrost.query');
+  expect(queries).toEqual([
+    { op: 'bifrost.query', sql: 'SELECT binding_id, window_start, window_end, ended_at FROM bifrost.verification.results WHERE execution_id = $1 LIMIT 1', params: ['exec_drift'], max_rows: 1 },
+    {
+      op: 'bifrost.query',
+      sql:
+        'SELECT r.execution_id, r.ended_at, r.window_start, r.window_end, to_json(o.output) AS output FROM bifrost.verification.results r JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id ' +
+        'WHERE r.binding_id = $1 AND r.ended_at <= $2::timestamptz ORDER BY r.ended_at DESC LIMIT 30',
+      params: ['bind_01', '2026-10-20T11:00:05Z'],
+      max_rows: 30
+    }
+  ]);
+  expect(context).toMatchObject({ state: 'populated', data: { window_start: '2026-10-20T10:00:00Z', window_end: '2026-10-20T11:00:00Z' } });
+  expect((context?.state === 'populated' ? context.data.history : []).map((point) => [point.execution_id, point.scores])).toEqual([
+    ['exec_drift_3', { latency_ms: 0.08, tokens: 0.04, cost: null }],
+    ['exec_drift_2', { latency_ms: 0.12, tokens: 0.04, cost: null }],
+    ['exec_drift_1', { latency_ms: 0.22, tokens: 0.04, cost: null }],
+    ['exec_drift', { latency_ms: 0.31, tokens: 0.04, cost: null }]
+  ]);
+  // A requirement without a drift judgment reads no history; a refused history query is its own part.
+  const plain = fixtureRecording();
+  await loadExecution({ executionId: EXECUTIONS.settled, node: 'req:has-answer' }, { executor: plain.executor });
+  expect(reads(plain.calls).filter((read) => read.startsWith('query'))).toEqual([]);
+  const noHistory = partOf(await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: denied } : undefined)).executor }));
+  expect(noHistory.drift).toEqual({ state: 'denied', problem: denied });
+  expect(noHistory.status.result?.outcome.requirements[0].detail?.drift).toEqual(driftReport);
+
+  // The catalog input is strict: an unknown field or a zero attempt is refused before any read.
+  expect(validatePanel('VerificationExecution', { executionId: 'exec_1', node: 'step:a', producer: { attempt: 1, item_index: 0, iteration_index: null }, output: 'o', details: true })).toMatchObject({ component: 'VerificationExecution' });
+  expect(validatePanel('VerificationExecution', { executionId: 'exec_1', producer: { attempt: 0 } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('VerificationExecution', { executionId: 'exec_1', primary: true })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+});
+
+test('execution states mark the declared graph with recorded progress', () => {
+  const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  const invocation = (step_id: string, record: object, attempt = 1, item_index: number | null = null, iteration_index: number | null = null) =>
+    ({ speculation: 'none', ...record, producer: { step_id, attempt, item_index, iteration_index } }) as never;
+  const ok = { state: 'action', status: 'succeeded' };
+  const bad = { state: 'action', status: 'failed' };
+
+  // Running: the last attempt of a retried step counts, a started step runs, the rest wait; nothing is judged.
+  const running = executionStates(graph, executionStatus.exec_running, [invocation('read-photo', ok), invocation('score', bad), invocation('score', ok, 2), invocation('classify', { state: 'started' })]);
+  expect(running).toEqual({
+    'step:read-photo': { word: 'succeeded', tone: 'ok', dim: false },
+    'step:score': { word: 'succeeded', tone: 'ok', dim: false },
+    'step:classify': { word: 'running', tone: 'running', dim: false },
+    'step:summarise': { word: 'pending', tone: 'neutral', dim: false },
+    'req:classified': { word: 'not judged', tone: 'neutral', dim: false },
+    'req:policy-followed': { word: 'not judged', tone: 'neutral', dim: false },
+    'req:has-answer': { word: 'not judged', tone: 'neutral', dim: false }
+  });
+  // Settled: the compact result judges requirements; a step that never ran says so, and a started step is not running.
+  const settled = executionStates(graph, executionStatus.exec_settled, [invocation('read-photo', { state: 'action', status: 'skipped' }), invocation('classify', { state: 'started' })]);
+  expect(settled).toMatchObject({
+    'step:read-photo': { word: 'skipped', tone: 'neutral' },
+    'step:score': { word: 'not run', dim: true },
+    'step:classify': { word: 'not finished', dim: true },
+    'req:classified': { word: 'passed', tone: 'ok' },
+    'req:policy-followed': { word: 'failed', tone: 'danger' }
+  });
+  // Before a result is visible a recorded requirement attempt is the judgment shown.
+  expect(executionStates(graph, executionStatus.exec_running, [invocation('policy-followed', { state: 'requirement', outcome: 'inconclusive' })])['req:policy-followed']).toEqual({ word: 'inconclusive', tone: 'warn' });
+  // Fan-out and repetition stay one node: mixed items count failures; a discarded speculative step recedes.
+  const fanned = executionStates(graph, executionStatus.exec_running, [
+    invocation('score', ok, 1, 0, 0),
+    invocation('score', bad, 1, 1, 0),
+    invocation('score', ok, 1, 1, 1),
+    invocation('score', bad, 1, 2, 0),
+    invocation('classify', { ...ok, speculation: 'discarded' })
+  ]);
+  expect(fanned['step:score']).toEqual({ word: '2 of 4 failed', tone: 'danger', dim: false });
+  expect(fanned['step:classify']).toEqual({ word: 'succeeded', tone: 'ok', dim: true });
+});
+
+test('execution inspector shows recorded state, judgments and outputs as separate facts', async () => {
+  const onaction = vi.fn();
+  const load = (input: Parameters<typeof loadExecution>[0], executor: Executor = fixtureExecutor) => loadExecution(input, { executor });
+  const settled = await load({ executionId: EXECUTIONS.settled });
+  const shown = render(VerificationExecution, { ...settled, onaction });
+  await waitFor(() => expect(shown.container.querySelector('[data-node="step:score"]')).toBeInTheDocument());
+  const node = (key: string) => shown.container.querySelector(`[data-node="${key}"]`) as HTMLElement;
+  const positions = () => [...shown.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform);
+  const viewport = () => (shown.container.querySelector('.svelte-flow__viewport') as HTMLElement).style.transform;
+  const sent = () => onaction.mock.lastCall?.[0];
+
+  // A judged execution opens on its first failed requirement; the loader says which selection it shows.
+  expect(settled.input).toEqual({ executionId: 'exec_settled', node: 'req:policy-followed' });
+  expect(node('req:policy-followed')).toHaveAttribute('aria-pressed', 'true');
+  expect((await load({ executionId: EXECUTIONS.settled, node: 'none' })).input.node).toBe('none');
+  expect((await load({ executionId: EXECUTIONS.running })).input.node).toBeUndefined();
+  await fireEvent.click(shown.container.querySelector('.svelte-flow__pane') as Element);
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'none' } });
+  expect(within(shown.container).getByRole('region', { name: 'Inspector' })).toBeInTheDocument();
+
+  // Lifecycle status and verdict are separate facts, each a word; the count is what the result records.
+  const head = within(shown.container).getByRole('region', { name: 'Execution' });
+  expect(head.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'completed');
+  expect(head.querySelector('[data-verdict]')).toHaveAttribute('data-verdict', 'failed');
+  expect(head).toHaveTextContent('3 of 3 requirements');
+  expect(head).toHaveTextContent('ticket-policy@1.1.0');
+  expect(within(head).queryByRole('button', { name: /Cancel execution/ })).toBeNull();
+
+  // The declared nodes, each with room for its recorded word and glyph beside the id; the definition alone is laid out narrower.
+  const declaredGraph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  const [bare, roomy] = [layoutDefinition(declaredGraph), layoutDefinition(declaredGraph, STATE_ROOM)];
+  expect(roomy.nodes.map((each) => [each.key, each.height])).toEqual(bare.nodes.map((each) => [each.key, each.height]));
+  for (const [index, each] of roomy.nodes.entries()) expect(each.width - bare.nodes[index].width, each.key).toBeGreaterThanOrEqual(0);
+  expect(roomy.width).toBeGreaterThan(bare.width);
+  expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('✓ succeeded');
+  expect(node('req:policy-followed').querySelector('[data-status]')).toHaveTextContent('✕ failed');
+  expect(shown.container).toHaveTextContent('Declared dependencies, marked with recorded state.');
+
+  // Selecting a node is a host action carrying the whole shareable selection, and shows at once.
+  await fireEvent.click(node('step:score'));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  // The host reloads with the selection, which reads the outputs.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:score' })), onaction });
+  const step = () => within(shown.container).getByRole('region', { name: 'Step score' });
+  // Every recorded invocation attempt is listed; the latest is shown until one is chosen.
+  const attempts = () => within(step()).getAllByRole('radio');
+  expect(attempts().map((each) => [each.textContent, each.getAttribute('aria-checked')])).toEqual([['attempt 1 · failed', 'false'], ['attempt 2 · succeeded', 'true']]);
+  expect(step()).toHaveTextContent('units');
+  await fireEvent.click(attempts()[0]);
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score', producer: { item_index: null, iteration_index: null, attempt: 1 } } });
+  expect(step().querySelector('[data-producer]')).toHaveAttribute('data-producer', 'attempt 1');
+  expect(step()).toHaveTextContent('timed out');
+  expect(step()).toHaveTextContent('This invocation retained no output.');
+  expect(positions().length).toBeGreaterThan(0);
+
+  // Refresh with the selection in the input: the exact attempt and output survive, and neither layout nor viewport moves.
+  const before = [positions(), viewport()];
+  const picked = { executionId: EXECUTIONS.settled, node: 'step:score', producer: { attempt: 2, item_index: null, iteration_index: null }, output: 'units' };
+  await shown.rerender({ ...(await load(picked)), onaction });
+  expect(node('step:score')).toHaveAttribute('aria-pressed', 'true');
+  expect(attempts().map((each) => each.getAttribute('aria-checked'))).toEqual(['false', 'true']);
+  expect(step().querySelector('[data-preview="units"] pre')?.textContent).toBe('{\n  "units": 3\n}');
+  expect([positions(), viewport()]).toEqual(before);
+  // A newer status on refresh changes the marks only.
+  await shown.rerender({ ...(await load(picked, fixtureRecording((request) => (request.op === 'verification.list_invocations' ? { ok: true, value: { execution_id: 'exec_settled', history: { acknowledged: 0, pending: 2, failed: 0 }, status: 'completed', items: [], next_cursor: 'next/1' } as never } : undefined)).executor)), onaction });
+  expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('not run');
+  expect([positions(), viewport()]).toEqual(before);
+  expect(shown.container.querySelector('[data-part="history"]')).toHaveTextContent('2 history events are not yet retained');
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'Next page of recorded progress' }));
+  expect(sent()).toEqual({ name: 'execution.page', input: { invocations: 'next/1' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+
+  // Previews are inert: markup in a JSON value is text, a directory is its manifest, and a file leaves only through the host.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:read-photo', producer: { attempt: 1 }, output: 'text' })), onaction });
+  expect(shown.container.querySelector('[data-preview="text"] pre')?.textContent).toContain('<script>alert(1)</script>');
+  expect(shown.container.querySelector('[data-preview] script, [data-preview] iframe, [data-preview] a')).toBeNull();
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output: 'tree' })), onaction });
+  const files = within(shown.container).getByRole('region', { name: 'Files of tree' });
+  expect(cells(files)).toEqual([['a.md', '4 B', '9f86d081…00a08', 'Download'], ['nested/b.md', '2.0 KiB', '9f86d081…00a08', 'Download']]);
+  await fireEvent.click(within(files).getAllByRole('button', { name: 'Download' })[1]);
+  expect(sent()).toEqual({ name: 'publication.download', input: { step_id: 'summarise', name: 'tree', producer: { item_index: null, iteration_index: null, attempt: 1 }, path: 'nested/b.md' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+
+  // Every retained output is a peer with its producer; none is the step's or the execution's primary result.
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'All retained outputs' }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'outputs' } });
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'outputs' })), onaction });
+  const all = within(shown.container).getByRole('region', { name: 'Retained outputs' });
+  expect(cells(all)).toEqual([['text', 'read-photo', 'attempt 1', 'json', '—'], ['units', 'score', 'attempt 2', 'json', '—'], ['report', 'summarise', 'attempt 1', 'file', '—'], ['tree', 'summarise', 'attempt 1', 'directory', '—']]);
+  expect(shown.container.textContent).not.toMatch(/primary|final output|report output/i);
+  await fireEvent.click(within(all).getByRole('button', { name: 'units' }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score', producer: { item_index: null, iteration_index: null, attempt: 2 }, output: 'units' } });
+
+  // A requirement shows the recorded judgment: outcome, reason, actual value, evidence locators and data; details only once loaded.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed' })), onaction });
+  const requirement = () => within(shown.container).getByRole('region', { name: 'Requirement policy-followed' });
+  expect(requirement().querySelector('[data-outcome]')).toHaveAttribute('data-outcome', 'failed');
+  expect(requirement()).toHaveTextContent('policy-followed did not hold');
+  expect(requirement()).toHaveTextContent('ticket kind: lines start: 4 end: 9');
+  expect(requirement().querySelector('.judgment')).toHaveTextContent('Data { "label": "refund" }');
+  expect(requirement().querySelector('[data-details]')).toBeNull();
+  // The check names an Agent Card as its judge, so the requirement links to that exact Card; an assert check has no judge to open.
+  await fireEvent.click(within(requirement()).getByRole('button', { name: `${AGENT.name}@${AGENT.version}` }));
+  expect(sent()).toEqual({ name: 'card.open', input: { card_ref: AGENT } });
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'Load completed details' }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'req:policy-followed', details: true } });
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true })), onaction });
+  expect(requirement().querySelector('[data-details]')).toHaveTextContent('operator: is_non_empty');
+  // Refused details leave the compact judgment in place.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true }, fixtureRecording((request) => (request.op === 'verification.get_execution_details' ? { ok: false, problem: denied } : undefined)).executor)), onaction });
+  expect(shown.container.querySelector('[data-part="Completed details"]')).toHaveTextContent(denied.code);
+  expect(requirement()).toHaveTextContent('policy-followed did not hold');
+  shown.unmount();
+
+  // Running: nothing is judged, the in-flight step says running, and Cancel is one host action that cannot be sent twice.
+  const actions = reactive<Record<string, { state: 'pending' }>>({});
+  const running = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.running, node: 'req:has-answer', details: true })), onaction, actions });
+  await waitFor(() => expect(running.container.querySelector('[data-node="step:classify"]')).toBeInTheDocument());
+  expect(running.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
+  expect(running.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  expect(running.container).toHaveTextContent('0 of 3 requirements');
+  expect(running.container.querySelector('[data-node="step:classify"] [data-status]')).toHaveTextContent('● running');
+  expect(within(running.container).getByRole('region', { name: 'Requirement has-answer' })).toHaveTextContent('Not judged yet.');
+  expect(running.container.querySelector('[data-part="Completed details"]')).toHaveTextContent('Details are recorded when the execution completes with a visible result.');
+  const cancel = within(running.container).getByRole('button', { name: /Cancel execution/ });
+  await fireEvent.click(cancel);
+  expect(sent()).toEqual({ name: 'execution.cancel', input: { execution_id: 'exec_running' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  expect(catalog.components.VerificationExecution.emits.find((action) => action.name === 'execution.cancel')?.completion).toBe('host-action');
+  actions['execution.cancel'] = { state: 'pending' };
+  await tick();
+  expect(cancel).toBeDisabled();
+  const sends = onaction.mock.calls.length;
+  await fireEvent.click(cancel);
+  expect(onaction.mock.calls).toHaveLength(sends);
+  running.unmount();
+
+  // A refused definition explains itself and keeps the status, verdict and outputs that are readable.
+  const noGraph = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.settled, node: 'outputs' }, fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: false, problem: denied } : undefined)).executor)), onaction });
+  expect(noGraph.container.querySelector('[data-node]')).toBeNull();
+  expect(noGraph.container.querySelector('[data-part="Verifier definition"]')).toHaveTextContent(denied.code);
+  expect(noGraph.container.querySelector('[data-verdict]')).toHaveAttribute('data-verdict', 'failed');
+  expect(within(noGraph.container).getByRole('region', { name: 'Retained outputs' }).querySelectorAll('tbody tr')).toHaveLength(4);
+  noGraph.unmount();
+
+  // Session: the pinned members of one source in recorded order, each opened as its own execution; an unreadable member keeps its row.
+  const session = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.session, node: 'input:outcomes' })), onaction });
+  const members = within(session.container).getByRole('list', { name: 'Members of outcomes' });
+  expect([...members.querySelectorAll('li')].map((row) => row.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+    expect.stringMatching(/^exec_settled .*completed .*failed$/i),
+    expect.stringMatching(/^exec_m2 .*completed .*passed$/i),
+    'exec_gone Execution not found (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)'
+  ]);
+  expect(session.container).toHaveTextContent('session-42');
+  await fireEvent.click(within(members).getByRole('button', { name: 'exec_m2' }));
+  expect(sent()).toEqual({ name: 'execution.open', input: { execution_id: 'exec_m2' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  session.unmount();
+
+  // Drift: method, recorded window, every feature with its recorded score and threshold, drifted first; an absent score stays absent.
+  const drift = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' })), onaction });
+  const table = within(drift.container).getByRole('region', { name: 'Drift features' });
+  expect([...table.querySelectorAll('tbody tr')].map((row) => [row.getAttribute('data-feature'), ...[...row.querySelectorAll('td')].slice(1, 4).map((cell) => cell.textContent?.trim())])).toEqual([
+    ['latency_ms', expect.stringContaining('drift'), '0.31', '0.25'],
+    ['cost', expect.stringContaining('inconclusive'), '—', '—'],
+    ['tokens', expect.stringContaining('no drift'), '0.04', '0.25']
+  ]);
+  const spark = table.querySelector('[data-feature="latency_ms"] svg') as SVGElement;
+  expect(spark).toHaveAttribute('aria-label', 'latency_ms: 4 recorded scores, this window marked');
+  expect(spark.querySelectorAll('.threshold, .current')).toHaveLength(2);
+  expect(table.querySelector('[data-feature="cost"] svg')).toBeNull();
+  expect(drift.container.querySelector('[data-drift]')).toHaveTextContent('Psi');
+  expect(drift.container.querySelector('[data-drift]')).toHaveTextContent('2026-10-20T10:00:00Z → 2026-10-20T11:00:00Z');
+  drift.unmount();
+
+  // Whole-read states: a refused or unknown execution shows the server's problem and nothing else; loading names the execution.
+  for (const state of ['denied', 'error'] as const) {
+    const refused = render(VerificationExecution, await load({ executionId: EXECUTIONS.settled }, stateExecutors[state]));
+    expect(refused.container).toHaveTextContent((refused.container.querySelector('code') as HTMLElement).textContent as string);
+    expect(refused.container.querySelector('[data-execution-status], [data-node]')).toBeNull();
+    refused.unmount();
+  }
+  expect(render(VerificationExecution, { input: { executionId: 'exec_x' }, result: { state: 'loading' } }).container).toHaveTextContent('Loading execution exec_x');
+});
+
+test('a retained text file previews as inert text within the bound, and says when it cannot', async () => {
+  const file = (output: string) => ({ executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output });
+  // A single file within the bound is read once, after its manifest, for the exact producer attempt.
+  const recording = fixtureRecording();
+  const report = await loadExecution(file('report'), { executor: recording.executor });
+  expect(recording.calls.map((call) => call.request)).toContainEqual({ op: 'verification.read_publication_text', execution_id: 'exec_settled', step_id: 'summarise', name: 'report', attempt: 1, max_bytes: 65_536 });
+  expect(partOf(report).text).toEqual({ state: 'populated', data: { text: '# Report\n<img src=x onerror=alert(1)>', truncated: false } });
+  const shown = render(VerificationExecution, report);
+  const preview = () => shown.container.querySelector('[data-preview] [data-text]') as HTMLElement;
+  expect(preview().querySelector('pre')?.textContent).toBe('# Report\n<img src=x onerror=alert(1)>');
+  expect(shown.container.querySelector('[data-preview] img, [data-preview] h1, [data-preview] a')).toBeNull();
+
+  // Bytes that are not text are never shown; the file still leaves through the host.
+  await shown.rerender(await loadExecution(file('binary'), { executor: fixtureRecording().executor }));
+  expect(preview()).toHaveTextContent('This file is not UTF-8 text. Download it to read it.');
+  expect(preview().querySelector('pre')).toBeNull();
+  expect(within(shown.container).getByRole('button', { name: 'Download' })).toBeInTheDocument();
+
+  // A file over the bound is not read at all, and says so; a directory and a JSON value read no file text.
+  const big = fixtureRecording();
+  await shown.rerender(await loadExecution(file('big'), { executor: big.executor }));
+  expect(reads(big.calls)).not.toContain('verification.read_publication_text');
+  expect(preview()).toHaveTextContent('This file is larger than the 64.0 KiB preview bound. Download it to read it.');
+  for (const output of ['tree', 'units']) {
+    const other = fixtureRecording();
+    expect(partOf(await loadExecution(file(output), { executor: other.executor })).text).toBeUndefined();
+    expect(reads(other.calls)).not.toContain('verification.read_publication_text');
+  }
+
+  // A host that cannot read file content shows that refusal beside the manifest, which stays readable.
+  const refusing = fixtureRecording((request) => (request.op === 'verification.read_publication_text' ? { ok: false, problem: denied } : undefined));
+  await shown.rerender(await loadExecution(file('report'), { executor: refusing.executor }));
+  expect(shown.container.querySelector('[data-part="File text"]')).toHaveTextContent(denied.title);
+  expect(within(shown.container).getByRole('region', { name: 'Files of report' })).toBeInTheDocument();
+});
+
+test('execution inspector shows a recorded actual value, a discarded output, a cut preview and the next page of outputs', async () => {
+  const onaction = vi.fn();
+  const big = 'x'.repeat(70_000);
+  const executor = fixtureRecording((request): WireResult | undefined => {
+    if (request.op === 'verification.list_publications')
+      return { ok: true, value: { items: [{ name: 'text', kind: 'json', producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 }, speculation: 'discarded' }], next_cursor: 'outputs/1' } as never };
+    if (request.op === 'verification.get_publication') return { ok: true, value: { kind: 'json', name: 'text', value: big, producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 } } as never };
+    return undefined;
+  }).executor;
+  const load = (input: Parameters<typeof loadExecution>[0]) => loadExecution(input, { executor });
+
+  // The compared value of a judgment is shown as recorded.
+  const shown = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.settled, node: 'req:classified' })), onaction });
+  expect(within(shown.container).getByRole('region', { name: 'Requirement classified' }).querySelector('.judgment')).toHaveTextContent('Actual refund');
+
+  // A discarded speculative output says so, and the page of outputs continues through the host with the server's cursor.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'outputs' })), onaction });
+  expect(within(shown.container).getByRole('region', { name: 'Retained outputs' })).toHaveTextContent('discarded');
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'Next page of outputs' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'execution.page', input: { publications: 'outputs/1' } });
+
+  // A JSON value over the preview bound is cut, and says how much more is retained.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:read-photo', producer: { attempt: 1 }, output: 'text' })), onaction });
+  const preview = shown.container.querySelector('[data-preview="text"]') as HTMLElement;
+  expect(preview.querySelector('pre')?.textContent).toHaveLength(65_536);
+  expect(preview).toHaveTextContent('Preview stops at 64.0 KiB; 4.4 KiB more is retained.');
+});
+
+test('a drift judgment shows its declared baseline and says when its window and history are refused', async () => {
+  // The baseline facts are the exact Verifier's declaration: signal and condition, as registered.
+  const shown = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: fixtureRecording().executor }));
+  const declared = () => shown.container.querySelector('[data-drift] [data-declared]') as HTMLElement;
+  expect(declared()).toHaveTextContent('Declared baseline and condition');
+  expect(declared().querySelector('pre')?.textContent).toBe('signal:\n  kind: feature\n  name: latency_ms\ncondition:\n  kind: window\n  size: 100');
+
+  // Refused retained context is said in place; the recorded features and the declaration stay readable.
+  const refusing = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: denied } : undefined));
+  await shown.rerender(await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: refusing.executor }));
+  expect(shown.container.querySelector('[data-drift] [data-part="Window and history"]')).toHaveTextContent(denied.title);
+  expect(within(shown.container).getByRole('region', { name: 'Drift features' }).querySelectorAll('tbody tr')).toHaveLength(3);
+  expect(declared()).toHaveTextContent('latency_ms');
+});
+
+test('an unavailable read, a refused progress read and context not yet retained each say so in place', async () => {
+  const unavailable = { code: 'WYRD_SERVER_503_UNAVAILABLE', title: 'Service unavailable', status: 503 };
+  const unknown = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 };
+  // An unavailable execution read shows the server's own problem, which is not the unknown-execution one.
+  const down = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: recording(() => ({ ok: false, problem: unavailable })).executor }));
+  expect(down.container).toHaveTextContent(unavailable.code);
+  expect(down.container).not.toHaveTextContent(unknown.title);
+  down.unmount();
+  const missing = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: recording(() => ({ ok: false, problem: unknown })).executor }));
+  expect(missing.container).toHaveTextContent(unknown.code);
+  expect(missing.container).not.toHaveTextContent(unavailable.title);
+  missing.unmount();
+
+  // Progress alone unavailable: its part names the problem; the recorded state, the graph and the outputs stay readable.
+  const noProgress = fixtureRecording((request) => (request.op === 'verification.list_invocations' ? { ok: false, problem: unavailable } : undefined));
+  const partial = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: noProgress.executor }));
+  expect(partial.container.querySelector('[data-part="Recorded progress"]')).toHaveTextContent(unavailable.code);
+  expect(partial.container.querySelector('[data-part="Retained outputs"], [data-part="Verifier definition"]')).toBeNull();
+  expect(partial.container.querySelector('[data-execution-status]')).not.toBeNull();
+  expect(partial.container.querySelector('[data-node]')).not.toBeNull();
+  expect(partial.container).toHaveTextContent('All retained outputs');
+  partial.unmount();
+
+  // A Verifier not yet visible in retained metadata is said where the graph would be.
+  const unseen = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: true, value: { columns: [], rows: [], terminal: terminal(0) } } : undefined));
+  const early = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.running }, { executor: unseen.executor }));
+  expect(early.container.querySelector('[data-part="Verifier definition"]')).toHaveTextContent('not yet visible in retained metadata');
+  early.unmount();
+
+  // A drift judgment whose retained result has no row yet says so; nothing is drawn as an empty history.
+  const drift = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: unseen.executor }));
+  expect(drift.container.querySelector('[data-drift] [data-part="Window and history"]')).toHaveTextContent('The retained result of this execution is not yet visible. Refresh to read it again.');
+  expect(within(drift.container).getByRole('region', { name: 'Drift features' }).querySelectorAll('tbody tr')).toHaveLength(3);
+});
+
+test('JSON and YAML blocks are coloured by syntax role without changing their text', () => {
+  const json = JSON.stringify({ kind: 'json', value: { item: 'tent', price: 150, late: false, ref: 'policy@1.0.0' } }, null, 2);
+  const yaml = fmtYaml({ signal: { kind: 'Distribution', features: ['latency'] }, threshold: 0.25, started: '2026-11-16T00:00:00Z' });
+  for (const text of [json, yaml]) expect(codeTokens(text).map((token) => token.text).join('')).toBe(text);
+
+  const of = (text: string, kind: string) => codeTokens(text).filter((token) => token.kind === kind).map((token) => token.text);
+  expect(of(json, 'key')).toEqual(['"kind"', '"value"', '"item"', '"price"', '"late"', '"ref"']);
+  expect(of(json, 'string')).toEqual(['"json"', '"tent"', '"policy@1.0.0"']);
+  expect(of(json, 'number')).toEqual(['150']);
+  expect(of(json, 'literal')).toEqual(['false']);
+  expect(of(yaml, 'key')).toEqual(['signal', 'kind', 'features', 'threshold', 'started']);
+  // A version or a timestamp is not a number.
+  expect(of(yaml, 'number')).toEqual(['0.25']);
+
+  const toml = '# wyrd.toml, "quoted" 1\n[repository.verified_by]\nverifier = [\n  "./review/pr-review.yaml",\n]\nruns_on = { kind = "pull_request" }\n';
+  const tomlOf = (kind: string) => codeTokens(toml, true).filter((token) => token.kind === kind).map((token) => token.text);
+  expect(codeTokens(toml, true).map((token) => token.text).join('')).toBe(toml);
+  expect(tomlOf('comment')).toEqual(['# wyrd.toml, "quoted" 1']);
+  expect(tomlOf('key')).toEqual(['repository.verified_by', 'verifier', 'runs_on', 'kind']);
+  expect(tomlOf('string')).toEqual(['"./review/pr-review.yaml"', '"pull_request"']);
+});
+
+test('an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution', async () => {
+  const onaction = vi.fn();
+  const list = render(RecordTable, { input: { signal: 'executions' }, result: { state: 'populated', data: { rows: executions } }, labels: verifierLabels, onaction });
+  expect(list.getAllByRole('columnheader').map((heading) => heading.textContent?.trim())).toEqual(['Time ↓', 'Verifier', 'Card', 'Run', 'Session', 'Service', 'Status', 'Verdict']);
+  const cells = (row: number) => [...list.getAllByRole('row')[row].querySelectorAll('td')].map((cell) => cell.textContent?.trim());
+  // Status and verdict are separate facts: a completed failure, then a recorded cancel and a direct execution with no result, neither with a verdict.
+  expect(cells(1).slice(6)).toEqual(['■completed', '✕failed']);
+  expect(cells(4).slice(6)).toEqual(['⊘cancelled', 'none']);
+  expect(cells(5).slice(6)).toEqual(['○not recorded', 'none']);
+  // A session id is the caller's text, shown whole.
+  expect(cells(2)[4]).toBe('conversation-7');
+  // Completed before its result row is visible: the recorded status, and no verdict borrowed from anywhere.
+  expect(cells(6).slice(6)).toEqual(['■completed', 'none']);
+  expect(list.getByText('not recorded').closest('[title]')).toHaveAttribute('title', 'No result of this direct execution is retained.');
+  // Unfinished queued work states its recorded lifecycle.
+  expect(cells(7).slice(6)).toEqual(['◷waiting', 'none']);
+  // The Verifier reads as the name the host supplied, with its exact version on hover; an id without one is shortened, never dropped.
+  expect(list.getAllByText('ticket-policy')[0]).toHaveAttribute('title', 'ticket-policy@1.1.0');
+  expect(list.getByText('01a1…195f')).toHaveAttribute('title', '01a1e602-c9a9-7d0b-a028-5acc7427195f');
+  expect(list.getAllByRole('row')[1].querySelector('time')).toHaveAttribute('datetime', '2026-10-20T11:58:02.412000Z');
+  expect(list.getByText(/^Showing 7 executions/)).toBeInTheDocument();
+  // A row opens its exact execution, by click or Enter.
+  await fireEvent.click(list.getAllByRole('row')[5]);
+  await fireEvent.keyDown(list.getAllByRole('row')[1], { key: 'Enter' });
+  expect(onaction.mock.calls.map(([intent]) => intent)).toEqual([
+    { name: 'record.open', input: { execution_id: 'exec_open' } },
+    { name: 'record.open', input: { execution_id: 'exec_failed' } }
+  ]);
+  for (const [intent] of onaction.mock.calls) expect(validateIntent('RecordTable', intent)).toEqual(intent);
+  list.unmount();
+
+  // Facets: no recorded verdict is counted apart and filters by IS NULL; a Verifier value reads as its name and filters by its UID.
+  const filter = vi.fn();
+  const facets = [
+    { column: 'verdict', values: { ...facet, rows: [['passed', 10], [null, 2]] } },
+    { column: 'verifier_card_uid', values: { ...facet, rows: [[VERIFIER_UIDS.policy, 9], [VERIFIER_UIDS.drift, 3]] } }
+  ];
+  const rail = render(FacetRail, { input: { signal: 'executions', facets: ['verdict', 'verifier_card_uid'] }, result: { state: 'populated', data: { facets } }, labels: verifierLabels, onaction: filter });
+  await fireEvent.click(rail.getByRole('button', { name: /no recorded verdict\s*2/ }));
+  await fireEvent.click(rail.getByRole('button', { name: /latency-drift@1\.0\.0\s*3/ }));
+  expect(filter.mock.calls.map(([intent]) => intent.input)).toEqual([
+    { signal: 'executions', column: 'verdict', value: null },
+    { signal: 'executions', column: 'verifier_card_uid', value: VERIFIER_UIDS.drift }
+  ]);
+  rail.unmount();
+
+  // Both charts draw the read series; no verdict is a series of its own, outlined instead of filled.
+  const chart = render(Chart, {
+    input: { type: 'timeseries', title: 'Executions', sql: '-', x: 'at', y: ['executions'], series: 'verdict', range: RANGE },
+    result: { state: 'populated', data: executionsByVerdict },
+    compact: true,
+    bars: true,
+    colors: { passed: 'var(--declare)', failed: 'var(--danger)', inconclusive: 'var(--muted)', 'no verdict': 'transparent' }
+  });
+  expect(chart.container.textContent).toContain('no verdict');
+  // A transparent colour is a dashed outline in the key and in the plot, never a filled verdict.
+  expect(chart.container.querySelector('.key i.hollow')?.parentElement).toHaveTextContent('no verdict');
+  expect(chart.container.querySelectorAll('rect.segment.hollow').length).toBeGreaterThan(0);
+  chart.unmount();
+});
+
+test('the Repositories index joins Repository Cards and GitHub access by repository id', async () => {
+  const reads = fixtureRecording();
+  const index = await loadRepositoryIndex({}, { executor: reads.executor });
+  expect(ops(reads.calls)).toEqual(['github.get_connection', 'cards.list', 'cards.get_by_ref', 'cards.get_by_ref', 'cards.get_by_ref']);
+  if (index.result.state !== 'populated') throw new Error(index.result.state);
+  expect(index.result.data.total).toBe(4);
+  expect(index.result.data.rows).toMatchObject([
+    { card: { name: 'docs-site', versions: 2, selected: '0.3.0' }, fullName: 'acme/docs-site', access: 'granted', readiness: 'none', bindings: 0 },
+    { card: { name: 'ledger', versions: 2, selected: '1.1.0' }, repositoryId: '702551908', access: 'removed', readiness: 'inactive', bindings: 1 },
+    { card: { name: 'payments-api', versions: 2, selected: '1.4.0' }, fullName: 'acme/payments-api', access: 'granted', readiness: 'ready', bindings: 2 },
+    { repositoryId: '741660215', fullName: 'acme/web-checkout', access: 'granted', readiness: 'undeclared' }
+  ]);
+  expect(index.result.data.rows[3].card).toBeUndefined();
+
+  // Search and Show narrow the same bounded join; the total stays the whole of it.
+  const shown = async (input: object) => {
+    const loaded = await loadRepositoryIndex(input, { executor: fixtureExecutor });
+    return loaded.result.state === 'populated' ? loaded.result.data.rows.map((row) => row.card?.name ?? row.fullName) : loaded.result.state;
+  };
+  expect(await shown({ show: 'ready' })).toEqual(['payments-api']);
+  expect(await shown({ show: 'inactive' })).toEqual(['docs-site', 'ledger']);
+  expect(await shown({ show: 'undeclared' })).toEqual(['acme/web-checkout']);
+  expect(await shown({ query: 'ACME/pay' })).toEqual(['payments-api']);
+  expect(await shown({ query: 'ledger', show: 'ready' })).toEqual([]);
+  expect(validatePanel('RepositoryIndex', { show: 'paused' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+
+  // A lost or absent connection changes access words, never the Cards; nothing without a Card is listed.
+  const withConnection = (view: object) => fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: true, value: view as never } : undefined)).executor;
+  const lost = await loadRepositoryIndex({}, { executor: withConnection({ ...connection, state: 'suspended', repositories: [] }) });
+  expect(lost.result).toMatchObject({ state: 'populated', data: { total: 3, rows: [{ access: 'granted' }, { access: 'lost', readiness: 'inactive' }, { access: 'granted' }] } });
+  const none = await loadRepositoryIndex({}, { executor: withConnection({ host: 'github.com', app: connection.app, state: 'not_connected', repositories: [] }) });
+  expect(none.result).toMatchObject({ state: 'populated', data: { rows: [{}, { access: 'none', readiness: 'inactive' }, {}] } });
+
+  // Integration permission is separate from Card permission: a refused connection keeps the Cards and guesses no access reason.
+  const noIntegration = await loadRepositoryIndex({}, { executor: fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(noIntegration.result).toMatchObject({
+    state: 'populated',
+    data: { total: 3, connection: { state: 'denied' }, rows: [{ access: 'granted', readiness: 'none' }, { access: 'unreachable', readiness: 'inactive' }, { access: 'granted', readiness: 'ready' }] }
+  });
+  // A refused Card listing is the panel's state and no Card is read after it.
+  const noCards = fixtureRecording((request) => (request.op === 'cards.list' ? { ok: false, problem: denied } : undefined));
+  expect((await loadRepositoryIndex({}, { executor: noCards.executor })).result).toEqual({ state: 'denied', problem: denied });
+  expect(ops(noCards.calls)).toEqual(['github.get_connection', 'cards.list']);
+  // One refused Card read keeps its row; repositories without a Card are then not claimed.
+  const oneRefused = await loadRepositoryIndex({}, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.name === 'ledger' ? { ok: false, problem: failure } : undefined)).executor });
+  expect(oneRefused.result).toMatchObject({ state: 'populated', data: { total: 3, partial: expect.stringContaining('could not be read'), rows: [{}, { card: { name: 'ledger' }, problem: failure }, {}] } });
+
+  const onaction = vi.fn();
+  const view = render(RepositoryIndex, { ...index, onaction });
+  const rows = within(view.container).getAllByRole('row');
+  expect(rows).toHaveLength(5);
+  expect(within(rows[0]).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['Repository', 'Card version', 'GitHub access', 'Automatic verification']);
+  expect(rows[1]).toHaveTextContent('Not configured');
+  expect(rows[1]).toHaveTextContent('Selected version 0.3.0 has verifier = [].');
+  expect(rows[2]).toHaveTextContent('Removed');
+  expect(rows[2]).toHaveTextContent('No new executions start without GitHub access. 1 binding stay declared.');
+  expect(rows[3]).toHaveTextContent('Repository Card · acme/payments-api');
+  expect(rows[3]).toHaveTextContent('selected of 2');
+  expect(rows[3]).toHaveTextContent('2 Verifiers run on pull_request.');
+  expect(rows[4]).toHaveTextContent('no Card');
+  expect(rows[4]).toHaveTextContent('Not declared');
+  expect(view.container).toHaveTextContent('4 of 4 shown');
+  expect(view.container).toHaveTextContent('Granting GitHub access never registers a Repository Card or binds Verifiers. Declare a wyrd.toml to register one.');
+  expect(view.container.querySelector('[role="status"]')).toBeNull();
+  await fireEvent.click(within(rows[3]).getByRole('button', { name: 'payments-api' }));
+  await fireEvent.click(within(rows[4]).getByRole('button', { name: 'acme/web-checkout' }));
+  await fireEvent.input(within(view.container).getByRole('searchbox', { name: 'Filter repositories' }), { target: { value: 'pay' } });
+  await fireEvent.submit(within(view.container).getByRole('searchbox').closest('form') as HTMLFormElement);
+  await fireEvent.click(within(within(view.container).getByRole('group', { name: 'Show' })).getByRole('button', { name: 'Not verifying' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.open', input: { card_ref: { kind: 'Repository', name: 'payments-api', version: '1.4.0' } } },
+    { name: 'repository.declare', input: { repository_id: '741660215' } },
+    { name: 'repository.filter', input: { query: 'pay' } },
+    { name: 'repository.filter', input: { show: 'inactive' } }
+  ]);
+  for (const intent of intents) expect(validateIntent('RepositoryIndex', intent)).toEqual(intent);
+
+  // Without a working connection the banner says so and leads to the connection; a filter with no match says that.
+  const banner = render(RepositoryIndex, { ...lost, onaction });
+  expect(within(banner.container).getByRole('status')).toHaveTextContent('GitHub installation access is lost. Registered Repository Cards stay readable; no new verification starts.');
+  await fireEvent.click(within(banner.container).getByRole('button', { name: 'Connection settings' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'connection.open', input: {} });
+  expect(render(RepositoryIndex, none).container).toHaveTextContent('GitHub is not connected.');
+  expect(render(RepositoryIndex, noIntegration).container).toHaveTextContent(`GitHub connection unavailable: ${denied.title} (${denied.code})`);
+  expect(render(RepositoryIndex, await loadRepositoryIndex({ query: 'zzz' }, { executor: fixtureExecutor })).container).toHaveTextContent('No repositories match this filter.');
+  expect(render(RepositoryIndex, oneRefused).container).toHaveTextContent(`${failure.title} (${failure.code})`);
+  expect(render(RepositoryIndex, { input: {}, result: { state: 'denied', problem: denied } }).container).toHaveTextContent(denied.code);
+  expect(render(RepositoryIndex, { input: {}, result: { state: 'loading' } }).container).toHaveTextContent('Loading repositories');
+});
+
+test('a Repository Card shows the viewed version apart from the selected policy, its exact bindings and a read-only declaration', async () => {
+  const selected = { kind: 'Repository', name: 'payments-api', version: '1.4.0' } as const;
+  const older = { ...selected, version: '1.3.0' } as const;
+  const reads = fixtureRecording();
+  const policy = await loadRepositoryPolicy({ cardRef: selected }, { executor: reads.executor });
+  expect(ops(reads.calls)).toEqual(['cards.get_by_ref', 'cards.list', 'github.get_connection']);
+  expect(policy.result).toMatchObject({
+    state: 'populated',
+    data: {
+      selected: true,
+      access: 'granted',
+      readiness: 'ready',
+      bindings: [
+        { name: 'pr-review', version: '1.3.0', startsOn: 'runs_on: pull_request', state: 'active' },
+        { name: 'dependency-audit', version: '0.4.0', startsOn: 'runs_on: pull_request', state: 'active' }
+      ]
+    }
+  });
+  const onaction = vi.fn();
+  const view = render(RepositoryPolicy, { ...policy, onaction });
+  expect(within(view.container).getByRole('heading', { level: 1 })).toHaveTextContent('payments-api');
+  expect(view.container).toHaveTextContent('✓ selected');
+  expect(view.container).toHaveTextContent('Repository/payments-api@1.4.0');
+  expect(view.container).toHaveTextContent('2 versions · selected 1.4.0');
+  expect(view.container).toHaveTextContent('Installation 41822907 can read acme/payments-api.');
+  expect(view.container.querySelector('[role="status"]')).toBeNull();
+  expect([...within(view.container).getByRole('combobox', { name: 'Card version' }).querySelectorAll('option')].map((option) => option.textContent)).toEqual(['1.4.0 · selected', '1.3.0']);
+  expect(within(view.container).getByRole('link', { name: 'acme/payments-api ↗' })).toHaveAttribute('href', 'https://github.com/acme/payments-api');
+  expect(within(view.container).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['Verifier', 'Exact version', 'Starts on', 'Binding', 'Definition']);
+  // The declaration is the Card as returned, read-only.
+  expect(view.container.querySelector('pre')?.textContent).toBe(fmtYaml(repositories['payments-api@1.4.0']));
+  expect(view.container).toHaveTextContent('Read-only. Change policy by editing the declaration and running wyrd declare.');
+  expect(view.container.querySelector('input, textarea, [contenteditable]')).toBeNull();
+  expect(view.container.textContent).not.toMatch(/Activate|Pause|Roll back/);
+
+  await fireEvent.change(within(view.container).getByRole('combobox', { name: 'Card version' }), { target: { value: '1.3.0' } });
+  await fireEvent.click(within(view.container).getAllByRole('button', { name: 'Verifier definition' })[1]);
+  await fireEvent.click(within(view.container).getByRole('tab', { name: 'wyrd.toml' }));
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Manage connection' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.version', input: { card_ref: older } },
+    { name: 'card.open', input: { card_ref: { kind: 'Verifier', name: 'dependency-audit', version: '0.4.0' } } },
+    { name: 'repository.declaration', input: { declaration: 'toml' } },
+    { name: 'connection.open', input: {} }
+  ]);
+  for (const intent of intents) expect(validateIntent('RepositoryPolicy', intent)).toEqual(intent);
+
+  // Viewing an older version reads the selected one for readiness and changes nothing: the page says which is selected.
+  const olderReads = fixtureRecording();
+  const viewed = await loadRepositoryPolicy({ cardRef: older, declaration: 'toml' }, { executor: olderReads.executor });
+  expect(olderReads.calls.map((call) => call.request).filter((request) => request.op === 'cards.get_by_ref')).toEqual([
+    { op: 'cards.get_by_ref', card_ref: older },
+    { op: 'cards.get_by_ref', card_ref: selected }
+  ]);
+  expect(viewed.result).toMatchObject({ state: 'populated', data: { selected: false, selectedVersion: '1.4.0', readiness: 'ready', bindings: [{ name: 'pr-review', state: 'not selected' }] } });
+  const old = render(RepositoryPolicy, { ...viewed, onaction });
+  expect(old.container).toHaveTextContent('not selected · viewing only');
+  expect(within(old.container).getByRole('status')).toHaveTextContent(
+    'You are viewing 1.3.0. Automatic verification uses the selected version 1.4.0; viewing does not change it. To select 1.3.0 again, declare it with wyrd declare.'
+  );
+  await fireEvent.click(within(old.container).getByRole('button', { name: 'View 1.4.0' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'card.version', input: { card_ref: selected } });
+  // The wyrd.toml tab is a labelled projection of the Card, never the file the author wrote.
+  const toml = old.container.querySelector('pre')?.textContent ?? '';
+  expect(toml).toContain('# Projection of Repository/payments-api@1.3.0, not the declared file.');
+  expect(toml).toContain('[repository.verified_by]\nverifier = [\n  { kind = "Verifier", name = "pr-review", version = "1.3.0" },\n]\nruns_on = { kind = "pull_request" }');
+  expect(old.container).toHaveTextContent('Reconstructed from the Card');
+
+  // Access removed on GitHub: the bindings stay declared and inactive.
+  const removed = await loadRepositoryPolicy({ cardRef: { kind: 'Repository', name: 'ledger', version: '1.1.0' } }, { executor: fixtureExecutor });
+  expect(removed.result).toMatchObject({ state: 'populated', data: { access: 'removed', readiness: 'inactive', bindings: [{ state: 'inactive · no access' }] } });
+  const lostView = render(RepositoryPolicy, removed);
+  expect(lostView.container).toHaveTextContent('Removed');
+  expect(lostView.container).toHaveTextContent('Inactive');
+  expect(lostView.container).toHaveTextContent('repository_id 702551908');
+  expect(within(lostView.container).queryByRole('link')).toBeNull();
+  // An empty policy is a valid selected version that starts nothing.
+  const empty = await loadRepositoryPolicy({ cardRef: { kind: 'Repository', name: 'docs-site', version: '0.3.0' } }, { executor: fixtureExecutor });
+  expect(empty.result).toMatchObject({ state: 'populated', data: { selected: true, access: 'granted', readiness: 'none', bindings: [] } });
+  expect(render(RepositoryPolicy, empty).container).toHaveTextContent('Version 0.3.0 declares verifier = []. Pull requests start no automatic verification; GitHub access is unaffected.');
+  // A refused connection read leaves policy readable and guesses no reason.
+  const noIntegration = await loadRepositoryPolicy({ cardRef: { kind: 'Repository', name: 'ledger', version: '1.1.0' } }, { executor: fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(noIntegration.result).toMatchObject({ state: 'populated', data: { access: 'unreachable', bindings: [{ name: 'pr-review' }] } });
+  expect(render(RepositoryPolicy, noIntegration).container).toHaveTextContent('No access');
+
+  // A refused, missing or foreign Card is the panel's state, with no connection read after it.
+  for (const state of ['denied', 'error'] as const) {
+    const refused = await loadRepositoryPolicy({ cardRef: selected }, { executor: stateExecutors[state] });
+    expect(refused.result.state).toBe(state);
+    expect(render(RepositoryPolicy, refused).container.querySelector('table, pre')).toBeNull();
+  }
+  const missing = fixtureRecording();
+  expect((await loadRepositoryPolicy({ cardRef: { ...selected, version: '9.9.9' } }, { executor: missing.executor })).result).toEqual({ state: 'error', problem: notFound });
+  expect(ops(missing.calls)).toEqual(['cards.get_by_ref']);
+  expect(validatePanel('RepositoryPolicy', { cardRef: VERIFIER })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(render(RepositoryPolicy, { input: { cardRef: selected }, result: { state: 'loading' } }).container).toHaveTextContent('Loading payments-api@1.4.0');
+});
+
+test('an accessible repository without a Card shows how to declare one, and an unknown id shows nothing', async () => {
+  const declare = await loadRepositoryDeclare({ repositoryId: '741660215' }, { executor: fixtureExecutor });
+  expect(declare.result).toMatchObject({ state: 'populated', data: { repositoryId: '741660215', fullName: 'acme/web-checkout', host: 'github.com' } });
+  const view = render(RepositoryDeclare, declare);
+  expect(within(view.container).getByRole('heading', { level: 1 })).toHaveTextContent('acme/web-checkout');
+  expect(view.container).toHaveTextContent('no Repository Card');
+  expect(view.container).toHaveTextContent('github · github.com · repository_id 741660215');
+  expect(view.container).toHaveTextContent('GitHub access is granted, but nothing is registered. Access alone never creates a Card, binds a Verifier or starts verification.');
+  for (const word of ['Not registered', 'Granted', 'Not declared']) expect(view.container).toHaveTextContent(word);
+  expect(view.container.querySelector('pre')?.textContent).toContain('[repository.verified_by]\nverifier = [\n  "./review/pr-review.yaml",\n]\nruns_on = { kind = "pull_request" }');
+  expect(view.container).toHaveTextContent('wyrd declare wyrd.toml');
+  expect(within(view.container).getByRole('link', { name: 'acme/web-checkout ↗' })).toHaveAttribute('href', 'https://github.com/acme/web-checkout');
+
+  // An id the connection does not reach, a foreign one, or one that already has a Card names no repository.
+  for (const repositoryId of ['999', '718204331']) {
+    const unknown = await loadRepositoryDeclare({ repositoryId }, { executor: fixtureExecutor });
+    expect(unknown.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
+    const shown = render(RepositoryDeclare, unknown);
+    expect(shown.container.querySelector('pre, dl')).toBeNull();
+    expect(shown.container.textContent).not.toMatch(/acme\//);
+  }
+  // A refused connection read is the panel's state and reads no Card after it.
+  const refused = fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem: denied } : undefined));
+  expect((await loadRepositoryDeclare({ repositoryId: '741660215' }, { executor: refused.executor })).result).toEqual({ state: 'denied', problem: denied });
+  expect(ops(refused.calls)).toEqual(['github.get_connection']);
+  expect(validatePanel('RepositoryDeclare', { repositoryId: '' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+});
+
+test('the GitHub integration shows safe connection state and asks before disconnecting', async () => {
+  const reads = fixtureRecording();
+  const github = await loadGithubIntegration({}, { executor: reads.executor });
+  expect(ops(reads.calls).slice(0, 2)).toEqual(['github.get_connection', 'cards.list']);
+  const onaction = vi.fn();
+  const view = render(GithubIntegration, { ...github, onaction });
+  expect(view.container).toHaveTextContent('Connected');
+  for (const fact of ['41822907', 'App wyrd-verify', 'github.com', 'Configured for this deployment']) expect(view.container).toHaveTextContent(fact);
+  expect(within(view.container).getByRole('link', { name: 'Manage access on GitHub ↗' })).toHaveAttribute('href', 'https://github.com/apps/wyrd-verify/installations/new');
+  const table = within(view.container).getByRole('table');
+  expect(within(table).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['GitHub repository', 'repository_id', 'Repository Card (registration is separate)', 'Automatic verification']);
+  const rows = within(table).getAllByRole('row');
+  expect(rows).toHaveLength(4);
+  expect(rows[1]).toHaveTextContent('Repository/payments-api@1.4.0');
+  expect(rows[1]).toHaveTextContent('Ready');
+  expect(rows[2]).toHaveTextContent('Not configured');
+  expect(rows[3]).toHaveTextContent('no Card');
+  await fireEvent.click(within(rows[1]).getByRole('button', { name: 'Repository/payments-api@1.4.0' }));
+  await fireEvent.click(within(rows[3]).getByRole('button', { name: 'How to declare' }));
+  // Disconnect asks first in a native dialog: closing it without confirming sends nothing, confirming sends one intent.
+  // jsdom has no modal dialogs, so this drives the dialog's own close event; Chromium proves the real one.
+  const dialog = view.container.querySelector('dialog') as HTMLDialogElement;
+  const showModal = vi.fn();
+  dialog.showModal = showModal;
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Disconnect' }));
+  expect(showModal).toHaveBeenCalledOnce();
+  expect(onaction).toHaveBeenCalledTimes(2);
+  expect(dialog).toHaveTextContent('New verification stops for 2 Repository Cards with access (docs-site, payments-api).');
+  expect(dialog).toHaveTextContent('Unfinished executions for those repositories are cancelled.');
+  expect(dialog).toHaveTextContent('Recorded executions, verdicts and evidence stay. Repository Cards and versions are unchanged.');
+  expect([...dialog.querySelectorAll('button')].map((button) => [button.textContent, button.value])).toEqual([['Cancel', 'cancel'], ['Disconnect GitHub', 'confirm']]);
+  expect(dialog.querySelector('form')).toHaveAttribute('method', 'dialog');
+  dialog.returnValue = 'cancel';
+  await fireEvent(dialog, new Event('close'));
+  expect(onaction).toHaveBeenCalledTimes(2);
+  dialog.returnValue = 'confirm';
+  await fireEvent(dialog, new Event('close'));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.open', input: { card_ref: { kind: 'Repository', name: 'payments-api', version: '1.4.0' } } },
+    { name: 'repository.declare', input: { repository_id: '741660215' } },
+    { name: 'github.disconnect', input: {} }
+  ]);
+  for (const intent of intents) expect(validateIntent('GithubIntegration', intent)).toEqual(intent);
+  // The props and markup carry the redacted view only.
+  expect(`${JSON.stringify(github)}${view.container.innerHTML}`).not.toMatch(/secret|private_key|token|pem|webhook/i);
+
+  // A pending or refused action is reported by the host and takes no second press.
+  const pending = render(GithubIntegration, { ...github, onaction, actions: { 'github.disconnect': { state: 'pending' } } });
+  expect(within(pending.container).getByRole('button', { name: 'Disconnect' })).toBeDisabled();
+  const refusedAction = render(GithubIntegration, { ...github, onaction, actions: { 'github.disconnect': { state: 'error', problem: denied } } });
+  expect(refusedAction.container).toHaveTextContent(denied.code);
+  expect(within(render(GithubIntegration, github).container).getByRole('button', { name: 'Disconnect' })).toBeDisabled();
+
+  // Not connected: one way in, and no repository table.
+  const withConnection = (view: object) => fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: true, value: view as never } : undefined)).executor;
+  const none = await loadGithubIntegration({}, { executor: withConnection({ host: 'github.com', app: connection.app, state: 'not_connected', repositories: [] }) });
+  const start = render(GithubIntegration, { ...none, onaction });
+  expect(start.container).toHaveTextContent('Not connected');
+  expect(start.container).toHaveTextContent('GitHub handles App installation, your authorization and which repositories Wyrd may read on github.com.');
+  expect(within(start.container).queryByRole('table')).toBeNull();
+  await fireEvent.click(within(start.container).getByRole('button', { name: 'Connect GitHub' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'github.connect', input: {} });
+  expect(within(render(GithubIntegration, { ...none, onaction, actions: { 'github.connect': { state: 'pending' } } }).container).getByRole('button', { name: 'Connect GitHub' })).toBeDisabled();
+  // Access lost: the state says so and no repository is claimed.
+  const lost = render(GithubIntegration, await loadGithubIntegration({}, { executor: withConnection({ ...connection, state: 'suspended', repositories: [] }) }));
+  expect(lost.container).toHaveTextContent('Access lost');
+  expect(lost.container).toHaveTextContent('No repository access while the installation is suspended or removed. Registered Repository Cards and their history stay readable.');
+
+  // Denied, and an unconfigured App, are the connection's own states; no Card is read after either.
+  const notConfigured = { code: 'WYRD_GITHUB_503_NOT_CONFIGURED', title: 'GitHub App not configured', status: 503 };
+  for (const problem of [denied, notConfigured]) {
+    const refused = fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem } : undefined));
+    const loaded = await loadGithubIntegration({}, { executor: refused.executor });
+    expect(ops(refused.calls)).toEqual(['github.get_connection']);
+    const shown = render(GithubIntegration, { ...loaded, onaction });
+    expect(shown.container).toHaveTextContent(problem.code);
+    expect(within(shown.container).queryByRole('button')).toBeNull();
+  }
+  // Refused Cards keep the connection and its repositories; registration is then not claimed either way.
+  const noCards = await loadGithubIntegration({}, { executor: fixtureRecording((request) => (request.op === 'cards.list' ? { ok: false, problem: denied } : undefined)).executor });
+  const cardless = render(GithubIntegration, noCards);
+  expect(within(cardless.container).getAllByRole('row')).toHaveLength(4);
+  expect(cardless.container).toHaveTextContent(`Repository Cards unavailable: ${denied.title} (${denied.code})`);
+  expect(cardless.container.textContent).not.toMatch(/no Card|Not declared/);
 });

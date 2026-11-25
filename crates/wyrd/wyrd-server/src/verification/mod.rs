@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
 use crate::components::operators::secrets::OperatorSecrets;
+use crate::scribe_outbox::ScribeOutbox;
 use crate::state::{AppState, EngineWorker};
 
 use self::cache::VerifierCardCache;
@@ -84,9 +85,10 @@ pub struct Verification {
 }
 
 impl Verification {
-    /// Capabilities over `postgres`, hosting `blocks`, sealing Operator
-    /// connections with `operator_secrets`, and closing queued executions
-    /// `execution_timeout` after admission.
+    /// Capabilities over `postgres`, recording admission-time cancellations
+    /// on `scribe`, hosting `blocks`, sealing Operator connections with
+    /// `operator_secrets`, and closing queued executions `execution_timeout`
+    /// after admission.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the submission
@@ -94,6 +96,7 @@ impl Verification {
     #[must_use]
     pub fn new(
         postgres: wyrd_sql::WyrdPostgres,
+        scribe: Arc<ScribeOutbox>,
         blocks: Option<HostedBlocks>,
         operator_secrets: OperatorSecrets,
         execution_timeout: Duration,
@@ -101,7 +104,7 @@ impl Verification {
         Self {
             health: Arc::default(),
             blocks: blocks.map(Arc::new),
-            submissions: SubmissionSink::outbox(postgres),
+            submissions: SubmissionSink::outbox(postgres, scribe),
             operator_secrets,
             execution_timeout,
         }
@@ -251,6 +254,9 @@ impl RuntimeLimits {
 pub struct CapabilityCrash {
     /// One armed flag per capability slot.
     armed: Arc<[AtomicBool; 4]>,
+    /// Armed to panic the runner's next completion flush task that takes
+    /// queued completions, dropping their replies.
+    completion_flush: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -267,6 +273,21 @@ impl CapabilityCrash {
     pub(crate) fn check(&self, capability: RuntimeCapability) {
         let armed = self.armed[capability.index()].swap(false, Ordering::SeqCst);
         assert!(!armed, "test-injected {} crash", capability.as_str());
+    }
+
+    /// Panic the next completion flush task that takes queued completions,
+    /// so those runs get no reply and settle alone.
+    pub fn crash_next_completion_flush(&self) {
+        self.completion_flush.store(true, Ordering::SeqCst);
+    }
+
+    /// Panic when a completion flush crash is armed, disarming it.
+    ///
+    /// # Panics
+    /// Panics exactly when a test armed a completion flush crash.
+    pub(crate) fn check_completion_flush(&self) {
+        let armed = self.completion_flush.swap(false, Ordering::SeqCst);
+        assert!(!armed, "test-injected completion flush crash");
     }
 }
 

@@ -28,11 +28,12 @@ use wyrd_spec::auth::{IssuerUrl, LoginInitiation, ProviderResponse, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    BrowserSessionAuthority, LoginState, approve_device_authorization, consume_login_state,
-    delete_user, human_connection_is_active, insert_user, lock_human_connection_slot,
-    lock_refresh_family, replace_idp_user_roles, upsert_user_identity, user_id_by_identity,
+    BrowserSessionAuthority, LoginState, advance_authorization_revision,
+    approve_device_authorization, consume_login_state, delete_user, human_connection_is_active,
+    insert_user, lock_human_connection_slot, lock_refresh_family, refresh_display_name,
+    replace_idp_user_bindings, upsert_user_identity, user_id_by_identity,
 };
-use wyrd_sql::row_types::auth::HumanConnectionBinding;
+use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanLoginAnchor};
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{
@@ -389,6 +390,9 @@ impl AuthorizationCodeExchange {
         )
         .await
         .map_err(store_error)?;
+        refresh_display_name(&mut conn, principal_id, identity.name.as_deref())
+            .await
+            .map_err(store_error)?;
         // Concurrent callbacks for this User would otherwise each replace
         // roles unseen by the other and the later one mint their union; the
         // family lock held to commit makes one callback's set the whole truth.
@@ -397,13 +401,19 @@ impl AuthorizationCodeExchange {
             .map_err(store_error)?;
         fence_bound_connection(&mut conn, login_state.connection).await?;
         let roles = role_names_to_refs(trusted, &identity.groups)?;
-        // The provider just asserted this human's `idp` authority. Recording
-        // it beside any `direct` grants is what makes the grant table the
-        // truth every later token is minted from.
+        // The provider just asserted this human's `idp` authority: tenant-scope
+        // bindings of the mapped roles, beside and never replacing `direct`
+        // bindings. A change advances the tenant's authorization revision so
+        // every replica re-resolves existing sessions.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
-        let roles_changed = replace_idp_user_roles(&mut conn, principal_id, &role_names)
+        let roles_changed = replace_idp_user_bindings(&mut conn, principal_id, &role_names)
             .await
             .map_err(store_error)?;
+        if roles_changed {
+            advance_authorization_revision(&mut conn)
+                .await
+                .map_err(store_error)?;
+        }
         let completion = match &login_state.initiation {
             LoginInitiation::Browser(_) => {
                 let verified = self
@@ -424,7 +434,7 @@ impl AuthorizationCodeExchange {
                     &mut conn,
                     *device_id,
                     principal_id,
-                    login_state.connection,
+                    HumanLoginAnchor::Connection(login_state.connection),
                 )
                 .await
                 .map_err(store_error)?
@@ -601,7 +611,7 @@ pub fn verify_response_issuer(
 /// is a refused sign-in, which the client sees as `access_denied`. Neither
 /// the provider's code nor its `error_description` is copied into the
 /// refusal, so none of its text is reflected or logged.
-fn provider_refusal(error: &str) -> WyrdError {
+pub(crate) fn provider_refusal(error: &str) -> WyrdError {
     let message = "the identity provider refused the sign-in".to_owned();
     let details = serde_json::json!({});
     match error {

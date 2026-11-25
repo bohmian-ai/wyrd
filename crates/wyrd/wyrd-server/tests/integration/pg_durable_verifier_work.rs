@@ -45,7 +45,7 @@ use wyrd_server::verification::state::{
 };
 use wyrd_server::verification::telemetry::{Envelopes, ExecutionMode};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, CardPermissionScope};
 use wyrd_spec::card::verifier::{Action, VerifierSpec};
 use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
 use wyrd_spec::verification::execution::{
@@ -59,6 +59,7 @@ use wyrd_spec::verification::{
     VerificationError, VerificationExecutionStatus, VerificationVerdict,
 };
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
+use wyrd_sql::queries::cards::card_scopes;
 use wyrd_sql::queries::verifier_executions::{
     ClaimedExecution, ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
 };
@@ -86,8 +87,8 @@ struct Leased {
     system: PrincipalId,
     /// The first claim's state writer.
     run: Arc<RunState>,
-    /// The claimed execution's Verifier.
-    verifier: CardUid,
+    /// The claimed execution's Verifier, as its exact scope.
+    verifier: CardPermissionScope,
 }
 
 impl Leased {
@@ -131,6 +132,11 @@ impl Leased {
             .expect("SYSTEM reads")
             .map(PrincipalId::new)
             .expect("the tenant has SYSTEM");
+        let verifier = card_scopes(&mut conn, std::slice::from_ref(&claimed.verifier_card_uid))
+            .await
+            .expect("the Verifier scope reads")
+            .remove(&claimed.verifier_card_uid)
+            .expect("the Verifier is registered");
         conn.commit().await.expect("the claim commits");
         let renewal = Arc::new(LeaseRenewal::new(
             server.state().postgres.wyrd().clone(),
@@ -153,7 +159,7 @@ impl Leased {
             held: std::sync::Mutex::new(vec![(Arc::clone(&run), lease)]),
             system,
             run,
-            verifier: claimed.verifier_card_uid,
+            verifier,
         }
     }
 
@@ -3285,7 +3291,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
     spec.validate().expect("valid Verifier");
     let spec = Arc::new(spec);
     let caller = leased.publisher([]);
-    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let verifier = leased.verifier.clone();
     let routes = BTreeMap::new();
     let run = async |state: &Arc<RunState>| {
         let recorded = state.snapshot().invocations;

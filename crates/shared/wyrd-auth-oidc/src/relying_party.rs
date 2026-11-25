@@ -167,7 +167,10 @@ impl ScreenedHttp {
     /// [`ProviderHttpError::Transport`] when the URL does not parse or the
     /// request fails, times out, or exceeds the body cap, and
     /// [`ProviderHttpError::Unavailable`] for a server-error status.
-    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ProviderHttpError> {
+    pub(crate) async fn send(
+        &self,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, ProviderHttpError> {
         let url = Url::parse(&request.uri().to_string())
             .map_err(|error| ProviderHttpError::Transport(error.to_string()))?;
         let client = self.client_for(&url).await?;

@@ -9,7 +9,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{CardAccess, PrincipalKindTag, WorkloadFamily};
 use wyrd_spec::ids::CardUid;
 
-use crate::permission::PermissionSet;
+use crate::permission::{EffectivePermissions, Permission, PermissionSet};
 
 pub use wyrd_spec::auth::PrincipalId;
 
@@ -28,11 +28,17 @@ pub struct Principal {
     pub kind: PrincipalKind,
     /// Tenant isolation key.
     pub tenant_id: DataTenantId,
-    /// Role names carried by the verified token.
+    /// The request's authority: the account's current server-resolved grants
+    /// bounded by every credential, delegation, and accepted-work ceiling.
+    ///
+    /// Never copied from a token's claims; the server's authority owner
+    /// attaches it after verifying identity.
+    pub effective_permissions: EffectivePermissions,
+    /// Names of the roles the account is currently bound to at any scope,
+    /// resolved by the server with [`Self::effective_permissions`]. Grants
+    /// never come from these names; role-subject gateway budgets match them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<RoleRef>,
-    /// The token's permission snapshot: resolved from the principal's roles
-    /// once at issuance and carried unchanged until the token expires.
-    pub effective_permissions: PermissionSet,
     /// Non-secret id of the credential the request authenticated with, when one
     /// was presented.
     ///
@@ -153,8 +159,7 @@ impl Principal {
         id: PrincipalId,
         kind: PrincipalKind,
         tenant_id: DataTenantId,
-        roles: Vec<RoleRef>,
-        effective_permissions: PermissionSet,
+        effective_permissions: impl Into<EffectivePermissions>,
     ) -> Self {
         let card_access = match kind {
             PrincipalKind::System => CardAccess::Scoped { cards: Vec::new() },
@@ -166,8 +171,8 @@ impl Principal {
             id,
             kind,
             tenant_id,
-            roles,
-            effective_permissions,
+            effective_permissions: effective_permissions.into(),
+            roles: Vec::new(),
             credential_id: None,
             card_access,
             workload_uid: None,
@@ -285,7 +290,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             kind,
             wyrd_spec::DataTenantId::new_v7(),
-            Vec::new(),
             PermissionSet::new(),
         )
     }
@@ -496,14 +500,15 @@ impl AuthContext {
         }
     }
 
-    /// The permissions authorization is decided against.
+    /// True when this context's authority covers `required`.
     ///
-    /// One vocabulary and one checker serve both planes; only the set differs.
+    /// One vocabulary and one checker serve both planes; only the authority
+    /// differs.
     #[must_use]
-    pub fn effective_permissions(&self) -> &PermissionSet {
+    pub fn permits(&self, required: &Permission) -> bool {
         match self {
-            Self::Platform(principal) => &principal.effective_permissions,
-            Self::Tenant(principal) => &principal.effective_permissions,
+            Self::Platform(principal) => principal.effective_permissions.contains(required),
+            Self::Tenant(principal) => principal.effective_permissions.contains(required),
         }
     }
 
@@ -570,7 +575,6 @@ mod auth_context_tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::TenantAdmin,
             DataTenantId::new_v7(),
-            Vec::new(),
             {
                 let mut set = PermissionSet::new();
                 set.insert(Permission::card_read());
@@ -610,22 +614,12 @@ mod auth_context_tests {
         let platform_context = AuthContext::from(platform());
         let tenant_context = AuthContext::from(tenant());
 
+        assert!(platform_context.permits(&Permission::tenant_create()));
         assert!(
-            platform_context
-                .effective_permissions()
-                .contains(&Permission::tenant_create())
-        );
-        assert!(
-            !tenant_context
-                .effective_permissions()
-                .contains(&Permission::tenant_create()),
+            !tenant_context.permits(&Permission::tenant_create()),
             "a tenant principal never holds platform authority"
         );
-        assert!(
-            tenant_context
-                .effective_permissions()
-                .contains(&Permission::card_read())
-        );
+        assert!(tenant_context.permits(&Permission::card_read()));
     }
 
     /// Every privileged operation is attributable to a principal, on either

@@ -46,12 +46,12 @@ use wyrd_sql::queries::verification::{
 };
 use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
-    Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
-    ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
-    GroupActivity, GroupSelection, PinnedGroup, Prepared, PullRequestBaseline, PullRequestEnd,
-    PullRequestHistory, PullRequestKey, PullRequestTarget, QueueCounts, RetryOutcome,
-    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
-    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
+    Admitted, CancelledExecution, Cause, ClaimedExecution, Completion, DueSettlement,
+    EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput, ExecutionLease,
+    ExecutionOrigin, ExecutionStatus, GroupActivity, GroupSelection, PinnedGroup, Prepared,
+    PullRequestBaseline, PullRequestEnd, PullRequestHistory, PullRequestKey, PullRequestTarget,
+    QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission,
+    Settlement, Submission, SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -97,7 +97,6 @@ fn actor(tenant: DataTenantId) -> Principal {
         PrincipalId::new(Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     )
 }
@@ -414,7 +413,7 @@ async fn execution_count(conn: &mut TenantConn<'_>) -> i64 {
 
 /// The direct accepted authority of `principal`, with no delegation chain.
 fn authority(principal: &Principal) -> AcceptedAuthority {
-    AcceptedAuthority::new(principal, &[])
+    AcceptedAuthority::new(principal, &[]).expect("representable")
 }
 
 /// The accepted authority of the binding owner's family account `principal`.
@@ -426,7 +425,6 @@ fn owner_authority(tenant: DataTenantId, principal: PrincipalId) -> AcceptedAuth
         principal,
         PrincipalKind::Service,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     ))
 }
@@ -474,6 +472,7 @@ async fn scheduled(
         .enqueue_scheduled(conn, binding, occurrence, &authority)
         .await
         .expect("scheduled execution enqueues")
+        .outcome
     {
         EnqueueOutcome::Enqueued(execution_id) => execution_id,
         other => panic!("expected a new execution, got {other:?}"),
@@ -501,7 +500,8 @@ async fn schedule_next_due(
         queue
             .schedule_due(conn, due, authority)
             .await
-            .expect("due binding settles"),
+            .expect("due binding settles")
+            .outcome,
     )
 }
 
@@ -551,7 +551,8 @@ async fn accept(
     let outcomes = queue
         .accept_submissions(conn, batch, &refused)
         .await
-        .expect("submission batch accepts");
+        .expect("submission batch accepts")
+        .outcome;
     assert_eq!(outcomes.len(), 1, "one outcome per submission");
     outcomes[0]
 }
@@ -750,7 +751,8 @@ async fn unrunnable_targets_are_refused() {
             queue
                 .enqueue_scheduled(&mut conn, binding, window(), &owner_authority)
                 .await
-                .expect("enqueue answers"),
+                .expect("enqueue answers")
+                .outcome,
             EnqueueOutcome::Refused(refusal)
         );
     }
@@ -878,7 +880,8 @@ async fn keyed_submissions_replay_conflict_and_scope_to_subject_and_actor() {
         queue
             .accept_submissions(&mut conn, &[original.clone(), retry], &HashMap::new())
             .await
-            .expect("replayed batch accepts"),
+            .expect("replayed batch accepts")
+            .outcome,
         vec![
             SubmissionOutcome::Replayed(execution),
             SubmissionOutcome::Replayed(execution)
@@ -934,6 +937,7 @@ async fn keyed_submissions_replay_conflict_and_scope_to_subject_and_actor() {
 
     let mut pairs = Vec::new();
     for accepted in [through(&alice, &bob), through(&carol, &bob)] {
+        let accepted = accepted.expect("representable");
         let pair = accepted.attribution();
         let keyed = submission(tenant, accepted, original_request.clone(), Some("retry-1"));
         let execution_id = submitted(&queue, &mut conn, &keyed).await;
@@ -1067,7 +1071,8 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
                 &HashMap::new(),
             )
             .await
-            .expect("later batch accepts");
+            .expect("later batch accepts")
+            .outcome;
         later.commit().await.expect("later commits");
         outcome
     };
@@ -1093,7 +1098,7 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
 }
 
 /// Revoke `principal` the way its revocation does: suspend the account, then
-/// cancel its unfinished executions, returning how many were cancelled.
+/// cancel its unfinished executions, returning each one cancelled.
 ///
 /// # Panics
 /// Panics when the suspension or cancellation fails.
@@ -1101,7 +1106,7 @@ async fn revoke(
     queue: &VerifierExecutionQueue,
     conn: &mut TenantConn<'_>,
     principal: PrincipalId,
-) -> u64 {
+) -> Vec<CancelledExecution> {
     assert!(
         suspend_service_account_principal(conn, principal.as_uuid())
             .await
@@ -1157,7 +1162,7 @@ async fn revocation_and_admission_order_on_the_principal() {
     let mut probe = fixture.tenant_conn().await.expect("probe opens");
 
     let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
-    assert_eq!(revoke(&queue, &mut revoker, first).await, 0);
+    assert_eq!(revoke(&queue, &mut revoker, first).await, []);
     let late = submission(
         tenant,
         owner_authority(tenant, first),
@@ -1166,9 +1171,12 @@ async fn revocation_and_admission_order_on_the_principal() {
     );
     let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
     let admission = async {
-        let outcome = accept(&queue, &mut admitter, &late).await;
+        let admitted = queue
+            .accept_submissions(&mut admitter, std::slice::from_ref(&late), &HashMap::new())
+            .await
+            .expect("submission batch accepts");
         admitter.commit().await.expect("admission commits");
-        outcome
+        admitted
     };
     tokio::pin!(admission);
     let raced = tokio::select! {
@@ -1180,7 +1188,19 @@ async fn revocation_and_admission_order_on_the_principal() {
         "an admission waits for an uncommitted revocation"
     );
     revoker.commit().await.expect("revocation commits");
-    assert_eq!(admission.await, SubmissionOutcome::Accepted);
+    assert_eq!(
+        admission.await,
+        Admitted {
+            outcome: vec![SubmissionOutcome::Accepted],
+            cancelled: vec![CancelledExecution {
+                execution_id: late.execution_id,
+                verifier_card_uid: custom.clone(),
+                card_uid: first_card.clone(),
+                attribution: late.authority.attribution(),
+            }],
+        },
+        "the admission returns what its fence cancelled"
+    );
     let mut reader = fixture.tenant_conn().await.expect("reader opens");
     assert_revoked(&queue, &mut reader, late.execution_id).await;
     reader.rollback().await.expect("reader rolls back");
@@ -1211,7 +1231,12 @@ async fn revocation_and_admission_order_on_the_principal() {
     admitter.commit().await.expect("admission commits");
     assert_eq!(
         revocation.await,
-        1,
+        [CancelledExecution {
+            execution_id: early.execution_id,
+            verifier_card_uid: custom,
+            card_uid: second_card,
+            attribution: early.authority.attribution(),
+        }],
         "the revocation cancels the admitted execution"
     );
     let mut reader = fixture.tenant_conn().await.expect("reader opens");
@@ -1280,20 +1305,40 @@ async fn background_admission_of_a_revoked_owner_is_cancelled() {
         panic!("expected a group candidate");
     };
 
-    assert_eq!(revoke(&queue, &mut conn, principal).await, 0);
+    assert_eq!(revoke(&queue, &mut conn, principal).await, []);
+    let scheduled = queue
+        .accept_scheduled(&mut conn, &occurrence)
+        .await
+        .expect("occurrence admits");
     assert_eq!(
-        queue
-            .accept_scheduled(&mut conn, &occurrence)
-            .await
-            .expect("occurrence admits"),
+        scheduled.outcome,
         EnqueueOutcome::Enqueued(occurrence.execution_id)
     );
     assert_eq!(
-        queue
-            .accept_grouped(&mut conn, &group)
-            .await
-            .expect("group admits"),
+        scheduled.cancelled,
+        [CancelledExecution {
+            execution_id: occurrence.execution_id,
+            verifier_card_uid: verifier,
+            card_uid: owner,
+            attribution: authority.attribution(),
+        }],
+        "the admission returns what its fence cancelled"
+    );
+    let grouped = queue
+        .accept_grouped(&mut conn, &group)
+        .await
+        .expect("group admits");
+    assert_eq!(
+        grouped.outcome,
         EnqueueOutcome::Enqueued(group.execution_id)
+    );
+    assert_eq!(
+        grouped
+            .cancelled
+            .iter()
+            .map(|cancelled| (cancelled.execution_id, cancelled.attribution))
+            .collect::<Vec<_>>(),
+        [(group.execution_id, authority.attribution())]
     );
     assert_revoked(&queue, &mut conn, occurrence.execution_id).await;
     assert_revoked(&queue, &mut conn, group.execution_id).await;
@@ -1436,7 +1481,8 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         queue
             .enqueue_scheduled(&mut conn, binding, occurrence, &replay)
             .await
-            .expect("duplicate occurrence answers"),
+            .expect("duplicate occurrence answers")
+            .outcome,
         EnqueueOutcome::AlreadyEnqueued(execution)
     );
     assert_eq!(execution_count(&mut conn).await, 1);
@@ -1650,7 +1696,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
             .release(&mut conn, stale.lease, Duration::zero())
             .await
             .expect("stale release answers"),
-        Settlement::StaleLease
+        None
     );
     for _ in 0..2 {
         assert_eq!(
@@ -2116,7 +2162,7 @@ async fn release_requeues_without_consuming_an_attempt() {
             .release(&mut conn, first.lease, Duration::zero())
             .await
             .expect("release answers"),
-        Settlement::Applied
+        Some(VerificationExecutionStatus::Pending)
     );
     let status = queue
         .execution_status(&mut conn, execution)
@@ -2314,7 +2360,8 @@ async fn queue_state_is_tenant_isolated() {
                 &ExecutionAuthority::background(authority(&actor), actor.id),
             )
             .await
-            .expect("foreign enqueue answers"),
+            .expect("foreign enqueue answers")
+            .outcome,
         EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)
     );
     assert!(
@@ -3207,6 +3254,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
             .enqueue_group(conn, binding, pinned, &authority)
             .await
             .expect("group enqueue answers")
+            .outcome
     };
     let EnqueueOutcome::Enqueued(earlier) = enqueue(&mut conn, &first).await else {
         panic!("the first snapshot enqueues");
@@ -3635,7 +3683,8 @@ async fn a_batch_decides_its_submissions_against_each_other() {
             &HashMap::new(),
         )
         .await
-        .expect("batch accepts");
+        .expect("batch accepts")
+        .outcome;
 
     assert_eq!(
         outcomes,
@@ -3920,7 +3969,8 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_scheduled(&mut conn, &first)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(first.execution_id)
     );
     conn.rollback().await.expect("writer rolls back");
@@ -3944,14 +3994,16 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_scheduled(&mut earlier, &first)
             .await
-            .expect("earlier admission answers"),
+            .expect("earlier admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(first.execution_id)
     );
     let later_accept = async {
         let outcome = queue
             .accept_scheduled(&mut later, &second)
             .await
-            .expect("later admission answers");
+            .expect("later admission answers")
+            .outcome;
         later.commit().await.expect("later commits");
         outcome
     };
@@ -3982,7 +4034,8 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_scheduled(&mut conn, &second)
             .await
-            .expect("replay answers"),
+            .expect("replay answers")
+            .outcome,
         EnqueueOutcome::AlreadyEnqueued(first.execution_id)
     );
     assert_eq!(
@@ -4050,7 +4103,8 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_grouped(&mut conn, &updated)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(updated.execution_id)
     );
     assert_eq!(
@@ -4070,7 +4124,8 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_grouped(&mut conn, &recreated)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(recreated.execution_id)
     );
     assert_eq!(
@@ -4087,7 +4142,8 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_grouped(&mut conn, &winner)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(winner.execution_id)
     );
     assert_eq!(
@@ -4099,7 +4155,8 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         queue
             .accept_grouped(&mut conn, &loser)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::AlreadyEnqueued(winner.execution_id),
         "same content accepts once"
     );
@@ -4212,14 +4269,16 @@ async fn queued_admission_preserves_tenant_and_input_identity() {
         queue
             .accept_scheduled(&mut foreign, &scheduled)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)
     );
     assert_eq!(
         queue
             .accept_grouped(&mut foreign, &grouped)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)
     );
     assert_eq!(execution_count(&mut foreign).await, 0);
@@ -4241,14 +4300,16 @@ async fn queued_admission_preserves_tenant_and_input_identity() {
         queue
             .accept_scheduled(&mut conn, &scheduled)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(scheduled.execution_id)
     );
     assert_eq!(
         queue
             .accept_grouped(&mut conn, &grouped)
             .await
-            .expect("admission answers"),
+            .expect("admission answers")
+            .outcome,
         EnqueueOutcome::Enqueued(grouped.execution_id)
     );
     assert_eq!(pending_groups(&mut conn, group_binding).await, 0);
@@ -4314,8 +4375,10 @@ fn pins(head: &str) -> PullRequestActivation {
             sha: head.repeat(40),
         },
         head_repository_id: Some(RepositoryId::new("42").expect("valid repository id")),
-        delivery_id: Uuid::now_v7().to_string(),
+        delivery_id: Some(Uuid::now_v7().to_string()),
+        request_key: None,
         generation: Uuid::now_v7(),
+        members: Vec::new(),
     }
 }
 
@@ -4326,6 +4389,30 @@ fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
         repository_id: repository,
         number: 7,
     }
+}
+
+/// What a cancellation of `executions` must return: each execution with the
+/// Verifier and attribution its stored row holds, in execution order.
+///
+/// # Panics
+/// Panics when an execution's status cannot be read or does not exist.
+async fn stored_cancellations(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    executions: &[ExecutionId],
+) -> Vec<CancelledExecution> {
+    let mut expected = Vec::new();
+    for execution in executions {
+        let stored = status(queue, conn, *execution).await;
+        expected.push(CancelledExecution {
+            execution_id: *execution,
+            verifier_card_uid: stored.verifier_card_uid,
+            card_uid: stored.card_uid,
+            attribution: stored.attribution,
+        });
+    }
+    expected.sort_by_key(|cancelled| cancelled.execution_id);
+    expected
 }
 
 /// Every binding admitted under `owner`'s background authority.
@@ -4385,8 +4472,13 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
     let (a, superseded) = queue
         .reserve_pull_request(&mut conn, &first, t1, &targets)
         .await
-        .expect("generation reserves");
+        .expect("generation reserves")
+        .outcome;
     assert_eq!((a.len(), superseded.len()), (2, 0));
+    let first = PullRequestActivation {
+        members: a.clone(),
+        ..first
+    };
     assert!(
         queue
             .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 10)
@@ -4451,11 +4543,15 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
     let (b, superseded) = queue
         .reserve_pull_request(&mut conn, &second, t2, &targets)
         .await
-        .expect("new generation reserves");
+        .expect("new generation reserves")
+        .outcome;
     assert_eq!(b.len(), 2);
+    let mut superseded = superseded;
+    superseded.sort_by_key(|cancelled| cancelled.execution_id);
     assert_eq!(
-        superseded.iter().copied().collect::<BTreeSet<_>>(),
-        a.iter().copied().collect::<BTreeSet<_>>()
+        superseded,
+        stored_cancellations(&queue, &mut conn, &a).await,
+        "supersession returns each cancelled execution's Verifier and attribution"
     );
     for execution in &a {
         let state = status(&queue, &mut conn, *execution).await.state;
@@ -4490,6 +4586,50 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
     assert!(history.current.expect("current").reviews(&second));
 }
 
+/// A PR generation reserved for a Repository owner revoked after its
+/// authority was resolved is cancelled by the admission's principal fence,
+/// and the reservation returns each cancelled execution with its Verifier and
+/// attribution.
+///
+/// # Panics
+/// Panics when the reservation fails, its execution stays runnable, or the
+/// returned cancellation differs.
+#[tokio::test]
+async fn pull_request_reservation_of_a_revoked_owner_is_cancelled() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
+    record_machine_authentication(&mut conn, principal, &owner)
+        .await
+        .expect("owner activates");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, principal, &bindings).await;
+    assert_eq!(revoke(&queue, &mut conn, principal).await, []);
+
+    let repository_id = RepositoryId::new("42").expect("valid repository id");
+    queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    let observed = database_now(&mut conn).await;
+    let Admitted {
+        outcome: (reserved, superseded),
+        cancelled,
+    } = queue
+        .reserve_pull_request(&mut conn, &pins("a"), observed, &targets)
+        .await
+        .expect("generation reserves");
+    assert_eq!((reserved.len(), superseded.len()), (1, 0));
+    assert_revoked(&queue, &mut conn, reserved[0]).await;
+    assert_eq!(
+        cancelled,
+        stored_cancellations(&queue, &mut conn, &reserved).await,
+        "the reservation returns what its fence cancelled"
+    );
+}
+
 /// Closing a PR cancels its unfinished executions with the close code and
 /// deactivates its generation, keeping settled history; access loss does
 /// the same for the repository's PRs, and a reservation it cancels is never
@@ -4516,7 +4656,8 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
     let (executions, _) = queue
         .reserve_pull_request(&mut conn, &pins("a"), observed, &targets)
         .await
-        .expect("generation reserves");
+        .expect("generation reserves")
+        .outcome;
     let refused = status(&queue, &mut conn, executions[1]).await.state;
     assert_eq!(refused.status, VerificationExecutionStatus::Errored);
     assert_eq!(refused.error, Some(refusal));
@@ -4532,7 +4673,11 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
         )
         .await
         .expect("PR deactivates");
-    assert_eq!(cancelled, vec![executions[0]]);
+    assert_eq!(
+        cancelled,
+        stored_cancellations(&queue, &mut conn, &executions[..1]).await,
+        "closing returns the cancelled execution's Verifier and attribution"
+    );
     let state = status(&queue, &mut conn, executions[0]).await.state;
     assert_eq!(
         state.error.map(|error| error.code).as_deref(),
@@ -4554,7 +4699,8 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
     let (reopened_executions, _) = queue
         .reserve_pull_request(&mut conn, &pins("a"), reopened, &targets[..1])
         .await
-        .expect("reopened generation reserves");
+        .expect("reopened generation reserves")
+        .outcome;
     queue
         .activate_pull_requests(&mut conn, &reopened_executions)
         .await
@@ -4564,7 +4710,7 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
             .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["9".to_owned()]))
             .await
             .expect("other repository cancels"),
-        0,
+        Vec::new(),
         "another repository's loss cancels nothing here"
     );
     queue
@@ -4584,7 +4730,8 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
     let (reserved, _) = queue
         .reserve_pull_request(&mut conn, &pins("d"), reserved_at, &targets[..1])
         .await
-        .expect("a generation reserves");
+        .expect("a generation reserves")
+        .outcome;
     queue
         .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["42".to_owned()]))
         .await
@@ -4614,7 +4761,8 @@ async fn running_generation(
     let (reserved, _) = queue
         .reserve_pull_request(conn, &pins(head), observed, targets)
         .await
-        .expect("generation reserves");
+        .expect("generation reserves")
+        .outcome;
     queue
         .activate_pull_requests(conn, &reserved)
         .await

@@ -118,7 +118,9 @@ fn query_tool() -> Tool {
         QUERY,
         "Query Bifrost",
         "Run one bounded read-only SELECT against this caller's authorized Bifrost tables and \
-         return the complete result. Wyrd selects the execution path; the caller cannot.",
+         return the complete result. Wyrd selects the execution path; the caller cannot. \
+         Prefix EXPLAIN for the plan without executing it, or EXPLAIN ANALYZE to execute it \
+         and return the plan with operator metrics.",
         input_schema(),
     )
 }

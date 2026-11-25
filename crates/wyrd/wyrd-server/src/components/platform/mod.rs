@@ -13,6 +13,9 @@
 //! replaces the global credential, so losing the provider costs the deployment
 //! nothing but individual sign-in.
 //!
+//! `console` is the platform console's browser-session boundary: platform-user
+//! password sign-in, session reads and logout under `/platform/browser`.
+//!
 //! `benchmark`, built only with the `bench` feature, lets a benchmark stage
 //! and publish this replica's Scribe on request.
 //!
@@ -25,14 +28,18 @@
 #[cfg(feature = "bench")]
 pub mod benchmark;
 pub mod builtins;
+pub mod console;
 pub mod credentials;
 pub mod identity;
 pub mod provisioning;
 pub mod recovery;
 pub mod routes;
+pub mod social;
 pub mod stored_secrets;
 
+pub use console::platform_console_router;
 pub use credentials::platform_credentials_router;
 pub use identity::{platform_identity_router, platform_login_router};
 pub use routes::{platform_auth_router, platform_router};
+pub use social::platform_social_router;
 pub use stored_secrets::platform_stored_secrets_router;

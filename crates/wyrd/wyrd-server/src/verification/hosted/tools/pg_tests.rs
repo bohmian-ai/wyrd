@@ -446,7 +446,11 @@ fn file_publications_decide_their_file_permission() {
             executed_by: Some(PrincipalId::new(uuid::Uuid::now_v7())),
             ..caller([
                 Permission::tool_invoke_any(),
-                Permission::verifier_run(verifier.clone()),
+                Permission::verifier_run(wyrd_spec::auth::CardPermissionScope::version(
+                    wyrd_spec::envelope::CardKind::Verifier,
+                    wyrd_spec::ids::CardName::new("publisher").expect("name"),
+                    verifier.clone(),
+                )),
             ])
         };
         let publisher = publishing(granted.clone()).await;

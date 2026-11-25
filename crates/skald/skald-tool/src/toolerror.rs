@@ -109,8 +109,10 @@ impl From<&ToolError> for WyrdError {
     /// The catalog owns every public metadata field, so this projection only
     /// chooses the variant and supplies the message plus structured details.
     /// A [`ToolError::StructuredInvocation`] already carries a stable code from
-    /// its owner, so it is reconstructed from that code where the catalog knows
-    /// it and otherwise preserved under `details.original_code`.
+    /// its owner, so it is reconstructed from that code where the catalog or
+    /// the delegated Bifrost catalog knows it, so a refused query keeps its
+    /// `WYRD_VALA_*` code, and otherwise preserved under
+    /// `details.original_code`.
     fn from(error: &ToolError) -> Self {
         let message = error.to_string();
         match error {
@@ -128,6 +130,10 @@ impl From<&ToolError> for WyrdError {
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({}));
                 Self::from_code(&structured.code, structured.detail.clone(), details.clone())
+                    .or_else(|| {
+                        wyrd_spec::vala::error::BifrostError::from_unit_code(&structured.code)
+                            .map(Self::from)
+                    })
                     .unwrap_or(Self::ToolInvocationFailed {
                         message,
                         details: serde_json::json!({
@@ -203,9 +209,9 @@ mod tests {
         assert_eq!(error.code(), "WYRD_TEST_500_STRUCTURED");
     }
 
-    /// Every tool failure reaches a catalog variant, and a structured failure
-    /// whose code the catalog does not know keeps that code in `details`
-    /// instead of losing it.
+    /// Every tool failure reaches a catalog variant, a refused Bifrost query
+    /// keeps its `WYRD_VALA_*` code, and a structured failure whose code the
+    /// catalog does not know keeps that code in `details` instead of losing it.
     #[test]
     fn tool_errors_project_onto_the_catalog() {
         let cases: Vec<(ToolError, &str)> = vec![
@@ -247,6 +253,17 @@ mod tests {
                     safe_details: None,
                 })),
                 "WYRD_AGENT_412_DELEGATION_DEPTH",
+            ),
+            (
+                ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
+                    code: "WYRD_VALA_403_QUERY_FORBIDDEN".to_owned(),
+                    status: 403,
+                    title: "Query forbidden".to_owned(),
+                    detail: "query forbidden".to_owned(),
+                    remediation: "request the table's query grant".to_owned(),
+                    safe_details: None,
+                })),
+                "WYRD_VALA_403_QUERY_FORBIDDEN",
             ),
         ];
         for (error, expected) in cases {

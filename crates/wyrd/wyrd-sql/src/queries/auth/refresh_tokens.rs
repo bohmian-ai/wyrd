@@ -21,7 +21,7 @@ const CONSUME_ACTIVE_REFRESH_SQL: &str = r"
        AND expires_at > statement_timestamp()
     RETURNING id, data_tenant_id, principal_kind, principal_id, token_hash,
               issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
-              human_connection_id, human_connection_revision, client_id
+              human_connection_id, human_connection_revision, client_id, password_revision
 ";
 
 /// Serializes every refresh operation for one stored principal family in the
@@ -36,7 +36,7 @@ const REFRESH_ISSUANCE_INSTANT_SQL: &str = r"
 const REFRESH_BY_HASH_SQL: &str = r"
     SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
            issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
-           human_connection_id, human_connection_revision, client_id
+           human_connection_id, human_connection_revision, client_id, password_revision
       FROM wyrd.auth_refresh_tokens
      WHERE token_hash = $1
        AND data_tenant_id = $2
@@ -49,8 +49,8 @@ const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r"
     INSERT INTO wyrd.auth_refresh_tokens (
         id, data_tenant_id, principal_kind, principal_id,
         token_hash, expires_at, rotated_from,
-        human_connection_id, human_connection_revision, client_id
-    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9)
+        human_connection_id, human_connection_revision, client_id, password_revision
+    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9, $10)
 ";
 
 /// Sample the `PostgreSQL` issuance instant for a refresh token, truncated to a
@@ -269,9 +269,10 @@ pub async fn insert_human_refresh_token(
         .bind(token_hash)
         .bind(expires_at)
         .bind(rotated_from)
-        .bind(session.connection.connection_id)
-        .bind(session.connection.connection_revision)
+        .bind(session.anchor.connection().map(|c| c.connection_id))
+        .bind(session.anchor.connection().map(|c| c.connection_revision))
         .bind(session.client.as_str())
+        .bind(session.anchor.password_revision())
         .execute(&mut **conn.transaction())
         .await?;
     Ok(())

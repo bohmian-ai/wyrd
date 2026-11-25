@@ -6,22 +6,77 @@ import './theme.css';
 
 export { default as Chart } from './components/Chart.svelte';
 export { default as CardHeader } from './components/CardHeader.svelte';
+export { default as CardInventory } from './components/CardInventory.svelte';
+export { default as CardFacts } from './components/CardFacts.svelte';
+export { default as RelationshipList } from './components/RelationshipList.svelte';
+export { default as ArtifactTable } from './components/ArtifactTable.svelte';
+export { default as PromptMessages } from './components/PromptMessages.svelte';
+export { default as PromptVariables } from './components/PromptVariables.svelte';
+export { default as UsedBy } from './components/UsedBy.svelte';
+export { default as VersionDiff } from './components/VersionDiff.svelte';
+export { default as VerifierDefinition } from './components/VerifierDefinition.svelte';
+export { default as RunsOn } from './components/RunsOn.svelte';
+export { default as RepositoryIndex } from './components/RepositoryIndex.svelte';
+export { default as RepositoryPolicy } from './components/RepositoryPolicy.svelte';
+export { default as RepositoryDeclare } from './components/RepositoryDeclare.svelte';
+export { default as GithubIntegration } from './components/GithubIntegration.svelte';
+export { default as VerificationExecution } from './components/VerificationExecution.svelte';
+export { default as VerifierGraph } from './components/VerifierGraph.svelte';
+export { default as Panel } from './components/Panel.svelte';
 export { default as StatStrip } from './components/StatStrip.svelte';
 export { default as FacetRail } from './components/FacetRail.svelte';
 export { default as RecordTable } from './components/RecordTable.svelte';
 export { default as TraceWaterfall } from './components/TraceWaterfall.svelte';
 export { default as RecordDetail } from './components/RecordDetail.svelte';
 export { default as EmptyState } from './components/EmptyState.svelte';
+export { default as ActionButton } from './components/ActionButton.svelte';
 export { default as CardRefChip } from './components/CardRefChip.svelte';
 export { default as VerdictPill } from './components/VerdictPill.svelte';
-export { default as StatusPill, type Tone } from './components/StatusPill.svelte';
+export { default as StatusPill, CARD_TONES, type Tone } from './components/StatusPill.svelte';
 export { default as Sparkline } from './components/Sparkline.svelte';
 export { default as DurationBar } from './components/DurationBar.svelte';
 export { default as Drawer } from './components/Drawer.svelte';
 export * from './format.js';
 export type * from './contract.js';
 export type {
+  ArtifactTableProps,
+  CardFactsProps,
   CardHeaderProps,
+  CardInventoryProps,
+  CardRelationshipsData,
+  CardVersions,
+  PromptChange,
+  PromptMessagesProps,
+  PromptUser,
+  PromptVariable,
+  PromptVariablesProps,
+  RelationshipListProps,
+  UsedByProps,
+  DefinitionEdge,
+  DefinitionGraph,
+  DefinitionInput,
+  DefinitionRequirement,
+  DefinitionStep,
+  RunsOnProps,
+  RepositoryIndexProps,
+  RepositoryPolicyProps,
+  RepositoryDeclareProps,
+  GithubIntegrationProps,
+  RepositoryRow,
+  DriftContext,
+  DriftPoint,
+  ExecutionData,
+  ExecutionDefinition,
+  NodeState,
+  Part,
+  SessionMember,
+  VerificationExecutionProps,
+  VerifierBinding,
+  VerifierDefinitionData,
+  VerifierDefinitionProps,
+  VerifierOwner,
+  VersionDiffData,
+  VersionDiffProps,
   ChartProps,
   ComponentProps,
   FacetRailProps,

@@ -47,7 +47,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError, HostWork};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId};
+use wyrd_spec::auth::{Attribution, CardPermissionScope, PrincipalId};
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
@@ -64,8 +64,8 @@ use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadi
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::get_card_for_reconciliation;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalStatus,
-    VerifierExecutionQueue,
+    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, Settlement,
+    TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
@@ -75,7 +75,7 @@ use super::RuntimeLimits;
 use super::approvals::ApprovalDecisions;
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::cache::{Db, Target, exact_ref};
-use super::claims::{ClaimLoop, LeasedWork, settled};
+use super::claims::{ClaimLoop, LeasedWork};
 use super::completions::{Completions, SettleError};
 use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
@@ -204,6 +204,9 @@ pub struct AttemptClaim {
     /// Verifier, recorded as the attempt's `load` phase. The start anchors
     /// the claimed remaining deadline, so loading and handoff spend it.
     loaded: (Instant, Instant),
+    /// When the claim statement put the run in `running`, staged as its
+    /// status row once the claim commits.
+    claimed_at: DateTime<Utc>,
     /// The attempt's root span.
     span: tracing::Span,
 }
@@ -417,6 +420,7 @@ impl VerifierRunner {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_crash(mut self, crash: CapabilityCrash) -> Self {
+        self.completions.arm_crash(crash.clone());
         self.claims.arm_crash(crash);
         self
     }
@@ -554,7 +558,7 @@ impl VerifierRunner {
             let outcome = if deadline <= tokio::time::Instant::now() {
                 timed_out()
             } else {
-                self.compute(tenant, run, &verifier.spec, system, &state, telemetry)
+                self.compute(tenant, run, &verifier, system, &state, telemetry)
                     .await
             };
             match outcome {
@@ -766,7 +770,7 @@ impl VerifierRunner {
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
-        spec: &Arc<VerifierSpec>,
+        verifier: &Target,
         system: PrincipalId,
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
@@ -779,17 +783,22 @@ impl VerifierRunner {
             {
                 return outcome;
             }
-            let prepared = match self.prepare(tenant, run, spec, system, telemetry).await {
+            let prepared = match self
+                .prepare(tenant, run, &verifier.spec, system, telemetry)
+                .await
+            {
                 Ok(mut prepared) => self
-                    .deferred(tenant, run, spec, system, state, &mut prepared.1)
+                    .deferred(tenant, run, &verifier.spec, system, state, &mut prepared.1)
                     .await
                     .map(|()| prepared),
                 Err(outcome) => Err(outcome),
             };
             match prepared {
                 Ok(prepared) => {
-                    self.dispatch(tenant, run, spec, system, state, telemetry, &work, prepared)
-                        .await
+                    self.dispatch(
+                        tenant, run, verifier, system, state, telemetry, &work, prepared,
+                    )
+                    .await
                 }
                 Err(outcome) => outcome,
             }
@@ -947,7 +956,7 @@ impl VerifierRunner {
         Ok(())
     }
 
-    /// Run `spec` over the claimed execution's `prepared` input.
+    /// Run `verifier` over the claimed execution's `prepared` input.
     ///
     /// The engine executes as the authority accepted with the execution,
     /// executed by `system`, with model calls attributed to the verified Card
@@ -966,7 +975,7 @@ impl VerifierRunner {
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
-        spec: &Arc<VerifierSpec>,
+        verifier: &Target,
         system: PrincipalId,
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
@@ -974,12 +983,17 @@ impl VerifierRunner {
         (drift, evidence, routes, run_id): Prepared,
     ) -> EngineOutcome {
         let caller = Caller::accepted(&run.authority, system);
+        let verifier_scope = CardPermissionScope::version(
+            verifier.verifier.kind.clone(),
+            verifier.verifier.name.clone(),
+            run.verifier_card_uid.clone(),
+        );
         let engine = telemetry.time(Phase::Setup, || {
             self.blocks.engine(
                 &self.state,
                 Execution {
                     caller: &caller,
-                    verifier: &run.verifier_card_uid,
+                    verifier: &verifier_scope,
                     routes: &routes,
                     subject: GatewayCallContext {
                         workload_card_uid: run
@@ -1018,7 +1032,7 @@ impl VerifierRunner {
             .with_approvals(decisions)
             .with_host_work(work.clone());
         match engine
-            .run(Arc::clone(spec), evidence, state.deadline())
+            .run(Arc::clone(&verifier.spec), evidence, state.deadline())
             .await
         {
             Ok(outcome) => EngineOutcome::Completed(outcome),
@@ -1209,11 +1223,17 @@ impl VerifierRunner {
     /// ID, and a lost lease leaves the result written for a run another claim
     /// re-executes.
     ///
+    /// Once the settlement commits, the status it recorded is staged on the
+    /// Scribe outbox as the execution's status row, stamped with the instant
+    /// this settlement began; a stale lease, a failed transaction, and
+    /// [`Transition::LeaseLost`] stage nothing. Staging never waits, and a
+    /// lost row fails nothing.
+    ///
     /// Returns the stable outcome label: `completed`, `retrying`,
     /// `exhausted`, `cancelled`, `timed_out`, `errored`,
-    /// `released`, `deferred`, or `stale_lease` when another claim already
-    /// holds the run. [`Transition::LeaseLost`] opens no transaction and is
-    /// `stale_lease`.
+    /// `released`, `deferred`, `parked`, or `stale_lease` when another claim
+    /// already holds the run. [`Transition::LeaseLost`] opens no transaction
+    /// and is `stale_lease`.
     ///
     /// # Errors
     /// Returns [`SettleError`] when the transaction or the batch holding the
@@ -1227,6 +1247,36 @@ impl VerifierRunner {
         if transition == Transition::LeaseLost {
             return Ok("stale_lease");
         }
+        let occurred_at = Utc::now();
+        let (outcome, status) = self.apply(tenant, run, transition).await?;
+        if let Some(status) = status {
+            self.outbox.stage(
+                tenant,
+                ScribeWrite::status(
+                    run.lease.execution_id,
+                    &run.verifier_card_uid,
+                    &run.card_uid,
+                    status,
+                    run.attribution,
+                    occurred_at,
+                ),
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Commit `transition` for claimed `run`, through the group commit for a
+    /// completion, returning [`Self::settle`]'s outcome label and the status
+    /// the committed settlement recorded, `None` for a stale lease.
+    ///
+    /// # Errors
+    /// As [`Self::settle`].
+    async fn apply(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        transition: Transition,
+    ) -> Result<Recorded, SettleError> {
         let lease = run.lease;
         if let Transition::Complete {
             result_id,
@@ -1245,7 +1295,11 @@ impl VerifierRunner {
                 pr_source_extracted: *pr_source_extracted,
             };
             if let Some(settlement) = self.completions.complete(tenant, completion).await? {
-                return Ok(settled(settlement, "completed"));
+                return Ok(recorded(
+                    settlement,
+                    "completed",
+                    VerificationExecutionStatus::Completed,
+                ));
             }
         }
         Ok(self.settle_alone(tenant, run, transition).await?)
@@ -1254,7 +1308,9 @@ impl VerifierRunner {
     /// Apply `transition` to claimed `run` in its own tenant transaction,
     /// outside the group commit.
     ///
-    /// Returns the same outcome labels as [`Self::settle`].
+    /// Returns the same outcome labels and statuses as [`Self::apply`]. A
+    /// park records `waiting`, which the queue never stores: it returns the
+    /// run as `pending` or `retrying` until a wake or recheck claims it.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the transaction fails; nothing is applied.
@@ -1263,7 +1319,7 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedExecution,
         transition: Transition,
-    ) -> Result<&'static str, SqlError> {
+    ) -> Result<Recorded, SqlError> {
         let lease = run.lease;
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let outcome = match transition {
@@ -1283,7 +1339,11 @@ impl VerifierRunner {
                     pr_source_extracted,
                 };
                 let settlement = self.queue.complete(&mut conn, &completion).await?;
-                settled(settlement, "completed")
+                recorded(
+                    settlement,
+                    "completed",
+                    VerificationExecutionStatus::Completed,
+                )
             }
             Transition::Retry(error) => {
                 tracing::warn!(
@@ -1293,18 +1353,23 @@ impl VerifierRunner {
                     "verification attempt failed"
                 );
                 match self.queue.retry(&mut conn, lease, &error).await? {
-                    RetryOutcome::Scheduled(_) => "retrying",
-                    RetryOutcome::Exhausted => "exhausted",
-                    RetryOutcome::StaleLease => "stale_lease",
+                    RetryOutcome::Scheduled(_) => {
+                        ("retrying", Some(VerificationExecutionStatus::Retrying))
+                    }
+                    RetryOutcome::Exhausted => {
+                        ("exhausted", Some(VerificationExecutionStatus::Errored))
+                    }
+                    RetryOutcome::StaleLease => ("stale_lease", None),
                 }
             }
-            Transition::Terminate(status, error) => settled(
+            Transition::Terminate(status, error) => recorded(
                 self.queue
                     .terminate(&mut conn, lease, status, &error)
                     .await?,
                 terminal_label(status),
+                execution_status(status),
             ),
-            Transition::Release => settled(
+            Transition::Release => released(
                 self.queue
                     .release(&mut conn, lease, chrono::Duration::zero())
                     .await?,
@@ -1317,7 +1382,7 @@ impl VerifierRunner {
                     message = %error.message,
                     "verification execution deferred by admission backpressure"
                 );
-                settled(
+                released(
                     self.queue.release(&mut conn, lease, self.poll()).await?,
                     "deferred",
                 )
@@ -1325,12 +1390,12 @@ impl VerifierRunner {
             Transition::Park(recheck) => {
                 let recheck = chrono::Duration::from_std(recheck)
                     .unwrap_or_else(|_| chrono::Duration::zero());
-                settled(
-                    self.queue.release(&mut conn, lease, recheck).await?,
-                    "parked",
-                )
+                match self.queue.release(&mut conn, lease, recheck).await? {
+                    Some(_) => ("parked", Some(VerificationExecutionStatus::Waiting)),
+                    None => ("stale_lease", None),
+                }
             }
-            Transition::LeaseLost => "stale_lease",
+            Transition::LeaseLost => ("stale_lease", None),
         };
         conn.commit().await?;
         Ok(outcome)
@@ -1390,6 +1455,7 @@ impl LeasedWork for VerifierRunner {
         let deadline = chrono::Duration::from_std(self.limits.execution_timeout)
             .unwrap_or_else(|_| chrono::Duration::minutes(5));
         let claimed = self.queue.claim(conn, lease, deadline, limit).await?;
+        let claimed_at = Utc::now();
         let statement_us = u64::try_from(resolving.elapsed().as_micros()).unwrap_or(u64::MAX);
         let batch = claimed.len();
         for run in claimed {
@@ -1438,6 +1504,7 @@ impl LeasedWork for VerifierRunner {
                 run,
                 verifier,
                 loaded: (resolving, Instant::now()),
+                claimed_at,
                 span,
             });
         }
@@ -1460,17 +1527,19 @@ impl LeasedWork for VerifierRunner {
         abandon: CancellationToken,
         spawned_at: Instant,
     ) -> bool {
+        self.running(tenant, &claim);
         let AttemptClaim {
             run,
             verifier,
             loaded,
             span,
+            ..
         } = claim;
         span.record(
             "task_start_delay_us",
             u64::try_from(spawned_at.elapsed().as_micros()).unwrap_or(u64::MAX),
         );
-        self.attempt(tenant, &run, verifier, loaded, &stop, &abandon)
+        Box::pin(self.attempt(tenant, &run, verifier, loaded, &stop, &abandon))
             .instrument(span)
             .await
     }
@@ -1481,6 +1550,7 @@ impl LeasedWork for VerifierRunner {
     /// Uses the same fenced release transition as the drain. A failed release
     /// is logged; the lease then expires into a reclaim.
     async fn release_late(&self, tenant: DataTenantId, claim: &AttemptClaim) {
+        self.running(tenant, claim);
         let run = &claim.run;
         match self.settle(tenant, run, Transition::Release).await {
             Ok(outcome) => {
@@ -1494,6 +1564,24 @@ impl LeasedWork for VerifierRunner {
 }
 
 impl VerifierRunner {
+    /// Stage committed `claim`'s `running` status row, stamped with the
+    /// instant its claim statement ran, so a cancellation committed after
+    /// the claim but before this call still records after it.
+    fn running(&self, tenant: DataTenantId, claim: &AttemptClaim) {
+        let run = &claim.run;
+        self.outbox.stage(
+            tenant,
+            ScribeWrite::status(
+                run.lease.execution_id,
+                &run.verifier_card_uid,
+                &run.card_uid,
+                VerificationExecutionStatus::Running,
+                run.attribution,
+                claim.claimed_at,
+            ),
+        );
+    }
+
     /// Execute one claimed run inside its attempt span and settle it.
     ///
     /// The claim's Verifier resolution is recorded as the `load` phase. The
@@ -1978,6 +2066,32 @@ impl Transition {
             Self::Retry(error) | Self::Terminate(_, error) | Self::Defer(error) => Some(error),
             Self::Complete { .. } | Self::Release | Self::Park(_) | Self::LeaseLost => None,
         }
+    }
+}
+
+/// A settlement's stable outcome label and the status it recorded, `None`
+/// when it changed nothing.
+type Recorded = (&'static str, Option<VerificationExecutionStatus>);
+
+/// `label` recording `status` when `settlement` applied, else a stale lease
+/// recording nothing.
+const fn recorded(
+    settlement: Settlement,
+    label: &'static str,
+    status: VerificationExecutionStatus,
+) -> Recorded {
+    match settlement {
+        Settlement::Applied => (label, Some(status)),
+        Settlement::StaleLease => ("stale_lease", None),
+    }
+}
+
+/// `label` recording the status a release returned the run to, else a
+/// stale lease recording nothing.
+const fn released(status: Option<VerificationExecutionStatus>, label: &'static str) -> Recorded {
+    match status {
+        Some(status) => (label, Some(status)),
+        None => ("stale_lease", None),
     }
 }
 

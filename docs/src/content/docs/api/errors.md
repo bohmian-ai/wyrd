@@ -75,9 +75,12 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_TOKEN_EXPIRED` | 401 | Token expired | Re-authenticate to obtain a fresh token. |
 | `WYRD_AUTH_401_UNAUTHENTICATED` | 401 | Not authenticated | Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer &lt;token&gt;`. |
 | `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` | 401 | Workload root refused | `workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID. |
+| `WYRD_AUTH_403_METHOD_UNAVAILABLE` | 403 | Method not available | Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it. |
 | `WYRD_AUTH_403_ORIGIN_REFUSED` | 403 | Request origin refused | Send browser-session requests from the Wyrd application's own origin; cross-site and origin-less browser-session mutations are refused. |
 | `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
-| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one. |
+| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with a method the operation accepts, then retry within five minutes; an API key or recovery session cannot prove a recent sign-in. |
+| `WYRD_AUTH_403_SIGNUP_CHALLENGE` | 403 | Signup challenge not passed | Complete the human check on the signup page again and resubmit; each token is used once. |
+| `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT` | 403 | Workspace limit reached | Sign in to a workspace this identity already owns, or ask an operator to retire one; retrying does not help. |
 | `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION` | 403 | Delegated permissions cannot be represented | The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant. |
 | `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | 403 | Workload context required | This account is restricted to one workload family, so Card-attributed emission needs the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root. |
 | `WYRD_AUTH_404_ADMIN_NOT_FOUND` | 404 | Admin resource not found in tenant | Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant. |
@@ -87,7 +90,11 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` | 409 | Tenant OIDC candidate is not freshly tested | Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test. |
 | `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
 | `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
+| `WYRD_AUTH_429_EMAIL_ATTEMPTS` | 429 | Too many email requests | Wait `details.retry_after_seconds` until the fixed email window ends, then ask again. |
 | `WYRD_AUTH_429_PASSWORD_ATTEMPTS` | 429 | Too many password attempts | Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again. |
+| `WYRD_AUTH_429_SIGNUP_ATTEMPTS` | 429 | Too many workspace signups | Wait `details.retry_after_seconds` until the fixed signup window ends, then try again. |
+| `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` | 429 | Too many sign-in starts | Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again. |
+| `WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE` | 503 | Authorization state unavailable | Retry with backoff. The credential is still valid; the server cannot confirm current grants until its database is reachable. |
 | `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` | 503 | OIDC discovery unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure. |
 | `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | 503 | Auth verify backend unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure. |
 
@@ -184,6 +191,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` | 403 | GitHub repository not accessible | Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it. |
 | `WYRD_GITHUB_404_NOT_CONNECTED` | 404 | GitHub not connected | Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser. |
 | `WYRD_GITHUB_409_CONNECTION_CONFLICT` | 409 | GitHub connection conflict | An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed. |
+| `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` | 409 | Pull request not reviewable | Request a review only for an open, ready pull request of a repository whose selected Repository declares pull_request bindings; details.reason is not_found, closed, draft or no_bindings, and no work was accepted. |
 | `WYRD_GITHUB_503_NOT_CONFIGURED` | 503 | GitHub integration not configured | Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected. |
 | `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | 503 | GitHub unavailable | Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy. |
 
@@ -467,7 +475,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_400_INGEST_PROTO` | 400 | Invalid ingest request | Fix the ingest request fields and retry with a valid Wyrd ingest payload. |
 | `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` | 400 | OTLP request body malformed | The OTLP request body could not be decoded. Verify the Content-Type matches the encoding (application/x-protobuf or application/json) and that the payload is a valid OTLP ExportRequest. |
 | `WYRD_VALA_400_PAGE_TOKEN_INVALID` | 400 | Page token invalid | Restart the query from page 1 without a page_token. |
-| `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected. |
+| `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement, or one EXPLAIN [ANALYZE] of it; DDL/DML and unsupported constructs are rejected. |
 | `WYRD_VALA_400_SCHEMA_PARSE` | 400 | Bifrost schema parse failed | Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data. |
 | `WYRD_VALA_400_VARIANT_INVALID_JSON` | 400 | Invalid Variant JSON | Supply valid JSON text or a valid arrow.parquet.variant value for the Variant field; use try_parse_json in SQL to map invalid text to null. |
 | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` | 400 | Variant numeric value out of range | Send integers within the signed 64-bit or Variant decimal range, or send the number as a string. |

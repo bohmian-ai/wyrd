@@ -2,9 +2,11 @@
 //!
 //! [`GithubConnections`] is the one owner of connect, read, disconnect,
 //! GitHub's setup and OAuth callback redirects, installation webhooks and
-//! narrowed installation tokens. Every caller operation evaluates
-//! `identity_connections:write` and stages the decision on the process audit
-//! outbox before it runs. A connection transaction is one-use login state
+//! narrowed installation tokens. The read evaluates `github_connections:read`
+//! and every other caller operation `github_connections:write`, the GitHub
+//! configuration permission that confers neither OIDC administration nor
+//! tenant data; each stages the decision on the process audit outbox before
+//! it runs. A connection transaction is one-use login state
 //! bound to the beginning principal, its tenant and, from GitHub's setup
 //! redirect on, one browser; the callback consumes it before any provider IO
 //! and associates only after GitHub confirms the installation and the
@@ -41,12 +43,13 @@ use wyrd_sql::queries::github_installations::{
     associate_github_installation, github_installation, lock_github_installation,
     release_github_installation, remove_github_repositories, set_github_installation_suspended,
 };
-use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
+use wyrd_sql::queries::verifier_executions::{CancelledExecution, VerifierExecutionQueue};
 
 use super::app::{GithubApp, refused, unavailable};
 use super::pull_requests::PullRequestEvent;
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::scribe_outbox::stage_cancelled;
 use crate::state::{AppState, registry_db_error};
 
 /// Audit operation of a connect.
@@ -185,19 +188,19 @@ impl<'a> GithubConnections<'a> {
         Ok(self.app()?.settings().host())
     }
 
-    /// Evaluate `identity_connections:write` for `operation` and stage the
-    /// decision on the process audit outbox.
+    /// Evaluate the GitHub configuration permission `operation` needs,
+    /// `github_connections:read` for the read and `github_connections:write`
+    /// otherwise, and stage the decision on the process audit outbox.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without it.
     fn authorize(&self, caller: &Caller, operation: &str) -> Result<(), WyrdError> {
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::identity_connections_write(),
-            operation,
-            RESOURCE,
-        )
+        let permission = if operation == READ {
+            Permission::github_connections_read()
+        } else {
+            Permission::github_connections_write()
+        };
+        audit::authorize(self.state, caller, &permission, operation, RESOURCE)
     }
 
     /// A tenant connection for `tenant`.
@@ -360,14 +363,17 @@ impl<'a> GithubConnections<'a> {
         let app = self.app()?;
         self.authorize(caller, DISCONNECT)?;
         let mut conn = self.conn(caller.data_tenant_id).await?;
-        let Some(released) = Self::fence_and_release(&mut conn, None).await? else {
+        let (released, cancelled) = Self::fence_and_release(&mut conn, None).await?;
+        let Some(released) = released else {
             conn.commit().await.map_err(registry_db_error)?;
             return Err(WyrdError::GithubNotConnected {
                 message: "this tenant has no GitHub installation associated".to_owned(),
                 details: serde_json::json!({}),
             });
         };
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        self.record_cancelled(caller.data_tenant_id, cancelled, occurred_at);
         tracing::info!(revision = released.revision, "GitHub connection released");
         Ok(Self::view(app, Some(&released)))
     }
@@ -382,31 +388,34 @@ impl<'a> GithubConnections<'a> {
     /// `repository_access_lost`, keeping their history. Once it commits,
     /// [`Self::installation_token`] refuses every repository of the
     /// installation and discards any token GitHub was still minting under
-    /// the released revision.
+    /// the released revision. Returns the released association and the
+    /// executions cancelled, which the caller records once it commits.
     ///
     /// # Errors
     /// Returns a registry error.
     async fn fence_and_release(
         conn: &mut TenantConn<'_>,
         only: Option<(&str, i64)>,
-    ) -> Result<Option<GithubInstallationRow>, WyrdError> {
+    ) -> Result<(Option<GithubInstallationRow>, Vec<CancelledExecution>), WyrdError> {
         let held = lock_github_installation(conn)
             .await
             .map_err(registry_db_error)?;
         let released = release_github_installation(conn, only)
             .await
             .map_err(registry_db_error)?;
+        let mut cancelled = Vec::new();
         if released.is_some()
             && let Some(host) = held.as_ref().and_then(|row| row.host.as_deref())
         {
-            Self::access_lost(conn, host, None).await?;
+            cancelled = Self::access_lost(conn, host, None).await?;
         }
-        Ok(released)
+        Ok((released, cancelled))
     }
 
     /// Cancel the unfinished pull-request executions of `host`'s
     /// `repositories`, or of every repository when `None`, with
-    /// `repository_access_lost`, in the caller's transaction.
+    /// `repository_access_lost`, in the caller's transaction. Returns the
+    /// executions cancelled, which the caller records once it commits.
     ///
     /// # Errors
     /// Returns a registry error.
@@ -414,18 +423,34 @@ impl<'a> GithubConnections<'a> {
         conn: &mut TenantConn<'_>,
         host: &str,
         repositories: Option<&[String]>,
-    ) -> Result<(), WyrdError> {
+    ) -> Result<Vec<CancelledExecution>, WyrdError> {
         let cancelled = VerifierExecutionQueue::default()
             .cancel_pull_request_repositories(conn, host, repositories)
             .await
             .map_err(registry_db_error)?;
-        if cancelled > 0 {
+        if !cancelled.is_empty() {
             tracing::info!(
-                cancelled,
+                cancelled = cancelled.len(),
                 "pull-request work cancelled on repository access loss"
             );
         }
-        Ok(())
+        Ok(cancelled)
+    }
+
+    /// Record `cancelled`, committed at `occurred_at` in `tenant`, as each
+    /// execution's `cancelled` status on the process Scribe outbox.
+    fn record_cancelled(
+        &self,
+        tenant: DataTenantId,
+        cancelled: Vec<CancelledExecution>,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        stage_cancelled(
+            self.state.bifrost.scribe_outbox(),
+            tenant,
+            cancelled,
+            occurred_at,
+        );
     }
 
     /// GitHub's setup redirect reached the caller's signed-in browser: bind
@@ -702,9 +727,13 @@ impl<'a> GithubConnections<'a> {
                 .await;
         }
         let mut conn = self.conn(tenant).await?;
+        let mut cancelled = Vec::new();
         let changed = match (event, payload.action.as_deref()) {
             ("installation", Some("deleted")) => {
-                Self::fence_and_release(&mut conn, Some((&host, installation_id))).await?
+                let (released, fenced) =
+                    Self::fence_and_release(&mut conn, Some((&host, installation_id))).await?;
+                cancelled = fenced;
+                released
             }
             ("installation_repositories", Some("removed")) => {
                 let removed: Vec<String> = payload
@@ -717,13 +746,15 @@ impl<'a> GithubConnections<'a> {
                         .await
                         .map_err(registry_db_error)?;
                 if changed.is_some() {
-                    Self::access_lost(&mut conn, &host, Some(&removed)).await?;
+                    cancelled = Self::access_lost(&mut conn, &host, Some(&removed)).await?;
                 }
                 changed
             }
             _ => None,
         };
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        self.record_cancelled(tenant, cancelled, occurred_at);
         if let Some(row) = changed {
             tracing::info!(
                 event,
@@ -772,10 +803,13 @@ impl<'a> GithubConnections<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(connection_changed)?;
+        let mut cancelled = Vec::new();
         if current.suspended {
-            Self::access_lost(&mut conn, &app.settings().host(), None).await?;
+            cancelled = Self::access_lost(&mut conn, &app.settings().host(), None).await?;
         }
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        self.record_cancelled(tenant, cancelled, occurred_at);
         tracing::info!(
             suspended = current.suspended,
             revision = row.revision,

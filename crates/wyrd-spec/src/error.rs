@@ -590,6 +590,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The sign-in, enrollment, recovery or signup method requested is not
+    /// offered now: the operator disabled it, the tenant requires company
+    /// SSO, or a prerequisite such as signup or its mail relay is absent.
+    #[error("[WYRD_AUTH_403_METHOD_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+        status = 403,
+        title = "Method not available",
+        remediation = "Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it."
+    )]
+    MethodUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A local username and password did not sign in: an unknown username, a
     /// wrong password, a suspended User, or an account without a local
     /// password, indistinguishably.
@@ -621,6 +637,84 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Too many workspace creations in the current fixed window, from this
+    /// source or for this provider identity.
+    #[error("[WYRD_AUTH_429_SIGNUP_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_SIGNUP_ATTEMPTS",
+        status = 429,
+        title = "Too many workspace signups",
+        remediation = "Wait `details.retry_after_seconds` until the fixed signup window ends, then try again."
+    )]
+    SignupAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Too many unauthenticated sign-in starts from this source in the
+    /// current fixed window; the start recorded nothing.
+    #[error("[WYRD_AUTH_429_SIGN_IN_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_SIGN_IN_ATTEMPTS",
+        status = 429,
+        title = "Too many sign-in starts",
+        remediation = "Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again."
+    )]
+    SignInAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Too many emailed-proof requests (workspace discovery, contact
+    /// verification, password reset) from this source or for this account in
+    /// the current fixed window; nothing was mailed.
+    #[error("[WYRD_AUTH_429_EMAIL_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_EMAIL_ATTEMPTS",
+        status = 429,
+        title = "Too many email requests",
+        remediation = "Wait `details.retry_after_seconds` until the fixed email window ends, then ask again."
+    )]
+    EmailAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The proven identity already owns the deployment's owned-workspace cap
+    /// of signup-created workspaces that are not retired. Waiting does not
+    /// clear it.
+    #[error("[WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT",
+        status = 403,
+        title = "Workspace limit reached",
+        remediation = "Sign in to a workspace this identity already owns, or ask an operator to retire one; retrying does not help."
+    )]
+    SignupWorkspaceLimit {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The configured human challenge refused this workspace creation: the
+    /// token is missing, invalid, expired, already used, or was solved on
+    /// another hostname or for another action.
+    #[error("[WYRD_AUTH_403_SIGNUP_CHALLENGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_SIGNUP_CHALLENGE",
+        status = 403,
+        title = "Signup challenge not passed",
+        remediation = "Complete the human check on the signup page again and resubmit; each token is used once."
+    )]
+    SignupChallenge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// An enrollment invitation or password-reset code is malformed, unknown,
     /// expired, revoked, already used, or for another tenant,
     /// indistinguishably.
@@ -644,7 +738,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
         status = 403,
         title = "Recent sign-in required",
-        remediation = "Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one."
+        remediation = "Sign in again with a method the operation accepts, then retry within five minutes; an API key or recovery session cannot prove a recent sign-in."
     )]
     RecentLoginRequired {
         /// Human-readable error message.
@@ -1143,6 +1237,23 @@ pub enum WyrdError {
         remediation = "Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure."
     )]
     AuthVerifyUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The server holds no usable current authorization state for the
+    /// tenant: none was loaded, a newer committed change is known but not yet
+    /// applied, or database confirmation has failed for longer than the
+    /// freshness bound. Never a missing-permission decision.
+    #[error("[WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE",
+        status = 503,
+        title = "Authorization state unavailable",
+        remediation = "Retry with backoff. The credential is still valid; the server cannot confirm current grants until its database is reachable."
+    )]
+    AuthorizationUnavailable {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2558,6 +2669,20 @@ pub enum WyrdError {
         remediation = "Send the documented query parameters or JSON body; details.field names the rejected part."
     )]
     GithubRequestInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A fresh review was requested for a pull request that cannot be reviewed now.
+    #[error("[WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE",
+        status = 409,
+        title = "Pull request not reviewable",
+        remediation = "Request a review only for an open, ready pull request of a repository whose selected Repository declares pull_request bindings; details.reason is not_found, closed, draft or no_bindings, and no work was accepted."
+    )]
+    GithubPullRequestNotReviewable {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -4115,8 +4240,14 @@ impl WyrdError {
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
             | Self::OriginRefused { message, details }
+            | Self::MethodUnavailable { message, details }
             | Self::PasswordInvalid { message, details }
             | Self::PasswordAttempts { message, details }
+            | Self::SignupAttempts { message, details }
+            | Self::SignInAttempts { message, details }
+            | Self::EmailAttempts { message, details }
+            | Self::SignupWorkspaceLimit { message, details }
+            | Self::SignupChallenge { message, details }
             | Self::OneTimeCodeInvalid { message, details }
             | Self::RecentLoginRequired { message, details }
             | Self::DeviceAuthorization { message, details }
@@ -4155,6 +4286,7 @@ impl WyrdError {
             | Self::GatewayUpstreamUnavailable { message, details }
             | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }
+            | Self::AuthorizationUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
             | Self::MissingRequiredField { message, details }
             | Self::PermissionUnauthenticated { message, details }
@@ -4311,6 +4443,7 @@ impl WyrdError {
             | Self::GithubRepositoryInaccessible { message, details }
             | Self::GithubWebhookRefused { message, details }
             | Self::GithubRequestInvalid { message, details }
+            | Self::GithubPullRequestNotReviewable { message, details }
             | Self::SpecTriggerActivationMismatch { message, details }
             | Self::SpecInvalidServiceComponentKind { message, details }
             | Self::SpecUnboundVerifierPeer { message, details }
@@ -4530,6 +4663,15 @@ impl WyrdError {
         Self::WorkloadContextRequired {
             message: message.into(),
             details: serde_json::json!({ "reason": "workload_context_required" }),
+        }
+    }
+
+    /// Construct [`WyrdError::AuthorizationUnavailable`] for `reason`.
+    #[must_use]
+    pub fn authorization_unavailable(reason: &'static str) -> Self {
+        Self::AuthorizationUnavailable {
+            message: format!("current authorization state is unavailable: {reason}"),
+            details: serde_json::json!({ "reason": reason }),
         }
     }
 
@@ -5055,6 +5197,10 @@ mod tests {
                 message: "browser request origin refused".to_owned(),
                 details: serde_json::json!({}),
             },
+            WyrdError::MethodUnavailable {
+                message: "password sign-in is not available for this workspace".to_owned(),
+                details: serde_json::json!({ "reason": "method_unavailable" }),
+            },
             WyrdError::PasswordInvalid {
                 message: "username or password not accepted".to_owned(),
                 details: serde_json::json!({}),
@@ -5062,6 +5208,26 @@ mod tests {
             WyrdError::PasswordAttempts {
                 message: "too many password attempts".to_owned(),
                 details: serde_json::json!({ "retry_after_seconds": 900 }),
+            },
+            WyrdError::SignupAttempts {
+                message: "too many workspace signups".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 3600 }),
+            },
+            WyrdError::SignInAttempts {
+                message: "too many sign-in starts".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 3600 }),
+            },
+            WyrdError::EmailAttempts {
+                message: "too many email requests".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 3600 }),
+            },
+            WyrdError::SignupWorkspaceLimit {
+                message: "workspace limit reached".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::SignupChallenge {
+                message: "signup challenge not passed".to_owned(),
+                details: serde_json::json!({}),
             },
             WyrdError::OneTimeCodeInvalid {
                 message: "one-time code not accepted".to_owned(),
@@ -5117,6 +5283,10 @@ mod tests {
             },
             WyrdError::AuthVerifyUnavailable {
                 message: "permission resolver unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::AuthorizationUnavailable {
+                message: "authorization state unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::DiscoveryUnavailable {

@@ -166,6 +166,20 @@ function query(sql: string, params: readonly QueryParam[], max_rows?: number, ma
  */
 async function predicateFor(table: string, whereSql: string | undefined, context: LoadContext): Promise<{ sql?: string } | Loaded<never>> {
   if (!whereSql?.trim()) return {};
+  // Panels of one refresh share its context, so they share one validation; the memo dies with the context.
+  const memo = VALIDATED.get(context) ?? new Map<string, Promise<{ sql?: string } | Loaded<never>>>();
+  VALIDATED.set(context, memo);
+  const key = `${table}\n${whereSql}`;
+  const shared = memo.get(key) ?? validatePredicate(table, whereSql, context);
+  memo.set(key, shared);
+  return shared;
+}
+
+/** Each load context's predicate validations, by table and expression. */
+const VALIDATED = new WeakMap<LoadContext, Map<string, Promise<{ sql?: string } | Loaded<never>>>>();
+
+/** One `bifrost.validate_predicate` round trip; see {@link predicateFor}. */
+async function validatePredicate(table: string, whereSql: string, context: LoadContext): Promise<{ sql?: string } | Loaded<never>> {
   const dot = table.lastIndexOf('.');
   const [checked] = await context.executor.run(
     [{ op: 'bifrost.validate_predicate', namespace: table.slice(0, dot), name: table.slice(dot + 1), expression: whereSql }],
@@ -205,41 +219,67 @@ const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; f
   cost: { table: 'bifrost.gateway.calls', time: 'started_at', value: 'sum(CAST(cost AS DECIMAL(38, 12)))', filter: 'cost IS NOT NULL', byCurrency: true }
 };
 
-/** The total and per-bucket reads of one stat. */
-export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRange, bucket: string, predicate?: string): [Executed, Executed] {
-  const source = STAT_SOURCES[stat];
-  const filtered = source.table === SIGNALS.spans.table || source.table === SIGNALS.logs.table;
-  const plan = (series: boolean) => {
+/**
+ * The strip's reads: one per population, the stats over the same table, time
+ * column, root restriction and currency grouping. Each read scans once and
+ * groups per bucket and over the whole range by grouping sets; `whole` is 1
+ * on range rows. Stat `i` of the input reads column `s<i>`; a filter its
+ * population does not share becomes that aggregate's `FILTER`, and `m<i>`
+ * counts the rows it matched, so a bucket only the population recorded is
+ * not one of that stat's buckets.
+ */
+export function statQueries(input: StatStripInput, range: AbsoluteRange, bucket: string, predicate?: string): (Executed & { readonly stats: readonly number[] })[] {
+  const populations = new Map<string, number[]>();
+  input.stats.forEach((stat, index) => {
+    const source = STAT_SOURCES[stat];
+    const key = [source.table, source.time, source.roots, source.byCurrency].join('|');
+    populations.set(key, [...(populations.get(key) ?? []), index]);
+  });
+  return [...populations.values()].map((stats) => {
+    const sources = stats.map((index) => STAT_SOURCES[input.stats[index]]);
+    const [source] = sources;
+    const shared = sources.every((each) => each.filter === source.filter) ? source.filter : undefined;
     const binds = Binds.over(source.time, range);
-    const bin = series ? `date_bin(${binds.bind(bucket)}::interval, ${source.time})` : '';
-    if (source.filter) binds.clauses.push(source.filter);
+    const bin = `date_bin(${binds.bind(bucket)}::interval, ${source.time})`;
+    if (shared) binds.clauses.push(shared);
     if (input.scope) binds.clauses.push(`${input.scope.column} = ${binds.bind(input.scope.uid)}`);
-    if (filtered) binds.where(input.where).predicate(predicate);
+    if (source.table === SIGNALS.spans.table || source.table === SIGNALS.logs.table) binds.where(input.where).predicate(predicate);
     if (source.roots) binds.roots(source.table);
-    const currency = source.byCurrency ? ', currency' : '';
-    const sql = series
-      ? `SELECT ${bin} AS at, ${source.value} AS value${currency} FROM ${source.table} WHERE ${binds.sql} GROUP BY ${bin}${currency} ORDER BY at`
-      : `SELECT ${source.value} AS value${currency} FROM ${source.table} WHERE ${binds.sql}${currency ? ` GROUP BY currency ORDER BY currency` : ''}`;
-    return { sql, params: binds.params };
-  };
-  return [plan(false), plan(true)];
+    const values = stats
+      .map((index, at) => {
+        const filter = sources[at].filter && !shared ? ` FILTER (WHERE ${sources[at].filter})` : '';
+        return `${sources[at].value}${filter} AS s${index}${filter ? `, count(*)${filter} AS m${index}` : ''}`;
+      })
+      .join(', ');
+    const [currency, sets] = source.byCurrency ? [', currency', '(at, currency), (currency)'] : ['', '(at), ()'];
+    return {
+      stats,
+      sql: `SELECT grouping(at) AS whole, at, ${values}${currency} FROM (SELECT ${bin} AS at, * FROM ${source.table} WHERE ${binds.sql}) AS scoped GROUP BY GROUPING SETS (${sets}) ORDER BY whole, at${currency}`,
+      params: binds.params
+    };
+  });
 }
 
-/** Load each stat's total and series in one batch; one refusal refuses the strip. */
+/** Load the strip's population reads in one batch; one refusal refuses the strip. */
 export async function loadStatStrip(input: StatStripInput, context: LoadContext): Promise<StatStripProps> {
   const range = rangeOf(input.range, context);
   if ('code' in range) return { input, result: { state: 'error', problem: range } };
   const predicate = await predicateFor(SIGNALS[logStats(input.stats) ? 'logs' : 'spans'].table, input.where_sql, context);
   if ('state' in predicate) return { input, result: predicate };
-  const plans = input.stats.map((stat) => statQueries(stat, input, range, bucketFor(range), predicate.sql));
-  const results = await context.executor.run(plans.flatMap(([total, series]) => [query(total.sql, total.params), query(series.sql, series.params)]), context.signal);
+  const plans = statQueries(input, range, bucketFor(range), predicate.sql);
+  const results = await context.executor.run(plans.map((plan) => query(plan.sql, plan.params)), context.signal);
   const failure = firstFailure(results);
   if (failure) return { input, result: failure };
-  const stats = input.stats.map((stat, index) => ({
-    stat,
-    total: (results[index * 2] as { value: QueryResult }).value,
-    series: (results[index * 2 + 1] as { value: QueryResult }).value
-  }));
+  const reads = new Map(plans.flatMap((plan, at) => plan.stats.map((index) => [index, (results[at] as { value: QueryResult }).value] as const)));
+  const stats = input.stats.map((stat, index) => {
+    const all = reads.get(index) as QueryResult;
+    // A filtered stat's buckets are those where its filter matched a row, as its own WHERE would group them.
+    const matched = all.columns.findIndex((column) => column.name === `m${index}`);
+    const read = matched < 0 ? all : { ...all, rows: all.rows.filter((row) => Number(row[0]) === 1 || Number(row[matched]) > 0) };
+    const value = [`s${index}`, 'value'] as const;
+    const currency = STAT_SOURCES[stat].byCurrency ? ['currency'] : [];
+    return { stat, total: wholeRows(read, 1, [value, ...currency]), series: wholeRows(read, 0, ['at', value, ...currency]) };
+  });
   const recorded = stats.some(({ total }) => total.rows.some((row) => row[0] !== null && Number(row[0]) !== 0));
   if (!recorded) {
     const tables = [...new Set(input.stats.map((stat) => (stat === 'tokens' ? 'bifrost.gateway.calls usage' : STAT_SOURCES[stat].table)))].join(' or ');
@@ -255,37 +295,73 @@ function scopeText(input: StatStripInput): string {
 
 /** Why a signal list is empty, naming the table, its event-time column and the WHERE that would have to match. */
 function emptyList(signal: Signal, where: readonly Filter[] = []): string {
+  if (signal === 'executions') return 'No execution matches these filters in this window.';
   const what = signal === 'traces' ? 'root spans' : 'rows';
   const matching = where.length ? ` matching ${where.map((filter) => filter.column).join(', ')}` : '';
   return `No ${what} in ${SIGNALS[signal].table} with ${SIGNALS[signal].time} in this range${matching}.`;
 }
 
-/** Facet counts of one column under the list's own WHERE and range. */
-export function facetQuery(input: FacetRailInput, column: string, range: AbsoluteRange, predicate?: string): Executed {
+/**
+ * Value counts of every facet under the list's own WHERE and range, in one
+ * grouping-set aggregate: one grouping set per distinct facet column, a
+ * `facet` index naming the set, each facet's value in its own typed `f<i>`
+ * column, and the first {@link FACET_VALUES} + 1 values per facet by count,
+ * then value, so an eleventh row still reports that more exist.
+ */
+export function facetsQuery(input: FacetRailInput, range: AbsoluteRange, predicate?: string): Executed {
   const signal = SIGNALS[input.signal];
   const binds = Binds.over(signal.time, range);
   binds.where(input.where).predicate(predicate);
+  const columns = [...new Set(input.facets)];
   // A trace facet counts the traces with a span of each value, under the same span-level WHERE.
   const n = input.signal === 'traces' ? 'count(DISTINCT trace_id)' : 'count(*)';
   // A severity text value reads the highest severity number recorded with it, so its level comes from the number.
-  const level = input.signal === 'logs' && column === 'severity_text' ? ', max(severity_number) AS severity_number' : '';
+  const level = input.signal === 'logs' && columns.includes('severity_text') ? ', severity_number' : '';
+  const values = columns.map((_, index) => `f${index}`);
+  const facet =
+    columns.length === 1
+      ? '0'
+      : `CASE ${columns
+          .slice(0, -1)
+          .map((column, index) => `WHEN grouping(${column}) = 0 THEN ${index}`)
+          .join(' ')} ELSE ${columns.length - 1} END`;
+  const grouped =
+    `SELECT ${facet} AS facet, ${columns.map((column, index) => `${column} AS ${values[index]}`).join(', ')}, ${n} AS n${level ? ', max(severity_number) AS severity_number' : ''} ` +
+    `FROM ${signal.table} WHERE ${binds.sql} GROUP BY GROUPING SETS (${columns.map((column) => `(${column})`).join(', ')})`;
+  const shown = `facet, ${values.join(', ')}, n${level}`;
   return {
-    sql: `SELECT ${column} AS value, ${n} AS n${level} FROM ${signal.table} WHERE ${binds.sql} GROUP BY ${column} ORDER BY n DESC, value LIMIT ${FACET_VALUES + 1}`,
+    sql:
+      `SELECT ${shown} FROM (SELECT ${shown}, row_number() OVER (PARTITION BY facet ORDER BY n DESC, ${values.join(', ')}) AS rank FROM (${grouped}) AS grouped) AS ranked ` +
+      `WHERE rank <= ${FACET_VALUES + 1} ORDER BY facet, rank`,
     params: binds.params
   };
 }
 
-/** Load every facet in one batch; one refusal refuses the rail. */
+/** Splits one {@link facetsQuery} read into one facet's `value, n` rows, keeping its typed value column. */
+function facetValues(read: QueryResult, columns: readonly string[], column: string, input: FacetRailInput): QueryResult {
+  const index = columns.indexOf(column);
+  const level = input.signal === 'logs' && column === 'severity_text';
+  const at = (name: string) => read.columns.findIndex((each) => each.name === name);
+  const [value, n, severity] = [at(`f${index}`), at('n'), at('severity_number')];
+  const rows = read.rows.filter((row) => Number(row[0]) === index).map((row) => (level ? [row[value], row[n], row[severity]] : [row[value], row[n]]));
+  return {
+    columns: [{ ...read.columns[value], name: 'value' }, read.columns[n], ...(level ? [read.columns[severity]] : [])],
+    rows,
+    terminal: { ...read.terminal, row_count: rows.length }
+  };
+}
+
+/** Load every facet in one aggregate; its refusal refuses the rail. */
 export async function loadFacetRail(input: FacetRailInput, context: LoadContext): Promise<FacetRailProps> {
   const range = rangeOf(input.range, context);
   if ('code' in range) return { input, result: { state: 'error', problem: range } };
   const predicate = await predicateFor(SIGNALS[input.signal].table, input.where_sql, context);
   if ('state' in predicate) return { input, result: predicate };
-  const plans = input.facets.map((column) => facetQuery(input, column, range, predicate.sql));
-  const results = await context.executor.run(plans.map((plan) => query(plan.sql, plan.params)), context.signal);
-  const failure = firstFailure(results);
-  if (failure) return { input, result: failure };
-  const facets = input.facets.map((column, index) => ({ column, values: (results[index] as { value: QueryResult }).value }));
+  const plan = facetsQuery(input, range, predicate.sql);
+  const [read] = await context.executor.run([query(plan.sql, plan.params)], context.signal);
+  if (!read.ok) return { input, result: failed(read.problem) };
+  const columns = [...new Set(input.facets)];
+  const facets = input.facets.map((column) => ({ column, values: facetValues(read.value as QueryResult, columns, column, input) }));
   if (facets.every(({ values }) => values.rows.length === 0))
     return { input, result: { state: 'empty', data: { facets }, reason: emptyList(input.signal, input.where) } };
   return { input, result: { state: 'populated', data: { facets } } };
@@ -299,7 +375,8 @@ export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
   traces: ['trace_id', 'span_id', 'duration_nano'],
   spans: ['trace_id', 'span_id', 'parent_span_id'],
   logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
-  metrics: []
+  metrics: [],
+  executions: ['execution_id', 'subject_kind', 'subject_version', 'subject_card_uid', 'result_id', 'binding_id', 'workload_card_uid']
 };
 
 /** The columns a signal list shows. */
@@ -338,7 +415,7 @@ function orderKeys(signal: Signal, input: Extract<RecordTableInput, { signal: Si
  */
 function beyond(binds: Binds, keys: readonly OrderKey[], values: readonly QueryParam[], backward: boolean): string {
   const placeholders = keys.map(({ column }, index) =>
-    values[index] === null ? '' : column.endsWith('_unix_nano') ? `${binds.bind(values[index])}::timestamptz` : binds.bind(values[index])
+    values[index] === null ? '' : isInstant(column) ? `${binds.bind(values[index])}::timestamptz` : binds.bind(values[index])
   );
   let rest = '';
   for (let index = keys.length - 1; index >= 0; index -= 1) {
@@ -463,8 +540,6 @@ export interface MetricProps {
   readonly summary: Loaded<QueryResult>;
   /** Present when the metric records explicit-bucket histogram points in the range. */
   readonly histogram?: HistogramProps;
-  /** The keys offered to group by: the promoted columns, then the keys the metric's series record. */
-  readonly keys: readonly string[];
 }
 
 /** A Chart keyed by typed identity columns, with each line's Latest, Max and Mean. */
@@ -589,6 +664,22 @@ export function groupKeysQuery(input: MetricInput, range: AbsoluteRange, predica
   };
 }
 
+/**
+ * The keys a metric's group-by picker offers: the promoted columns, then the
+ * keys its sampled series record. Read only when the reader opens the picker,
+ * never with the metric's chart. A failed sample offers the promoted columns
+ * alone, since any key can still be typed; a refused predicate issues no read.
+ */
+export async function loadMetricKeys(input: MetricInput, context: LoadContext): Promise<Loaded<readonly string[]>> {
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { state: 'error', problem: range };
+  const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
+  if ('state' in predicate) return predicate;
+  const keyed = groupKeysQuery(input, range, predicate.sql);
+  const [sampled] = await context.executor.run([query(keyed.sql, keyed.params, KEY_SAMPLE, PLOT_BYTES)], context.signal);
+  return { state: 'populated', data: sampled.ok ? offeredKeys(sampled.value) : METRIC_GROUP_KEYS };
+}
+
 /** The promoted group keys, then each `attributes.`, `resource.` or `scope.` key `read`'s sets record, once each and sorted. */
 function offeredKeys(read: QueryResult): readonly string[] {
   const found = new Set<string>();
@@ -656,25 +747,20 @@ const SERIES_LABELS = ['resource', 'scope_name', 'scope_version', 'scope', 'attr
  * the plotted series of both. A refused predicate issues no read.
  */
 export async function loadMetric(input: MetricInput, context: LoadContext): Promise<MetricProps> {
-  const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state }, keys: METRIC_GROUP_KEYS });
+  const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state } });
   const range = rangeOf(input.range, context);
   if ('code' in range) return stopped({ state: 'error', problem: range });
   const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
   if ('state' in predicate) return stopped(predicate);
   let plan: ReturnType<typeof metricQueries>;
   let points: Executed;
-  let keyed: Executed;
   try {
     plan = metricQueries(input, range, predicate.sql);
     points = histogramQuery(input, range, predicate.sql);
-    keyed = groupKeysQuery(input, range, predicate.sql);
   } catch (error) {
     return stopped({ state: 'error', problem: inputProblem('Metric', { path: ['by'], message: (error as Error).message }) });
   }
-  const [chart, histogram, sampled] = await context.executor.run(
-    [query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES), query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES), query(keyed.sql, keyed.params, KEY_SAMPLE, PLOT_BYTES)],
-    context.signal
-  );
+  const [chart, histogram] = await context.executor.run([query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES), query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES)], context.signal);
   // With `apart`, one read labels only the plotted gauge, sum and histogram series.
   const ids = (read: typeof chart) => (read.ok ? read.value.rows.map((row) => String(row[columnIndex(read.value, 'series')])) : []);
   const plotted = input.apart ? [...new Set([...ids(chart), ...ids(histogram)])] : [];
@@ -699,8 +785,6 @@ export async function loadMetric(input: MetricInput, context: LoadContext): Prom
     identity,
     chart: { input: { ...metricChart(input), title, sql: plan.chart.sql, range }, executed: plan.chart, result: read.ok ? loaded(read.value) : failed(read.problem) },
     summary: read.ok ? loaded(plottedSummary(read.value, identity)) : failed(read.problem),
-    // A failed sample offers the promoted columns alone; any key can still be typed.
-    keys: sampled.ok ? offeredKeys(sampled.value) : METRIC_GROUP_KEYS,
     ...(!histogramRead.ok ? { histogram: histogramProps(input, range, points, failed(histogramRead.problem), histogramKeys) } : histogramRead.value.rows.length ? { histogram: histogramProps(input, range, points, histogramRead.value, histogramKeys) } : {})
   };
 }
@@ -1000,9 +1084,40 @@ export function traceOverviewQueries(input: { readonly where?: readonly Filter[]
   };
 }
 
+/**
+ * The two reads the trace overview issues: every matching span, then every
+ * matching root, each scanned once and grouped per bucket and over the whole
+ * range by `GROUPING SETS ((at), ())`. `whole` is 1 on the range row, so
+ * range totals and percentiles come from the data, never from buckets.
+ */
+export function traceOverviewReads(input: { readonly where?: readonly Filter[] }, range: AbsoluteRange, bucket: string, predicate?: string) {
+  const spans = SIGNALS.spans;
+  const plan = (select: string, roots: boolean) => {
+    const binds = Binds.over(spans.time, range);
+    const bin = `date_bin(${binds.bind(bucket)}::interval, ${spans.time})`;
+    binds.where(input.where).predicate(predicate);
+    if (roots) binds.roots(spans.table);
+    const scoped = `SELECT ${bin} AS at, trace_id, status_code, duration_nano FROM ${spans.table} WHERE ${binds.sql}`;
+    return { sql: `SELECT grouping(at) AS whole, at, ${select} FROM (${scoped}) AS scoped GROUP BY GROUPING SETS ((at), ()) ORDER BY whole, at`, params: binds.params };
+  };
+  const p = (share: number) => `approx_percentile_cont(duration_nano, ${share}) / 1e6`;
+  return {
+    spans: plan(`count(*) AS spans, count(*) FILTER (WHERE status_code = ${STATUS_ERROR}) AS errors, count(DISTINCT trace_id) AS traces, count(DISTINCT trace_id) FILTER (WHERE status_code = ${STATUS_ERROR}) AS error_traces, ${p(0.95)} AS span_p95_ms`, false),
+    roots: plan(`${p(0.95)} AS p95, ${p(0.5)} AS p50`, true)
+  };
+}
+
+/** The bucket (`whole` 0) or range (`whole` 1) rows of a grouping-set read, keeping only `names`, optionally renamed. */
+function wholeRows(read: QueryResult, whole: 0 | 1, names: readonly (string | readonly [string, string])[]): QueryResult {
+  const picks = names.map((name) => (typeof name === 'string' ? [name, name] : name));
+  const at = picks.map(([from]) => read.columns.findIndex((each) => each.name === from));
+  const rows = read.rows.filter((row) => Number(row[0]) === whole).map((row) => at.map((index) => row[index]));
+  return { columns: at.map((index, i) => ({ ...read.columns[index], name: picks[i][1] })), rows, terminal: { ...read.terminal, row_count: rows.length } };
+}
+
 /** Load the trace overview in one batch; one refused predicate refuses every chart with no dependent read. */
 export async function loadTraceOverview(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<TraceOverviewProps> {
-  const charts: Record<'spans' | 'errors' | 'duration', ChartInput> = {
+  const charts: Record<'spans' | 'errors' | 'duration', Extract<ChartInput, { type: 'timeseries' }>> = {
     spans: { type: 'timeseries', title: 'Spans', sql: '-', x: 'at', y: ['spans'] },
     errors: { type: 'timeseries', title: 'Errors', sql: '-', x: 'at', y: ['errors'] },
     duration: { type: 'timeseries', title: 'Duration', sql: '-', x: 'at', y: ['p95', 'p50'], unit: 'ms' }
@@ -1017,20 +1132,24 @@ export async function loadTraceOverview(input: { readonly where?: readonly Filte
   if ('code' in range) return all({ state: 'error', problem: range });
   const predicate = await predicateFor(SIGNALS.spans.table, input.where_sql, context);
   if ('state' in predicate) return all(predicate);
-  const plans = traceOverviewQueries(input, range, bucketFor(range), predicate.sql);
-  const order = ['spans', 'errors', 'duration', 'totals', 'durations'] as const;
-  const results = await context.executor.run(order.map((name) => query(plans[name].sql, plans[name].params)), context.signal);
-  const [spans, errors, duration, totals, durations] = results;
-  const chart = (name: 'spans' | 'errors' | 'duration', read: (typeof results)[number]): ChartProps => ({
+  const bucket = bucketFor(range);
+  const plans = traceOverviewQueries(input, range, bucket, predicate.sql);
+  const reads = traceOverviewReads(input, range, bucket, predicate.sql);
+  const [spans, roots] = await context.executor.run([query(reads.spans.sql, reads.spans.params), query(reads.roots.sql, reads.roots.params)], context.signal);
+  // Charts keep their own portable SQL; `executed` names the read that answered them.
+  const chart = (name: 'spans' | 'errors' | 'duration', read: typeof spans, executed: Executed): ChartProps => ({
     input: { ...charts[name], sql: plans[name].sql, range },
-    executed: plans[name],
-    result: read.ok ? shapeChart({ ...charts[name], sql: plans[name].sql, range }, read.value) : failed(read.problem)
+    executed,
+    result: read.ok ? shapeChart({ ...charts[name], sql: plans[name].sql, range }, wholeRows(read.value, 0, ['at', ...charts[name].y])) : failed(read.problem)
   });
-  const joined: Loaded<QueryResult> =
-    !totals.ok ? failed(totals.problem)
-    : !durations.ok ? failed(durations.problem)
-    : { state: 'populated', data: { ...totals.value, columns: [...totals.value.columns, ...durations.value.columns], rows: [[...totals.value.rows[0], ...durations.value.rows[0]]] } };
-  return { spans: chart('spans', spans), errors: chart('errors', errors), duration: chart('duration', duration), totals: joined };
+  const totals: Loaded<QueryResult> =
+    !spans.ok ? failed(spans.problem)
+    : !roots.ok ? failed(roots.problem)
+    : (() => {
+        const [all, root] = [wholeRows(spans.value, 1, ['spans', 'traces', 'error_traces', 'span_p95_ms']), wholeRows(roots.value, 1, [['p95', 'p95_ms'], ['p50', 'p50_ms']])];
+        return { state: 'populated', data: { ...all, columns: [...all.columns, ...root.columns], rows: [[...all.rows[0], ...root.rows[0]]] } };
+      })();
+  return { spans: chart('spans', spans, reads.spans), errors: chart('errors', spans, reads.spans), duration: chart('duration', roots, reads.roots), totals };
 }
 
 /** Log levels by OTLP severity number: 17 and up error, 13 and up warn, 9 and up info, 1 and up debug (TRACE and DEBUG), else unset. */
@@ -1068,6 +1187,155 @@ export async function loadLogTimeline(input: { readonly where?: readonly Filter[
   const [read] = await context.executor.run([query(plan.sql, plan.params)], context.signal);
   const chart = chartInput(plan.sql, range);
   return { input: chart, executed: plan, result: read.ok ? shapeChart(chart, read.value) : failed(read.problem) };
+}
+
+/** Verify's two charts: executions per bucket by recorded verdict, and by Verifier. */
+
+/** The series of an execution with no recorded verdict: a neutral bucket, never a verdict. */
+export const NO_VERDICT = 'no verdict';
+
+/** How an execution status or recorded verdict reads: its glyph, its words and its tone. Hue is never the only channel. */
+export type ExecutionMark = readonly [glyph: string, label: string, tone: 'text' | 'muted' | 'run' | 'ok' | 'warn' | 'danger'];
+/** Every retained execution status. `pending` is work accepted and not yet started, which a reader knows as queued. */
+export const EXECUTION_STATUS: Readonly<Record<string, ExecutionMark>> = {
+  pending: ['○', 'queued', 'muted'],
+  running: ['●', 'running', 'run'],
+  retrying: ['↻', 'retrying', 'run'],
+  waiting: ['◷', 'waiting', 'warn'],
+  completed: ['■', 'completed', 'text'],
+  errored: ['✕', 'errored', 'danger'],
+  timed_out: ['⧗', 'timed out', 'warn'],
+  cancelled: ['⊘', 'cancelled', 'muted'],
+  'not recorded': ['○', 'not recorded', 'muted']
+};
+/** Every recorded verdict. */
+export const EXECUTION_VERDICT: Readonly<Record<string, ExecutionMark>> = {
+  passed: ['✓', 'passed', 'ok'],
+  failed: ['✕', 'failed', 'danger'],
+  inconclusive: ['?', 'inconclusive', 'muted']
+};
+
+/** How many Verifiers the Verifier chart keys by name; the rest share one series, so its key stays on one line. */
+export const NAMED_VERIFIERS = 3;
+
+/**
+ * The Verify discovery read: every facet and both charts over the population
+ * the list reads, under the same range and WHERE, as one grouping-set
+ * aggregate that reads the population once. Its stages are sibling named
+ * queries, each reading the one before it, so the statement nests no deeper
+ * than the population.
+ *
+ * Rows carry a `facet` index: below the facet count, one facet's values as
+ * {@link facetsQuery} ranks them; at the count, executions per bucket and
+ * verdict, with no verdict as its own series; one past it, executions per
+ * bucket and Verifier, the {@link NAMED_VERIFIERS} Verifiers with the most
+ * executions over the whole range keyed by UID with their `place`, and every
+ * other Verifier counted together under a null `verifier`. `verifiers`
+ * is the number of Verifiers the range holds.
+ */
+export function executionDiscoveryQuery(input: FacetRailInput, range: AbsoluteRange): Executed {
+  const { table, time } = SIGNALS.executions;
+  const binds = Binds.over(time, range);
+  const bucket = binds.bind(bucketFor(range));
+  binds.where(input.where);
+  const columns = [...new Set(input.facets)];
+  const facets = columns.length;
+  const values = columns.map((_, index) => `f${index}`);
+  const population =
+    `SELECT ${columns.join(', ')}, date_bin(${bucket}::interval, ${time}) AS at, coalesce(verdict, '${NO_VERDICT}') AS verdict_series, verifier_card_uid AS verifier ` +
+    `FROM ${table} WHERE ${binds.sql}`;
+  const facet = `CASE WHEN grouping(verdict_series) = 0 THEN ${facets} WHEN grouping(verifier) = 0 THEN ${facets + 1} ${columns
+    .slice(0, -1)
+    .map((column, index) => `WHEN grouping(${column}) = 0 THEN ${index} `)
+    .join('')}ELSE ${facets - 1} END`;
+  const grouped =
+    `SELECT ${facet} AS facet, ${columns.map((column, index) => `${column} AS ${values[index]}`).join(', ')}, at, verdict_series, verifier, count(*) AS n FROM population ` +
+    `GROUP BY GROUPING SETS (${[...columns.map((column) => `(${column})`), '(at, verdict_series)', '(at, verifier)'].join(', ')})`;
+  const all = `facet, ${values.join(', ')}, at, verdict_series, verifier, n`;
+  const ranked = `SELECT ${all}, row_number() OVER (PARTITION BY facet ORDER BY n DESC, ${values.join(', ')}) AS rank, sum(n) OVER (PARTITION BY facet, verifier) AS total FROM grouped`;
+  const placed = `SELECT ${all}, rank, dense_rank() OVER (PARTITION BY facet ORDER BY total DESC, verifier) AS place FROM ranked`;
+  const counted = `SELECT ${all}, rank, place, max(place) OVER (PARTITION BY facet) AS verifiers FROM placed`;
+  const verifierChart = `facet = ${facets + 1}`;
+  const kept =
+    `SELECT facet, ${values.join(', ')}, at, CASE WHEN facet = ${facets} THEN verdict_series END AS verdict, ` +
+    `CASE WHEN ${verifierChart} AND place <= ${NAMED_VERIFIERS} THEN verifier END AS verifier, CASE WHEN ${verifierChart} AND place <= ${NAMED_VERIFIERS} THEN place END AS place, ` +
+    `CASE WHEN ${verifierChart} THEN verifiers END AS verifiers, n FROM counted WHERE facet >= ${facets} OR rank <= ${FACET_VALUES + 1}`;
+  // Facet rows are already one per value; chart rows of the Verifiers past the named ones fold into one per bucket.
+  return {
+    sql:
+      `WITH ${Object.entries({ population, grouped, ranked, placed, counted, kept }).map(([name, stage]) => `${name} AS (${stage})`).join(', ')} ` +
+      `SELECT facet, ${values.join(', ')}, at, verdict, verifier, place, verifiers, sum(n) AS n FROM kept ` +
+      `GROUP BY facet, ${values.join(', ')}, at, verdict, verifier, place, verifiers ORDER BY facet, at, n DESC, ${values.join(', ')}, place`,
+    params: binds.params
+  };
+}
+
+/** Props of the Verify charts: executions by verdict, and by Verifier with its named Verifiers in place order and how many others it counts together. */
+export interface ExecutionChartsProps {
+  readonly verdicts: ChartProps;
+  readonly verifiers: ChartProps;
+  readonly verifierSeries: { readonly top: readonly string[]; readonly more: number };
+}
+
+/** Executions per bucket and `series` under the list's own range and WHERE: the chart's own portable SQL, which a Chart panel or Query reruns. */
+function executionsBy(series: string, input: { readonly where?: readonly Filter[] }, range: AbsoluteRange): Executed {
+  const { table, time } = SIGNALS.executions;
+  const binds = Binds.over(time, range);
+  const bin = `date_bin(${binds.bind(bucketFor(range))}::interval, ${time})`;
+  binds.where(input.where);
+  return { sql: `SELECT ${bin} AS at, ${series}, count(*) AS executions FROM ${table} WHERE ${binds.sql} GROUP BY 1, 2 ORDER BY at`, params: binds.params };
+}
+
+/** The rows of one `facet` index of a discovery read as `columns`, renamed. */
+function discoveryRows(read: QueryResult, facet: number, columns: readonly [from: string, to: string][]): QueryResult {
+  const at = columns.map(([from]) => read.columns.findIndex((column) => column.name === from));
+  const rows = read.rows.filter((row) => Number(row[0]) === facet).map((row) => at.map((index) => row[index]));
+  return { columns: at.map((index, position) => ({ ...read.columns[index], name: columns[position][1] })), rows, terminal: { ...read.terminal, row_count: rows.length } };
+}
+
+/** Load the Verify facets and both charts in one read; its refusal refuses all three. */
+export async function loadExecutionDiscovery(input: FacetRailInput, context: LoadContext): Promise<{ readonly facets: FacetRailProps; readonly charts: ExecutionChartsProps }> {
+  const chart = (title: string, series: string, sql: string, range?: AbsoluteRange): ChartInput => ({ type: 'timeseries', title, sql, x: 'at', y: ['executions'], series, ...(range ? { range } : {}) });
+  const sqlOf = (series: string, range?: AbsoluteRange) => (range ? executionsBy(series, input, range).sql : '-');
+  const settled = (range: AbsoluteRange | undefined, verdicts: Loaded<QueryResult>, verifiers: Loaded<QueryResult>, verifierSeries: ExecutionChartsProps['verifierSeries'], executed?: Executed): ExecutionChartsProps => ({
+    verdicts: { input: chart('Executions', 'verdict', sqlOf(`coalesce(verdict, '${NO_VERDICT}') AS verdict`, range), range), ...(executed ? { executed } : {}), result: verdicts },
+    verifiers: { input: chart('By Verifier', 'verifier', sqlOf('verifier_card_uid AS verifier', range), range), ...(executed ? { executed } : {}), result: verifiers },
+    verifierSeries
+  });
+  const none = { top: [], more: 0 };
+  const range = rangeOf(input.range, context);
+  if ('code' in range) {
+    const result = { state: 'error', problem: range } as const;
+    return { facets: { input, result }, charts: settled(undefined, result, result, none) };
+  }
+  const plan = executionDiscoveryQuery(input, range);
+  const [read] = await context.executor.run([query(plan.sql, plan.params)], context.signal);
+  if (!read.ok) {
+    const result = failed(read.problem);
+    return { facets: { input, result }, charts: settled(range, result, result, none, plan) };
+  }
+  const value = read.value as QueryResult;
+  const columns = [...new Set(input.facets)];
+  const facets = input.facets.map((column) => ({ column, values: facetValues(value, columns, column, input) }));
+  const rail: FacetRailProps = facets.every(({ values }) => values.rows.length === 0)
+    ? { input, result: { state: 'empty', data: { facets }, reason: emptyList('executions') } }
+    : { input, result: { state: 'populated', data: { facets } } };
+  const verdicts = discoveryRows(value, columns.length, [['at', 'at'], ['verdict', 'verdict'], ['n', 'executions']]);
+  const verifiers = discoveryRows(value, columns.length + 1, [['at', 'at'], ['verifier', 'verifier'], ['n', 'executions']]);
+  const [place, verifier, counted] = ['place', 'verifier', 'verifiers'].map((name) => value.columns.findIndex((column) => column.name === name));
+  const chartRows = value.rows.filter((row) => Number(row[0]) === columns.length + 1);
+  const top = [...new Map(chartRows.filter((row) => row[place] !== null).map((row) => [Number(row[place]), String(row[verifier])])).entries()].sort(([a], [b]) => a - b).map(([, uid]) => uid);
+  const more = Math.max(0, Number(chartRows[0]?.[counted] ?? 0) - NAMED_VERIFIERS);
+  const verdictsInput = chart('Executions', 'verdict', executionsBy(`coalesce(verdict, '${NO_VERDICT}') AS verdict`, input, range).sql, range);
+  const verifiersInput = chart('By Verifier', 'verifier', executionsBy('verifier_card_uid AS verifier', input, range).sql, range);
+  return {
+    facets: rail,
+    charts: {
+      verdicts: { input: verdictsInput, executed: plan, result: shapeChart(verdictsInput, verdicts) },
+      verifiers: { input: verifiersInput, executed: plan, result: shapeChart(verifiersInput, verifiers) },
+      verifierSeries: { top, more }
+    }
+  };
 }
 
 /** How far a trace's spans may start outside its root's own start and end: clock skew between services, and work that outlives the root. */
@@ -1223,8 +1491,29 @@ const LABELS: Readonly<Record<string, string>> = {
   workload_card_uid: 'Workload',
   subject_card_uid: 'Card',
   gen_ai_request_model: 'Model',
-  gen_ai_operation_name: 'Operation'
+  gen_ai_operation_name: 'Operation',
+  recorded_at: 'Time',
+  ended_at: 'Ended',
+  verifier_card_uid: 'Verifier',
+  subject_name: 'Card',
+  subject_kind: 'Card kind',
+  subject_version: 'Card version',
+  run_id: 'Run',
+  group_id: 'Session',
+  binding_id: 'Binding',
+  origin: 'Origin',
+  status: 'Status',
+  verdict: 'Verdict',
+  execution_id: 'Execution',
+  result_id: 'Result',
+  service_version: 'Service version',
+  deployment_environment: 'Environment'
 };
+
+/** Whether `column` holds an instant: a signal table's nanosecond time, or a verification table's `_at` timestamp. */
+export function isInstant(column: string): boolean {
+  return column.endsWith('_unix_nano') || column.endsWith('_at');
+}
 
 /** A column's heading; the column name itself stays available as its title for writing WHERE. */
 export function columnLabel(column: string): string {
@@ -1253,7 +1542,7 @@ export const STATUS_NAMES: Readonly<Record<number, string>> = { 0: 'unset', 1: '
 export function cellText(column: string, value: unknown): string {
   if (value === null || value === undefined) return '∅';
   if (column === 'duration_nano') return fmtDuration(Math.round(Number(value) / 1e6));
-  const instant = column.endsWith('_unix_nano') && typeof value === 'string' && /^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(value);
+  const instant = isInstant(column) && typeof value === 'string' && /^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(value);
   if (instant) return `${instant[1]} ${instant[2]}${instant[3] ?? ''}`;
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }

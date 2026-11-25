@@ -291,7 +291,7 @@ async fn enqueue(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path is malformed, the caller lacks
-/// `verifier:read` on the execution's Verifier, the execution is not visible
+/// `executions:read` on the execution's trusted parent, the execution is not visible
 /// in the caller's tenant, or a read fails.
 #[utoipa::path(
     get,
@@ -305,8 +305,8 @@ async fn enqueue(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such execution is visible in the caller's tenant \
           yet (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The registry or the execution records are unavailable, \
@@ -338,7 +338,7 @@ async fn get_execution(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path, limit, or cursor is invalid,
-/// the caller lacks `verifier:read` on the execution's Verifier, the queued
+/// the caller lacks `executions:read` on the execution's trusted parent, the queued
 /// execution is not in the caller's tenant, or a read fails.
 #[utoipa::path(
     get,
@@ -356,8 +356,8 @@ async fn get_execution(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such queued execution in the caller's tenant \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
@@ -389,7 +389,7 @@ async fn list_invocations(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path, limit, or cursor is invalid,
-/// the caller lacks `verifier:read` on the execution's Verifier, the queued
+/// the caller lacks `executions:read` on the execution's trusted parent, the queued
 /// execution is not in the caller's tenant, or a read fails.
 #[utoipa::path(
     get,
@@ -406,8 +406,8 @@ async fn list_invocations(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such queued execution in the caller's tenant \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
@@ -440,7 +440,7 @@ async fn list_publications(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path or producer selector is
-/// invalid, the caller lacks `verifier:read` on the execution's Verifier,
+/// invalid, the caller lacks `executions:read` on the execution's trusted parent,
 /// the queued execution or publication is absent, or a read fails.
 #[utoipa::path(
     get,
@@ -459,8 +459,8 @@ async fn list_publications(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such queued execution in the caller's tenant, or no \
           such publication of the producer attempt \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
@@ -498,7 +498,7 @@ async fn get_publication(
 /// # Errors
 /// Returns a stable Wyrd error when the path, producer selector, or file
 /// path is invalid, the publication is JSON, the caller lacks
-/// `verifier:read` on the execution's Verifier, the queued execution or
+/// `executions:read` on the execution's trusted parent, the queued execution or
 /// publication is absent, its stored file descriptor is malformed, or storage
 /// fails.
 #[utoipa::path(
@@ -519,8 +519,8 @@ async fn get_publication(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such queued execution in the caller's tenant, or no \
           such publication of the producer attempt \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
@@ -556,8 +556,8 @@ async fn download_publication(
 ///
 /// This is the `get_url` a local publication download plan hands out; cloud
 /// backends hand out presigned URLs instead. It selects and authorizes
-/// exactly as the download plan does, `verifier:read` on the execution's
-/// Verifier, so a caller who may plan the download may fetch it.
+/// exactly as the download plan does, `executions:read` on the execution's
+/// trusted parent, so a caller who may plan the download may fetch it.
 ///
 /// # Errors
 /// Returns the stable Wyrd errors of the download plan, and a storage error
@@ -581,8 +581,8 @@ async fn download_publication(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such queued execution in the caller's tenant, no \
           such publication of the producer attempt, or no such stored object \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
@@ -747,7 +747,7 @@ async fn decide_approval(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path is malformed, the caller lacks
-/// `verifier:read` on the execution's Verifier, no complete details are
+/// `executions:read` on the execution's trusted parent, no complete details are
 /// visible in the caller's tenant, or a read fails.
 #[utoipa::path(
     get,
@@ -761,8 +761,8 @@ async fn decide_approval(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read on the execution's \
-          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks executions:read on the execution's \
+          trusted parent (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No complete details of such an execution are visible \
           in the caller's tenant: it is unknown, not yet recorded, or no longer readable \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),

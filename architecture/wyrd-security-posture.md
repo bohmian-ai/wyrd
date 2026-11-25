@@ -19,7 +19,8 @@ controls required to operate those boundaries.
 - Tenant-scoped SQL runs through `TenantConn` under Postgres RLS. Cross-tenant
   work runs only through the explicitly privileged `OperatorPool` capability.
 - Security uncertainty fails closed. Verification, authorization, policy,
-  tenant binding, and fencing failures deny the operation. Audit is
+  tenant binding, and fencing failures deny the operation, except for the explicit
+  bounded use of previously confirmed authorization state below. Audit is
   non-blocking: a decision that fails to commit is logged and counted and does
   not deny the operation.
 - Secrets are resolved from a deployment secret provider at runtime. They are
@@ -46,19 +47,25 @@ of a tenant's administration. Its principals live in `platform.principals`,
 carry no tenant, and are never implicitly authorized over a tenant's
 resources. The **tenant plane** operates one tenant's resources. Its
 principals live under `wyrd.*` behind RLS and can never reach the platform
-plane. Neither plane's credential or token is accepted by the other.
+plane. Neither plane's credential, token or browser session is accepted by the
+other. The human platform console is headed **Platform admin**; tenant human
+administrators remain **workspace admin**. Platform-user passwords and console
+sessions belong to existing tenantless platform principals, never tenant Users.
 
 `PrincipalKindTag` is the closed wire set shared by both planes:
 `global_admin`, `tenant_admin`, `user`, `service`, and `system`. A
 platform principal is `global_admin` or `user`; a tenant principal is
 `tenant_admin`, `user`, `service`, or the internal-only `system`. Agent is a
 Card kind, not a principal kind. The runtime `Principal { id, kind,
-tenant_id, roles, effective_permissions, credential_id, card_access,
+tenant_id, effective_permissions, credential_id, card_access,
 workload_uid }` carries the tenant-plane `PrincipalKind`, and
 `PlatformPrincipal { id, kind, effective_permissions, credential_id }` the
 tenantless platform identity.
 
-No principal binds a Card. A `service` principal is a stable account an
+Managed tenant accounts are User and Service; administrative access is a role,
+not another assignable account type. Existing bootstrap `tenant_admin` and internal
+`system` mechanics remain separate from account management. No principal identity
+contains a Card version. A `service` principal is a stable account an
 administrator creates explicitly; it serves Services, Agents, CI, and
 automation and outlives every release. A Card root is request execution
 context: the optional exchange or `x-wyrd-workload-uid` selection, signed as
@@ -91,7 +98,7 @@ member, already out of scope, is the only caller that could misuse it.
 
 Registering a Service or Agent Card creates Card versions only, never a
 principal, role grant, or credential. `POST /v1/principals` creates a Service
-account atomically with its roles, optional `workload_restriction`, and first
+account atomically with its scoped role bindings, optional `workload_restriction`, and first
 credential, returned once; failure creates nothing. A restriction is
 `{"mode":"unrestricted"}` (the default) or
 `{"mode":"family","kind":"Service","name":...}`. A family restriction
@@ -112,14 +119,13 @@ generic authorized operations work, and Card-sensitive work is refused with
 required to be a Service and resolved under the account's restriction; an unknown and a foreign root are
 refused identically. Agent Cards remain valid graph subjects, never workload roots or account families.
 Configured Service/version/environment is retained as correlation on inputs/results;
-environment and derived identity labels grant no authority. Roles are assigned to principals, not Cards. A tenant
-administrator (`*`, not `service_accounts:write`) grants and revokes direct
-roles with `PUT` and `DELETE /v1/principals/{id}/roles/{role}`
-(`wyrd principal role grant|revoke`); each decision is staged on the Scribe
-outbox as `auth.principal.role.grant` or `auth.principal.role.revoke`, and the
-change reaches the principal's next token. A user's assignments record their
-source: login replaces only `idp` assignments, so a direct grant survives the
-next login, and tokens carry the union of both sources.
+environment and derived identity labels grant no authority. Roles contain typed
+operations; bindings assign them to User or Service principals, or optional local
+groups, at explicit scopes. Tenant admins manage these assignments through the
+same server contracts used by HTTP/CLI, SDK/MCP and Settings → Access. Assignment
+sources distinguish direct, group and provider authority; login replaces only
+its provider's assignments. Changes affect existing sessions and tokens through
+current cached grants, not only the next login or token issuance.
 Every credential has one account owner and no version; releases never
 require rotation.
 The verification runtime also provisions one UUIDv7 `system` principal per
@@ -143,8 +149,20 @@ subject, and Oracle authorizes and audits every read under it like any
 caller's. The server never fabricates a user or other identity for its own
 reads.
 
+A PR-wide Wyrd fresh-review request requires the authenticated caller's current
+`cards:read`, `verifier:read` and `verifier:run` for every selected PR binding,
+plus an explicit
+write scope on MCP. The caller supplies only provider host, repository id, PR
+number and a request idempotency key, never tenant, member/policy/source pins or
+execution authority. Admission retains the selected declaration's accountable
+authority, including its refusal behavior, and never substitutes the requesting
+caller or SYSTEM when that authority cannot act. Retry does not bypass current
+read/action authorization or reactivate obsolete work; membership/counts apply
+the retained Repository parent boundary and sensitive-content checks before disclosure.
+
 A Verifier run is accepted under one authority that execution never widens.
-Queued work is activated only by a binding schedule or a caller's `submit`.
+Queued work is activated by a binding schedule, a caller's `submit`, or the
+selected Repository's PR admission, including the explicit fresh-review request.
 A submitted run keeps the caller's verified effective principal and
 delegation chain; its inputs row is staged on the Scribe outbox, and only
 after Scribe acknowledges that row is the submission handed to the queue
@@ -153,9 +171,9 @@ binding owner's authority, recovered from current grants in the run's tenant
 when the run is accepted; a missing, inactive, or foreign owner, or a tenant
 without SYSTEM, accepts no run and nothing falls back to another identity or
 SYSTEM. The accepted authority is stored server-side with no credential,
-survives claim, retry, and restart, and is not refreshed by later grant
-changes; every protected downstream action still checks its own permission
-against it. A tool call that an Agent's `code.run` Python makes through
+survives claim, retry, and restart as identity, attribution and a frozen permission
+ceiling. Later grants cannot widen it; every protected downstream action checks
+current account and delegation-participant grants within that accepted ceiling. A tool call that an Agent's `code.run` Python makes through
 `call_tool` is such an action: it uses the same accepted authority and the
 same exact `tool:invoke` and capability checks and non-blocking audit as the
 model's direct call, and nothing in the program can select or widen the
@@ -174,22 +192,27 @@ metadata grant nothing. A parked execution resumes under its own accepted
 authority, never the publisher's, and losing repository access cancels it
 `repository_access_lost`.
 
-Deciding a pending approval needs only `verifier:approve` on the execution's
-exact Verifier, granted by that Verifier's UID or by every Verifier in the
-tenant; the caller's Card scope attributes and never authorizes it.
-`verifier:run` and `verifier:read` never cover it. The built-in `editor` and
-`admin` Roles hold it for every Verifier; `workload` and `viewer` do not. Each
-check is audited under `verification.approval.decide` with the execution as
-the resource. The decision adds no authority to the
-execution: it resumes under its own accepted authority, and the decider's
-identity is recorded only as the decision's actor.
+Deciding a pending approval requires current `verifier:approve` on the exact
+Verifier and read access to the execution's retained authorization parent.
+`verifier:run` and `verifier:read` do not confer approval. The `approver` bundle
+allows read/decision at its applicable scope; it does not implicitly make another
+parent, such as a Repository, readable. `admin` covers tenant approvals; `editor`,
+`workload` and `viewer` do not. Each check is audited under
+`verification.approval.decide` with the execution as resource. The decider is
+recorded as decision actor and adds no authority to the resumed execution.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
 identity by itself, and coexists with any human administrator the tenant later
 adds. A platform administrator is created once, during deployment
 initialization, and administration of the platform plane is available through
-its credential whether or not a platform OIDC connection exists.
+its credential whether or not a platform OIDC connection exists. This bootstrap/global
+administrative key is CLI/API break-glass only and never enters a browser or Node.
+Human console operators use pre-registered platform `user` principals with the
+platform OIDC connection, or platform-user passwords for installs without an IdP.
+Password verifiers/revisions belong to the platform credential owner and share
+the tenant password validator (15–128 NFC-normalized Unicode characters,
+blocklist, Argon2id and bounded blocking/admission); they confer no tenant rights.
 
 Every authorization decision records the deciding principal's stored kind and,
 when the presented token was minted from a credential, that credential's
@@ -221,7 +244,7 @@ credential.
   platform-admin database access, creates no identity and writes no grant, and
   refuses on an uninitialized deployment. That database access is therefore
   equivalent in authority to holding the platform credential.
-- A platform session names the credential that minted it and re-reads that
+- A platform API token session names the credential that minted it and re-reads that
   credential on every request, so revoking a platform credential ends its live
   sessions on the next request. A platform session
   established by federated login names no credential; the principal itself is
@@ -233,9 +256,10 @@ credential.
   SDK or workload.
 - A credential has exactly one tenant owner, a Service account or a User.
   Personal User keys carry a normalized name, a nonempty permission ceiling
-  and an explicit expiry of at most 365 days; each exchange issues the
-  intersection of the ceiling with the User's current grants, so a later
-  grant never widens an old key. `personal_credentials:read` lists and
+  and an explicit expiry of at most 365 days. Exchange preserves the key's
+  ceiling in the signed token; requests must satisfy both current grants and
+  that ceiling, so a later grant never widens an old key. Restricted Service
+  keys use the same typed ceiling model. `personal_credentials:read` lists and
   `personal_credentials:write` revokes only the caller's own keys, both
   derived from the verified caller rather than a submitted principal;
   Service principals hold neither. Creation additionally requires a browser
@@ -260,14 +284,22 @@ credential.
   Rust-owned browser sessions, not an OAuth client or refresh-token grant.
   Revoking an OAuth refresh token (RFC 7009) ends that login's renewal; it
   does not withdraw access tokens already issued.
-- Every tenant access token carries issuer, audience `wyrd`, subject,
-  issued-at, expiry, unique token identity, principal, tenant, Card scope,
-  credential attribution, delegation chain, informational roles, and one
-  `permissions` set. The `permissions` claim is the only tenant authority; one
-  `TenantTokenIssuer` resolves it from current grants at issuance for API-key
-  exchange, OIDC login, human refresh, workload `jwt-bearer`, and delegation.
-  Verification is local and synchronous — signature, issuer, audience, expiry —
-  and reads no store, holds no cache, and resolves no roles.
+- Tenant access tokens carry `version`, `iss`, `aud`, `sub`, `principal`
+  (account ID, kind and tenant), `iat`, `exp`, `jti`, required `card_access`, and
+  conditional `cid`, `act` and `workload_uid` under their existing validation rules. They
+  carry neither authoritative `permissions` nor informational `roles`.
+  `TenantTokenIssuer` uses the same claim contract for local/OIDC human login,
+  API-key exchange, refresh, workload federation and delegation.
+- `permission_ceiling` is an optional signed typed PermissionSet, never a grant.
+  Ordinary human login and unrestricted Service-key tokens have no additional
+  ceiling. Restricted-key and delegated tokens retain their applicable ceilings.
+  Absence adds no restriction; an empty set permits nothing; invalid claims are
+  refused. Account grants remain server-owned and current.
+- Cryptographic verification is local, synchronous and store-free: signature,
+  issuer, audience, expiry and claim validation. Before permission checks, every
+  tenant ingress attaches already-resolved current authority from the server's
+  authorization snapshot. Successful signature verification alone grants no
+  resource access. There is one token contract, not a legacy-claims fallback.
 - Internal verification work mints no token. Results are staged on the
   process Scribe outbox under the operation's pair: a direct request's
   verified caller, or a queued run's subject with SYSTEM as actor. Trace
@@ -279,19 +311,20 @@ credential.
   principal or unreadable table identity fails closed before any row is
   returned.
 - Dedicated execution status/progress/publication reads authorize and audit current
-  `verifier:read` on the recorded exact Verifier, plus repository read where applicable.
+  read access on the trusted retained parent, with sensitive-content checks.
+  Repository-owned data needs no separate referenced-Verifier read grant.
   Execution reads use accepted/recovered Bifrost state through fixed
   tenant/execution-scoped statements under the same narrow SYSTEM read authority for
   registered `bifrost.verification.execution_inputs`, `results`, `execution_outputs` and
   `execution_events`. Retained identity and full metadata do not require a leftover
   execution row or fetching a deleted Card. Historical accepted authority is provenance,
-  not a grant to the requesting caller. Ordinary public Bifrost SQL retains caller table
+  not a grant to the requesting caller. Ordinary public Bifrost SQL retains caller source and managed-row
   permissions; no caller SQL runs under internal authority.
   Accepted publication mounts/download/local-content select the exact private
   verified File association retained in run state from acceptance onward and
   validate its tenant, producer, path, digest and length through existing storage
   owners. Do not rediscover by global digest or accept a caller storage path.
-  Local publication bytes remain under verifier authorization, never the
+  Local publication bytes remain under execution-parent authorization, never the
   cards:read blob route. Preserve external File completion/inventory acknowledgement,
   original evidence retention and independent delivery/replay authority. There
   is no active-Postgres descriptor custody or later reference transfer. Required
@@ -300,9 +333,10 @@ credential.
   writers, including during WAL recovery; historical authority remains provenance.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
-  token already issued keeps its snapshot authority until its five-minute
-  expiry; there is no revocation list or authorization epoch. The platform
-  plane instead revalidates current state on every request. Revoking a
+  token already issued uses current cached account authority under the freshness
+  bounds below; its signature is not a frozen grant. Credential revocation ends
+  renewal; it does not itself withdraw an already-issued bearer. The platform
+  plane revalidates current state on every request. Revoking a
   principal also cancels, in the same commit, every unfinished Verifier
   execution it submitted or accepted, so queued work never outlives the
   authority it was accepted under. A running claim observes that cancellation
@@ -330,9 +364,16 @@ credential.
   OAuth grant, client identification, redirect and refresh rules remain
   explicit for their actual machine-client consumers; browser login does not
   introduce a replacement OAuth client or relax exact provider callbacks.
-- Device approval records only the approving principal, tenant and
-  connection; tokens are minted on device-code redemption, never stored
-  awaiting pickup. Existing authorization-code records retain their history
+- Device approval accepts an allowed password, company OIDC or social login with
+  explicit user-code approval. Approved device records and their refresh families
+  retain exactly one anchor: local User/password revision, complete company OIDC
+  connection ID/revision, or social provider ID/revision and linked-identity
+  reference, together with the CLI client binding. Unapproved records
+  carry no authenticated principal or anchor. Refresh checks the original anchor
+  and current User, then rotates; an invalid anchor refuses renewal rather than
+  switching methods. Local CLI login needs no IdP or synthetic connection. Tokens
+  are minted on one-use device-code redemption, never stored awaiting pickup.
+  Existing authorization-code records retain their history
   and retention rules; retiring UI issuance does not delete those records.
   Provider-side authorization codes are exchanged only through the existing
   bound relying-party callback and never become browser session credentials.
@@ -349,8 +390,19 @@ credential.
 - Interactive CLI login rate limiting is an ingress concern: deployments
   rate-limit `POST /auth/device`, the user-code entry form, per client address
   (RFC 8628 §5.1).
-- Recoverable auth-provider and workload-issuer client secrets follow
-  [stored secrets](#stored-secrets). Wyrd stores no recoverable access token,
+- The server admits each unauthenticated sign-in start
+  (`POST /auth/browser/login`, `POST /auth/platform/login` and
+  `POST /auth/device_authorization`) through a shared per-source window
+  before it records a pending-login row, and refuses over the limit with
+  `429` and `Retry-After`, recording nothing. Signup and password sign-in
+  carry their own admission windows.
+- Recoverable auth-provider and workload-issuer client secrets, shared
+  social-provider client secrets, application SMTP credentials and the signup
+  challenge secret follow [stored secrets](#stored-secrets). Signup and sign-in
+  flow cookies, email proofs and keyed pseudonyms (admission and creator keys)
+  derive per-use keys from one random
+  platform derivation key, stored only as a `WyrdKms` envelope; wrapping-key
+  rotation re-wraps it and never changes it. Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.
 - `wyrd init` keeps local database URLs and the tenant key only in the
   protected `credentials.toml`; `config.toml` `[dev]` holds non-secret
@@ -358,10 +410,220 @@ credential.
   CLI resolves at apply time, and the server applies a composite document
   atomically, so a refused document commits nothing.
 
+### Social admission, account linking and application mail
+
+These capabilities ship in open source through one self-hosted/SaaS code path.
+Users remain tenant-local: the same person in two tenants has two independent
+Users. Platform administrators manage deployment-wide Google and GitHub.com
+clients, password availability, public local/social signup and application SMTP through
+Rust management APIs and their UI projections. Tenant administrators manage only
+their own company SSO connection and tenant login policy. Shared social providers
+sit beside the single Active company connection, not in its slot; platform SSO
+continues to authenticate platform administrators only. Platform authority grants
+no implicit tenant administration.
+
+Operator onboarding shows provider registration instructions and the exact callback
+URL, accepts sealed client credentials, tests sign-in and enables the tested
+configuration. Stored secrets are omitted from read responses. Password is enabled
+by default; public local/social signup is disabled by default. SaaS enables signup via
+the same operator setting. Rust offers and enforces current allowed methods. Private defaults include no
+SMTP/provider credentials. Local acquisition requires password/signup enabled and
+SMTP; social acquisition requires an enabled provider and verified contact. The
+methods response distinguishes returning/invitation providers from usable creation
+providers, and advertises local signup, email discovery and password reset only
+when usable. Every root/login/invitation/device UI uses that response; Rust rechecks
+current policy at start and completion, including racing settings changes.
+
+Rust binds each provider transaction to its purpose (returning login, invitation,
+new-tenant signup or linking), exact provider revision, browser, trusted origin,
+target tenant where present and relevant invitation/User. Retain five-minute
+expiry, one-use completion, server-held state/PKCE, OIDC nonce and fixed completion
+destinations. Social callbacks are provider-specific, separate from the shared
+company callback. Disablement or revision change refuses in-flight completion
+and invalidates credentials anchored to that provider revision.
+
+Google uses OIDC with `openid email profile` and validated issuer, subject,
+audience, signature, nonce and expiry. GitHub.com uses authorization code with
+S256 PKCE and an authenticated user lookup, with numeric user ID under a fixed
+GitHub.com namespace. It supplies no OIDC ID token. Request no repository or
+organization access. For public acquisition only, GitHub may request `user:email`
+and fetch authenticated email records to prove a verified contact. Accept Google's
+`email_verified` only after OIDC validation; absent provider contact proof, require
+a separate Wyrd email challenge bound to the social attempt. Returning login and
+invitation acceptance have no added email-verification prerequisite. Provider tokens are transient identity-resolution
+inputs; retain no provider refresh-token vault.
+
+Returning social login resolves only tenant + issuer/provider namespace + subject.
+An unknown identity, inactive User or inactive tenant refuses without User
+creation. Email never selects, links or merges accounts and may repeat. Social
+login grants no role and does not clear company, direct or local-group bindings.
+Company SSO retains its existing provisioning and source-qualified group mapping.
+
+Invitations name a recipient and explicit scoped assignments. Individual and bulk
+entry create separate expiring, one-use invitations with per-recipient outcomes
+and pending/resend/revoke operations. Each invitation is a link carrying its
+one-time code in the URL fragment, returned once to the administrator and, with SMTP, emailed; Wyrd
+stores only a verifier. Resend replaces the code. Possession of the live link
+admits one enrollment by any allowed method; the address never selects, links or
+identifies an existing User. Opening the link consumes nothing. A forwarded
+live link admits its holder; single use, expiry and revoke bound that risk. Consumption revalidates issuer authority,
+roles/scopes, tenant policy and provider revision, then atomically creates the
+User, identity/credentials, bindings and session and consumes the invitation, or
+commits none. Concurrent redemption has one winner. An identity already owned by
+a User refuses new-User enrollment and directs the person to sign in and request
+access through ordinary binding administration.
+
+Enabled public local/social signup proves a verified contact and its creation identity, takes a new workspace name/slug
+and invokes the existing tenant provisioner with a human-owner initialization
+path. It creates a new tenant and a tenant-local User with tenant-wide admin
+binding. It never joins an existing tenant by email, domain or slug, grants the
+visitor platform authority, fabricates a platform caller or returns a bootstrap
+administrative key. Preserve claim/initialize/promote lifecycle across platform
+and tenant transactions; promote only when the tenant and administrator are usable.
+Bind retry ownership to the creation attempt and proven identity; another caller
+cannot adopt a failed claim, replay cannot create a second tenant and failure
+leaves no active ownerless tenant. A lost session response permits ordinary login
+to the completed tenant. Signup remains enabled at completion. Shared admission
+limits trusted source and verified provider identity before expensive creation;
+unavailable admission state refuses creation.
+
+Signup stores no pending User/tenant/attempt before email/provider proof
+(bounded shared admission counters remain permitted): the round-trip state is a sealed,
+short-lived, HttpOnly, path-scoped cookie, and the recorded proof is unique per
+state, so one callback yields at most one proof. Starting signup has its own
+shared source window, checked before provider work. Throttles answer `429` with
+`Retry-After` in whole seconds equal to the problem retry field. Admission keys and a signup tenant's creator key are HMAC-SHA-256
+pseudonyms, keyed from the `WyrdKms`-wrapped platform derivation key; no plain issuer, subject
+or address is stored there. Expired windows and attempts are purged in bounded
+background batches; a completed attempt keeps no email. An operator may
+configure a Turnstile challenge on browser signup completion, validated
+server-side for success, hostname and `signup` action after admission and before
+a tenant is claimed; refused tokens use `WYRD_AUTH_403_SIGNUP_CHALLENGE`. An
+unreachable challenge provider refuses creation, and SDK, CLI, MCP and API
+traffic is never challenged. One proven identity may hold at most an
+operator-configured number (default 3) of non-retired signup-created tenants,
+checked atomically with the claim and refused with
+`WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`. Only the browser holding a proven
+attempt's completion cookie may restart its stale interrupted creation after the
+existing claim-staleness bound, and only before proof expiry. A failed/provisioning
+claim counts until retired; operator creation neither counts nor is refused.
+The creator HMAC survives attempt purge: verified email namespace for local creation,
+provider namespace/subject for social. This is per identity, not per human across
+methods; never unify social identities through email.
+
+A request's trusted source is its TCP peer, unless that peer is inside the
+deployment-configured trusted ingress IP/CIDR list; then it is the client
+address from the configured header (for example `CF-Connecting-IP`). Forwarding
+headers from other peers are ignored, IPv4-mapped addresses are normalized and
+IPv6 sources are admitted by `/64`. Signup and local password admission derive
+the source this way, each with its own windows. Without a determinable source,
+signup refuses.
+
+Linking requires fresh proof of the User's current allowed method within five
+minutes plus proof of the new identity in the same bound transaction. An old
+cookie or recovery session alone is insufficient. Attach only to that same User;
+refuse another User's identity, with one winner under concurrency. Same-User
+repeat linking may succeed idempotently. Preserve principal ID, grants, groups
+and keys; never merge existing duplicates. Linking company SSO applies only that
+connection's validated group assignments. Adding a password to a social-only
+User requires fresh current-method proof and existing password validation.
+Removing a method requires fresh proof through a remaining allowed method,
+refuses the last usable method and invalidates credentials anchored to the
+removed identity. This does not prevent operator-wide provider/password disablement;
+existing administrative recovery and last-admin safeguards remain applicable.
+
+A freshly company-SSO-authenticated tenant administrator may require company SSO
+only with a tested Active connection, after warning about unlinked accounts.
+Then password/social starts, callbacks, existing browser sessions and CLI renewal
+refuse under established freshness rules. Policy remains enabled across company
+connection replacement, disablement or outage: no password/social fallback.
+Replacement retains connection-revision invalidation and issuer/subject rules.
+Disabling policy does not resurrect revoked sessions. Preserve personal/Service
+API-key policy and independent operator-assisted recovery. This is not continuous
+IdP offboarding; upstream removal alone does not revoke Wyrd grants or sessions.
+
+One operator-configured SMTP relay supplies host, port, TLS mode, optional sealed
+credentials and sender address, with test-send. Tenant administrators use it but
+cannot read/change its credentials. Wyrd runs without SMTP; administrators
+then copy invitation links and the UI says they are not emailed. Send separately after
+each invitation commits, outside the tenant transaction. Report relay acceptance
+or failure per recipient, never inbox delivery; failure leaves a pending invitation
+and no active User, with explicit resend available. Raw invitation secrets are not
+stored as a PostgreSQL mail spool. No new mail queue, automatic retry subsystem or
+provider-specific integration is required; Resend is simply a compatible-provider
+example. Provider account and sending-domain setup remain external operator work.
+
+
+Local public creation proves email before collecting username/password. Use the
+existing provisioner with local or external human-owner proof, activating only a
+usable admin/workspace and issuing the appropriate ordinary tenant session.
+Successful completion retry returns the same tenant, not another creation. Setup
+requires a named local human admin before claim, using a hidden password prompt
+or stdin; optional email remains unverified. Keep separate automation/recovery
+credentials and safe reruns without password reset/duplicate admin. Machine-only
+administrative tenant creation may omit human-admin input. Invitation links remain
+bearer enrollment authority, never verified-contact proof.
+
+Authenticated fresh allowed-method contact verification is tenant/User/purpose-bound;
+it atomically replaces contact and revision plus directory-update intent, notifies
+the old verified address and invalidates old-contact reset proofs. Duplicate
+addresses remain permitted within/across tenants, distinct from profile or
+invitation metadata. Normalize whitespace/domain, preserve local-part case and
+original delivery address; never collapse dots, plus tags or aliases.
+
+With SMTP, browser-bound verified-email discovery returns bounded deduplicated
+active workspace login links only. Request responses are generic; proof mail names
+no workspace. The platform HMAC email → tenant/User/contact-revision projection is
+control-plane metadata, not a global person, authorization or identity store.
+Tenant contact transactions advance revisions and notify existing reconciliation;
+authorized tenant reads update/remove the projection. Before disclosure, revalidate
+current verified contact, live User and live tenant through their owners. Stale,
+revoked, disabled, retired or unavailable validation reveals nothing; eventual lag
+may omit new links. No usernames/principal IDs, session, User, grant or account
+link is returned/created. Selecting a link requires ordinary tenant authentication.
+Without SMTP discovery is absent; saved URLs, invitations and live-session
+metadata enumeration remain independent alternatives.
+
+Email proofs use sealed authenticated encrypted envelopes with random identifier,
+canonical address, purpose, deadline and initiating-browser binding, never password.
+No pre-proof pending signup row is stored. After proof retain unique identifier
+digests/spent-proof metadata until expiry for one-use consumption across replicas;
+a lost response resumes only in the bound browser. Email proofs last fifteen
+minutes; signup completion and discovery-read cookies five minutes. Purposes for
+signup, discovery, contact and reset never substitute. Persisted deadlines use
+PostgreSQL time; envelopes use the PostgreSQL-anchored clock. Links carry proof in
+fragments, not query strings; opening consumes nothing, page code POSTs proof and
+clears the fragment. Proof/result pages and responses are `no-store` and retain
+trusted Origin, CSRF and host-only Secure/HttpOnly/SameSite protections.
+
+Password reset request takes tenant + username and sends only to an active eligible
+password User's verified contact. Known/unknown/unverified/ineligible requests have
+generic `202` bodies and comparable timing distributions; recipient throttles and
+SMTP outcomes cannot reveal account existence. Apply independent shared source and
+address/account budgets, including resend, before SMTP/hashing for verification,
+discovery and reset. Source throttles may return `429`; requests never lock accounts.
+Reset uses existing fifteen-minute single-use code redemption with contact revision
+binding, invalidates local sessions/CLI renewal, leaves keys alone, never signs in,
+adds a password or bypasses SSO, and notifies the verified contact after success.
+Codes remain manual input, never URLs. Admin codes preserve offline recovery.
+
+ApplicationMail sends signup/contact/discovery/reset and reset-notification mail
+after transactions, outside locks. Reset requests use bounded process-owned
+transient sends on the same public response path for all accounts, with no durable
+delivery guarantee; a crash may lose a send and users request again. Account-specific
+relay failures are hidden; uniform deployment-wide `503` is permitted. Operator
+test-send and invitations retain honest relay outcomes. No mail queue, raw-body
+spool, automatic retry or provider-specific API is added. Removing SMTP disables
+mail-dependent starts, not password login or valid issued reset redemption; signed
+proofs retain their deadline if signup/method remain enabled. Never log addresses,
+passwords, codes or proofs; use HMAC admission keys and existing bounded Argon2id
+blocking strategy. These auth/control-plane operations add no verification,
+gateway, Oracle or Scribe hot-path wait; audit delivery remains nonblocking.
+
 ### First-party browser sessions
 
 - Rust owns the complete browser-session lifecycle in the existing auth and
-  SQL owners. Node renders pages and forwards the selected tenant's cookie
+  SQL owners. Node renders pages and forwards the selected plane's cookie
   and trusted public-origin context; it owns no durable session, OAuth code
   exchange, refresh token, API key or credential encryption. The existing
   database is the shared replica authority, with no additional secret/env
@@ -372,17 +634,19 @@ credential.
   login transaction. State, nonce, PKCE, issuer, connection revision, public
   origin and one-use completion remain validated by the same Rust owners as
   device and connection-test login. Browser transaction cookies are opaque
-  bindings; no PKCE verifier is exposed to Node or browser storage. Login
+  bindings; signup pre-proof state may use an authenticated sealed HttpOnly cookie,
+  never a plaintext PKCE verifier exposed to Node or script storage. Login
   transactions expire within five minutes. Post-login redirection is to the
   resolved tenant's fixed signed-in path, never an arbitrary return URL.
-- Session identifiers use cryptographic randomness and are regenerated at
+- Tenant session identifiers use cryptographic randomness and are regenerated at
   successful login. A host-only HttpOnly, SameSite=Lax cookie carries only
   that identifier, not OAuth tokens, API keys or identity/permission claims.
   Cookies are Secure in production; only the existing loopback-development
   HTTP exception is permitted. Raw identifiers never enter database rows,
   metadata, URLs, logs or traces. The record stores a one-way digest, tenant,
   principal, twelve-hour absolute expiry, revocation and exactly one anchor:
-  the exact human-connection revision of an SSO session, the originating
+  the exact company-connection revision of an SSO session, the social
+  provider ID/revision and linked-identity reference of a social session, the originating
   credential reference of a recovery session, or the local User's password
   revision of a password session. There is
   no sliding renewal and no recoverable credential vault. Database-owned
@@ -400,28 +664,42 @@ credential.
   session and clears its cookie. Recovery logout never revokes the API key or
   other browser sessions; logout does not end the IdP session.
 - Local password login (`POST /auth/browser/password/login`), invitation
-  signup, password change and code reset run in Rust. Passwords are 8–128
-  characters, NFC-normalized and blocklist-checked, stored only as an
+  signup, password change and code reset run in Rust. Passwords are 15–128
+  Unicode characters after NFC normalization, blocklist-checked, stored only as an
   Argon2id verifier, and never logged, echoed or relayed through Node storage.
-  Ten failures per tenant and username, or one hundred per source, refuse
+  One validator governs setup, direct/local creation, invitation, change, reset
+  and password-add. No truncation, composition rules or periodic rotation; allow
+  paste/password managers. Local signup requires completed email proof and creates
+  a password-anchored session only after provisioning promotion; social signup
+  creates its social anchor and no password. Email discovery creates no session.
+  Ten failures per tenant and username, or one hundred per trusted source
+  (see social admission), refuse
   further attempts with `429` and `Retry-After` until the window passes;
   unknown users and wrong passwords are indistinguishable. Invitation and
   reset codes are 256-bit, single-use, stored by SHA-256 verifier and bound to
   tenant and purpose. Change and reset advance the User's password revision,
-  which ends every local session; API keys stay valid until revoked.
+  which ends every local session and invalidates local CLI renewal anchored to
+  the old revision; API keys stay valid until revoked. Invitations hold explicit
+  role-and-scope intents for the User created at acceptance, not bare role IDs.
+  Consumption revalidates the issuer's current assignment authority, roles, scopes
+  and tenant, and atomically creates the User and bindings or neither. Missing
+  scope is refused, never promoted to All.
 - Every browser-session request checks current tenant/principal authority.
-  SSO sessions require the exact Active connection revision; password
-  sessions require the User's current password revision and never consult a
-  connection. API-key-backed
+  Company SSO sessions require the exact Active connection revision; social
+  sessions require the enabled provider revision and live linked identity.
+  Password sessions require the User's current password revision. These human
+  method sessions obey current login policy and operator method availability. API-key-backed
   sessions require a still-valid originating credential and preserve all its
   effective-permission restrictions. Existing grant resolution, credential
   attribution, permission checks and non-blocking audit are reused; no Node
   role mapping, durable credential cache or fallback authority exists. Tenant
-  bearer verification remains local and synchronous until token expiry; this
-  session boundary does not change that contract.
+  signature verification remains local and synchronous; bearer and browser
+  requests use the same cached current grants and restrictive ceilings.
 - The existing protected tenant `/v1` HTTP APIs explicitly accept cookie
-  sessions through their normal principal/permission boundary. Platform,
-  MCP, OTLP, gateway and gRPC routes do not inherit cookie authentication.
+  sessions through their normal principal/permission boundary. Platform operations
+  accept only their separately scoped platform browser session described below,
+  never a tenant cookie. MCP, OTLP, gateway and gRPC routes do not inherit cookie
+  authentication.
   Tenant API cookie authentication requires exactly one selected session;
   ambiguous multiple session cookies are refused, never first-cookie-wins.
   Only the session-metadata enumeration accepts multiple tenant sessions.
@@ -442,9 +720,49 @@ credential.
   unavailable storage; a database outage cannot become anonymous, cached or
   mock success. Cookie authentication is documented alongside bearer
   authentication in served OpenAPI. UI-only OAuth issuance/renewal is retired
-  when its consumers move, without changing CLI/device, SDK, platform,
+  when its consumers move, without changing CLI/device, SDK, platform API tokens,
   workload or provider-test behavior. Existing credential-bearing UI cookies
   are cleared and require sign-in; there is no plaintext compatibility path.
+
+#### Platform console browser sessions
+
+The `/platform` console and `/platform/ui/*` pages use the existing Rust
+first-party browser-session machinery extended to the platform plane. Reuse
+`PlatformLogin` and the existing platform login wire contracts for the one
+platform OIDC connection, including pre-registration, issuer/subject pinning,
+state, PKCE, nonce and one-use callback proof. Unknown operators are refused,
+never enrolled. MFA is the IdP's policy. Without an IdP, an authorized registered
+platform `user` may authenticate with its platform-local password. No bootstrap
+key browser login, new principal kind or parallel authentication engine exists.
+
+Rust creates a fresh opaque identifier in a distinct host-only Secure, HttpOnly,
+SameSite=Lax cookie with `Path=/platform`. Rust's platform SQL owner stores only
+its digest, principal, exact password or connection revision anchor, creation and
+last activity, revocation and recent-authentication time. Records are tenantless
+in `platform`, with forced platform-owner RLS, unique digest lookup and bounded
+expiry cleanup through existing auth maintenance. Reuse existing platform login
+transaction storage for browser/session/principal binding and one-use login or
+re-authentication purpose. No provider token, raw cookie, password or bootstrap
+key is retained. PostgreSQL derives idle/absolute deadlines: 15 minutes idle and
+eight hours absolute; activity never extends the latter.
+
+Every request checks the live platform principal and original anchor; suspension,
+password invalidation or connection replacement refuses the session. Logout
+revokes the selected session. Node forwards only the selected platform cookie to
+Rust platform operations and safe metadata back to pages. It neither exchanges
+codes nor stores credentials. Tenant sessions are refused by platform handlers;
+platform cookies are never forwarded to or accepted on tenant routes/enumeration
+or other protocols. Cookie path scoping is additional to these server checks.
+Origin/CSRF, fixed redirects, no-store, secret redaction, fail-closed storage and
+nonblocking audit follow the shared browser machinery.
+
+Destructive console actions, including retiring a workspace or changing provider,
+SMTP or signup settings, require same-operator fresh password or platform OIDC
+re-authentication within the existing five-minute human-proof window. OIDC requests
+fresh IdP authentication; an existing Wyrd cookie alone cannot satisfy it. Stale,
+tenant, different-operator or break-glass proof cannot authorize the mutation.
+CLI/API credentials remain their separate authorization channel; the global key
+is never sent to Node or a browser. No platform refresh-token flow is added.
 
 ### Delegation and federation
 
@@ -463,11 +781,13 @@ credential.
 - Token exchange adds no permission check of its own. `MAX_DELEGATION_DEPTH`
   is five: issuance refuses a deeper chain and verification rejects one, so a
   non-conforming token never enters request context. Every later request runs
-  the ordinary permission check against the delegated principal and its
-  intersected set; the `act` chain is attribution for audit only.
+  the ordinary permission check against current subject and actor grants and every
+  inherited/signed ceiling. The `act` chain retains audit attribution and identifies
+  participants whose current authority constrains delegated access.
 - Delegation depth is bounded, every hop is authorized, and the effective
-  permission set is the exact intersection of the actor's current permissions
-  and the subject's, so it can only narrow. If the complete intersection cannot
+  signed ceiling is the exact intersection of actor and subject authority and
+  inherited restrictions at exchange. Later checks also require current authority
+  of every participant, so delegation can only narrow. If the complete intersection cannot
   be represented by existing token scopes, refuse exchange before signing and
   issue no token. Do not silently discard common authority or widen a grant.
   Preserve explicit deployment/model grants beside `all`: only those explicit
@@ -483,8 +803,10 @@ credential.
   rootless semantics, all under the account's restriction. Assertion claims
   never select a principal and the `tenant` selector only routes.
 - A connection is selected by the login entry point, never by a token, header,
-  hostname, or post-login chooser. A tenant entry resolves only that tenant's
-  connection; the deployment's single platform-scope connection resolves only
+  hostname, or post-login chooser. A company-SSO entry resolves only that tenant's
+  connection; social entries select the operator provider through the bound
+  transaction described in social admission above. The deployment's single
+  platform-scope connection resolves only
   platform principals pre-registered against an expected issuer and claim and
   pinned on `(issuer, subject)` at first login. An unknown platform subject is
   denied and never provisioned just in time, and the platform connection's
@@ -492,7 +814,7 @@ credential.
   administrative credential.
 - Unknown issuers, unknown keys after one bounded refresh, unavailable JWKS,
   invalid claims, and ambiguous claim mappings fail authentication.
-- Every tenant shares one human-login callback, so authorization responses are
+- Tenant-configured company connections share one human-login callback, so authorization responses are
   bound to their issuer (RFC 9207) after the login state is consumed and
   before any token-endpoint request: a present `iss` must equal the issuer the
   login state recorded, byte for byte, and an absent `iss` is refused when the
@@ -524,8 +846,8 @@ or files with its private key, OAuth client secret and webhook secret held as
 `SecretString`; none is ever accepted from TOML, a tenant, a Card or a
 request. `wyrd.github_installations` holds at most one installation per
 tenant and one tenant per installation and host, under forced RLS; it stores
-no key or token. A tenant principal holding `identity_connections:write`
-begins a one-use transaction in `auth_login_state` (`flow = 'github'`), bound
+no key or token. An administrator or principal with explicit GitHub-configuration
+permission begins a one-use transaction in `auth_login_state` (`flow = 'github'`), bound
 to that principal and, at setup, to an HttpOnly browser binding cookie. Only
 the matching principal and browser can consume it, once, before it expires,
 and only against the slot revision it captured, so a stale callback cannot
@@ -533,7 +855,11 @@ restore a released or replaced connection. The callback redeems the OAuth
 code with PKCE for a transient user token that is used for the
 installation-access check and dropped. Disconnect fences the tenant's GitHub
 work before it releases the installation. Every operation authorizes and
-audits through the ordinary permission path.
+audits through the ordinary permission path. Connection configuration pages,
+installation inventory and all associated UI/HTTP routes enforce that permission
+in Rust. Repository Card access confers no connection access; GitHub configuration
+authority alone confers neither OIDC administration nor tenant data read. Retained
+review reads need no GitHub call and survive disconnect under their Wyrd grants.
 
 ## Wyrd signing keys and JWKS
 
@@ -561,160 +887,188 @@ selected key URLs are rejected.
 
 ## Authorization and policy
 
-Every route declares one typed `Permission { resource, action, scope }`.
-Issuance resolves permissions within the principal's tenant and signs them into
-the token; verification constructs the runtime principal from that claim. Scope never selects or widens
-tenancy: tenant identity comes only from the verified principal.
-
-A route whose objects are not known until the request is planned — a Bifrost
-SQL query — admits on the coarse operation capability and then takes the
-authoritative object decision inside the owning service against the resolved
-objects, before admission, audit acceptance, peer dispatch, or source IO. One
-uncovered object denies the whole request without returning rows, and the
-approved scoped decision is bound into the distributed permission digest so a
-worker cannot widen it.
-
-There is no runtime cross-service invoke policy decision point. Wyrd
-authorizes every protected API request with its own RBAC permission check on the
-verified principal, recorded to canonical audit; there is no separate
-policy engine, policy cache, or stale-allow mode to reason about.
+Every route declares one typed `Permission { resource, action, scope }`. The
+verified identity selects one tenant; scopes never select or widen tenancy.
+Server-owned current grants and every applicable restrictive ceiling must cover
+the operation and its target. No role name, Card reference or signed identity
+alone grants access. There is no external policy service or second checker.
 
 ### Request principal
 
-HTTP handlers receive identity through two extractors. `AuthenticatedPrincipal`
-verifies the signed Wyrd access token from `X-Wyrd-Access-Token`; `Caller`
-projects that verified principal with the request ID. `Caller.data_tenant_id`
-is copied from `principal.tenant_id`; no request header is tenant authority.
+The shared verifier checks token identity and signed restrictions synchronously
+without stores. Server ingress resolves current account authority before building
+the authenticated runtime principal and `Caller`; `Caller.data_tenant_id` comes
+only from the verified identity. HTTP, MCP, gateway, OTLP, native Bifrost and peer
+execution obey this boundary. A signature-only Gate context cannot authorize data.
+Browser sessions retain Rust-owned authentication and use the same grant checker.
 
-An optional `x-wyrd-workload-uid` header (HTTP, MCP, gateway, and OTLP
-metadata) selects request context, never identity or tenant. On a token
-that already signs a root, an equal selector is idempotent and a different
-one is refused as `signed_workload_mismatch`. On a rootless bearer the
-server resolves the root under the token's signed `card_access` and the
-account restriction, with no broader live-grant lookup and no activity
-recorded; an unknown and a foreign root are refused identically. A
-repeated or malformed selector is refused. Native Bifrost and OTLP gRPC
-apply the same server-owned selection before Gate admission, so a User bearer
-driving a loaded state writes natively under its validated root; signature
-verification stays store-free, and Gate itself, without that server-resolved
-caller, accepts only a signed root and refuses a selector it would have to
-resolve.
+An optional `x-wyrd-workload-uid` selector chooses context, never identity or tenant.
+An equal signed root is idempotent; a different root is refused as
+`signed_workload_mismatch`. Rootless selection resolves under signed `card_access`
+and the account's WorkloadRestriction; malformed/repeated, unknown or foreign
+roots are refused without activity, and unknown/foreign are indistinguishable.
+Native Bifrost and OTLP gRPC perform the same server-owned selection before Gate.
+WorkloadRestriction limits which Service family an account runs as; it grants no
+operations. PermissionScope limits which target resources an operation reaches;
+it never changes owning workload, subject, Verifier or principal attribution.
 
 ### Permission model
 
-`Permission { resource: Resource, action: Action, scope: PermissionScope }` is
-the one authorization vocabulary. `resource` and `action` name the operation;
-`scope` names the objects it may reach. A static role-derived grant over a
-named object is RBAC, not ABAC. Handlers
-require a typed `Permission`, never a flat string; `resource:action` names an
-operation only and the object axis has no string spelling.
+`Operation { resource, action }` uses closed typed Resource/Action enums, including
+existing wildcard and AnyOf semantics. A Role stores operations, not object scopes.
+A RoleBinding records its tenant, subject (User/Service ID and kind, or local
+group), role, explicit PermissionScope and assignment source. The server compiles
+bindings into `Permission { resource, action, scope }` values in PermissionSet.
+Direct/group grants are additive and absence denies. There is no explicit deny,
+policy language, mandatory group, ownership grant or nested/group-sync mechanism.
+Provider mapping replaces only its own source-qualified bindings.
 
-`Resource` and `Action` are closed enums in `wyrd_runtime::permission`, each
-with `AnyOf(..)` and `Wildcard`. Adding a variant is a reviewed Rust contract
-change; there are no custom runtime permission strings and no
-`Other(String)` escape hatch.
+PermissionScope is a closed domain-tagged union:
 
-`PermissionScope` is a closed, domain-tagged union:
+- `All` covers the operation's objects within the verified tenant only.
+- `Card(CardPermissionScope)` is `Family { kind, name }` or
+  `Version { kind, name, uid }`, with tenant supplied by the verified context.
+  Family covers existing/future versions and retained history; exact-version
+  scope covers only its validated UID and never follows recreation. General Card
+  version scope covers Verifiers; there is no separate Verifier-only scope.
+- `Bifrost(BifrostPermissionScope)` retains logical catalog/schema or exact
+  table UID scope for `bifrost_query:read`, including validated identifier segments.
+- `Gateway(GatewayAccess)` retains deployment/model scope and explicit `granted`
+  deployment semantics. Broad grants never erase required explicit grants.
+- `GithubConnection(GithubConnectionId)` addresses connection configuration.
+- `Tool(BuiltinTool)` addresses one exact built-in tool.
 
-- `All` covers every object of the permission's own resource and action. It
-  never widens the resource or the action.
-- `Bifrost(BifrostPermissionScope)` is valid only on `bifrost_query` `read`.
-  `Schema { catalog, schema }` covers every table currently or later resolved
-  beneath that logical catalog and schema. `Table { catalog, schema,
-  table_uid }` covers exactly that registered table UID and does not follow a
-  dropped-and-recreated table; catalog and schema ride with the UID so the
-  synchronous check needs no catalog lookup. Catalog and schema are the logical
-  SQL names (catalog `bifrost`, schema `logs`), validated as identifier segments.
+Bindings apply only to compatible operations at that scope or its applicable
+descendants. Reject unknown, cross-tenant and wholly inapplicable assignments;
+never promote missing or incompatible scope to All. Resource, action and scope
+must each cover the requirement. Schema covers its tables, family covers its
+versions, and an exact object covers itself, not a broader scope. Account-wide
+All is tenant-limited. Malformed permissions/ceilings refuse authority.
+`PermissionSet::covers_operation` is coarse route admission only when targets
+are not yet known; it never substitutes for final target checks.
 
-- `Verifier(CardUid)` is valid only on `verifier` `run`, `read`, and
-  `approve`, and covers exactly that Verifier Card UID. `All` on the same
-  operation covers every Verifier; no Verifier scope covers `All`, and each
-  action is granted separately.
+The existing `wyrd.auth_roles` owns typed operation bundles;
+`wyrd.auth_role_bindings` is the common source of scoped assignments rather than
+parallel User/Service grant stores. Optional `auth_groups` and
+`auth_group_memberships` provide tenant-local rosters. These and their references
+are tenant-qualified and protected by forced RLS. Bootstrap/internal authority
+retains its existing owner. Authentication alone adds no grant; configured issuer
+grants use the same binding model, without an implicit viewer fallback.
 
-A future domain that needs object scope adds its own typed variant rather than
-reusing another domain's identity spelling.
+### Current authority and freshness
 
-Coverage is per axis, and a `Permission` covers a requirement only when all
-three cover. `Wildcard` covers every resource or action and `AnyOf` covers its
-members; otherwise only the identical variant covers. `All` covers every scope;
-a schema scope covers itself and every table scope in that exact
-catalog/schema; a table scope covers only its UID; no Bifrost scope covers
-`All`. A wildcard or multi-resource grant cannot carry a Bifrost scope: decode
-rejects it. Grants are additive and absence is denial; there is no explicit
-deny, ownership, or grant option.
+Each process holds an immutable tenant authorization snapshot and already-resolved
+account views. Compile role/group bindings when first populated or meaningfully
+changed, not on each request. Access-affecting mutations atomically advance the
+tenant's `wyrd.auth_authorization_revisions` state and notify listeners. Background
+confirmation checks revisions; unchanged revision renews freshness without
+rebuilding grants. Healthy replicas enforce committed changes within five seconds.
+A known newer revision must be refreshed before any allow.
 
-`PermissionSet` keeps itself minimal on insert: an insert already covered is a
-no-op, and entries the insert covers are removed. Every authorization decision
-is `PermissionSet::contains`. `PermissionSet::covers_operation` ignores scope
-and answers only whether the principal holds the operation under some scope; it
-is route admission for requests whose objects are unknown until planning, never
-authorization. Built-in administrative authority is ordinary wildcard
-permissions, never a role-name bypass.
+A warm request performs local credential validation, a memory lookup and typed
+containment checks, with no permission SQL or role/group expansion. A miss or
+invalidation can acquire current permission state through the sanctioned reload.
+Signature verification and the checker remain synchronous and store-free; server
+hosting owns acquisition and refresh. Do not hold a lock across IO.
 
-Roles persist permissions as a JSONB array in `wyrd.auth_roles.permissions`,
-the direct serde projection of `Permission`:
-
-```json
-[
-  {"resource": "cards", "action": "write", "scope": "all"},
-  {"resource": {"any_of": ["operators", "triggers"]}, "action": "invoke", "scope": "all"},
-  {"resource": "bifrost_query", "action": "read",
-   "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}},
-  {"resource": "bifrost_query", "action": "read",
-   "scope": {"bifrost": {"table": {"catalog": "bifrost", "schema": "traces",
-                                   "table_uid": "0199f0c1-2f7e-7c2a-9a6f-1c9b2f4d5e60"}}}}
-]
-```
-
-`scope` is required; a two-field object is rejected, not promoted to `all`.
-Malformed identities, Bifrost scope on another resource, and Bifrost scope on
-any action other than `read` are rejected at decode, so a corrupt role row
-surfaces by name instead of resolving into authority. Role permissions are the
-only static grant model: there is no second grant table, policy lookup, or SQL
-`GRANT` language. The shape may add closed variants or optional fields; existing
-field names and variant meanings do not change.
+If database confirmation fails without known invalidation, a previously confirmed
+snapshot may allow until at most five minutes after its last successful database
+confirmation. Requests, failed refresh and token renewal never extend the bound.
+Known invalidation, absent state or expired freshness refuses as unavailable,
+without anonymous or token-snapshot fallback. Browser authentication and other
+store-dependent operations may fail sooner. Long streams revalidate authority and
+freshness before further output. No warm permission or managed-row check adds a
+PostgreSQL, object-store, Vault or Scribe wait; audit stages on the process outbox.
 
 ### Permission check
 
-`PermissionCheck` is the one runtime authorization chokepoint:
+PermissionCheck is the common synchronous, store-free authorization chokepoint
+for User and Service. An allow requires that current grants contain the required
+permission and every applicable credential, token, delegation and accepted-work
+ceiling also contains it. Missing ceiling means no added restriction; an empty
+ceiling permits nothing. An unavailable snapshot is refused before containment;
+a valid snapshot lacking permission yields ordinary permission denial.
+Audit, tracing and public error mapping remain at this shared boundary.
 
-```rust
-fn check(&self, principal: &Principal, permission: &Permission) -> PermissionVerdict;
-```
+Delegation checks current subject and every actor's grants within all inherited
+and signed ceilings. Accepted work serializes its frozen ceiling, identities and
+attribution; retry/recovery cannot enlarge it with later grants or substitute
+SYSTEM. Principal revocation retains its existing cancellation behavior.
 
-It is synchronous and infallible. Denial is `PermissionVerdict::Deny`, not a
-Rust error, and the handler boundary maps it into the public catalog
-(`WYRD_PERMISSION_403_DENIED_RBAC`). The signature takes no target parameter:
-the object is inside `Permission` as its scope. `RbacCheck`, the implementation,
-is stateless and allows exactly when
-`principal.effective_permissions.contains(permission)`, with no query-path
-database or network lookup. Handlers call
-`state.permission_check.check(&principal, &permission).into_result()?` and add
-no shortcut helpers, so audit, tracing, and policy stay at one call site. CEL
-and ABAC never sit behind this trait, and `PermissionDenyReason` has no ABAC
-variant.
+### Resource and retained-data visibility
+
+Capture a trusted exact authorization parent at acceptance: subject Card for
+ordinary verification, Verifier for subjectless direct work, Repository for PR
+work and its members. Retain exact/family identity with derived records after
+queue cleanup or Card deletion. This is an access boundary, never a replacement
+for the owning workload Card, workload_uid, subject, exact Verifier or actor chain.
+
+Repository Card read covers its reviews, review sets, members and retained evidence
+under sensitive-content controls, including for custom roles. Separate referenced
+Verifier read or GitHub configuration is unnecessary. Opening another Card's
+definition checks that Card independently. Starting work, authoring policy and
+approval require their distinct operations; approval also requires parent read.
+
+Point reads, downloads, lists, search, counts and pagination apply visibility
+before returning or aggregating results. Unknown/inaccessible exact objects are
+indistinguishable. Unprovable parents remain hidden even from admins. Public SQL
+and internal reads exposing caller data obey the same managed-row boundary;
+source, peer, query reuse or pagination cannot widen it. Ordinary user tables and
+unattributed telemetry stay table-scoped; captured gateway payloads need separate
+permission even in predicates, and audit history needs explicit tenant audit read.
+See [Bifrost public surface](bifrost-design.md#public-surface) for source enforcement.
+
+### Access administration
+
+Settings → Access exposes Users, Service accounts, Roles and optional Groups
+through existing Rust-owned account/credential workflows and common HTTP/CLI,
+SDK/MCP contracts. Tenant admins administer access; preserve last-admin protection.
+Service provisioning displays runtime family separately from operation grants;
+select family name, never release version. Grant forms select subject, role and
+explicit scope, show applicable operations and source, and explain family coverage
+of future versions. Removing one binding does not remove inherited/broader grants.
+
+Built-ins are read-only; custom roles select closed typed operations:
+
+| Role | Operations within applicable scopes |
+|---|---|
+| viewer | Resource/derived reads and authorized queries; no audit or captured payload read |
+| editor | Viewer plus authoring, binding management, execute/cancel; no approval/access administration |
+| workload | Granted runtime definition/artifacts/context/evidence reads, execute, authorized ingest and gateway invocation; no authoring/approval/audit/payload read |
+| approver | Read/decide on granted Verifiers where parent is readable; no authoring/execute or implicit different-parent read |
+| auditor | Tenant audit-history read; no implicit ordinary data/payload access |
+| admin | All tenant operations at tenant scope |
+
+An authenticated user can copy their identity, requested action and supplied
+link/identifier to request access through an existing communication channel. An
+admin responds with an ordinary binding; current sessions benefit after normal
+propagation. Help reveals no hidden target, owner, admin roster or installation
+inventory. There is no persisted request queue, notification or message sending.
 
 ### Auth crate boundaries
 
 ```text
-wyrd-runtime      Principal, Permission, PermissionSet, PermissionCheck, builtin roles
-wyrd-auth-issue   issuing keys, JWT claims, API-key hashing, delegation depth
-wyrd-auth-verify  synchronous JWT verifier, key map, principal from the permissions claim
-wyrd-sql          tenant-bound role, principal, and credential rows
-wyrd-server       HTTP handlers, TenantConn acquisition, credential writes, audit staging, error mapping
+wyrd-spec         pure wire contracts for roles, bindings, scopes and permissions
+wyrd-runtime      Principal, PermissionSet, PermissionCheck, builtin role behavior
+wyrd-auth-issue   issuing keys, identity/restriction claims, API-key hashing, delegation depth
+wyrd-auth-verify  synchronous store-free signature and claim verification
+wyrd-sql          tenant-bound accounts, operations, bindings, groups, revisions and credentials
+wyrd-auth         issuance, current authority acquisition and compiled account views
+wyrd-server       ingress composition, credential writes, audit staging and error mapping
 ```
 
-Shared auth crates do not depend on SQL. `wyrd-auth`'s `TenantTokenIssuer`
-resolves tenant permissions once, at issuance, over `TenantConn`.
+Shared auth shells remain SQL-free. Rust owns durable behavior; SDKs project the
+wire contracts and Node renders/forwards. Existing owners are extended rather
+than adding a policy service, parallel grant store or alternate checker.
 
 ### Production composition
 
-Server construction injects the configured permission resolver and canonical
-audit writer as required capabilities. A production profile cannot substitute
-an in-memory credential store, test key, or best-effort background audit
-emitter. Missing or unhealthy capabilities prevent the affected role from
-becoming ready. Dependency injection exists to make the boundary testable, not
-to make a security control optional.
+Server construction injects the current-authority resolver and canonical audit
+writer as required capabilities. A production profile cannot substitute an
+in-memory credential store or test key. Missing capabilities prevent readiness;
+subsequent authorization freshness follows the explicit bounds above. Audits use
+the canonical nonblocking outbox. Dependency injection makes security testable,
+not optional.
 
 ## Peer identity and distributed Oracle
 
@@ -738,8 +1092,8 @@ and opens no private listener.
 - The receiver owns authorization context. For query forwarding,
   reservations, stages and fragments, shuffle reads, Scribe active-stream
   listing, and Scribe live fragments, it checks the applicable tenant,
-  table/object/snapshot, query or
-  assignment, target node and fence, deadline, protocol version, request body
+  table/object/snapshot, authorization revision and applicable row/ceiling boundary,
+  query or assignment, target node and fence, deadline, protocol version, request body
   digest, and resource bounds against its own trusted state before decoding
   an executable plan or touching tenant storage. A mismatched or unresolvable
   context fails closed with no cross-tenant result.
@@ -829,7 +1183,21 @@ references, carry the tenant key in their foreign keys. `platform.*` is the
 privileged plane above tenant scope.
 
 Row-level security is the authoritative tenant boundary, and the pool decides
-scope. Every table enables and forces RLS. Tenant tables carry a
+scope. Every PostgreSQL table enables and forces RLS, including platform
+tables. Genuine deployment-wide and pre-tenant records belong to the existing
+platform plane and may omit `data_tenant_id`; they remain protected by narrowly
+authorized platform operations and platform RLS policies. Do not fabricate a
+tenant or give a signup visitor platform authority to store those records.
+The only new cross-tenant lookup purpose is the bounded verified-email workspace
+projection: HMAC canonical email, tenant ID, User reference and contact revision,
+with no password, grants, sessions or evidence. It and pre-tenant proven-email /
+one-use redemption metadata are platform-owner-only forced-RLS records. Tenant
+verified contacts lead with `data_tenant_id`, force RLS and retain tenant-qualified
+User references. Tenant mutations notify reconciliation; results always revalidate
+current tenant/User/contact through authorized tenant owners before disclosure.
+A stale projection cannot confer access or reveal a revoked association.
+This exception is to the tenant-key requirement only, not forced RLS. Tenant
+tables carry a
 `tenant_isolation` policy with both predicates:
 
 ```sql

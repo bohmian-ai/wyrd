@@ -31,6 +31,17 @@ const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 /// The served name of the tenant browser-session cookie scheme.
 const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";
 
+/// The platform console's own session cookie, required by the console
+/// operations that act on an existing platform session.
+const PLATFORM_BROWSER_SESSION_SCHEME: &str = "wyrdPlatformBrowserSession";
+
+/// Console operations that require the platform session cookie and nothing else.
+const PLATFORM_SESSION_PATHS: [&str; 3] = [
+    "/platform/browser/session",
+    "/platform/browser/password/reauth",
+    "/platform/browser/oidc/reauth",
+];
+
 /// The requirement of an operation that accepts the access token or, without
 /// one, a browser session.
 fn token_or_browser_session() -> Value {
@@ -238,8 +249,14 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards/download/init",
         "/v1/principals/{principal_id}/credentials/{credential_id}",
         "/v1/principals",
-        "/v1/principals/{principal_id}/roles",
-        "/v1/principals/{principal_id}/roles/{role}",
+        "/v1/principals/{principal_id}/access",
+        "/v1/access/roles",
+        "/v1/access/roles/{role}",
+        "/v1/access/bindings",
+        "/v1/access/bindings/{binding_id}",
+        "/v1/access/groups",
+        "/v1/access/groups/{group_id}",
+        "/v1/access/groups/{group_id}/members/{principal_id}",
         "/v1/verification/bindings/{binding_id}",
         "/v1/verification/evidence",
         "/v1/verification/execute",
@@ -269,6 +286,10 @@ async fn the_served_document_describes_the_composed_surface() {
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
+    assert!(
+        !paths.contains_key("/v1/principals/{principal_id}/roles"),
+        "superseded role-assignment routes are not documented"
+    );
     assert!(
         !paths.contains_key("/v1/cards/{card_uid}/abort"),
         "a route the server does not mount is not documented"
@@ -359,18 +380,20 @@ async fn github_connection_operations_publish_their_contract() {
 /// The tenant human-connection administration surface is served with its typed
 /// contract and no secret-bearing or unsupported shape.
 ///
-/// Each of the six operations publishes its route-specific refusals as
-/// problem+json; the redacted view and list shapes expose no secret field; the
-/// input schema offers exactly the three supported client-authentication
-/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
-/// its request body; and activation requires the recovery key.
+/// Each of the six connection operations and the two login-policy operations
+/// publishes its route-specific refusals as problem+json; the redacted view
+/// and list shapes expose no secret field; the policy read carries only its
+/// state, revisions, readiness and warning count; the input schema offers
+/// exactly the three supported client-authentication methods (never
+/// `PrivateKeyJwt`); both PUTs publish their typed request bodies; and
+/// activation requires the recovery key.
 #[tokio::test]
 async fn identity_connection_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
-    let operations: [(&str, &str, &[&str]); 6] = [
+    let operations: [(&str, &str, &[&str]); 8] = [
         ("/v1/identity/oidc/connections", "get", &["403", "503"]),
         (
             "/v1/identity/oidc/candidate",
@@ -397,6 +420,12 @@ async fn identity_connection_operations_publish_their_contract() {
             "delete",
             &["403", "404", "503"],
         ),
+        ("/v1/identity/login-policy", "get", &["403", "503"]),
+        (
+            "/v1/identity/login-policy",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
     ];
     for (path, method, statuses) in operations {
         let operation = &document["paths"][path][method];
@@ -422,7 +451,32 @@ async fn identity_connection_operations_publish_their_contract() {
         "the candidate PUT publishes its typed body although it reads raw bytes"
     );
 
+    assert_eq!(
+        document["paths"]["/v1/identity/login-policy"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/LoginPolicyChange",
+        "the policy PUT publishes its typed body although it reads raw bytes"
+    );
+
     let schemas = &document["components"]["schemas"];
+    // The warning is a count: the policy read names no User, identity or secret.
+    let mut policy_fields: Vec<_> = schemas["LoginPolicyView"]["properties"]
+        .as_object()
+        .expect("LoginPolicyView publishes its properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    policy_fields.sort_unstable();
+    assert_eq!(
+        policy_fields,
+        [
+            "connection",
+            "ready",
+            "require_company_sso",
+            "revision",
+            "users_without_company_identity"
+        ]
+    );
     let view_fields = schemas["HumanConnectionView"]["properties"]
         .as_object()
         .expect("HumanConnectionView publishes its properties");
@@ -582,6 +636,93 @@ async fn tenant_login_operations_publish_their_contract() {
             "{path} client_id is optional: {client_id}"
         );
     }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The principal read projections publish their fields: the caller's own
+/// email and display name on `/me`, every sign-in method, each directory
+/// item's display name, method and scoped Roles, the page's status counts,
+/// the `role` filter, and each Role's description and member count, with the
+/// Role PUT's optional description and its length refusal.
+///
+/// # Panics
+/// Panics when the served document omits one of them.
+#[tokio::test]
+async fn principal_read_projections_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let required = |schema: &str| -> Vec<String> {
+        schemas[schema]["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect()
+    };
+    for (schema, fields, always) in [
+        (
+            "CurrentUserProfile",
+            &["display_name", "email", "authentication"][..],
+            &["authentication"][..],
+        ),
+        (
+            "PrincipalSummary",
+            &["display_name", "authentication", "roles"][..],
+            &["roles"][..],
+        ),
+        ("PrincipalPage", &["counts"][..], &["counts"][..]),
+        (
+            "PrincipalStatusCounts",
+            &["active", "suspended"][..],
+            &["active", "suspended"][..],
+        ),
+        (
+            "RoleView",
+            &["description", "member_count"][..],
+            &["member_count"][..],
+        ),
+        ("PutRoleRequest", &["description"][..], &[][..]),
+    ] {
+        for field in fields {
+            assert!(
+                schemas[schema]["properties"][field].is_object(),
+                "{schema} publishes {field}: {}",
+                schemas[schema]
+            );
+        }
+        let required = required(schema);
+        for field in always {
+            assert!(
+                required.iter().any(|name| name == field),
+                "{schema} requires {field}"
+            );
+        }
+    }
+    assert!(
+        !required("PutRoleRequest").contains(&"description".to_owned()),
+        "a Role description is optional"
+    );
+    assert_eq!(
+        schemas["AccountAuthentication"]["enum"],
+        serde_json::json!(["password", "google", "github", "sso"])
+    );
+    assert!(
+        document["paths"]["/v1/principals"]["get"]["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|parameter| parameter["name"] == "role" && parameter["in"] == "query"),
+        "the directory takes the role filter"
+    );
+    assert!(
+        documented_description(&document, "/v1/access/roles/{role}", "put", 400)
+            .contains("200 characters"),
+        "the Role PUT documents its description limit"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -767,7 +908,9 @@ async fn every_problem_response_declares_its_media_type_and_stable_code() {
 /// with `security(())`. The only other override is the browser-session
 /// cookie, offered as an alternative to — never instead of — the access token,
 /// and only on the protected tenant `/v1` HTTP surface: MCP, OTLP, the platform
-/// plane and gateway inference stay bearer-only.
+/// plane and gateway inference stay bearer-only. The platform console's
+/// operations on an existing console session require that session's own
+/// cookie instead, and no other operation names it.
 #[tokio::test]
 async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     let server = WyrdTestServer::start_in_process()
@@ -800,8 +943,14 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
         );
     }
 
+    let platform = &document["components"]["securitySchemes"][PLATFORM_BROWSER_SESSION_SCHEME];
+    assert_eq!(platform["type"], "apiKey");
+    assert_eq!(platform["in"], "cookie");
+    assert_eq!(platform["name"], "wyrd_platform_session");
+
     let mut cleared = BTreeSet::new();
     let mut cookie_paths = BTreeSet::new();
+    let mut platform_session_paths = BTreeSet::new();
     let mut bearer_only_v1 = BTreeSet::new();
     for (path, item) in document["paths"].as_object().expect("paths object") {
         for (method, operation) in item.as_object().expect("path item is an object") {
@@ -819,6 +968,14 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
                 cookie_paths.insert(path.clone());
                 continue;
             }
+            if overridden == &serde_json::json!([{ PLATFORM_BROWSER_SESSION_SCHEME: [] }]) {
+                assert!(
+                    PLATFORM_SESSION_PATHS.contains(&path.as_str()),
+                    "{method} {path} requires the platform console session outside the console"
+                );
+                platform_session_paths.insert(path.as_str());
+                continue;
+            }
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
             assert!(
@@ -831,6 +988,11 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     assert!(
         !cleared.is_empty(),
         "sign-in and credential exchange cannot themselves require a session"
+    );
+    assert_eq!(
+        platform_session_paths,
+        BTreeSet::from(PLATFORM_SESSION_PATHS),
+        "each console session operation requires the platform session cookie"
     );
     for path in ["/v1/identity/oidc/connections", "/v1/cards"] {
         assert!(
@@ -2293,7 +2455,9 @@ async fn no_yaml_projection_is_routed() {
 
 /// The operations that clear their `security` requirement are exactly the
 /// ones an anonymous caller can reach, and the ones that offer the browser
-/// session are exactly the ones that read it.
+/// session are exactly the ones that read it. An operation that names its own
+/// scheme instead, such as the platform console session cookie, is protected:
+/// a credential-free caller and a tenant session cookie are both refused.
 ///
 /// This is the behavioural replacement for the hand-written anonymous-path
 /// list: each operation's own declaration is the input, and the assembled
@@ -2340,7 +2504,8 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
 
             let security = operation.get("security");
             let accepts_cookie = security == Some(&token_or_browser_session());
-            if security.is_some() && !accepts_cookie {
+            let anonymous = security == Some(&json!([{}]));
+            if anonymous {
                 cleared += 1;
                 if code == "WYRD_AUTH_401_UNAUTHENTICATED" {
                     defects.push(format!(
@@ -2354,7 +2519,7 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
                      answered {status} ({code}) without a token"
                 ));
             }
-            if security.is_some() && !accepts_cookie {
+            if anonymous {
                 continue;
             }
 

@@ -185,7 +185,8 @@ oracle0="$(oracle_pods)"
   || fail "the Oracle tier did not start with exactly one ready replica: $oracle0"
 require_pinned wyrd-core-0 "$oracle0"
 
-setup_out="$(k exec wyrd-core-0 -- wyrd-server setup --tenant acme)"
+setup_out="$(printf 'acme-admin-local\n' | k exec -i wyrd-core-0 -- \
+  wyrd-server setup --tenant acme --admin-username acme-admin --admin-password-stdin)"
 api_key="$(sed -n 's/^admin_credential: //p' <<<"$setup_out")"
 [[ -n $api_key ]] || fail "setup disclosed no tenant credential: $setup_out"
 

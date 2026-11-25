@@ -14,7 +14,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use wyrd_ai::WyrdClient;
 use wyrd_ai::auth::{
-    CreateServicePrincipalRequest, Principals, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    CreateServicePrincipalRequest, Principals, ScopedRoleAssignment, WorkloadFamily, WorkloadKind,
+    WorkloadRestriction,
 };
 use wyrd_ai::bifrost::{Bifrost, BifrostOptions, QueryParam};
 use wyrd_ai::cards::{BundleMode, CardKind, CardSelector, Cards};
@@ -223,7 +224,7 @@ async fn scheduled_check_judges_each_window() {
         .expect("principals connect")
         .create_service_principal(&CreateServicePrincipalRequest {
             name: "checkout-runtime".to_owned(),
-            roles: vec!["workload".to_owned()],
+            assignments: vec![ScopedRoleAssignment::tenant("workload")],
             description: None,
             workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
                 kind: WorkloadKind::Service,

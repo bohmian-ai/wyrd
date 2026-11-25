@@ -2804,7 +2804,6 @@ mod tests {
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::User,
             crate::test_support::tenant(),
-            Vec::new(),
             PermissionSet::new(),
         )
     }
@@ -4969,7 +4968,6 @@ mod tests {
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::System,
             crate::test_support::tenant(),
-            Vec::new(),
             PermissionSet::new(),
         )
         .with_card_access(

@@ -85,7 +85,8 @@ impl<'a> ApprovalDecisions<'a> {
     }
 
     /// Accept `receipt`, a decision of `execution_id`'s approval occurrence
-    /// whose Verifier version is `verifier`, under `attribution`, and wait
+    /// whose Verifier version is `verifier`, retained under the execution's
+    /// exact `subject`, under `attribution`, and wait
     /// for its own Scribe acknowledgement until `deadline`. A resubmission
     /// is absorbed by its batch fence; a different decision is refused.
     ///
@@ -98,11 +99,11 @@ impl<'a> ApprovalDecisions<'a> {
     pub(crate) async fn accept(
         &self,
         attribution: Attribution,
-        (execution_id, verifier): (ExecutionId, &CardUid),
+        (execution_id, verifier, subject): (ExecutionId, &CardUid, &CardUid),
         receipt: &ApprovalReceipt,
         deadline: Instant,
     ) -> Result<(), WyrdError> {
-        let row = row(execution_id, verifier, receipt)?;
+        let row = row((execution_id, verifier, subject), receipt)?;
         let writer = || {
             WyrdError::from(BifrostError::WriterUnavailable {
                 table: APPROVALS_TABLE.to_owned(),
@@ -147,8 +148,7 @@ impl<'a> ApprovalDecisions<'a> {
 /// Returns an internal error when the receipt is pending, expired, or lacks
 /// its actor or time, or a value does not fit its column.
 fn row(
-    execution_id: ExecutionId,
-    verifier: &CardUid,
+    (execution_id, verifier, subject): (ExecutionId, &CardUid, &CardUid),
     receipt: &ApprovalReceipt,
 ) -> Result<StagedRow, WyrdError> {
     let decision = match receipt.status {
@@ -182,7 +182,8 @@ fn row(
             "actor_id" => Cell::text(Some(actor.as_str())),
             "reason" => Cell::text(receipt.reason.as_deref()),
             "decided_at" => Cell::Micros(Some(decided_at.timestamp_micros())),
-            // Shared dimensions and the workload, subject, and run columns.
+            SUBJECT_CARD_UID => Cell::text(Some(subject.as_str())),
+            // Shared dimensions and the workload and run columns.
             _ => Cell::text(None::<&str>),
         })
         .collect();

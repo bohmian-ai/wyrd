@@ -29,7 +29,11 @@ RUN chmod 0755 /usr/local/bin/wyrd-server /entrypoint.sh \
 
 # Mount /var/lib/wyrd persistently: local artifact storage and Scribe's
 # private WAL/staging live there. Postgres and the signing key are external.
-ENV WYRD_SERVER_BIND=127.0.0.1:8081 \
+# The bundled nginx is the server's and BFF's only peer and states each
+# visitor's TCP address in X-Real-IP, replacing any value the browser sent.
+ENV WYRD_TRUSTED_INGRESS=127.0.0.1/32 \
+    WYRD_CLIENT_ADDRESS_HEADER=X-Real-IP \
+    WYRD_SERVER_BIND=127.0.0.1:8081 \
     WYRD_GRPC_BIND=127.0.0.1:50053 \
     WYRD_UI_BIND=127.0.0.1:3000 \
     WYRD_STORAGE_URL=file:///var/lib/wyrd/storage \

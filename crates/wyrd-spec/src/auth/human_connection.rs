@@ -303,6 +303,62 @@ pub struct ConnectionActivate {
     pub recovery_api_key: SecretBearer,
 }
 
+/// A tenant connection revision a login-policy read observed or a change
+/// expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LoginPolicyConnection {
+    /// The Active company connection's id.
+    pub id: Uuid,
+    /// That connection's revision.
+    pub revision: u64,
+}
+
+/// `GET /v1/identity/login-policy` response: whether the tenant requires
+/// company SSO, and what enabling it would affect.
+///
+/// Read by tenant administrators before they confirm a change. The warning
+/// is a count only; it names no User.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LoginPolicyView {
+    /// Company SSO is the tenant's only human sign-in method.
+    pub require_company_sso: bool,
+    /// The policy revision; `0` before the policy was ever changed. A change
+    /// submits the revision it read.
+    pub revision: u64,
+    /// The current Active company connection, or `None` without one.
+    pub connection: Option<LoginPolicyConnection>,
+    /// The Active connection can sign people in now; enabling requires it.
+    pub ready: bool,
+    /// Active Users with no identity at the Active connection, who cannot
+    /// sign in while company SSO is required. Disabled Users and Services
+    /// are not counted.
+    pub users_without_company_identity: u64,
+}
+
+/// `PUT /v1/identity/login-policy` body: the desired policy and the
+/// revisions the administrator confirmed it against.
+///
+/// Only a browser session created by a company sign-in through the current
+/// Active connection within the last five minutes may submit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LoginPolicyChange {
+    /// Require company SSO (`true`) or allow the other enabled methods again
+    /// (`false`).
+    pub require_company_sso: bool,
+    /// The policy revision the administrator read.
+    pub expected_revision: u64,
+    /// The Active connection the administrator read, `None` when the read
+    /// showed none; a change without a current Active connection is always
+    /// a conflict.
+    pub expected_connection: Option<LoginPolicyConnection>,
+}
+
 /// Refuse a Human issuer on the workload trusted-issuer surfaces.
 ///
 /// # Errors

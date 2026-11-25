@@ -93,10 +93,10 @@ echo "== startup_image_journey: serve, setup, routes"
 start_app development
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$app" | grep -q "$owner_pw" \
   && fail "the DBA credential reached the serving container"
-setup_out="$(docker exec "$app" wyrd-server setup --tenant acme)"
+setup_out="$(setup_acme)"
 api_key="$(sed -n 's/^admin_credential: //p' <<<"$setup_out")"
 [[ -n $api_key ]] || fail "setup disclosed no tenant credential: $setup_out"
-docker exec "$app" wyrd-server setup --tenant acme | grep -q "already set up" \
+setup_acme | grep -q "already set up" \
   || fail "second setup was not a no-op"
 
 [[ "$(curl -fsS "$http/healthz")" == ok ]] || fail "healthz through nginx"

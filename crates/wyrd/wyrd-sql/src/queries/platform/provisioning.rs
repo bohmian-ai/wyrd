@@ -41,7 +41,10 @@ pub async fn insert_provisioning_tenant(
     // The window is generous so a slow but live attempt is never stolen from;
     // provisioning is a handful of writes and takes nothing like that long. An
     // `active` or `suspended` tenant, and a `provisioning` row that is still
-    // moving, are genuine collisions and still conflict.
+    // moving, are genuine collisions and still conflict. So is any claim a
+    // public signup made: only its own attempt may resume it, through
+    // `claim_signup_tenant`, and its creator key marks it after the attempt
+    // is purged.
     let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
         "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
          VALUES ($1, $2, $3, 'provisioning')
@@ -51,9 +54,10 @@ pub async fn insert_provisioning_tenant(
                 status                    = 'provisioning',
                 provisioning_failed_reason = NULL,
                 updated_at                = now()
-          WHERE platform.tenants.status = 'failed'
-             OR (platform.tenants.status = 'provisioning'
-                 AND platform.tenants.updated_at < now() - interval '15 minutes')
+          WHERE platform.tenants.signup_creator_key IS NULL
+            AND (platform.tenants.status = 'failed'
+                 OR (platform.tenants.status = 'provisioning'
+                     AND platform.tenants.updated_at < now() - interval '15 minutes'))
          RETURNING data_tenant_id",
     )
     .bind(data_tenant_id.as_uuid())
@@ -78,6 +82,95 @@ pub async fn insert_provisioning_tenant(
             DataTenantId::try_from(claimed).map_err(SqlError::InvalidDataTenantId)?,
         )
     })
+}
+
+/// Claim `slug` for the public signup `attempt` by the identity whose keyed
+/// pseudonym is `creator`, or resume that attempt's own interrupted claim of
+/// it. The creator key stays on the tenant after the attempt is purged.
+///
+/// Unlike [`insert_provisioning_tenant`], only a `failed` or stale
+/// `provisioning` row this same attempt created is adopted, so no other
+/// visitor, signup or operator claim can be taken over. A signup claim goes
+/// stale after two minutes without progress, inside its proof's five-minute
+/// completion window.
+///
+/// A new claim is refused, returning `None`, when the creator already owns
+/// the deployment's owned-workspace cap of unretired signup tenants; failed
+/// and provisioning claims count, and resuming this attempt's own claim is
+/// not a new one. Claims by one creator are serialized on a transaction
+/// lock, so concurrent completions on any replica cannot exceed the cap.
+///
+/// # Errors
+/// Returns [`SqlError::UniqueViolation`] when the slug belongs to another
+/// tenant or claim, and [`SqlError::Query`] when the insert fails.
+pub async fn claim_signup_tenant(
+    pool: &OperatorPool,
+    data_tenant_id: DataTenantId,
+    slug: &str,
+    display_name: &str,
+    attempt: uuid::Uuid,
+    creator: &[u8; 32],
+) -> Result<Option<TenantClaim>, SqlError> {
+    let mut tx = pool.pool().begin().await.map_err(SqlError::from)?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(
+                    hashtextextended('wyrd.signup_creator:' || encode($1, 'hex'), 0))",
+    )
+    .bind(creator.as_slice())
+    .execute(&mut *tx)
+    .await
+    .map_err(SqlError::from)?;
+    let admitted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM platform.tenants WHERE signup_attempt_id = $2)
+                OR (SELECT count(*) FROM platform.tenants
+                     WHERE signup_creator_key = $1 AND status <> 'deleted')
+                   < (SELECT signup_workspace_cap FROM platform.login_settings)",
+    )
+    .bind(creator.as_slice())
+    .bind(attempt)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(SqlError::from)?;
+    if !admitted {
+        return Ok(None);
+    }
+    let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
+        "INSERT INTO platform.tenants
+             (data_tenant_id, slug, display_name, status, signup_attempt_id,
+              signup_creator_key)
+         VALUES ($1, $2, $3, 'provisioning', $4, $5)
+         ON CONFLICT (slug) DO UPDATE
+            SET display_name               = EXCLUDED.display_name,
+                status                     = 'provisioning',
+                provisioning_failed_reason = NULL,
+                updated_at                 = now()
+          WHERE platform.tenants.signup_attempt_id = EXCLUDED.signup_attempt_id
+            AND (platform.tenants.status = 'failed'
+                 OR (platform.tenants.status = 'provisioning'
+                     AND platform.tenants.updated_at < now() - interval '2 minutes'))
+         RETURNING data_tenant_id",
+    )
+    .bind(data_tenant_id.as_uuid())
+    .bind(slug)
+    .bind(display_name)
+    .bind(attempt)
+    .bind(creator.as_slice())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(SqlError::from)?;
+    let Some(claimed) = adopted else {
+        return Err(SqlError::UniqueViolation {
+            constraint: "tenants_slug_key".to_owned(),
+        });
+    };
+    tx.commit().await.map_err(SqlError::from)?;
+    Ok(Some(if claimed == data_tenant_id.as_uuid() {
+        TenantClaim::Created
+    } else {
+        TenantClaim::Resumed(
+            DataTenantId::try_from(claimed).map_err(SqlError::InvalidDataTenantId)?,
+        )
+    }))
 }
 
 /// Which tenant row a provisioning attempt ended up owning.

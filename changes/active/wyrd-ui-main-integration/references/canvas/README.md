@@ -1,4 +1,4 @@
-# Approved UI canvas — revision 18
+# Approved UI canvas — revision 19
 
 Visual reference for spec revision 5 (REQ-021–REQ-031), approved by the caller
 on 2026-10-19. The spec is authority; the canvas illustrates it. Values in the
@@ -18,6 +18,7 @@ dark theme only.
 | [TraceDrawer](TraceDrawer.dc.html) | [png](png/TraceDrawer.png) | Trace drawer: opens over the list, waterfall on top, span details below |
 | [Spans](Spans.dc.html) | [png](png/Spans.png) | Spans mode: every matching span, filters open, trace id opens the drawer |
 | [TimePicker](TimePicker.dc.html) | [png](png/TimePicker.png) | Time picker, open |
+| [Cards](Cards.dc.html) | [png](png/Cards.png) | Cards: every version from `cards.list`, kind and status filters, metadata filter, cursor paging |
 | [Home](Home.dc.html) | [png](png/Home.png) | Home — attention from failed verification, Services health, live Observe summary |
 | [Agent](Agent.dc.html) | [png](png/Agent.png) | Agent Card: composition, invoke_agent spans and gateway calls attributed to it, bound Verifiers |
 | [Prompt](Prompt.dc.html) | [png](png/Prompt.png) | Prompt Card: the prompt is the page; spec only, no telemetry |

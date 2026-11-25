@@ -7,7 +7,7 @@ section: Operate
 order: 3
 ---
 
-People sign in to Wyrd through your organization's identity provider, such as Okta or Keycloak. Wyrd stores no passwords and has no invite step: a person's account is created the first time they sign in. A new account holds no role until you grant one.
+People sign in to Wyrd with a local username and password, or through your organization's identity provider, such as Okta or Keycloak. This guide connects a provider: then a person's account is created the first time they sign in, and it holds no role until you grant one. To add people without a provider, see [Without an identity provider](#without-an-identity-provider).
 
 You connect the provider once per tenant. Wyrd only trusts a connection after a real test sign-in succeeds, so a typo in the issuer or client ID cannot lock your team out.
 
@@ -129,7 +129,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 The response shows `"state":"Active"`. The recovery key proves an administrator can still get in with a key if the provider ever breaks; Wyrd checks it and does not store it. Keep the `admin_credential` in your secret manager for that reason.
 
-## 6. Sign in and grant roles
+## 6. Sign in and grant access
 
 Each person signs in once from a terminal:
 
@@ -137,14 +137,14 @@ Each person signs in once from a terminal:
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no role yet. As the administrator, find it and grant a role:
+The browser opens at your provider; they sign in and approve the code the CLI shows. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
 
 ```bash
 wyrd principal list --kind user --email alice@example.com
-wyrd principal role grant --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind user --grant editor:all
 ```
 
-The role takes effect within 5 minutes, when their access token next renews. [Roles](/understand/identity-and-authorization/#roles) lists what each role allows.
+`editor:all` covers the whole tenant; `viewer:Repository/payments` would cover one Repository family. The grant reaches their current session within about 5 seconds; they do not sign in again. [Roles](/understand/identity-and-authorization/#roles) lists what each role allows.
 
 ## Map provider groups to roles
 
@@ -178,17 +178,66 @@ Then add `groups` to `claim_mapping` and a `group_role_map` to `connection.json`
 
 Repeat steps 3 to 5 with the new `revision` the stage call returns. Only a connection that passes its own test replaces the active one, so sign-in keeps working until then.
 
-Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Roles you grant with `wyrd principal role grant` are separate: sign-in never adds or removes them.
+Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Bindings you grant with `wyrd principal access grant` are separate: sign-in never adds or removes them.
+
+## Require company sign-in
+
+Once the connection is active, you can make it the only way people sign in to the tenant. Password and Google or GitHub sign-in then stop, and so do the sessions and CLI sign-ins they started. API keys keep working.
+
+1. Sign in to the UI through your company provider, as an account that holds `admin`.
+2. Open **Settings**. **Require company SSO** shows how many active accounts cannot sign in through your company.
+3. Check **Require company SSO for every person** and select **Enable**.
+
+The page then reads `✓ Required`, and the sign-in page offers only your company provider. **Disable** works the same way. Disabling lets password and social sign-in start again, but every session and CLI sign-in that enabling ended stays ended.
+
+<Aside type="caution" title="Wyrd never links accounts">
+A password, Google or GitHub account and a company account are separate accounts, even with the same email. Requiring company sign-in moves no roles, keys or history to the company account. Grant the company accounts their roles before you enable it. The warning count tells you how many accounts this leaves out.
+</Aside>
+
+Enabling and disabling need a company sign-in from the last five minutes. An API key or a recovery session cannot change the policy. If your provider is down while company sign-in is required, people cannot sign in until it returns or you activate a replacement connection with the recovery key, as in step 5.
 
 ## Without an identity provider
 
-Until you connect a provider, give each person a key on their own account:
+Wyrd keeps local Users of its own, so a team can sign in before or without connecting a provider. As the administrator, invite a person with the grants their account receives:
 
 ```bash
-wyrd principal credential create-principal --name alice --role editor
+wyrd principal user invite --recipient alice@example.com --recipient bob@example.com \
+  --grant viewer:Repository/payments
 ```
 
-They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
+Each recipient gets a separate `invitation_link`, printed only this once. Send each person their link. Until an operator configures a mail relay (see [Email invitations](#email-invitations)), Wyrd does not email links, and `delivery` reads `not_emailed`. The person opens the link and chooses a username and password. Each link works once, for 24 hours. Anyone holding a live link can use it, so revoke one that reached the wrong person. `GET /v1/principals/users/invitations` lists pending invitations without their links. `POST /v1/principals/users/invitations/{id}/resend` replaces a link, and the old one stops working. `DELETE /v1/principals/users/invitations/{id}` revokes it.
+
+You can also create the User yourself. The password is read from standard input, so it never enters the command line or your shell history:
+
+```bash
+wyrd principal user create --username alice --grant editor:all < alice-password.txt
+```
+
+When a platform operator has enabled Google sign-in for the deployment, the invitation page also offers **Join with Google**. The person's account is then tied to that Google account, whatever its email address, and they return with **Continue with Google** on the sign-in page. A Google account that already has an account in the tenant cannot use a second link; the sign-in page tells them to sign in instead.
+
+In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email addresses and choose a role and a scope, and the page shows each link once. **Pending invitations** lists every live invitation, with **Resend** and **Revoke**.
+
+Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
+
+## Recovery email and password reset
+
+A person with a password resets it on the sign-in page with **Reset your password**. With a mail relay, they enter their username and Wyrd emails a one-time code to the account's verified recovery email; the page answers every username the same, so it never says whether an account exists. Without a relay, or when the account has no verified recovery email, an administrator issues the code with `POST /v1/principals/users/{principal_id}/password-reset` and gives it to the person. A code works once, for fifteen minutes. Setting the new password signs the person out everywhere and ends their CLI sign-ins; API keys keep working.
+
+Each person verifies their own recovery email under **Settings**, then **Account**, then **Recovery email**. The section appears only when the deployment has a mail relay, needs a sign-in from the last five minutes, and never shows the current address. Wyrd emails a link to the new address; opening it in the same browser while signed in finishes the change, and the previous address is told. A verified recovery email is also what **Find my workspaces** uses to list the workspaces that address can sign in to; an unverified profile email is never used for either.
+
+## Email invitations
+
+Wyrd can also email each invitation link through an SMTP relay you already use: your company's mail server or a transactional mail service such as Resend. Set up the sending account and domain with that service first. As a platform administrator, store the relay. The password is sealed and never returned, and tenant administrators can neither read nor change it:
+
+```bash
+curl -X PUT https://wyrd.example.com/platform/mail \
+  -H "X-Wyrd-Access-Token: Bearer $PLATFORM_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"host":"smtp.example.com","port":587,"tls":"starttls","username":"wyrd","password":"…","sender":"invites@example.com"}'
+```
+
+`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. To change other settings later, send the same `username` without `password` and Wyrd keeps the stored password; a new `username` needs its `password`, and leaving out `username` removes the stored sign-in. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
+
+From then on, Wyrd emails each new or resent link separately to its recipient and still returns it to you. `delivery` reads `accepted` when the relay took the message. That is not proof it reached an inbox. It reads `failed` when the relay refused it or could not be reached. The invitation stays pending, so copy the link or resend once the relay works. Wyrd does not queue or retry mail.
 
 ## If it fails
 
@@ -197,7 +246,8 @@ They set it as `WYRD_API_KEY`. Each call is audited under that account. The acco
 | The provider says the redirect URI is invalid | Register the exact `callback_url` from step 1. Call the API at the public address, not an internal one |
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` from activate | The test expired after 15 minutes, or you staged a new revision since. Rerun step 4 |
 | `WYRD_AUTH_409_CONNECTION_CONFLICT` | `expected_revision` is stale, or the recovery key is not an admin key of this tenant. Read the current revision with the step 1 call |
-| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no role yet. Grant one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
+| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` when you enable or disable company sign-in | Sign in through your company again, return to **Settings**, and confirm again |
+| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no grant yet. Bind one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
 
 ## Next
 

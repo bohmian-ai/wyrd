@@ -87,7 +87,7 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{
         HumanConnectionWrite, LoginState, consume_login_state, human_connection_in_state,
         insert_device_authorization, insert_human_candidate, insert_login_state, insert_role,
-        insert_user, list_user_roles, lock_refresh_family, replace_idp_user_roles,
+        insert_user, list_role_bindings, lock_refresh_family, replace_idp_user_bindings,
         user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
@@ -709,12 +709,16 @@ mod pg_tests {
         let sessions = crate::auth::browser::browser_sessions(&state)
             .expect("browser sessions are configured");
         for completion in [completion_a, completion_b] {
-            let roles = sessions
+            let session = sessions
                 .resolve(signed_in(&completion).cookie.expose_secret())
                 .await
-                .expect("the session resolves")
-                .verified
-                .principal
+                .expect("the session resolves");
+            let roles = state
+                .auth
+                .authority
+                .authorize(state.postgres.wyrd(), &session.verified)
+                .await
+                .expect("the session's account is current")
                 .roles;
             assert_eq!(role_set(roles), BTreeSet::from([BETA.to_owned()]));
         }
@@ -876,13 +880,15 @@ mod pg_tests {
                 &mut conn,
                 Uuid::now_v7(),
                 "connection_tester",
-                &serde_json::to_value([Permission::identity_connections_write()])
-                    .expect("permission encodes"),
+                &serde_json::to_value([wyrd_spec::auth::Operation::of(
+                    &Permission::identity_connections_write(),
+                )])
+                .expect("operation encodes"),
                 false,
             )
             .await
             .expect("role inserts");
-            replace_idp_user_roles(&mut conn, user, &["connection_tester"])
+            replace_idp_user_bindings(&mut conn, user, &["connection_tester"])
                 .await
                 .expect("role grants");
         }
@@ -938,7 +944,8 @@ mod pg_tests {
     /// The tenant role the role-sync cases map a provider group to.
     const SYNC_ROLE: &str = "login_sync_probe";
 
-    /// Create and commit tenant role `name`.
+    /// Create and commit tenant role `name`, bundling `cards:read` so a
+    /// binding of it contributes authority.
     ///
     /// # Panics
     /// Panics when the role cannot be written.
@@ -948,7 +955,8 @@ mod pg_tests {
             &mut conn,
             Uuid::now_v7(),
             name,
-            &serde_json::json!([]),
+            &serde_json::to_value([wyrd_spec::auth::Operation::of(&Permission::card_read())])
+                .expect("operation encodes"),
             false,
         )
         .await
@@ -978,9 +986,13 @@ mod pg_tests {
     /// Panics when the query fails.
     async fn user_roles(fixture: &PgFixture, user: Uuid) -> Vec<String> {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        list_user_roles(&mut conn, user)
+        list_role_bindings(&mut conn)
             .await
-            .expect("role list runs")
+            .expect("binding list runs")
+            .into_iter()
+            .filter(|binding| binding.subject.user_id == Some(user))
+            .map(|binding| binding.role_name)
+            .collect()
     }
 
     /// A mock JWKS endpoint serving the test Ed25519 key.
@@ -1134,6 +1146,7 @@ mod pg_tests {
             subject: subject.to_owned(),
             email: email.map(ToOwned::to_owned),
             groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+            name: None,
         }
     }
 

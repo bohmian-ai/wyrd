@@ -159,7 +159,8 @@ impl<'a> DeferredEvidence<'a> {
     }
 
     /// Accept `published` for `input` of `source` for each of `subscribers`,
-    /// recorded at `recorded_at` under `attribution`, and wait for every
+    /// each retained under its exact subject in `subjects`, recorded at
+    /// `recorded_at` under `attribution`, and wait for every
     /// acceptance's own Scribe acknowledgement until `deadline`.
     ///
     /// Each acceptance is staged on its own reserved outbox slot. A
@@ -175,7 +176,11 @@ impl<'a> DeferredEvidence<'a> {
         attribution: Attribution,
         (source, input): (EvidenceSource<'_>, &SlotName),
         published: &Published,
-        (subscribers, recorded_at): (&[CardUid], DateTime<Utc>),
+        (subscribers, subjects, recorded_at): (
+            &[CardUid],
+            &BTreeMap<CardUid, CardUid>,
+            DateTime<Utc>,
+        ),
         deadline: Instant,
     ) -> Result<(), WyrdError> {
         let outbox = self.app.bifrost.scribe_outbox();
@@ -186,7 +191,10 @@ impl<'a> DeferredEvidence<'a> {
         };
         let mut acks = Vec::with_capacity(subscribers.len());
         for verifier in subscribers {
-            let row = row(source, input, verifier, published, recorded_at)?;
+            let subject = subjects.get(verifier).ok_or_else(|| {
+                WyrdError::internal("every evidence subscriber names its subject")
+            })?;
+            let row = row(source, input, (verifier, subject), published, recorded_at)?;
             let slot = outbox.reserve_until(1, deadline).await.map_err(|full| {
                 tracing::warn!(
                     admitted = full.admitted,
@@ -253,7 +261,8 @@ fn derived(parts: &[&str]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// `verifier`'s acceptance of `published` as its staged row.
+/// `verifier`'s acceptance of `published` as its staged row, retained
+/// under `subject`, the exact Card of the work it was accepted for.
 ///
 /// # Errors
 /// Returns an internal error when the declaration exceeds a Variant limit
@@ -261,7 +270,7 @@ fn derived(parts: &[&str]) -> Uuid {
 fn row(
     source: EvidenceSource<'_>,
     input: &SlotName,
-    verifier: &CardUid,
+    (verifier, subject): (&CardUid, &CardUid),
     published: &Published,
     recorded_at: DateTime<Utc>,
 ) -> Result<StagedRow, WyrdError> {
@@ -282,7 +291,8 @@ fn row(
             "sha256" => Cell::text(Some(published.sha256.as_str())),
             "value" => Cell::Variant(value.take()),
             "recorded_at" => Cell::Micros(Some(recorded_at.timestamp_micros())),
-            // Shared dimensions and the workload, subject, and run columns.
+            SUBJECT_CARD_UID => Cell::text(Some(subject.as_str())),
+            // Shared dimensions and the workload and run columns.
             _ => Cell::text(None::<&str>),
         })
         .collect();

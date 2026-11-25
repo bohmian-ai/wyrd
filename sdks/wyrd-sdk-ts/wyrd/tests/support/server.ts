@@ -102,7 +102,7 @@ export async function runtimeAccount(
   }
   const created = await principals.createServicePrincipal({
     name,
-    roles: ["workload"],
+    assignments: [{ role: "workload", scope: "all" }],
     workload_restriction: { mode: "family", kind: card.kind, name: card.name },
   });
   return { principalId: created.principal_id, key: created.credential };
@@ -228,6 +228,8 @@ export interface ServerOptions {
   readonly githubApp?: boolean;
   /** Direct verification deadline from arrival in milliseconds; the production deadline by default. */
   readonly verifyTimeoutMs?: number;
+  /** Google's OpenID Connect issuer, so a story signs in at a local fake Google. */
+  readonly googleIssuer?: string;
   /** Start a fresh server for every test instead of one per story file. */
   readonly perTest?: boolean;
 }
@@ -276,6 +278,7 @@ export function serverTest(options: ServerOptions = {}) {
           scribeOutboxCapacity: options.scribeOutboxCapacity,
           githubApp: options.githubApp,
           verifyTimeoutMs: options.verifyTimeoutMs,
+          googleIssuer: options.googleIssuer,
         });
         deploy(server);
         await use(server);

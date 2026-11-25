@@ -24,7 +24,14 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 if TYPE_CHECKING:
-    from wyrd.auth import FamilyRestriction
+    from wyrd.auth import (
+        AccessSummary,
+        CreateRoleBindingRequest,
+        FamilyRestriction,
+        Operation,
+        PrincipalKind,
+        PrincipalSummary,
+    )
 
 from .support import FIXTURES, Count, client_of, declare, hydrated, runtime_account
 
@@ -32,6 +39,9 @@ pytestmark = pytest.mark.integration
 
 TENANT_WIDE = "SELECT COUNT(*) AS n FROM bifrost.drift.observations"
 """A tenant-wide query over a built-in table, which ``workload`` permits."""
+
+READS: list[Operation] = [{"resource": "cards", "action": "read"}]
+"""The one operation the custom roles in these tests carry."""
 
 AUTHORED = FIXTURES / "cards/gateway_inference/ask-prompt.yaml"
 """A Card only an author can declare."""
@@ -41,7 +51,7 @@ DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
 
 @pytest.fixture
 def server(wyrd_server: WyrdTestServer) -> Iterator[WyrdTestServer]:
-    """A server of this test's own, so no other test sees a Role granted here."""
+    """A server of this test's own, so no other test sees a role bound here."""
     with WyrdTestServer(mutate_env=False) as server:
         yield server
 
@@ -52,9 +62,19 @@ ACCOUNT = "observed-service-runtime"
 def issue(server: WyrdTestServer) -> tuple[str, str]:
     """Create the unrestricted ``ACCOUNT`` holding only ``workload``; return its principal id and key."""
     created = Principals(client_of(server)).create_service_principal(
-        {"name": ACCOUNT, "roles": ["workload"]}
+        {"name": ACCOUNT, "assignments": [{"role": "workload", "scope": "all"}]}
     )
     return created["principal_id"], created["credential"]
+
+
+def bind_all(principal: str, kind: PrincipalKind, role: str) -> CreateRoleBindingRequest:
+    """A request binding ``role`` tenant-wide to one account."""
+    return {"subject": {"principal": {"id": principal, "kind": kind}}, "role": role, "scope": "all"}
+
+
+def grants(access: AccessSummary) -> list[tuple[str, str]]:
+    """Each grant's role and source kind, sorted: the summary promises no grant order."""
+    return sorted((grant["role"], grant["source"]["kind"]) for grant in access["grants"])
 
 
 def author(server: WyrdTestServer, key: str) -> None:
@@ -62,30 +82,27 @@ def author(server: WyrdTestServer, key: str) -> None:
     Cards(client_of(server, key)).declare_from_path(AUTHORED)
 
 
-def test_granted_editor_reaches_the_next_token_until_revoked(server: WyrdTestServer) -> None:
+def test_bound_editor_reaches_the_next_request_until_unbound(server: WyrdTestServer) -> None:
     principal, key = issue(server)
     principals = Principals(client_of(server))
 
     (found,) = principals.list(kind="service", name=ACCOUNT)["principals"]
     assert found["principal_id"] == principal
     assert found["workload_restriction"] == {"mode": "unrestricted"}
-    assert principals.roles(principal)["roles"] == [{"role": "workload", "source": "direct"}]
+    assert grants(principals.access(principal)) == [("workload", "direct")]
     assert len(Bifrost(client=client_of(server, key)).sql(TENANT_WIDE, model=Count)) == 1
     with pytest.raises(WyrdError) as refused:
         author(server, key)
     assert refused.value.code == DENIED
 
-    granted = principals.grant_role(principal, "editor")
-    assert granted["changed"]
-    assert granted["roles"] == [
-        {"role": "editor", "source": "direct"},
-        {"role": "workload", "source": "direct"},
-    ]
-    assert not principals.grant_role(principal, "editor")["changed"]
+    granted = principals.bind(bind_all(principal, "service", "editor"))
+    assert granted["scope"] == "all"
+    assert principals.bind(bind_all(principal, "service", "editor"))["id"] == granted["id"]
+    assert grants(principals.access(principal)) == [("editor", "direct"), ("workload", "direct")]
     author(server, key)
 
-    revoked = principals.revoke_role(principal, "editor")
-    assert revoked["changed"]
+    principals.unbind(granted["id"])
+    assert grants(principals.access(principal)) == [("workload", "direct")]
     with pytest.raises(WyrdError) as refused:
         author(server, key)
     assert refused.value.code == DENIED
@@ -93,12 +110,13 @@ def test_granted_editor_reaches_the_next_token_until_revoked(server: WyrdTestSer
 
 def test_only_a_tenant_admin_assigns_roles(server: WyrdTestServer) -> None:
     principal, key = issue(server)
+    (workload,) = Principals(client_of(server)).access(principal)["grants"]
     own = Principals(client_of(server, key))
 
     with pytest.raises(WyrdError) as granted:
-        own.grant_role(principal, "editor")
+        own.bind(bind_all(principal, "service", "editor"))
     with pytest.raises(WyrdError) as revoked:
-        own.revoke_role(principal, "workload")
+        own.unbind(workload["binding_id"])
 
     assert granted.value.code == DENIED
     assert revoked.value.code == DENIED
@@ -115,15 +133,83 @@ def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None
     assert page["principals"][0]["workload_restriction"] is None
     assert page["next"] is None
 
-    granted = principals.grant_role(user, "viewer")
-    assert granted["changed"]
-    assert granted["roles"] == [
-        {"role": "viewer", "source": "direct"},
-        {"role": "viewer", "source": "idp"},
+    granted = principals.bind(bind_all(user, "user", "viewer"))
+    assert grants(principals.access(user)) == [("viewer", "direct"), ("viewer", "provider")]
+    principals.unbind(granted["id"])
+    assert grants(principals.access(user)) == [("viewer", "provider")]
+
+
+def test_a_role_filter_pages_this_tenants_holders_with_their_counts(
+    server: WyrdTestServer,
+) -> None:
+    principals = Principals(client_of(server))
+    principals.put_role("ledger_reader", {"operations": READS})
+    users = {server.bootstrap_user(["ledger_reader"], name) for name in ("ann", "bo")}
+    service, _ = issue(server)
+    principals.bind(bind_all(service, "service", "ledger_reader"))
+    # Another tenant's holder of a same-named role is never counted or listed.
+    other = server.seed_tenant("ledger-other")
+    foreign = Principals(
+        client_of(server, server.bootstrap_service_in_tenant(other, ["admin"], "other-admin"))
+    )
+    foreign.put_role("ledger_reader", {"operations": READS})
+    foreign.create_service_principal(
+        {"name": "stranger", "assignments": [{"role": "ledger_reader", "scope": "all"}]}
+    )
+
+    seen: list[PrincipalSummary] = []
+    after = None
+    while True:
+        page = principals.list(role="ledger_reader", limit=1, after=after)
+        assert page["counts"] == {"active": 3, "suspended": 0}
+        seen += page["principals"]
+        if page["next"] is None:
+            break
+        after = page["next"]
+
+    by_id = {found["principal_id"]: found for found in seen}
+    assert set(by_id) == {*users, service}
+    assert by_id[service]["authentication"] is None
+    assert by_id[service]["roles"] == [
+        {"role": "ledger_reader", "scope": "all"},
+        {"role": "workload", "scope": "all"},
     ]
-    revoked = principals.revoke_role(user, "viewer")
-    assert revoked["changed"]
-    assert revoked["roles"] == [{"role": "viewer", "source": "idp"}]
+    for user in users:
+        assert by_id[user]["authentication"] == "sso"
+        assert by_id[user]["display_name"] is None
+        assert by_id[user]["roles"] == [{"role": "ledger_reader", "scope": "all"}]
+
+
+def test_a_role_nobody_holds_lists_no_one(server: WyrdTestServer) -> None:
+    nobody = Principals(client_of(server)).list(role="no_such_role")
+    assert nobody["principals"] == []
+    assert nobody["counts"] == {"active": 0, "suspended": 0}
+
+
+def test_roles_carry_their_description_and_member_count(server: WyrdTestServer) -> None:
+    principals = Principals(client_of(server))
+    created = principals.put_role(
+        "ledger_reader", {"operations": READS, "description": "Reads ledger Cards"}
+    )
+    assert created["description"] == "Reads ledger Cards"
+    assert created["member_count"] == 0
+
+    server.bootstrap_user(["ledger_reader"], "ann")
+    roles = {role["name"]: role for role in principals.roles()["roles"]}
+    assert roles["ledger_reader"]["member_count"] == 1
+    assert roles["viewer"]["description"] == "Read Cards, executions, artifacts and tables"
+
+    # The role is replaced whole: a request without a description clears it.
+    cleared = principals.put_role("ledger_reader", {"operations": READS})
+    assert cleared["description"] is None
+    assert cleared["member_count"] == 1
+
+
+def test_a_built_in_role_refuses_a_new_description(server: WyrdTestServer) -> None:
+    principals = Principals(client_of(server))
+    with pytest.raises(WyrdError) as refused:
+        principals.put_role("viewer", {"operations": READS, "description": "Mine now"})
+    assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
 def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
@@ -136,6 +222,8 @@ def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
     assert me["principal_kind"] == "user"
     assert me["username"] == "keeper"
     assert me["authentication"] == "password"
+    assert me["display_name"] is None
+    assert me["email"] is None
     assert me["permissions"] == sorted(ceiling)
 
     page = own.list_credentials_page(user, limit=10)
@@ -256,7 +344,9 @@ def test_a_family_has_one_runtime_account_until_released(server: WyrdTestServer)
     principals = Principals(client_of(server))
     family: FamilyRestriction = {"mode": "family", "kind": "Service", "name": FAMILY}
     first, _ = runtime_account(FAMILY, client=client_of(server))
-    second = principals.create_service_principal({"name": "second", "roles": ["workload"]})
+    second = principals.create_service_principal(
+        {"name": "second", "assignments": [{"role": "workload", "scope": "all"}]}
+    )
 
     (found,) = principals.list(kind="service", name=f"{FAMILY}-runtime")["principals"]
     assert found["workload_restriction"] == family
@@ -306,7 +396,7 @@ def test_a_delegate_acts_for_its_subject_from_its_own_root(
     root, bundle = next(iter(releases(server, tmp_path).items()))
     account, key = runtime_account(FAMILY, client=client_of(server))
     owner = Principals(client_of(server)).create_service_principal(
-        {"name": "delegating-subject", "roles": ["workload"]}
+        {"name": "delegating-subject", "assignments": [{"role": "workload", "scope": "all"}]}
     )
     subject = client_of(server, owner["credential"]).access_token()
 
@@ -317,3 +407,52 @@ def test_a_delegate_acts_for_its_subject_from_its_own_root(
     delegated = client_of(server, key, root).on_behalf_of(subject)
     [row] = attributed(server, [emit(hydrated(bundle, delegated))])
     assert (row.sub_principal_id, row.act_principal_id) == (owner["principal_id"], account)
+
+
+def test_a_family_bound_viewer_reads_only_that_family(server: WyrdTestServer) -> None:
+    cards = Cards(client_of(server))
+    payments = declare(cards, "cards/repository_declaration/code-review.yaml")["code-review"]
+    other = declare(cards, "cards/repository_declaration/unrelated.yaml")["unrelated-check"]
+    created = Principals(client_of(server)).create_service_principal(
+        {
+            "name": "payments-reader",
+            "assignments": [
+                {
+                    "role": "viewer",
+                    "scope": {"card": {"family": {"kind": "Verifier", "name": "code-review"}}},
+                }
+            ],
+        }
+    )
+    own = Cards(client_of(server, created["credential"]))
+
+    assert [ref.name for ref in own.list(kind="Verifier").refs] == ["code-review"]
+    assert own.get(payments).card_ref.name == "code-review"
+    with pytest.raises(WyrdError) as hidden:
+        own.get(other)
+    assert hidden.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+
+def test_a_release_grants_nothing_and_its_account_holds_only_its_grants(
+    server: WyrdTestServer, tmp_path: Path
+) -> None:
+    root = next(iter(releases(server, tmp_path)))
+    principals = Principals(client_of(server))
+    assert principals.list(kind="service", name=f"{FAMILY}-runtime")["principals"] == []
+
+    account, key = runtime_account(FAMILY, client=client_of(server))
+    access = principals.access(account)
+    assert grants(access) == [("workload", "direct")]
+    (summary,) = principals.list(kind="service", name=f"{FAMILY}-runtime")["principals"]
+    assert summary["workload_restriction"] == {"mode": "family", "kind": "Service", "name": FAMILY}
+
+    with pytest.raises(WyrdError) as ungranted:
+        Cards(client_of(server, key, root)).declare_from_path(AUTHORED)
+    assert ungranted.value.code == DENIED
+    for refused_root, code in (
+        ("not-a-card-uid", "WYRD_SPEC_400_VALIDATION"),
+        ("01900000-0000-7000-8000-000000000000", "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"),
+    ):
+        with pytest.raises(WyrdError) as refused:
+            client_of(server, key, refused_root).access_token()
+        assert refused.value.code == code, refused_root

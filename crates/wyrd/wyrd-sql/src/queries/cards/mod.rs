@@ -34,7 +34,8 @@ pub use delete::{
     soft_delete_card_with_state,
 };
 pub use get::{
-    fetch_card_row, find_card_by_ref, get_card_by_ref, get_card_by_uid, get_card_for_reconciliation,
+    card_scopes, fetch_card_row, find_card_by_ref, get_card_by_ref, get_card_by_uid,
+    get_card_for_reconciliation,
 };
 pub use lifecycle::{
     CardManifestCompletionRow, CardReconcileClaim, MAX_RECONCILE_ATTEMPTS, RECONCILE_KIND_BLOB,

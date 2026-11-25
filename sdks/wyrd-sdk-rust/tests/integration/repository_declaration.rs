@@ -11,7 +11,9 @@ mod pg_tests {
         CardKind, CardRef, CardSelector, Cards, DeclarationReceipt, ListCardsRequest,
     };
     use wyrd_ai::cli;
-    use wyrd_ai::github::{GithubConnection, GithubConnectionState};
+    use wyrd_ai::github::{
+        GithubConnection, GithubConnectionState, GithubPullRequestReviewRequest,
+    };
     use wyrd_ai::verify::Execution;
     use wyrd_spec::envelope::RepositoryStatus;
     use wyrd_spec::ids::RepositoryId;
@@ -584,15 +586,17 @@ mod pg_tests {
 
     /// An opened pull request on the declared repository admits one queued
     /// execution per binding, pinned to its base and head; a pushed head
-    /// supersedes it and a close cancels the newer one, both still
-    /// inspectable with their pins and stable cancellation codes.
+    /// supersedes it, a fresh review request at the same head supersedes
+    /// that under a key whose retry returns the same generation, and a close
+    /// cancels the newest one, all still inspectable with their pins and
+    /// stable cancellation codes.
     ///
     /// # Panics
     /// Panics when admission, pins or cancellation differ.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the repository-managed Postgres journey lifecycle"]
     async fn pull_requests_admit_pinned_executions_and_supersede_them() {
-        let (mock, deployment, _connection, _key) = connected().await;
+        let (mock, deployment, connection, _key) = connected().await;
         let cards = deployment.cards().await;
         let checkout = checkout(&mock, "acme/api");
         let root = declare_toml(&cards, &checkout, "minimal")
@@ -631,7 +635,7 @@ mod pg_tests {
             Some("1")
         );
         assert!(
-            !pins.delivery_id.is_empty(),
+            pins.delivery_id.as_deref().is_some_and(|id| !id.is_empty()),
             "the admitting delivery is named"
         );
 
@@ -651,9 +655,49 @@ mod pg_tests {
             "history keeps its pins"
         );
 
+        let review = GithubPullRequestReviewRequest {
+            host: mock.host(),
+            repository_id: RepositoryId::new("1").expect("valid repository id"),
+            number: 7,
+        };
+        let requested = connection
+            .review_pull_request(&review, "rust-review-7")
+            .await
+            .expect("a fresh review is accepted");
+        let fresh = newest(&deployment, &binding).await;
+        assert_eq!(requested.executions, [fresh.execution_id]);
+        let pins = fresh.pull_request.as_ref().expect("PR pins are served");
+        assert_eq!(
+            (
+                pins.generation,
+                pins.members.as_slice(),
+                pins.request_key.as_deref(),
+                pins.head.sha.as_str()
+            ),
+            (
+                requested.generation,
+                requested.executions.as_slice(),
+                Some("rust-review-7"),
+                "b2"
+            )
+        );
+        assert_eq!(
+            connection
+                .review_pull_request(&review, "rust-review-7")
+                .await
+                .expect("the retry is accepted"),
+            requested,
+            "a retry of the key returns the same generation"
+        );
+        assert_eq!(
+            inspect(&deployment, pushed.execution_id).await.status,
+            VerificationExecutionStatus::Cancelled,
+            "the fresh review supersedes the pushed head's set"
+        );
+
         mock.edit_pull_request(1, 7, |pr| pr.open = false);
         deliver(&mock, &deployment, "closed").await;
-        let closed = inspect(&deployment, pushed.execution_id).await;
+        let closed = inspect(&deployment, fresh.execution_id).await;
         assert_eq!(closed.status, VerificationExecutionStatus::Cancelled);
         assert_eq!(
             closed.error.map(|error| error.code).as_deref(),

@@ -121,6 +121,8 @@ impl GatewayApiKeys {
             .map_err(|WyrdErrorResponse(error)| error)
         };
         self.reuse_or_exchange(entry, Instant::now, verify, exchange)
+            .await?
+            .authorize(state)
             .await
     }
 

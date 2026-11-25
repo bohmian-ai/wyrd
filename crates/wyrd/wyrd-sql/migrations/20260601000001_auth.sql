@@ -21,6 +21,9 @@ CREATE TABLE wyrd.auth_users (
     password_hash   TEXT,
     auth_type       TEXT NOT NULL CHECK (auth_type IN ('password','oauth_google','oauth_github')),
     status          TEXT NOT NULL CHECK (status IN ('active','suspended','deleted')),
+    -- The identity provider's name for the person, refreshed at each
+    -- successful sign-in that supplies one; never user-edited.
+    display_name    TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (data_tenant_id, email),
@@ -49,6 +52,9 @@ CREATE TABLE wyrd.auth_roles (
     name            TEXT NOT NULL,
     permissions     JSONB NOT NULL,
     builtin         BOOLEAN NOT NULL DEFAULT FALSE,
+    -- One-line summary: server-set for built-in Roles, administrator-set
+    -- for custom Roles.
+    description     TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (data_tenant_id, name),
     UNIQUE (data_tenant_id, id)

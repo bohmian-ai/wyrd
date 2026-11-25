@@ -567,12 +567,39 @@ async fn sandbox_contains_runaway_code() {
     );
 }
 
-/// Critical process pressure pauses new operations: one whose deadline
-/// passes is busy, the process-capacity refusal the engine defers rather
+/// An overcommitted worker makes process pressure critical before the call
+/// returns, so work submitted right after it is already refused admission;
+/// dropping the observation lets pressure recover.
+///
+/// # Panics
+/// Panics when pressure is not critical as the call returns, or never
+/// recovers once the observation drops.
+#[tokio::test]
+async fn overcommitted_worker_is_critical_at_once() {
+    let process = process(256 << 20);
+    let workloads = process.workloads().clone();
+    let sandbox = Sandbox::start(worker(), HostedLimits::default(), &process)
+        .await
+        .expect("pool starts");
+    let held = sandbox.overcommit_for_test();
+    assert_eq!(
+        workloads.pressure().state,
+        PressureState::Critical,
+        "overcommitment is observed before the call returns"
+    );
+    drop(held);
+    until("pressure recovers", || {
+        (workloads.pressure().state == PressureState::Normal).then_some(())
+    })
+    .await;
+}
+
+/// Process pressure pauses new operations whose inputs fit: with memory
+/// held as verification work, one whose deadline passes is busy, the process-capacity refusal the engine defers rather
 /// than retries or judges, and once pressure recovers the next one runs.
 ///
 /// # Panics
-/// Panics when an operation starts under critical pressure, its refusal is
+/// Panics when an operation starts under that pressure, its refusal is
 /// not busy, or work does not resume after recovery.
 #[tokio::test]
 async fn sandbox_pauses_under_process_pressure() {
@@ -586,9 +613,11 @@ async fn sandbox_pauses_under_process_pressure() {
     let sandbox = Sandbox::start(worker(), limits, &process)
         .await
         .expect("pool starts");
-    let occupied = sandbox.occupy_for_test(0);
-    until("the full ledger turns pressure critical", || {
-        (workloads.pressure().state == PressureState::Critical).then_some(())
+    // Room for the operation's inputs, so it waits on pressure instead of
+    // being refused memory at once.
+    let occupied = sandbox.occupy_for_test(1 << 20);
+    until("the held ledger contends", || {
+        (workloads.pressure().state != PressureState::Normal).then_some(())
     })
     .await;
     let soon = Instant::now() + Duration::from_millis(300);

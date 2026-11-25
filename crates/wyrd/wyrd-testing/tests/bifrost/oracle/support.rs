@@ -529,7 +529,6 @@ pub(crate) fn query_context(
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([permission.clone()]),
     );
     Ok(vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
@@ -1015,4 +1014,34 @@ pub(crate) fn render_rows(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Journ
                 .collect()
         })
         .collect()
+}
+
+/// Bound on how long one awaited observation may take before it is a failure.
+pub(crate) const OBSERVATION_DEADLINE: Duration = Duration::from_mins(1);
+
+/// Interval between polls for a settled gauge.
+pub(crate) const PHYSICAL_EVIDENCE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Polls the Oracle's own runtime inspection until `ready` holds.
+///
+/// # Errors
+///
+/// Returns the inspection error, or a timeout naming the last inspection.
+pub(crate) async fn wait_inspection(
+    server: &wyrd_testing::server::WyrdTestServer,
+    ready: impl Fn(&wyrd_testing::server::OracleRuntimeInspection) -> bool,
+) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + OBSERVATION_DEADLINE;
+    loop {
+        let inspection = server.oracle_runtime_inspection()?;
+        if ready(&inspection) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("the Oracle never reached the awaited state: {inspection:?}").into(),
+            );
+        }
+        tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
+    }
 }

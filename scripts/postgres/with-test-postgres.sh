@@ -52,15 +52,28 @@ trap 'handle_signal TERM' TERM
 # container is routinely reachable only seconds later -- and occasionally not at
 # all, when that forwarder misses the guest port under churn. Waiting alone
 # cannot fix the second case, so a project whose endpoint never opens is rebuilt
-# once, which makes the forwarder observe a fresh guest port.
+# once, which makes the forwarder observe a fresh guest port. Mailpit's SMTP and
+# API ports are forwarded the same way, so they are probed the same way.
 start_postgres() {
   # This function is called from an `if !` condition, which disables errexit for
-  # everything it runs. Both commands must therefore report their own failure,
+  # everything it runs. Every command must therefore report its own failure,
   # or a Compose that never came up would fall through to the endpoint probe.
-  "${compose[@]}" up --detach --wait postgres || return 1
-  endpoint="$("${compose[@]}" port --protocol tcp postgres 5432)" || return 1
+  "${compose[@]}" up --detach --wait postgres mailpit || return 1
+  published mailpit 1025 || return 1
+  mail_smtp="$host:$port"
+  published mailpit 8025 || return 1
+  mail_api="$host:$port"
+  # Last, so `host` and `port` name Postgres for the rest of the script.
+  published postgres 5432
+}
+
+# Set `host` and `port` to the host endpoint publishing `service`'s
+# container port, once it accepts a TCP connection from this host.
+published() {
+  local service=$1 container_port=$2 endpoint
+  endpoint="$("${compose[@]}" port --protocol tcp "$service" "$container_port")" || return 1
   if [[ ! $endpoint =~ ^(127\.0\.0\.1|localhost|0\.0\.0\.0):([1-9][0-9]*)$ ]]; then
-    echo "Docker returned an invalid loopback Postgres endpoint: '$endpoint'" >&2
+    echo "Docker returned an invalid loopback $service endpoint: '$endpoint'" >&2
     return 1
   fi
   host="${BASH_REMATCH[1]}"
@@ -74,26 +87,29 @@ start_postgres() {
     fi
     sleep 1
   done
+  echo "$service endpoint ${host}:${port} (container port $container_port) never accepted a connection" >&2
   return 1
 }
 
 if ! start_postgres; then
-  echo "Postgres endpoint ${host-unknown}:${port-unknown} never accepted a connection; rebuilding the project once" >&2
+  echo "A published endpoint never accepted a connection; rebuilding the project once" >&2
   "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
   if ! start_postgres; then
     # An environment fault, not a test result, and it aborts the whole lane.
     # Print what the container and the host socket table say at the moment of
     # refusal so the next occurrence is diagnosable from the lane log.
     {
-      echo "Postgres endpoint ${host-unknown}:${port-unknown} never accepted a connection"
+      echo "Endpoint ${host-unknown}:${port-unknown} still never accepted a connection"
       echo "--- compose ps"
       "${compose[@]}" ps --all
       echo "--- published ports"
       "${compose[@]}" port --protocol tcp postgres 5432 || true
+      "${compose[@]}" port --protocol tcp mailpit 1025 || true
+      "${compose[@]}" port --protocol tcp mailpit 8025 || true
       echo "--- host listeners on ${port-0}"
       (ss -lntp "sport = :${port-0}" || true) 2>/dev/null
-      echo "--- postgres log (last 40)"
-      "${compose[@]}" logs --tail 40 postgres || true
+      echo "--- postgres and mailpit logs (last 40 each)"
+      "${compose[@]}" logs --tail 40 postgres mailpit || true
     } >&2
     exit 1
   fi
@@ -118,6 +134,10 @@ export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform:${platform_password}
 # already 2 and read their own suffixed vars.
 export WYRD_DB_MAX_CONNECTIONS="${WYRD_DB_MAX_CONNECTIONS:-8}"
 export WYRD_DB_MAX_CONNECTIONS_VALA="${WYRD_DB_MAX_CONNECTIONS_VALA:-8}"
+
+# The local SMTP relay invitation-mail journeys send through, and its API.
+export WYRD_TEST_MAILPIT_SMTP="$mail_smtp"
+export WYRD_TEST_MAILPIT_API="http://$mail_api"
 
 # Use the container's own psql so the client always matches the server.
 {

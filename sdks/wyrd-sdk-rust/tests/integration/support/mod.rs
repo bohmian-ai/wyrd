@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use wyrd_ai::auth::{
     CreateServicePrincipalRequest, PrincipalId, PrincipalKindTag, PrincipalQuery, Principals,
-    WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    ScopedRoleAssignment, WorkloadFamily, WorkloadKind, WorkloadRestriction,
 };
 use wyrd_ai::cards::{BundleMode, CardRef, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::config::ClientConfig;
@@ -207,7 +207,10 @@ impl Deployment {
         self.granted_key(
             name,
             &[serde_json::json!({
-                "resource": "verifier", "action": "run", "scope": { "verifier": uid }
+                "resource": "verifier", "action": "run",
+                "scope": { "card": { "version": {
+                    "kind": verifier.kind, "name": verifier.name, "uid": uid
+                } } }
             })],
         )
         .await
@@ -611,7 +614,7 @@ pub async fn runtime_account(admin: &WyrdClient, card: &CardRef) -> (PrincipalId
     let created = principals
         .create_service_principal(&CreateServicePrincipalRequest {
             name,
-            roles: vec!["workload".to_owned()],
+            assignments: vec![ScopedRoleAssignment::tenant("workload")],
             description: None,
             workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
                 kind: WorkloadKind::from_card_kind(&card.kind)

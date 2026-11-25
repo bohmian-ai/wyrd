@@ -80,14 +80,13 @@ impl PermissionCheck for RbacCheck {
 mod tests {
     use super::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
     use crate::permission::{Permission, PermissionSet};
-    use crate::principal::{Principal, PrincipalId, PrincipalKind, RoleRef};
+    use crate::principal::{Principal, PrincipalId, PrincipalKind};
 
     fn principal_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Principal {
         Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             wyrd_spec::DataTenantId::new_v7(),
-            vec![RoleRef::new("editor").expect("static role is valid")],
             PermissionSet::from_iter(permissions),
         )
     }

@@ -18,28 +18,32 @@ pub enum SeedError {
 
 /// Seed the builtin roles for `data_tenant_id`.
 ///
-/// Existing rows are left untouched, making this helper safe to rerun during
-/// tenant repair workflows.
+/// An existing row keeps its operations and only takes the current
+/// server-set description, making this helper safe to rerun during tenant
+/// repair workflows.
 #[tracing::instrument(skip(conn), fields(data_tenant_id = %data_tenant_id))]
 pub async fn seed_builtin_roles_for_tenant(
     conn: &mut TenantConn<'_>,
     data_tenant_id: DataTenantId,
 ) -> Result<(), SeedError> {
     for role in BUILTIN_ROLES {
-        let permissions_json: Value = serde_json::to_value(role.permissions)?;
+        let permissions_json: Value = serde_json::to_value(role.operations)?;
         let id = builtin_role_uuid(data_tenant_id, role.name);
         sqlx::query(
             r"
             INSERT INTO wyrd.auth_roles
-                (id, data_tenant_id, name, permissions, builtin)
-            VALUES ($1, $2, $3, $4, TRUE)
-            ON CONFLICT (data_tenant_id, name) DO NOTHING
+                (id, data_tenant_id, name, permissions, builtin, description)
+            VALUES ($1, $2, $3, $4, TRUE, $5)
+            ON CONFLICT (data_tenant_id, name) DO UPDATE
+                SET description = EXCLUDED.description
+              WHERE wyrd.auth_roles.builtin
             ",
         )
         .bind(id)
         .bind(data_tenant_id.as_uuid())
         .bind(role.name)
         .bind(permissions_json)
+        .bind(role.description)
         .execute(&mut **conn.transaction())
         .await?;
     }
@@ -52,9 +56,9 @@ mod pg_tests {
 
     use sqlx::Row;
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::Permission;
     use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, builtin_role_uuid};
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::Operation;
 
     use super::seed_builtin_roles_for_tenant;
 
@@ -79,12 +83,12 @@ mod pg_tests {
             let permissions: serde_json::Value =
                 row.try_get("permissions").expect("permissions decode");
             let builtin: bool = row.try_get("builtin").expect("builtin decodes");
-            let decoded: Vec<Permission> =
-                serde_json::from_value(permissions).expect("permissions deserialize");
+            let decoded: Vec<Operation> =
+                serde_json::from_value(permissions).expect("operations deserialize");
 
             assert_eq!(id, builtin_role_uuid(tenant, role.name));
             assert!(builtin);
-            assert_eq!(decoded, role.permissions);
+            assert_eq!(decoded, role.operations);
         }
     }
 

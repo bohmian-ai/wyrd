@@ -35,6 +35,7 @@ use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, LiveBrowserSession, human_connection_is_active,
     insert_browser_session, live_browser_session, local_username, revoke_browser_session,
 };
+use wyrd_sql::row_types::auth::HumanLoginAnchor;
 
 use crate::audit::{LOGIN_OPERATION, principal_event};
 use crate::callback::audit_authorization_code_failure;
@@ -60,6 +61,10 @@ pub struct BrowserSession {
     /// Whether this is recent human sign-in proof: a password or provider
     /// session created in the last five minutes. A recovery session never is.
     pub recent: bool,
+    /// The human authentication the session was created through: a local
+    /// password revision or a provider connection revision. `None` for a
+    /// recovery session, which is never human sign-in proof.
+    pub anchor: Option<HumanLoginAnchor>,
 }
 
 /// A session just created, with the cookie value returned exactly once.
@@ -381,7 +386,12 @@ impl BrowserSessions {
             username,
             principal_kind: principal.kind.tag(),
             credential: session.credential,
-            permissions: permission_names(&principal.effective_permissions),
+            permissions: permission_names(
+                &principal
+                    .effective_permissions
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
             expires_at: session.expires_at,
         })
     }
@@ -418,13 +428,27 @@ impl BrowserSessions {
             BrowserSessionAuthority::Password(_) => {
                 (TenantGrant::PasswordLogin, BrowserCredential::Password)
             }
+            BrowserSessionAuthority::Social(_) => {
+                (TenantGrant::OidcLogin, BrowserCredential::Social)
+            }
         };
+        let (password, social) = match live.authority {
+            BrowserSessionAuthority::Password(_) => (true, None),
+            BrowserSessionAuthority::Social(anchor) => (false, Some(anchor)),
+            BrowserSessionAuthority::Connection(_) | BrowserSessionAuthority::ApiKey(_) => {
+                (false, None)
+            }
+        };
+        if !self.issuer.method_still_offered(password, social).await? {
+            return Err(IssuanceError::ConnectionInactive.into());
+        }
         let verified = self.issuer.verify(conn, live.principal_id, grant).await?;
         Ok(BrowserSession {
             verified,
             credential,
             expires_at: live.expires_at,
             recent: live.recent && credential != BrowserCredential::ApiKey,
+            anchor: live.authority.human_anchor(),
         })
     }
 
@@ -448,10 +472,16 @@ impl BrowserSessions {
 /// Store a new session for `verified`'s principal created through
 /// `authority` on `conn`, and return it with its cookie value.
 ///
-/// The caller commits `conn`; nothing is visible until it does.
+/// The caller commits `conn`; nothing is visible until it does. A password
+/// or social session is refused at the insert while the tenant requires
+/// company SSO, so a completion that passed its earlier method check while a
+/// policy change committed still creates nothing, and the caller's rollback
+/// undoes any User it provisioned.
 ///
 /// # Errors
-/// Returns [`WyrdError::AuthVerifyUnavailable`] when the insert fails.
+/// Returns [`WyrdError::MethodUnavailable`] for a password or social session
+/// while company SSO is required, and [`WyrdError::AuthVerifyUnavailable`]
+/// when the insert fails.
 pub(crate) async fn create_session(
     conn: &mut TenantConn<'_>,
     verified: VerifiedToken,
@@ -467,11 +497,16 @@ pub(crate) async fn create_session(
         BROWSER_SESSION_TTL,
     )
     .await
-    .map_err(store_error)?;
+    .map_err(store_error)?
+    .ok_or_else(|| WyrdError::MethodUnavailable {
+        message: "this workspace requires company SSO; sign in through your company".to_owned(),
+        details: json!({ "reason": "method_unavailable" }),
+    })?;
     let credential = match authority {
         BrowserSessionAuthority::Connection(_) => BrowserCredential::Sso,
         BrowserSessionAuthority::ApiKey(_) => BrowserCredential::ApiKey,
         BrowserSessionAuthority::Password(_) => BrowserCredential::Password,
+        BrowserSessionAuthority::Social(_) => BrowserCredential::Social,
     };
     Ok(CreatedBrowserSession {
         cookie,
@@ -480,6 +515,7 @@ pub(crate) async fn create_session(
             credential,
             expires_at,
             recent: credential != BrowserCredential::ApiKey,
+            anchor: authority.human_anchor(),
         },
     })
 }

@@ -52,13 +52,13 @@ use wyrd_server::verification::hosted::workspace::Workspaces;
 use wyrd_server::verification::telemetry::{Envelopes, ExecutionMode};
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
+use wyrd_spec::auth::{Attribution, CardPermissionScope, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{
     Action, AgentCall, Check, CodeCall, CodeCheck, CodeRuntime, CodeSource, VerifierSpec,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardUid, SlotName};
+use wyrd_spec::ids::{CardName, CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::TaskId;
@@ -207,7 +207,9 @@ impl Registered {
     }
 }
 
-/// A fresh user of `tenant` holding exactly `permissions`.
+/// A fresh user of `tenant` holding exactly `permissions`, whose work Wyrd
+/// executes as hosted work always runs: under the accepted authority, with a
+/// SYSTEM executor, never rebound to live grants.
 pub(crate) fn user(
     tenant: DataTenantId,
     permissions: impl IntoIterator<Item = Permission>,
@@ -218,12 +220,11 @@ pub(crate) fn user(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter(permissions),
         ),
         request_id: RequestId::now_v7(),
         delegation_chain: Vec::new(),
-        executed_by: None,
+        executed_by: Some(PrincipalId::new(uuid::Uuid::now_v7())),
     }
 }
 
@@ -376,13 +377,10 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
         slot: notes(),
         locator: Locator::Lines { start: 1, end: 2 },
     };
-    assert_eq!(
-        evidence
-            .cited(&BTreeSet::from([notes()]), vec![cited.clone()])
-            .await
-            .expect("citations check"),
-        vec![cited]
-    );
+    evidence
+        .validate(&[&cited])
+        .await
+        .expect("the citation names a location in the pinned file");
 
     let workspace = workspaces(HostedLimits::default())
         .open(
@@ -756,13 +754,10 @@ async fn evidence_metadata_is_resolved_once() {
         slot: doc.clone(),
         locator: Locator::Lines { start: 1, end: 1 },
     };
-    assert_eq!(
-        evidence
-            .cited(&BTreeSet::from([doc.clone()]), vec![cited.clone()])
-            .await
-            .expect("citations check"),
-        vec![cited]
-    );
+    evidence
+        .validate(&[&cited])
+        .await
+        .expect("the citation names a location in the pinned file");
     let mounted = |value: InputDeclaration, slot: &SlotName| CallInput {
         value: CallValue::Evidence(value),
         sources: BTreeSet::from([slot.clone()]),
@@ -954,8 +949,8 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
 /// query, code, and file calls run and are recorded, yet Oracle refuses the
 /// other table and a join reaching it: tool grants never widen data scope.
 /// The located line the file tool returned becomes the step's citation, and
-/// a tool-less check judged by the real evidence reader keeps it and drops a
-/// fabricated one. A call to a tool the Agent did not declare fails the step.
+/// a tool-less check returns it beside a fabricated one as authored, and the
+/// real evidence reader validates the first and refuses the second by name. A call to a tool the Agent did not declare fails the step.
 ///
 /// # Panics
 /// Panics when a scope widens, a call goes unrecorded, an invalid citation
@@ -996,7 +991,6 @@ async fn recovered_authority_bounds_every_agent_tool() {
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([
             Permission::tool_invoke_any(),
             Permission::card_read(),
@@ -1007,7 +1001,6 @@ async fn recovered_authority_bounds_every_agent_tool() {
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([Permission::bifrost_query_read()]),
     );
     let authority = AcceptedAuthority::new(
@@ -1016,7 +1009,10 @@ async fn recovered_authority_bounds_every_agent_tool() {
             principal: PrincipalRef::from_principal(&initiator),
         }],
     );
-    let caller = Caller::accepted(&authority, PrincipalId::new(uuid::Uuid::now_v7()));
+    let caller = Caller::accepted(
+        &authority.expect("the delegated authority accepts"),
+        PrincipalId::new(uuid::Uuid::now_v7()),
+    );
 
     let limits = HostedLimits {
         monty_min_workers: 0,
@@ -1089,7 +1085,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
         Arc::new(NoRegistry),
     )
     .with_toolset(Arc::new(tools))
-    .with_evidence(evidence);
+    .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>);
 
     let declared = reviewer(&["bifrost.query", "code.run", "fs.read"]);
     let id = TaskId::new("review").expect("task id");
@@ -1205,10 +1201,26 @@ async fn recovered_authority_bounds_every_agent_tool() {
     checked.settle().await;
     let verdict = verdict.expect("the check runs").verdict;
     assert_eq!(verdict.outcome, VerificationVerdict::Passed);
+    let fabricated = json!({"slot": "notes", "locator": {"lines": {"start": 9, "end": 9}}});
     assert_eq!(
         serde_json::to_value(&verdict.citations).expect("citations"),
-        json!([cited])
+        json!([cited, fabricated]),
+        "the executor returns the verdict as authored"
     );
+    evidence
+        .validate(&[&verdict.citations[0]])
+        .await
+        .expect("the located line validates");
+    match evidence
+        .validate(&verdict.citations.iter().collect::<Vec<_>>())
+        .await
+    {
+        Err(BlockError::Terminal { reason }) => assert_eq!(
+            reason,
+            r#"invalid citation: slot notes has no location {"lines":{"start":9,"end":9}}"#
+        ),
+        other => panic!("the fabricated line was accepted: {other:?}"),
+    }
 
     let refused = step(Action::Agent(declared), &ToolCallsOwner::default())
         .await
@@ -1251,7 +1263,7 @@ async fn card_resolution_is_the_verifier_run() {
     };
     let agent = exact("Agent", "reviewer", Some(&uid));
     let prompt = exact("Prompt", "reviewer-prompt", None);
-    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let verifier = stand_in_verifier();
     let registry =
         |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller, verifier.clone());
     let runner = user(tenant, [Permission::verifier_run(verifier.clone())]);
@@ -1567,9 +1579,9 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// A queued execution that process memory cannot admit returns to the
 /// queue with its attempt refunded and runs once memory frees.
 ///
-/// An overcommitted worker turns process pressure critical. The queued
-/// execution waits out its code timeout, is refused busy, and is
-/// deferred rather than failed, retried, or judged; once the memory frees,
+/// An overcommitted worker turns process pressure critical before the
+/// execution is queued, so the runner refuses it busy and defers it rather
+/// than failing, retrying, or judging it; once the memory frees,
 /// it completes on its first counted attempt with its real verdict.
 ///
 /// # Panics
@@ -1630,9 +1642,9 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .expect("blocks are hosted")
             .sandbox(),
     );
-    // An overcommitted worker keeps pressure critical, pausing the queued
-    // operation until its code timeout, when it defers; the byte ledger
-    // keeps room for the run's input read and result.
+    // An overcommitted worker makes pressure critical at once, so the queued
+    // execution defers; the byte ledger keeps room for the run's input read
+    // and result.
     let held = sandbox.overcommit_for_test();
     let deferred = seed
         .submit(&adder, &subject, one())
@@ -1654,7 +1666,17 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     while !logs.text().lines().any(|line| {
         line.contains("deferred by admission backpressure") && line.contains(&deferred.to_string())
     }) {
-        assert!(Instant::now() < deadline, "the adder was never deferred");
+        if Instant::now() >= deadline {
+            let row = seed.execution(deferred).await;
+            let text = logs.text();
+            let tail: Vec<&str> = text.lines().rev().take(60).collect();
+            panic!(
+                "the adder was never deferred; execution: {row:?}; runtime finished: {}; \
+                 last captured lines (newest first):\n{}",
+                task.is_finished(),
+                tail.join("\n")
+            );
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let waiting = seed.execution(deferred).await.expect("execution reads");
@@ -1760,7 +1782,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         let (caller, state) = (&caller, registered.server.state());
         async move {
             let routes = BTreeMap::new();
-            let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+            let verifier = stand_in_verifier();
             blocks
                 .engine(
                     state,
@@ -2062,7 +2084,11 @@ async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
         let runner = seed
             .clone()
             .with_actor_permissions(PermissionSet::from_iter([Permission::verifier_run(
-                verifier.clone(),
+                CardPermissionScope::version(
+                    CardKind::Verifier,
+                    CardName::new(format!("{name}-verifier")).expect("name"),
+                    verifier.clone(),
+                ),
             )]));
         executions.push(
             runner
@@ -3111,4 +3137,17 @@ async fn code_shutdown_settles_pending_host_work() {
         .await
         .expect_err("a closed sandbox admits nothing");
     assert!(matches!(refused, BlockError::Busy { .. }), "{refused}");
+}
+
+/// The exact scope of a Verifier the registry is never asked to load, so a
+/// definition check authorizes against it alone.
+///
+/// # Panics
+/// Panics when a `UUIDv7` is not a Card UID.
+fn stand_in_verifier() -> CardPermissionScope {
+    CardPermissionScope::version(
+        CardKind::Verifier,
+        CardName::new("stand-in").expect("name"),
+        CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"),
+    )
 }

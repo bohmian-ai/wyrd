@@ -19,11 +19,9 @@
 //! ([`BrowserSessions::recover`]); and a repeated logout is safe
 //! ([`BrowserSessions::logout`]).
 
-use std::net::{IpAddr, SocketAddr};
-
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, Extension, Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -32,23 +30,30 @@ use wyrd_auth::browser_sessions::{BROWSER_SESSION_TTL, BrowserSessions, CreatedB
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     BrowserApiKeyRequest, BrowserLoginRequest, BrowserLoginResponse, BrowserLogoutRequest,
-    BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, PasswordChangeRequest,
-    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest,
+    BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, ContactRequest,
+    ContactVerifyRequest, DiscoveryPage, DiscoveryQuery, DiscoveryRequest, DiscoveryVerifyRequest,
+    PasswordChangeRequest, PasswordLoginRequest, PasswordResetCodeRequest, PasswordResetRequest,
+    PasswordSignupRequest, ProofStatus, ProofStatusResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
+use wyrd_sql::row_types::auth::HumanLoginAnchor;
 
+use crate::auth::social::available_methods;
+use crate::auth::source::RequestSource;
 use crate::auth::{RequestOrigin, auth_not_configured};
+use crate::components::platform::social::{admit_sign_in, social};
 use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
 
 /// Request extension marking recent human sign-in proof: the request was
 /// authenticated by a password or provider browser session created at most
 /// five minutes ago. Bearer, API-key and recovery-session requests never
-/// carry it.
+/// carry it. It holds the session's login anchor, `None` for a social
+/// session, so a handler can require proof through one exact connection.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RecentHumanLogin;
+pub(crate) struct RecentHumanLogin(pub(crate) Option<HumanLoginAnchor>);
 
 /// Prefix of every tenant browser-session cookie name; the rest is the
 /// tenant's route key.
@@ -148,7 +153,11 @@ pub(crate) fn cookie_header(
 }
 
 /// `Set-Cookie` that installs a tenant's new session cookie.
-fn set_session_cookie(origin: &Url, tenant: &TenantSlug, cookie: &SecretString) -> HeaderValue {
+pub(crate) fn set_session_cookie(
+    origin: &Url,
+    tenant: &TenantSlug,
+    cookie: &SecretString,
+) -> HeaderValue {
     cookie_header(
         origin,
         &format!("{SESSION_COOKIE_PREFIX}{tenant}"),
@@ -170,7 +179,7 @@ fn clear_session_cookie(origin: &Url, label: &str) -> HeaderValue {
 }
 
 /// A `no-store` response carrying `cookies` as separate `Set-Cookie` headers.
-fn with_cookies(
+pub(crate) fn with_cookies(
     status: StatusCode,
     cookies: Vec<HeaderValue>,
     body: impl IntoResponse,
@@ -184,21 +193,26 @@ fn with_cookies(
 
 /// The request id string for audit correlation, minting one when the
 /// request-id layer did not run.
-fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId {
+pub(crate) fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId {
     request_id.map_or_else(RequestId::now_v7, |Extension(id)| id)
 }
 
 /// `POST /auth/browser/login` — begin a provider sign-in for one tenant.
 ///
-/// Begins a login transaction ([`BrowserSessions::begin`]) and sets its
-/// random binding in the `wyrd_login` cookie, scoped to `/auth/callback` and
+/// Begins a login transaction through the tenant's company SSO
+/// ([`BrowserSessions::begin`]) or, when the body names one, the shared
+/// social provider ([`BrowserSessions::begin_social`]), and sets its random
+/// binding in the `wyrd_login` cookie, scoped to that flow's callback and
 /// living as long as the login state. The provider callback completes the
 /// sign-in only for the browser presenting that binding. The response
-/// carries the provider authorization URL the browser navigates to.
+/// carries the provider authorization URL the browser navigates to. The
+/// start is first counted in its source's sign-in window, so a refused start
+/// records nothing.
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
-/// `Origin`; `401 WYRD_AUTH_401_INVALID_TOKEN` for an unknown tenant or one
+/// `Origin`; `429 WYRD_AUTH_429_SIGN_IN_ATTEMPTS` with `Retry-After` while
+/// the source's window is exhausted; `401 WYRD_AUTH_401_INVALID_TOKEN` for an unknown tenant or one
 /// without an Active connection, indistinguishably; `503
 /// WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` or `WYRD_AUTH_503_VERIFY_UNAVAILABLE`
 /// when the provider or store is unavailable.
@@ -212,11 +226,14 @@ fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId {
           headers(("Set-Cookie" = String, description = "The `wyrd_login` transaction cookie"))),
         (status = 401, description = "SSO sign-in is not available for this tenant \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
-        (status = 503, description = "The identity provider or store is unavailable \
-          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
-          body = WyrdProblem)
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
+        (status = 429, description = "Too many sign-in starts from this source \
+          (WYRD_AUTH_429_SIGN_IN_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The identity provider or store is unavailable, or the \
+          start cannot be admitted (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     security(()),
     tag = "Auth"
@@ -226,20 +243,48 @@ pub async fn login(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
+    RequestSource(source): RequestSource,
     request: Result<Json<BrowserLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
-    let begun = browser_sessions(&state)?
-        .begin(&request.tenant, &origin)
-        .await?;
+    admit_sign_in(&state, source).await?;
+    let sessions = browser_sessions(&state)?;
+    let (begun, path) = match request.provider {
+        None => (
+            sessions.begin(&request.tenant, &origin).await?,
+            LOGIN_COOKIE_PATH,
+        ),
+        Some(provider) => {
+            if !available_methods(&state, Some(&request.tenant))
+                .await?
+                .sign_in
+                .providers
+                .contains(&provider)
+            {
+                return Err(method_unavailable(&format!("{provider} sign-in")));
+            }
+            (
+                sessions
+                    .begin_social(
+                        social(&state)?,
+                        &request.tenant,
+                        provider,
+                        request.invitation_code.as_ref(),
+                        &origin,
+                    )
+                    .await?,
+                SOCIAL_LOGIN_COOKIE_PATH,
+            )
+        }
+    };
     Ok(with_cookies(
         StatusCode::OK,
         vec![cookie_header(
             &origin,
             LOGIN_COOKIE,
             begun.binding.expose_secret(),
-            LOGIN_COOKIE_PATH,
+            path,
             LOGIN_COOKIE_MAX_AGE_SECONDS,
         )],
         Json(BrowserLoginResponse {
@@ -249,13 +294,17 @@ pub async fn login(
 }
 
 /// Name of the cookie holding a browser sign-in's login-transaction binding.
-const LOGIN_COOKIE: &str = "wyrd_login";
+pub(crate) const LOGIN_COOKIE: &str = "wyrd_login";
 
-/// The only path the login-transaction cookie is sent to.
-const LOGIN_COOKIE_PATH: &str = "/auth/callback";
+/// The only path a company sign-in's login-transaction cookie is sent to.
+pub(crate) const LOGIN_COOKIE_PATH: &str = "/auth/callback";
+
+/// The only paths a social sign-in's login-transaction cookie is sent to: the
+/// provider-specific social callbacks.
+pub(crate) const SOCIAL_LOGIN_COOKIE_PATH: &str = "/auth/social";
 
 /// Lifetime of the login-transaction cookie: the five-minute login state.
-const LOGIN_COOKIE_MAX_AGE_SECONDS: u64 = 300;
+pub(crate) const LOGIN_COOKIE_MAX_AGE_SECONDS: u64 = 300;
 
 /// The login-transaction binding a provider callback request presents, when
 /// it presents exactly one `wyrd_login` cookie.
@@ -268,8 +317,9 @@ pub(crate) fn login_binding(headers: &HeaderMap) -> Option<String> {
 }
 
 /// The callback response for a completed browser sign-in: the tenant's
-/// session cookie is set, the login-transaction cookie cleared, and the
-/// browser redirected (`303`) to the tenant home.
+/// session cookie is set, the login-transaction cookie scoped to the
+/// callback `login_path` cleared, and the browser redirected (`303`) to the
+/// tenant home.
 ///
 /// # Errors
 /// Returns the refusals of [`BrowserSessions::view`].
@@ -277,25 +327,29 @@ pub(crate) async fn signed_in(
     state: &AppState,
     origin: &Url,
     created: &CreatedBrowserSession,
+    login_path: &str,
 ) -> Result<Response, WyrdErrorResponse> {
     let view = browser_sessions(state)?.view(&created.session).await?;
     Ok(see_other(
         &format!("/t/{}", view.tenant),
         vec![
             set_session_cookie(origin, &view.tenant, &created.cookie),
-            clear_login_cookie(origin),
+            clear_login_cookie(origin, login_path),
         ],
     ))
 }
 
 /// The callback response for a browser sign-in that failed after its login
-/// state was consumed. The login-transaction cookie is always cleared. A
+/// state was consumed. The login-transaction cookie scoped to the callback
+/// `login_path` is always cleared. A
 /// server-side failure (a `5xx` catalog error such as an unavailable store or
 /// provider) is answered as that error itself, `no-store`, so the browser sees
 /// an outage rather than a credential refusal and can begin a new sign-in. A
 /// refusal redirects (`303`) to the tenant's sign-in page with
-/// `login=failed`. The exchange already audited the failure; it is only
-/// logged here.
+/// `login=failed`, `login=no_account` when a verified provider identity
+/// belongs to no User there, or `login=account_exists` when an invitation
+/// enrollment's identity already has one. The exchange already audited the failure; it is
+/// only logged here.
 ///
 /// # Errors
 /// Returns `error` itself when the tenant has left the directory, and
@@ -305,17 +359,26 @@ pub(crate) async fn login_refused(
     origin: &Url,
     tenant_id: DataTenantId,
     error: WyrdError,
+    login_path: &str,
 ) -> Result<Response, WyrdErrorResponse> {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     if status.is_server_error() {
         tracing::warn!(code = error.code(), "browser sign-in failed on the server");
         return Ok(with_cookies(
             status,
-            vec![clear_login_cookie(origin)],
+            vec![clear_login_cookie(origin, login_path)],
             WyrdErrorResponse::from(error),
         ));
     }
     tracing::info!(code = error.code(), "browser sign-in refused");
+    let reason = match &error {
+        WyrdError::InvalidToken { details, .. } => match details["reason"].as_str() {
+            Some("no_account") => "no_account",
+            Some("account_exists") => "account_exists",
+            _ => "failed",
+        },
+        _ => "failed",
+    };
     let (tenant, _) = state
         .postgres
         .wyrd()
@@ -330,14 +393,15 @@ pub(crate) async fn login_refused(
         })?
         .ok_or(error)?;
     Ok(see_other(
-        &format!("/t/{tenant}/login?login=failed"),
-        vec![clear_login_cookie(origin)],
+        &format!("/t/{tenant}/login?login={reason}"),
+        vec![clear_login_cookie(origin, login_path)],
     ))
 }
 
-/// `Set-Cookie` that removes the login-transaction cookie.
-fn clear_login_cookie(origin: &Url) -> HeaderValue {
-    cookie_header(origin, LOGIN_COOKIE, "", LOGIN_COOKIE_PATH, 0)
+/// `Set-Cookie` that removes the login-transaction cookie scoped to the
+/// callback `login_path`.
+pub(crate) fn clear_login_cookie(origin: &Url, login_path: &str) -> HeaderValue {
+    cookie_header(origin, LOGIN_COOKIE, "", login_path, 0)
 }
 
 /// A `no-store` `303 See Other` to the same-origin `location`, carrying
@@ -345,7 +409,7 @@ fn clear_login_cookie(origin: &Url) -> HeaderValue {
 ///
 /// # Panics
 /// Never: `location` is a path built from a route key, which is header-safe.
-fn see_other(location: &str, cookies: Vec<HeaderValue>) -> Response {
+pub(crate) fn see_other(location: &str, cookies: Vec<HeaderValue>) -> Response {
     let mut response = with_cookies(StatusCode::SEE_OTHER, cookies, ());
     response.headers_mut().insert(
         header::LOCATION,
@@ -539,12 +603,6 @@ pub async fn logout(
     ))
 }
 
-/// The TCP peer the password failure source window is keyed by, when the
-/// listener recorded one.
-fn peer(connect: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
-    connect.map(|Extension(ConnectInfo(addr))| addr.ip())
-}
-
 /// `POST /auth/browser/password/signup` — enroll a local User with a one-use
 /// invitation and sign the browser in.
 ///
@@ -566,8 +624,8 @@ fn peer(connect: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
           is taken (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The invitation is unknown, expired, revoked or used \
           (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -584,6 +642,7 @@ pub async fn password_signup(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
         .password_signup(request, request_id(id).as_str())
@@ -609,8 +668,8 @@ pub async fn password_signup(
           headers(("Set-Cookie" = String, description = "The tenant session cookie"))),
         (status = 401, description = "Username or password not accepted \
           (WYRD_AUTH_401_PASSWORD_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 429, description = "Too many failed attempts; retry after the window ends \
           (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem,
           headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
@@ -626,14 +685,15 @@ pub async fn password_login(
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     id: Option<Extension<RequestId>>,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    RequestSource(source): RequestSource,
     request: Result<Json<PasswordLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
-        .password_login(request, peer(connect), request_id(id).as_str())
+        .password_login(request, source, request_id(id).as_str())
         .await?;
     signed_in_view(&sessions, &origin, StatusCode::OK, &created).await
 }
@@ -662,8 +722,8 @@ pub async fn password_login(
         (status = 401, description = "No live password session for the tenant, or the current \
           password is not accepted (WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_PASSWORD_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 429, description = "Too many failed attempts \
           (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
@@ -677,29 +737,396 @@ pub async fn password_change(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    RequestSource(source): RequestSource,
     request: Result<Json<PasswordChangeRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let tenant = request.tenant.clone();
-    let cookie = session_cookies(&headers)
-        .into_iter()
-        .find_map(|(label, value)| (label.as_ref() == Some(&tenant)).then_some(value))
-        .ok_or_else(|| WyrdError::InvalidToken {
-            message: "no live browser session; sign in again".to_owned(),
-            details: serde_json::json!({ "reason": "browser_session_invalid" }),
-        })?;
-    let session = sessions.resolve(&cookie).await?;
-    sessions
-        .password_change(&session, request, peer(connect))
+    let session = sessions
+        .resolve(&tenant_session(&headers, &tenant)?)
         .await?;
+    sessions.password_change(&session, request, source).await?;
     Ok(with_cookies(
         StatusCode::NO_CONTENT,
         vec![clear_session_cookie(&origin, tenant.as_str())],
         (),
     ))
+}
+
+/// The value of `tenant`'s session cookie among `headers`.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidToken`] when the request carries none.
+fn tenant_session(headers: &HeaderMap, tenant: &TenantSlug) -> Result<String, WyrdError> {
+    session_cookies(headers)
+        .into_iter()
+        .find_map(|(label, value)| (label.as_ref() == Some(tenant)).then_some(value))
+        .ok_or_else(|| WyrdError::InvalidToken {
+            message: "no live browser session; sign in again".to_owned(),
+            details: serde_json::json!({ "reason": "browser_session_invalid" }),
+        })
+}
+
+/// Name of the cookie holding a contact verification's sealed flow.
+const CONTACT_COOKIE: &str = "wyrd_contact";
+
+/// Path the contact flow cookie is scoped to.
+const CONTACT_COOKIE_PATH: &str = "/auth/browser/email";
+
+/// Lifetime of the contact flow cookie: the proof's fifteen minutes.
+const CONTACT_COOKIE_MAX_AGE_SECONDS: u64 = 900;
+
+/// The deployment's application mail owner.
+///
+/// # Errors
+/// Returns `503` when application mail is not configured on this server.
+fn application_mail(state: &AppState) -> Result<&wyrd_auth::mail::ApplicationMail, WyrdError> {
+    state
+        .auth
+        .application_mail
+        .as_ref()
+        .ok_or_else(|| WyrdError::AuthVerifyUnavailable {
+            message: "application mail is not configured".to_owned(),
+            details: serde_json::json!({}),
+        })
+}
+
+/// `POST /auth/browser/email/request` — mail a proof of a recovery address
+/// for the signed-in User.
+///
+/// Needs `tenant`'s password or provider session from the last five
+/// minutes and a configured mail relay. Sets the `wyrd_contact` flow cookie
+/// the same browser presents to verify.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_INVALID_TOKEN` without a live session for `tenant`;
+/// `403 WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` for an older or recovery
+/// session; `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a relay;
+/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address;
+/// `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` once the source's or account's email
+/// window is exhausted; `503` when the store, key or relay fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/email/request",
+    request_body = ContactRequest,
+    responses(
+        (status = 202, description = "A proof was mailed; the flow cookie is set",
+          body = ProofStatusResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_contact` flow cookie"))),
+        (status = 400, description = "Invalid body or address (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 401, description = "No live session for the tenant \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, the sign-in is not recent, or \
+          mail is not configured (WYRD_AUTH_403_ORIGIN_REFUSED, \
+          WYRD_AUTH_403_RECENT_LOGIN_REQUIRED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
+          body = WyrdProblem),
+        (status = 429, description = "The source's or account's email window is exhausted; nothing was mailed \
+          (WYRD_AUTH_429_EMAIL_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = String, description = "Whole seconds until the window ends"))),
+        (status = 503, description = "The store, key or relay is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn contact_request(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    RequestSource(source): RequestSource,
+    request: Result<Json<ContactRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let session = sessions
+        .resolve(&tenant_session(&headers, &request.tenant)?)
+        .await?;
+    let flow = social(&state)?
+        .request_contact(
+            &sessions,
+            application_mail(&state)?,
+            &session,
+            source,
+            &request,
+            &origin,
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::ACCEPTED,
+        vec![cookie_header(
+            &origin,
+            CONTACT_COOKIE,
+            flow.expose_secret(),
+            CONTACT_COOKIE_PATH,
+            CONTACT_COOKIE_MAX_AGE_SECONDS,
+        )],
+        Json(ProofStatusResponse {
+            status: ProofStatus::CheckEmail,
+        }),
+    ))
+}
+
+/// `POST /auth/browser/email/verify` — make the address a contact message
+/// was sent to the signed-in User's verified recovery contact.
+///
+/// The browser presents its `wyrd_contact` flow cookie, `tenant`'s session
+/// for the same User and the proof from the message. The address replaces
+/// any earlier contact, which is told of the change.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_INVALID_TOKEN` without a live session for `tenant`;
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for a missing, foreign or
+/// stale flow or a wrong proof; `400` once expired; `503` when the store
+/// or key fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/email/verify",
+    request_body = ContactVerifyRequest,
+    responses(
+        (status = 204, description = "The address is the verified contact; the flow cookie is \
+          cleared", headers(("Set-Cookie" = String, description = "The cleared flow cookie"))),
+        (status = 400, description = "Invalid body, or the proof expired \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "No live session, or no usable flow or proof \
+          (WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_ONE_TIME_CODE_INVALID)",
+          body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn contact_verify(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<ContactVerifyRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let session = sessions
+        .resolve(&tenant_session(&headers, &request.tenant)?)
+        .await?;
+    let mut flows = cookie_pairs(&headers).filter(|(name, _)| *name == CONTACT_COOKIE);
+    let flow = match (flows.next(), flows.next()) {
+        (Some((_, value)), None) => Some(value),
+        _ => None,
+    };
+    social(&state)?
+        .verify_contact(
+            &sessions,
+            application_mail(&state)?,
+            &session,
+            &request.tenant,
+            flow,
+            &request.proof,
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::NO_CONTENT,
+        vec![cookie_header(
+            &origin,
+            CONTACT_COOKIE,
+            "",
+            CONTACT_COOKIE_PATH,
+            0,
+        )],
+        (),
+    ))
+}
+
+/// Name of the cookie holding a discovery's sealed flow, then its read.
+const DISCOVERY_COOKIE: &str = "wyrd_discovery";
+
+/// Path the discovery cookie is scoped to.
+const DISCOVERY_COOKIE_PATH: &str = "/auth/browser/workspaces";
+
+/// Lifetime of the discovery flow cookie: the proof's fifteen minutes.
+const DISCOVERY_FLOW_MAX_AGE_SECONDS: u64 = 900;
+
+/// Lifetime of the discovery read cookie.
+const DISCOVERY_READ_MAX_AGE_SECONDS: u64 = 300;
+
+/// The one `wyrd_discovery` cookie `headers` carry; `None` for none or
+/// several.
+fn discovery_cookie(headers: &HeaderMap) -> Option<&str> {
+    let mut found = cookie_pairs(headers).filter(|(name, _)| *name == DISCOVERY_COOKIE);
+    match (found.next(), found.next()) {
+        (Some((_, value)), None) => Some(value),
+        _ => None,
+    }
+}
+
+/// `POST /auth/browser/workspaces/request` — mail a proof that lists the
+/// workspaces an address may sign in to.
+///
+/// Answers `202` alike for every address and sets the `wyrd_discovery`
+/// flow cookie the same browser presents to verify. The message names no
+/// workspace and is sent after the answer, so neither its relay's outcome
+/// nor its latency reaches the response.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a mail relay;
+/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address;
+/// `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` once the source's email window is
+/// exhausted; `503` when the store or key fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/workspaces/request",
+    request_body = DiscoveryRequest,
+    responses(
+        (status = 202, description = "Admitted; a proof is mailed after the answer, unless the \
+          address's window withholds it. The flow cookie is set", body = ProofStatusResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_discovery` flow cookie"))),
+        (status = 400, description = "Invalid body or address (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or mail is not configured \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
+        (status = 429, description = "The source's email window is exhausted; nothing was mailed \
+          (WYRD_AUTH_429_EMAIL_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = String, description = "Whole seconds until the window ends"))),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn discovery_request(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    RequestSource(source): RequestSource,
+    request: Result<Json<DiscoveryRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let flow = social(&state)?
+        .begin_discovery(application_mail(&state)?, source, &request.email, &origin)
+        .await?;
+    Ok(with_cookies(
+        StatusCode::ACCEPTED,
+        vec![cookie_header(
+            &origin,
+            DISCOVERY_COOKIE,
+            flow.expose_secret(),
+            DISCOVERY_COOKIE_PATH,
+            DISCOVERY_FLOW_MAX_AGE_SECONDS,
+        )],
+        Json(ProofStatusResponse {
+            status: ProofStatus::CheckEmail,
+        }),
+    ))
+}
+
+/// `POST /auth/browser/workspaces/verify` — spend a discovery proof in the
+/// browser that asked for it and read the first page of its workspaces.
+///
+/// Replaces the flow cookie with a five-minute read cookie for the next
+/// pages. Creates no session, User or grant.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for a missing or foreign flow,
+/// a wrong proof or a spent one; `400` once expired; `503` when the store or
+/// key fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/workspaces/verify",
+    request_body = DiscoveryVerifyRequest,
+    responses(
+        (status = 200, description = "The first page of workspaces; the read cookie is set",
+          body = DiscoveryPage,
+          headers(("Set-Cookie" = String, description = "The `wyrd_discovery` read cookie"))),
+        (status = 400, description = "Invalid body, or the proof expired \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "No usable flow or proof in this browser \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign (WYRD_AUTH_403_ORIGIN_REFUSED)",
+          body = WyrdProblem),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn discovery_verify(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<DiscoveryVerifyRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let (read, page) = social(&state)?
+        .verify_discovery(
+            state.postgres.wyrd(),
+            discovery_cookie(&headers),
+            &request.proof,
+            &origin,
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![cookie_header(
+            &origin,
+            DISCOVERY_COOKIE,
+            read.expose_secret(),
+            DISCOVERY_COOKIE_PATH,
+            DISCOVERY_READ_MAX_AGE_SECONDS,
+        )],
+        Json(page),
+    ))
+}
+
+/// `GET /auth/browser/workspaces` — the next page of the discovery this
+/// browser's read cookie holds.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` without a read cookie; `400`
+/// once it expired; `503` when the store or key fails.
+#[utoipa::path(
+    get,
+    path = "/auth/browser/workspaces",
+    params(DiscoveryQuery),
+    responses(
+        (status = 200, description = "The next page of workspaces", body = DiscoveryPage),
+        (status = 400, description = "The read expired (WYRD_AUTH_400_INVALID_STATE)",
+          body = WyrdProblem),
+        (status = 401, description = "No discovery read in this browser \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn discovery_next(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    Query(query): Query<DiscoveryQuery>,
+) -> Result<Json<DiscoveryPage>, WyrdErrorResponse> {
+    let page = social(&state)?
+        .discovery_next(
+            state.postgres.wyrd(),
+            discovery_cookie(&headers),
+            &query.cursor,
+            &origin,
+        )
+        .await?;
+    Ok(Json(page))
 }
 
 /// `POST /auth/browser/password/reset` — set a local User's password with a
@@ -720,8 +1147,8 @@ pub async fn password_change(
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The reset code is unknown, expired or used \
           (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -737,8 +1164,108 @@ pub async fn password_reset(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
-    browser_sessions(&state)?.password_reset(request).await?;
+    require_password(&state, &request.tenant).await?;
+    browser_sessions(&state)?
+        .password_reset(request, state.auth.application_mail.as_ref())
+        .await?;
     Ok(with_cookies(StatusCode::NO_CONTENT, Vec::new(), ()))
+}
+
+/// `POST /auth/browser/password/reset/request` — mail a reset code to the
+/// named User's verified recovery address.
+///
+/// Every admitted request for a tenant that offers password reset gets the
+/// same `202`, answered before any account is read: only an active local
+/// password User with a verified contact is mailed, and a lost send is not
+/// retried. The request never locks the account.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS` while this source's
+/// window is exhausted; `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` when the
+/// tenant does not offer password reset; `503` when admission or the store
+/// is unavailable.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/password/reset/request",
+    request_body = PasswordResetCodeRequest,
+    responses(
+        (status = 202, description = "Accepted; a code is mailed only when the account can \
+          use one", body = ProofStatusResponse),
+        (status = 400, description = "Invalid body (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or password reset is not \
+          offered (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
+          body = WyrdProblem),
+        (status = 429, description = "Too many requests from this source \
+          (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "Admission or the store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn password_reset_request(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    RequestSource(source): RequestSource,
+    request: Result<Json<PasswordResetCodeRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let social = social(&state)?;
+    social.admit_password_reset(source).await?;
+    if !available_methods(&state, Some(&request.tenant))
+        .await?
+        .email
+        .password_reset
+    {
+        return Err(method_unavailable("password reset"));
+    }
+    social.request_password_reset(
+        &browser_sessions(&state)?,
+        application_mail(&state)?,
+        request.tenant,
+        request.username,
+        &origin,
+    );
+    Ok(with_cookies(
+        StatusCode::ACCEPTED,
+        Vec::new(),
+        Json(ProofStatusResponse {
+            status: ProofStatus::CheckEmail,
+        }),
+    ))
+}
+
+/// Refuse unless `tenant`'s current methods report offers password sign-in.
+///
+/// # Errors
+/// Returns [`WyrdError::MethodUnavailable`] with reason `method_unavailable` when
+/// password is disabled or the tenant requires company SSO, and `503` when the
+/// report cannot be read.
+async fn require_password(state: &AppState, tenant: &TenantSlug) -> Result<(), WyrdErrorResponse> {
+    if available_methods(state, Some(tenant))
+        .await?
+        .sign_in
+        .password
+    {
+        Ok(())
+    } else {
+        Err(method_unavailable("password sign-in"))
+    }
+}
+
+/// The `403` refusal of a sign-in `method` the methods report no longer
+/// offers.
+pub(crate) fn method_unavailable(method: &str) -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::MethodUnavailable {
+        message: format!("{method} is not available for this workspace"),
+        details: serde_json::json!({ "reason": "method_unavailable" }),
+    })
 }
 
 /// The response for a session just created: its metadata at `status` with
@@ -873,10 +1400,12 @@ mod pg_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth::connections::HumanConnections;
+    use wyrd_auth::social::{SocialEndpoints, SocialSignIn};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
     use wyrd_spec::auth::{BrowserLoginResponse, Sha256Hex};
     use wyrd_spec::error::WyrdError;
     use wyrd_storage::{LocalSigner, StorageHandle};
@@ -954,6 +1483,22 @@ mod pg_tests {
                     ScreenedHttp::allowing_internal(),
                     audit,
                 )),
+                social_sign_in: Some(SocialSignIn::new(
+                    fixture.operator_pool().clone(),
+                    Some(Arc::new(
+                        WyrdKms::new(
+                            &KmsConfig {
+                                backend: Some(KmsBackendKind::Memory),
+                                active_key: Some("dev".to_owned()),
+                                ..KmsConfig::default()
+                            },
+                            false,
+                        )
+                        .expect("memory facade builds"),
+                    )),
+                    ScreenedHttp::allowing_internal(),
+                    SocialEndpoints::default(),
+                )),
                 ..ServerAuth::default()
             }
         })
@@ -971,6 +1516,10 @@ mod pg_tests {
             .with_state(state)
             .oneshot(
                 Request::post("/auth/browser/login")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [198, 51, 100, 7],
+                        443,
+                    ))))
                     .header(header::HOST, "wyrd.example.com")
                     .header("x-forwarded-proto", "https")
                     .header(header::ORIGIN, origin)
@@ -1098,7 +1647,15 @@ mod pg_tests {
         let provider = MockServer::start().await;
         let state = login_state(&fixture, &provider).await;
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
-        let refuse = |error| super::login_refused(&state, &origin, fixture.data_tenant_id(), error);
+        let refuse = |error| {
+            super::login_refused(
+                &state,
+                &origin,
+                fixture.data_tenant_id(),
+                error,
+                super::LOGIN_COOKIE_PATH,
+            )
+        };
         let unavailable = [
             WyrdError::AuthVerifyUnavailable {
                 message: "auth backend unavailable".to_owned(),

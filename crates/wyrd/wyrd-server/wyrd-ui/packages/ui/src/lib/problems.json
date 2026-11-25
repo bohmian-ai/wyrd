@@ -17,6 +17,15 @@
     "title": "Permission denied (RBAC)",
     "type": "https://wyrd.dev/problems/WYRD_PERMISSION_403_DENIED_RBAC"
   },
+  "emailAttempts": {
+    "code": "WYRD_AUTH_429_EMAIL_ATTEMPTS",
+    "detail": "Too many email requests",
+    "details": {},
+    "remediation": "Wait `details.retry_after_seconds` until the fixed email window ends, then ask again.",
+    "status": 429,
+    "title": "Too many email requests",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_429_EMAIL_ATTEMPTS"
+  },
   "expired": {
     "code": "WYRD_AUTH_401_TOKEN_EXPIRED",
     "detail": "Token expired",
@@ -34,6 +43,15 @@
     "status": 500,
     "title": "Internal error",
     "type": "https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL"
+  },
+  "methodUnavailable": {
+    "code": "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+    "detail": "Method not available",
+    "details": {},
+    "remediation": "Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it.",
+    "status": 403,
+    "title": "Method not available",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_403_METHOD_UNAVAILABLE"
   },
   "notFound": {
     "code": "WYRD_SPEC_404_NOT_FOUND",
@@ -75,10 +93,19 @@
     "code": "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
     "detail": "Recent sign-in required",
     "details": {},
-    "remediation": "Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one.",
+    "remediation": "Sign in again with a method the operation accepts, then retry within five minutes; an API key or recovery session cannot prove a recent sign-in.",
     "status": 403,
     "title": "Recent sign-in required",
     "type": "https://wyrd.dev/problems/WYRD_AUTH_403_RECENT_LOGIN_REQUIRED"
+  },
+  "signInAttempts": {
+    "code": "WYRD_AUTH_429_SIGN_IN_ATTEMPTS",
+    "detail": "Too many sign-in starts",
+    "details": {},
+    "remediation": "Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again.",
+    "status": 429,
+    "title": "Too many sign-in starts",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_429_SIGN_IN_ATTEMPTS"
   },
   "unauthenticated": {
     "code": "WYRD_AUTH_401_UNAUTHENTICATED",

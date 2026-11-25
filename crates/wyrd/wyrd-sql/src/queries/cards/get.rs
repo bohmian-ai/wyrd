@@ -26,6 +26,23 @@ const SELECT_BY_REF: &str = r"
       AND status != 'deleted'
 ";
 
+const SELECT_SCOPES: &str = r"
+    SELECT card_uid, kind, name
+    FROM wyrd.cards
+    WHERE card_uid = ANY($1)
+";
+
+/// One registered Card's identity as an authorization check needs it.
+#[derive(sqlx::FromRow)]
+struct ScopeRow {
+    /// The Card's UID.
+    card_uid: uuid::Uuid,
+    /// The stored Card kind.
+    kind: String,
+    /// The stored Card name.
+    name: String,
+}
+
 const SELECT_FOR_RECONCILIATION: &str = r"
     SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
@@ -167,4 +184,41 @@ pub async fn find_card_by_ref(
     row.map(ParsedCardRow::try_from).transpose().map_err(|e| {
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
     })
+}
+
+/// The exact registered scope of each of `uids` that names a Card, in one
+/// statement: the trusted family an authorization check needs when the
+/// caller holds only a UID. A UID naming no Card is absent from the map.
+///
+/// # Errors
+///
+/// Returns the registry error when the read or decode fails.
+pub async fn card_scopes(
+    conn: &mut TenantConn<'_>,
+    uids: &[CardUid],
+) -> Result<std::collections::HashMap<CardUid, wyrd_spec::auth::CardPermissionScope>, WyrdError> {
+    let ids: Vec<uuid::Uuid> = uids.iter().map(CardUid::as_uuid).collect();
+    let rows = sqlx::query_as::<_, ScopeRow>(SELECT_SCOPES)
+        .bind(&ids)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(super::registry_db_error)?;
+    rows.into_iter()
+        .map(
+            |ScopeRow {
+                 card_uid: uid,
+                 kind,
+                 name,
+             }| {
+                let uid = CardUid::from_uuid(uid).map_err(super::registry_db_error)?;
+                let kind: CardKind = serde_json::from_value(serde_json::Value::String(kind))
+                    .map_err(super::registry_db_error)?;
+                let name = CardName::new(name).map_err(super::registry_db_error)?;
+                Ok((
+                    uid.clone(),
+                    wyrd_spec::auth::CardPermissionScope::version(kind, name, uid),
+                ))
+            },
+        )
+        .collect()
 }

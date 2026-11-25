@@ -1,0 +1,25 @@
+# The second release of support-model, sharing its artifact.
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  name: support-model
+  version: 2.0.0
+spec:
+  interface:
+    kind: Custom
+    meta:
+      framework_version: 0.1.0
+      loader_module: support
+      loader_class: SupportModel
+      extra: {}
+  task_type: Other
+  signature:
+    inputs:
+      - name: question
+        dtype: utf8
+    outputs:
+      - name: answer
+        dtype: utf8
+artifacts:
+  - relative_path: support-model.bin
+    content_type: application/octet-stream

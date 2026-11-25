@@ -5,7 +5,7 @@ import json
 
 card = await call_tool('cards.get', {'card_ref': {'kind': 'Service', 'name': 'policy-desk', 'version': '1.0.0'}})
 try:
-    await call_tool('bifrost.query', {'sql': 'SELECT execution_id FROM bifrost.verification.results LIMIT 1', 'max_rows': 1})
+    await call_tool('bifrost.query', {'sql': 'SELECT name FROM bifrost.traces.spans LIMIT 1', 'max_rows': 1})
     query = 'allowed'
     again = None
 except RuntimeError as error:

@@ -4,14 +4,22 @@
   the server load returned. Every control navigates, so the investigation
   survives reload, Back and a shared link; Live re-runs the same load.
 -->
+<script lang="ts" module>
+  /** Each address's last settled sections, outliving a mount so Back keeps the page's height. */
+  const remembered = new Map<string, unknown>();
+</script>
+
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import { onDestroy, untrack } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
   import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
   import { MAX_GROUP_KEYS, METRIC_AGGREGATIONS, METRIC_GROUP_KEYS, METRIC_NAMES, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
-  import { PRESETS, appliedRange, closed, groupColumns, moved, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
+  import { PRESETS, appliedRange, closed, groupColumns, moved, population, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
+  import { Streamed } from '$lib/streamed.svelte';
+  import Updating from '$lib/Updating.svelte';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
@@ -29,6 +37,33 @@
   const current = $derived(readState(page.url.searchParams));
   const observe = $derived(data.observe);
   const view = $derived('problem' in observe ? undefined : observe);
+  /** Overview, timeline, facets and metric names: in the first HTML, then read from `observe/support` when their population changes and on each Live refresh. */
+  type Support = NonNullable<NonNullable<typeof view>['support']>;
+  const streamed = new Streamed<Support>(remembered as Map<string, Support>);
+  // The first HTML renders its own support: effects never run on the server. A remount with none shows its address's remembered support.
+  untrack(() => 'problem' in data.observe || (data.observe.support && streamed.follow(data.observe.support, remembering())));
+  onDestroy(() => streamed.stop());
+  /** The population support counts; paging, sorting, columns, grouping and the open record keep it. */
+  const populationKey = $derived(view ? writeState(population(current)).toString() : undefined);
+  /** Where support is remembered: its population, which list choices share, so Back to any of them keeps the page's height. */
+  function remembering() {
+    return `${base}/observe?${writeState(population(readState(page.url.searchParams)))}`;
+  }
+  /** Read support for the current population under the range the list was read in. */
+  const readSupport = () => {
+    if (!data.range || 'problem' in data.observe) return Promise.resolve();
+    const search = writeState({ ...population(readState(page.url.searchParams)), from: data.range.from, to: data.range.to });
+    return streamed.read(`${base}/observe/support?${search}`, remembering());
+  };
+  $effect.pre(() => {
+    void populationKey;
+    untrack(() => {
+      if (!view) return streamed.follow(undefined, remembering());
+      if (view.support) return streamed.follow(view.support, remembering());
+      void readSupport();
+    });
+  });
+  const support = $derived(streamed.value);
   const form = $derived(page.form as { draft?: string; problem?: Problem } | null);
 
   /** The URL of `next`, on its first page when it reads another list. */
@@ -64,10 +99,20 @@
     };
   }
 
+  // Live waits for each refresh, its list and then its support, before timing the next, so slow refreshes never pile up.
+  // Live alone, not the state object each refresh replaces: a refresh must not restart the timer it is timing.
+  const live = $derived(current.live);
   $effect(() => {
-    if (!current.live) return;
-    const timer = setInterval(() => invalidate('wyrd:observe'), LIVE_MS);
-    return () => clearInterval(timer);
+    if (!live) return;
+    let timer: ReturnType<typeof setTimeout>;
+    let stopped = false;
+    const refresh = async () => {
+      await invalidate('wyrd:observe');
+      if (!stopped) await readSupport();
+    };
+    const tick = () => (timer = setTimeout(() => void refresh().finally(() => stopped || tick()), LIVE_MS));
+    tick();
+    return () => ((stopped = true), clearTimeout(timer));
   });
 
   /** Zoom the applied range around its centre by `factor`: ½ zooms in, 2 out. */
@@ -102,7 +147,7 @@
   /** The list bar's slot for the trace list's Wrap, Columns and CSV. */
   let listTools = $state<HTMLElement>();
   const totals = $derived.by(() => {
-    const read = view?.overview?.totals;
+    const read = support?.overview?.totals;
     if (read?.state !== 'populated' || !data.range) return undefined;
     const row = read.data.rows[0];
     const at = (name: string) => Number(row[read.data.columns.findIndex((column) => column.name === name)] ?? 0);
@@ -122,8 +167,8 @@
   const metric = $derived(current.signal === 'metrics' ? selectedMetric(current) : undefined);
   let find = $state('');
   /** The names the server found for `find`; absent while the search is blank, so the view's own read shows. */
-  let searched = $state<{ for: string; read: NonNullable<typeof view>['metrics'] }>();
-  const names = $derived(find.trim() && searched?.for === find.trim() ? searched.read : view?.metrics);
+  let searched = $state<{ for: string; read: NonNullable<Support>['metrics'] }>();
+  const names = $derived(find.trim() && searched?.for === find.trim() ? searched.read : support?.metrics);
   const metricRows = $derived.by(() => {
     if (names?.state !== 'populated') return [];
     return names.data.rows.slice(0, METRIC_NAMES).map(([name, type, unit]) => ({ name: String(name), type: String(type ?? ''), unit: unit ? String(unit) : '' }));
@@ -151,7 +196,7 @@
   });
   const metricRow = $derived(metricRows.find((row) => row.name === metric));
   const facetValues = (column: string): readonly unknown[] => {
-    const read = view?.facets.result;
+    const read = support?.facets.result;
     if (read?.state !== 'populated') return [];
     return read.data.facets.find((facet) => facet.column === column)?.values.rows.map(([value]) => value) ?? [];
   };
@@ -162,6 +207,20 @@
   /** The reader's visible series, per metric view and histogram plot; absent shows the Chart's default. */
   let picks = $state<Record<string, ReadonlySet<string>>>({});
   const seriesKey = $derived(view?.series ? JSON.stringify(view.series.input) : '');
+  /** The selected metric's group keys, read once per metric view when the reader first opens the picker. */
+  let offered = $state<{ for: string; keys: readonly string[] }>();
+  const offerKeys = async () => {
+    const at = seriesKey;
+    if (!data.range || !at || offered?.for === at) return;
+    const params = new URLSearchParams(page.url.searchParams);
+    params.set('from', data.range.from);
+    params.set('to', data.range.to);
+    params.set('keys', '');
+    offered = { for: at, keys: METRIC_GROUP_KEYS };
+    const response = await fetch(`${base}/observe/metrics?${params}`).catch(() => undefined);
+    const keys = response?.ok ? await response.json().catch(() => undefined) : undefined;
+    if (Array.isArray(keys) && offered?.for === at) offered = { for: at, keys };
+  };
   /** `n` `noun`s in words: "1 trace", "2 traces". */
   const plural = (n: number, noun: string) => `${fmtNumber(n)} ${noun}${n === 1 ? '' : 's'}`;
 </script>
@@ -234,8 +293,8 @@
   {#if 'problem' in observe}
     <EmptyState state="error" problem={observe.problem} />
   {:else if current.signal === 'traces'}
-    {#if observe.overview}
-      {@const overview = observe.overview}
+    {#if support?.overview}
+      {@const overview = support.overview}
       <section class="panel overview" aria-label="Overview" data-panel="overview">
         <header>
           <p class="h">Drag across any chart to zoom all three</p>
@@ -243,6 +302,7 @@
             <button type="button" class="badge" onclick={reset} aria-label="Reset zoom">Zoomed {data.range.from.slice(11, 19)} – {data.range.to.slice(11, 19)} ✕</button>
           {/if}
         </header>
+        <Updating pending={streamed.pending}>
         <div class="trio">
           <Chart
             {...overview.spans}
@@ -265,6 +325,11 @@
           />
           <Chart {...overview.duration} compact colors={DURATIONS} headline={totals ? { value: `p95 ${fmtDuration(totals.p95)}` } : undefined} {actions} onaction={onaction('Chart')} />
         </div>
+        </Updating>
+      </section>
+    {:else if !support}
+      <section class="panel overview" aria-label="Overview" data-panel="overview">
+        <EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Reading the overview'} />
       </section>
     {/if}
     <div class="listbar">
@@ -277,30 +342,36 @@
         Filters{current.where.length ? ` · ${current.where.length}` : ''}
       </button>
       {#if totals && current.mode === 'spans'}
-        <span class="counts">{plural(totals.spans, 'span')} match · p95 {fmtDuration(totals.spanP95)}</span>
+        <span class="counts" aria-busy={streamed.pending ? 'true' : undefined}>{plural(totals.spans, 'span')} match · p95 {fmtDuration(totals.spanP95)}</span>
       {:else if totals}
-        <span class="counts">{plural(totals.traces, 'trace')} · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
+        <span class="counts" aria-busy={streamed.pending ? 'true' : undefined}>{plural(totals.traces, 'trace')} · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
       {/if}
       {@render grouping()}
       <span class="listtools" bind:this={listTools}></span>
     </div>
     <div class="split" class:folded={!filtersOpen}>
-      {#if filtersOpen}<div id="facets" data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
+      {#if filtersOpen}<div id="facets" data-panel="facets">{#if support}<Updating pending={streamed.pending}><FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} /></Updating>{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>{/if}
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />{/if}
       </div>
     </div>
     {@render children()}
   {:else if current.signal === 'logs'}
-    {#if observe.timeline}
-      {@const timeline = observe.timeline}
+    {#if support?.timeline}
+      {@const timeline = support.timeline}
       <section class="panel overview" aria-label="Timeline" data-panel="timeline">
-        <Chart {...timeline} input={{ ...timeline.input, title: `${timeline.input.title} · drag to zoom` }} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+        <Updating pending={streamed.pending}>
+          <Chart {...timeline} input={{ ...timeline.input, title: `${timeline.input.title} · drag to zoom` }} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+        </Updating>
+      </section>
+    {:else if !support}
+      <section class="panel overview" aria-label="Timeline" data-panel="timeline">
+        <EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Reading the timeline'} />
       </section>
     {/if}
     <!-- The records work region: fields, records and the selected record side by side, wrapping on a narrow screen. -->
     <div class="work">
-      <div data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>
+      <div data-panel="facets">{#if support}<Updating pending={streamed.pending}><FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} /></Updating>{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} tools={grouping} />{/if}
       </div>
@@ -434,9 +505,9 @@
           if (key && !current.by?.includes(key)) go({ ...closed(current), by: [...(current.by ?? []), key] });
         }}
       >
-        <input name="key" list="group-keys" placeholder="attributes.http.route" aria-label="Add a group key" />
+        <input name="key" list="group-keys" placeholder="attributes.http.route" aria-label="Add a group key" onfocus={offerKeys} oninput={offerKeys} />
       </form>
-      <datalist id="group-keys">{#each view?.series?.keys ?? METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
+      <datalist id="group-keys">{#each offered?.for === seriesKey ? offered.keys : METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
     {/if}
   </span>
 {/snippet}
@@ -452,6 +523,10 @@
 {/snippet}
 
 <style>
+  /* Counts of the previous population while its successor is read. */
+  .counts[aria-busy='true'] {
+    opacity: 0.5;
+  }
   .top {
     display: flex;
     flex-wrap: wrap;
@@ -694,9 +769,9 @@
     color: var(--muted);
     font: 12px var(--font-mono);
   }
-  /* A choice fits "all series" or a short column name; a long attribute name truncates in the closed control. */
+  /* A choice is as wide as a short column name, so the Logs header keeps one row beside the open record; a long attribute name truncates in the closed control. */
   .by select {
-    max-width: 11em;
+    max-width: 7em;
   }
   .keys {
     flex-wrap: wrap;

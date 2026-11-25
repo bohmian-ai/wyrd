@@ -1,8 +1,26 @@
 import type { Cookies } from '@sveltejs/kit';
 import { WyrdClient } from 'wyrd-ai';
-import { serverUrl } from '../upstream';
+import { serverUrl, stateSource } from '../upstream';
 import { upstreamProblem } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
+
+/** A shared social sign-in provider. */
+export type SocialProvider = 'google' | 'github';
+
+/** The sign-in methods `GET /auth/browser/methods` allows. */
+export type LoginMethods = {
+  password: boolean;
+  company_sso: boolean;
+  providers: SocialProvider[];
+  signup: boolean;
+  local_signup: boolean;
+  email_discovery: boolean;
+  password_reset: boolean;
+  email_verification_required: boolean;
+  signup_providers: SocialProvider[];
+  /** The configured signup challenge's public Turnstile site key; absent without one. */
+  signup_challenge_site_key?: string;
+};
 
 const sessionPrefix = 'wyrd_session_';
 const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
@@ -18,25 +36,28 @@ type View = {
   expires_at: string;
 };
 
-type Call = { method: 'GET' | 'POST' | 'DELETE'; cookie?: string; body?: unknown };
+type Call = { method: 'GET' | 'POST' | 'PUT' | 'DELETE'; cookie?: string; body?: unknown };
 
 /**
- * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
+ * Call one Rust `/auth/browser/*`, `/platform/*` or `/v1` operation server to server as the
  * browser at `url`: the trusted public origin goes as `Origin` and the
- * forwarded host and scheme, and only the cookie the caller selected is sent.
+ * forwarded host and scheme, the visitor's address as `stateSource` states it,
+ * and only the cookie the caller selected is sent.
  * An unreachable server is the stable `upstream` problem.
  */
-async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
+export async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
+  const headers = new Headers({
+    origin: url.origin,
+    'x-forwarded-host': url.host,
+    'x-forwarded-proto': url.protocol.slice(0, -1),
+    ...(cookie ? { cookie } : {}),
+    ...(body === undefined ? {} : { 'content-type': 'application/json' })
+  });
+  stateSource(headers);
   try {
     return await fetch(new URL(path, serverUrl()), {
       method,
-      headers: {
-        origin: url.origin,
-        'x-forwarded-host': url.host,
-        'x-forwarded-proto': url.protocol.slice(0, -1),
-        ...(cookie ? { cookie } : {}),
-        ...(body === undefined ? {} : { 'content-type': 'application/json' })
-      },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'manual',
       signal: AbortSignal.timeout(30_000)
@@ -47,7 +68,7 @@ async function call(path: string, url: URL, { method, cookie, body }: Call): Pro
 }
 
 /** Refuse with the safe problem a non-2xx Wyrd answer maps to. */
-async function refuse(response: Response): Promise<never> {
+export async function refuse(response: Response): Promise<never> {
   reject(await upstreamProblem(response));
 }
 
@@ -178,17 +199,40 @@ export class BrowserSessions {
     return sessionPrefix + tenantKey;
   }
 
-  /** Begin SSO sign-in: the server sets the login cookie and returns the provider URL. */
-  async begin(tenantKey: string, url: URL, cookies: Cookies): Promise<string> {
+  /**
+   * Begin a provider sign-in: company SSO, or the shared `provider`, which
+   * with `invitationCode` redeems that invitation link. The server sets the
+   * login cookie and returns the provider URL.
+   */
+  async begin(
+    tenantKey: string,
+    url: URL,
+    cookies: Cookies,
+    provider?: SocialProvider,
+    invitationCode?: string
+  ): Promise<string> {
     this.cookieName(tenantKey);
     const response = await call('/auth/browser/login', url, {
       method: 'POST',
-      body: { tenant: tenantKey }
+      body: { tenant: tenantKey, provider, invitation_code: invitationCode }
     });
     if (!response.ok) await refuse(response);
     relayCookies(response, cookies);
     const begun = (await response.json()) as { authorization_url: string };
     return begun.authorization_url;
+  }
+
+  /**
+   * The sign-in methods Rust allows on this tenant's pages, or with no tenant
+   * on the deployment's root pages (creation and discovery); rendering only,
+   * never enforcement.
+   */
+  async methods(tenantKey: string | null, url: URL): Promise<LoginMethods> {
+    if (tenantKey !== null) this.cookieName(tenantKey);
+    const query = tenantKey === null ? '' : `?tenant=${encodeURIComponent(tenantKey)}`;
+    const response = await call(`/auth/browser/methods${query}`, url, { method: 'GET' });
+    if (!response.ok) await refuse(response);
+    return (await response.json()) as LoginMethods;
   }
 
   /** Recovery sign-in: the server verifies the API key and sets the tenant session cookie. */
@@ -231,6 +275,20 @@ export class BrowserSessions {
   }
 
   /** Set a new password with an operator-issued reset code; signs nothing in. */
+  /**
+   * Ask Rust to mail a reset code to the verified recovery email of
+   * `username`; every account gets the same answer, so nothing here says
+   * whether one exists.
+   */
+  async requestReset(tenantKey: string, username: string, url: URL): Promise<void> {
+    this.cookieName(tenantKey);
+    const response = await call('/auth/browser/password/reset/request', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, username }
+    });
+    if (!response.ok) await refuse(response);
+  }
+
   async resetPassword(tenantKey: string, resetCode: string, newPassword: string, url: URL): Promise<void> {
     this.cookieName(tenantKey);
     const response = await call('/auth/browser/password/reset', url, {

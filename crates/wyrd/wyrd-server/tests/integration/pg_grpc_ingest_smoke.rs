@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use bytes::Bytes;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
@@ -27,20 +27,18 @@ use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFin
 use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
 use vala_bifrost_redux::tables::{DomainTable, verification::ResultsTable};
 use vala_sql::TenantConn;
-use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{
     BifrostPermissionScope, BifrostTableScope, PermissionScope, PermissionSet, Principal,
-    PrincipalId, PrincipalKind, RoleRef,
+    PrincipalId, PrincipalKind,
 };
 use wyrd_server::AppState;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, build_peer_grpc, serve_grpc};
 use wyrd_server::verification::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::TenantTableBinding;
-use wyrd_testing::WyrdTestServer;
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
@@ -75,43 +73,20 @@ async fn seed_tenant(server: &WyrdTestServer, tenant: DataTenantId, slug: &str) 
         .expect("the seeded tenant receives every built-in table");
 }
 
-/// Mints one user token carrying the requested built-in roles' permissions.
+/// Signs in a new User of `tenant` holding the tenant-wide built-in `roles`.
 ///
 /// # Panics
 ///
-/// Panics when a static role is invalid or the fixture key cannot sign the token.
-fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
-    let principal = TokenPrincipalRef {
-        id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindTag::User,
-        tenant_id: tenant,
+/// Panics when the User cannot be created or signed in.
+async fn mint_user_jwt(server: &WyrdTestServer, tenant: DataTenantId, roles: &[&str]) -> String {
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user_in_tenant(tenant, &format!("ingest-{}", uuid::Uuid::now_v7()), roles)
+        .await
+        .expect("user bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
     };
-    state
-        .auth
-        .issuing_key
-        .as_ref()
-        .expect("test state has issuing key")
-        .issue_access_token(
-            wyrd_auth_issue::AccessGrant {
-                principal,
-                roles: roles
-                    .iter()
-                    .map(|role| RoleRef::new(role).expect("static role is valid"))
-                    .collect(),
-                permissions: wyrd_runtime::builtin_roles::BUILTIN_ROLES
-                    .iter()
-                    .filter(|builtin| roles.contains(&builtin.name))
-                    .flat_map(|builtin| builtin.permissions.iter().cloned())
-                    .collect(),
-                card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
-                workload_uid: None,
-                credential_id: None,
-                act: None,
-                audience: wyrd_spec::auth::TokenAudience::Wyrd,
-            },
-            ChronoDuration::minutes(5),
-        )
-        .expect("test jwt mints")
+    jwt
 }
 
 /// Builds two logical rows of the private-tail fixture.
@@ -166,7 +141,6 @@ fn test_principal(tenant: DataTenantId) -> Principal {
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     )
 }
@@ -530,7 +504,7 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
     // The fixture's own tenant, so any refusal past verification is about the
     // request rather than a tenant the fixture never provisioned.
     let tenant = server.data_tenant_id();
-    let jwt = mint_user_jwt(state, tenant, &[]);
+    let jwt = mint_user_jwt(&server, tenant, &[]).await;
 
     let (_, health_service) = health_reporter();
     let router = build_app_grpc(
@@ -611,7 +585,7 @@ async fn ingest_logical_batch(
         )
         .await
         .expect("logical dataset registers for the authenticated tenant");
-    let jwt = mint_user_jwt(state, tenant, &["admin"]);
+    let jwt = mint_user_jwt(server, tenant, &["admin"]).await;
     let batch_id = uuid::Uuid::now_v7();
 
     let (_, health_service) = health_reporter();
@@ -1134,34 +1108,24 @@ impl ResultTableHarness {
     }
 }
 
-/// Mints a five-minute token for `principal` carrying only
-/// `bifrost:record:write`.
+/// Exchanges a new record-writing Service of `tenant` for its token: the
+/// built-in `workload` role grants `bifrost_record:write` tenant-wide.
 ///
 /// # Panics
 ///
-/// Panics when the fixture key cannot sign the token.
-fn mint_record_writer_jwt(state: &AppState, principal: TokenPrincipalRef) -> String {
-    state
-        .auth
-        .issuing_key
-        .as_ref()
-        .expect("test state has issuing key")
-        .issue_access_token(
-            wyrd_auth_issue::AccessGrant {
-                principal,
-                roles: vec![],
-                permissions: [wyrd_runtime::Permission::bifrost_record_write()]
-                    .into_iter()
-                    .collect(),
-                card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
-                workload_uid: None,
-                credential_id: None,
-                act: None,
-                audience: wyrd_spec::auth::TokenAudience::Wyrd,
-            },
-            ChronoDuration::minutes(5),
-        )
-        .expect("record-writer jwt mints")
+/// Panics when the Service cannot be created or its key exchanged.
+async fn mint_record_writer_jwt(server: &WyrdTestServer, tenant: DataTenantId) -> String {
+    let Bootstrap::Machine { api_key, .. } = server
+        .bootstrap_service_in_tenant(tenant, "record-writer", &["workload"])
+        .await
+        .expect("service bootstraps")
+    else {
+        panic!("service bootstrap returned a non-machine principal");
+    };
+    server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("the record writer's key exchanges")
 }
 
 /// No public writer reaches a verification result table over gRPC.
@@ -1180,17 +1144,12 @@ fn mint_record_writer_jwt(state: &AppState, principal: TokenPrincipalRef) -> Str
 #[tokio::test]
 async fn public_result_writes_are_refused_over_grpc() {
     let harness = ResultTableHarness::start("public-result-writes").await;
-    let state = harness.server.state();
-    let service_jwt = mint_record_writer_jwt(
-        state,
-        TokenPrincipalRef {
-            id: PrincipalId::new(Uuid::now_v7()),
-            kind: PrincipalKindTag::Service,
-            tenant_id: harness.tenant,
-        },
-    );
+    let service_jwt = mint_record_writer_jwt(&harness.server, harness.tenant).await;
     let writers = [
-        ("user", mint_user_jwt(state, harness.tenant, &["admin"])),
+        (
+            "user",
+            mint_user_jwt(&harness.server, harness.tenant, &["admin"]).await,
+        ),
         ("service", service_jwt),
     ];
     let mut expected = Vec::new();
@@ -1299,7 +1258,8 @@ async fn system_read_authority_reads_only_the_named_table() {
                 table_uid: Uuid::from_slice(&table_uid).expect("16-byte table UID"),
             })),
             ..wyrd_runtime::Permission::bifrost_query_read()
-        }]),
+        }])
+        .into(),
     );
 
     let query = |sql: &str| {
@@ -1387,7 +1347,7 @@ async fn forged_tenant_result_writes_are_refused() {
     let harness = ResultTableHarness::start("result-forged-tenant").await;
     let foreign = DataTenantId::new_v7();
     seed_tenant(&harness.server, foreign, "result-forged-foreign").await;
-    let admin_jwt = mint_user_jwt(harness.server.state(), harness.tenant, &["admin"]);
+    let admin_jwt = mint_user_jwt(&harness.server, harness.tenant, &["admin"]).await;
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let parts: Vec<&str> = admin_jwt.split('.').collect();
     let [header, payload, signature] = parts.as_slice() else {

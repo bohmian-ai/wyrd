@@ -32,6 +32,8 @@ type Journey = {
   switchTenants: { keycloak: string; second: string; peer: string };
   replacementTenant: string;
   replacementOwnerKey: string;
+  /** A recovery API key for the peer switch tenant's headless owner. */
+  peerOwnerKey: string;
   /** Each provider's login form fields: Keycloak's admin and reader, and Dex's user. */
   users: Record<'admin' | 'reader' | 'dex', Record<string, string>>;
 };
@@ -321,7 +323,7 @@ async function expectSessionEnded(browser: Browser, replica: 0 | 1, tenant: stri
 
 /** The page and its data channel carry neither the session cookie nor any token. */
 async function expectNoSecrets(browser: Browser, tenant: string, session: string) {
-  for (const path of [`/t/${tenant}`, `/t/${tenant}/__data.json`, `/t/${tenant}/settings`]) {
+  for (const path of [`/t/${tenant}`, `/t/${tenant}/__data.json`, `/t/${tenant}/settings/account`]) {
     for (const replica of [0, 1] as const) {
       const response = await browser.go(replica, path);
       // Served to the session (a reader may be denied a page), never sent to sign-in.
@@ -370,7 +372,7 @@ async function freshBff(): Promise<{ url: string; stop: () => void }> {
 
 test('production SSO crosses replicas', async () => {
   const sso = journey.ssoTenant;
-  const settings = `/t/${sso}/settings`;
+  const settings = `/t/${sso}/settings/sign-in`;
 
   // A missing or forged login binding at an unknown state is the stable problem and sets nothing.
   const alice = new Browser();
@@ -433,12 +435,12 @@ test('production SSO crosses replicas', async () => {
   }
   const crossed = new Browser();
   crossed.cookies.set(sessionCookie(journey.apiKeyTenant), session);
-  expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings`)).headers.get('location')).toBe(
+  expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings/account`)).headers.get('location')).toBe(
     `/t/${journey.apiKeyTenant}/login`
   );
   expect(crossed.cookies.has(sessionCookie(journey.apiKeyTenant))).toBe(false);
   expect(
-    (await alice.go(0, `/t/${journey.apiKeyTenant}/settings?/deactivate`, { form: {} })).status
+    (await alice.go(0, `/t/${journey.apiKeyTenant}/settings/sign-in?/deactivate`, { form: {} })).status
   ).toBe(401);
 
   // A cross-site form post is refused (SvelteKit `csrf.checkOrigin`).
@@ -486,27 +488,48 @@ test('production SSO crosses replicas', async () => {
   expect((await second.go(1, `/t/${sso}`)).status).toBe(200);
   expect((await second.go(0, `/t/${sso}`)).status).toBe(200);
 
-  // The admin may deactivate; every session signed in through that connection ends at once.
+  // Deactivate and Remove are links to a confirmation stating their impact, never an
+  // immediate post; opening either and cancelling it changes nothing.
+  const page = await (await alice.go(0, settings)).text();
+  expect(page).toContain(`href="${settings}?confirm=deactivate"`);
+  expect(page).not.toContain('action="?/deactivate"');
+  expect(page).not.toContain('action="?/remove"');
+  for (const asked of ['deactivate', 'remove']) {
+    const confirm = await (await alice.go(1, `${settings}?confirm=${asked}`)).text();
+    expect(confirm, asked).toContain(`action="?/${asked}"`);
+    expect(confirm, asked).toContain('can no longer get in');
+  }
+  expect(await (await alice.go(0, settings)).text()).toContain('Danger zone');
+  for (const [browser, replica] of [[alice, 1], [bob, 0], [second, 1]] as const)
+    expect((await browser.go(replica, `/t/${sso}`)).status).toBe(200);
+
+  // Confirmed, the admin deactivates; every session signed in through that connection ends at once.
   const deactivated = await alice.go(1, `${settings}?/deactivate`, { form: {} });
   expect(deactivated.status).not.toBe(403);
   expect(deactivated.status).toBeLessThan(500);
   await expectSessionEnded(alice, 0, sso);
   await expectSessionEnded(bob, 1, sso);
   await expectSessionEnded(second, 0, sso);
-  // The operator's recovery session rests on its key, not the connection, and stays live.
-  expect((await operator.go(0, settings)).status).toBe(200);
+  // The operator's recovery session rests on its key, not the connection, and stays live,
+  // and its reload shows no Active connection left to deactivate.
+  const after = await operator.go(0, settings);
+  expect(after.status).toBe(200);
+  const reloaded = await after.text();
+  expect(reloaded).not.toContain('Danger zone');
+  expect(reloaded).toContain('Not set up');
 }, journeyTimeout + 30_000);
 
 test('OIDC-off credential UI', async () => {
   const tenant = journey.apiKeyTenant;
   const login = `/t/${tenant}/login`;
-  const settings = `/t/${tenant}/settings`;
+  const settings = `/t/${tenant}/settings/sign-in`;
   const browser = new Browser();
 
   const recovery = `${login}/api-key`;
-  // Routine sign-in is SSO; the operator key form is a separate recovery page the login page links to.
+  // Without an Active connection the page offers no SSO; the operator key form is a separate
+  // recovery page the login page links to.
   const page = await (await browser.go(0, login)).text();
-  expect(page).toContain('Sign in with SSO');
+  expect(page).not.toContain('Sign in with SSO');
   expect(page).not.toContain('name="apiKey"');
   expect(page).toContain(`href="${recovery}"`);
   expect(await (await browser.go(1, recovery)).text()).toContain('name="apiKey"');
@@ -596,14 +619,14 @@ test('production multi-provider tenant switch', async () => {
   expect(browser.cookies.get(sessionCookie(keycloak))).toBe(keycloakSession);
 
   // Both replicas render a chooser of exactly this browser's sessions; a forged
-  // session-cookie hint never renders and is cleared. (Settings render for every
+  // session-cookie hint never renders and is cleared. (Your account renders for every
   // member; the Dex tenant's role-less user is denied the home page.)
   browser.cookies.set(sessionCookie('ui-ghost'), 'd'.repeat(64));
   for (const [replica, tenant] of [
     [0, keycloak],
     [1, second]
   ] as const) {
-    const page = await browser.go(replica, `/t/${tenant}/settings`);
+    const page = await browser.go(replica, `/t/${tenant}/settings/account`);
     expect(page.status).toBe(200);
     expect(chooserTenants(await page.text())).toEqual([second, keycloak].sort());
   }
@@ -613,7 +636,7 @@ test('production multi-provider tenant switch', async () => {
   const toSecond = await browser.go(1, '/?/switch', { form: { tenantKey: second } });
   expect(toSecond.status).toBe(303);
   expect(toSecond.headers.get('location')).toBe(`/t/${second}`);
-  expect((await browser.go(1, `/t/${second}/settings`)).status).toBe(200);
+  expect((await browser.go(1, `/t/${second}/settings/account`)).status).toBe(200);
   const toKeycloak = await browser.go(0, '/?/switch', { form: { tenantKey: keycloak } });
   expect(toKeycloak.headers.get('location')).toBe(`/t/${keycloak}`);
 
@@ -639,7 +662,7 @@ test('production multi-provider tenant switch', async () => {
   // The same provider user signed in to the peer is a different tenant's
   // session: it joins this browser's chooser, but never opens the other tenant.
   const peerSession = await ssoLogin(browser, journey.users.admin, 1, 0, peer);
-  expect(chooserTenants(await (await browser.go(1, `/t/${keycloak}/settings`)).text())).toEqual(
+  expect(chooserTenants(await (await browser.go(1, `/t/${keycloak}/settings/account`)).text())).toEqual(
     [second, keycloak, peer].sort()
   );
   const crossed = new Browser();
@@ -648,12 +671,12 @@ test('production multi-provider tenant switch', async () => {
     `/t/${keycloak}/login`
   );
   expect(crossed.cookies.has(sessionCookie(keycloak))).toBe(false);
-  expect((await browser.go(0, `/t/${peer}/settings`)).status).toBe(200);
+  expect((await browser.go(0, `/t/${peer}/settings/account`)).status).toBe(200);
 
   // Signing out of one tenant leaves the others signed in.
   await browser.go(1, '/?/logout', { form: { tenantKey: peer } });
   expect(browser.cookies.has(sessionCookie(peer))).toBe(false);
-  expect(chooserTenants(await (await browser.go(0, `/t/${keycloak}/settings`)).text())).toEqual(
+  expect(chooserTenants(await (await browser.go(0, `/t/${keycloak}/settings/account`)).text())).toEqual(
     [second, keycloak].sort()
   );
 
@@ -681,7 +704,7 @@ test('production multi-provider tenant switch', async () => {
 
 test('production provider replacement settings', async () => {
   const tenant = journey.replacementTenant;
-  const settings = `/t/${tenant}/settings`;
+  const settings = `/t/${tenant}/settings/sign-in`;
   const alice = new Browser();
   const stage = () =>
     alice.go(0, `${settings}?/stage`, {
@@ -696,12 +719,12 @@ test('production provider replacement settings', async () => {
         groupRoles: ''
       }
     });
-  /** The rendered connections: ids in page order (Active first) and the candidate revision. */
+  /** The rendered connections' ids and the candidate revision. */
   const connections = async () => {
-    const html = await (await alice.go(1, settings)).text();
+    const html = await (await alice.go(1, `${settings}?confirm=remove`)).text();
     return {
       ids: [...html.matchAll(/name="id" value="([0-9a-f-]{36})"/g)].map(([, id]) => id),
-      revision: /action="\?\/test">[\s\S]*?name="revision" value="(\d+)"/.exec(html)?.[1]
+      revision: /action="\?\/test"[^>]*>[\s\S]*?name="revision" value="(\d+)"/.exec(html)?.[1]
     };
   };
 
@@ -714,7 +737,7 @@ test('production provider replacement settings', async () => {
   expect((await stage()).status).toBe(200);
   const discarded = await connections();
   expect(discarded.ids).toHaveLength(2);
-  const removed = await alice.go(1, `${settings}?/remove`, { form: { id: discarded.ids[1] } });
+  const removed = await alice.go(1, `${settings}?/remove`, { form: { id: discarded.ids.find((id) => id !== oldConnection)! } });
   expect(removed.status).toBe(200);
   expect((await connections()).ids).toEqual([oldConnection]);
 
@@ -773,7 +796,7 @@ test('production provider replacement settings', async () => {
   expect(listed.status).toBe(200);
   const view = (await listed.json()) as { active: { id: string; issuer: string } | null };
   expect(view.active?.issuer.replace(/\/$/, '')).toBe(secondIssuer);
-  expect(view.active?.id).toBe(ids[1]);
+  expect(view.active?.id).toBe(ids.find((id) => id !== oldConnection));
   const retiredConnection = `/identity/oidc/connections/${oldConnection}`;
   expect((await asKey(journey.replacementOwnerKey, 'DELETE', retiredConnection)).status).toBeLessThan(300);
   expect((await asKey(journey.replacementOwnerKey, 'DELETE', retiredConnection)).status).toBe(404);
@@ -782,6 +805,24 @@ test('production provider replacement settings', async () => {
   // Removing the retired connection leaves the replacement's session live.
   expect((await replaced.go(0, settings)).status).toBe(200);
   expect((await replaced.go(1, settings)).status).toBe(200);
+
+  // The owner, signed in with its recovery key, removes the Active connection through its
+  // confirmation: cancelling keeps it, confirming deletes it and ends its sessions.
+  const owner = new Browser();
+  const ownerLogin = await owner.go(0, `/t/${tenant}/login/api-key`, { form: { apiKey: journey.replacementOwnerKey } });
+  expect(ownerLogin.headers.get('location')).toBe(`/t/${tenant}`);
+  const confirm = await (await owner.go(1, `${settings}?confirm=remove`)).text();
+  expect(confirm).toContain('Remove company SSO?');
+  expect(confirm).toContain('client secret are deleted');
+  const active = /action="\?\/remove"[^>]*>[\s\S]*?name="id" value="([0-9a-f-]{36})"/.exec(confirm)?.[1];
+  expect(active).toBe(view.active?.id);
+  expect(await (await owner.go(0, settings)).text()).toContain('Danger zone');
+  expect((await replaced.go(1, `/t/${tenant}`)).status).toBe(200);
+  expect((await owner.go(1, `${settings}?/remove`, { form: { id: active! } })).status).toBe(200);
+  const reloaded = await (await owner.go(0, settings)).text();
+  expect(reloaded).not.toContain('Danger zone');
+  expect(reloaded).toContain('Not set up');
+  await expectSessionEnded(replaced, 0, tenant);
 }, journeyTimeout);
 
 test('production SSO account settings', async () => {
@@ -802,7 +843,7 @@ test('production SSO account settings', async () => {
     const page = await context.newPage();
     const account = `${journey.origin}/t/${sso}/settings/account`;
     await page.goto(account);
-    await expect.poll(() => page.locator('dl').textContent()).toContain('Single sign-on');
+    await expect.poll(() => page.getByTestId('profile').textContent()).toContain('Single sign-on');
     expect(await page.getByLabel('Current password').count()).toBe(0);
     expect(await page.getByLabel('Expires after (days)').inputValue()).toBe('30');
     expect(await page.locator('input[name=permission]:checked').count()).toBe(0);
@@ -819,9 +860,82 @@ test('production SSO account settings', async () => {
     expect(((await used.json()) as { permissions: string[] }).permissions).toEqual(['cards:read']);
     await page.goto(account);
     expect(await page.content()).not.toContain(secret);
-    expect(await page.locator('tbody tr', { hasText: 'sso-laptop' }).textContent()).toContain('✓ active');
+    expect(await page.locator('tbody tr', { hasText: 'sso-laptop' }).textContent()).toContain('Active');
     expect(await page.content()).not.toContain(session);
   } finally {
     await chrome.close();
   }
+}, journeyTimeout);
+
+test('production required company SSO settings', async () => {
+  // The switch journey is done with this tenant; nothing after it signs in here.
+  const tenant = journey.switchTenants.peer;
+  const settings = `/t/${tenant}/settings/sign-in`;
+  // The policy form is the switch's confirmation, opened for the change the policy can take next.
+  const policyOf = async (browser: Browser, replica: 0 | 1) => {
+    const html = await (await browser.go(replica, settings)).text();
+    const required = html.includes('Company SSO is required.');
+    const dialog = await (await browser.go(replica, `${settings}?confirm=${required ? 'allow' : 'require'}`)).text();
+    const form = /<form[^>]*action="\?\/policy"[\s\S]*?<\/form>/.exec(dialog)?.[0] ?? '';
+    const field = (name: string) => new RegExp(`name="${name}"[^>]*value="([^"]*)"`).exec(form)?.[1];
+    return {
+      html,
+      required,
+      fields: {
+        require: field('require')!,
+        revision: field('revision')!,
+        connectionId: field('connectionId')!,
+        connectionRevision: field('connectionRevision')!
+      }
+    };
+  };
+
+  // A company administrator reads the policy and its account warning on either replica.
+  const alice = new Browser();
+  await ssoLogin(alice, journey.users.admin, 0, 1, tenant);
+  const before = await policyOf(alice, 1);
+  expect(before.required).toBe(false);
+  expect(before.html).toMatch(/\d+ (person has|people have) no company sign-in yet and would be locked out/);
+  expect(before.fields.require).toBe('true');
+
+  // Enabling needs the explicit confirmation; without it nothing changes.
+  const unconfirmed = await alice.go(0, `${settings}?/policy`, { form: before.fields });
+  expect(unconfirmed.status).toBe(400);
+  expect((await policyOf(alice, 1)).required).toBe(false);
+
+  // A reader is refused, and so is an operator's recovery session: neither proves a company sign-in.
+  const bob = new Browser();
+  await ssoLogin(bob, journey.users.reader, 1, 0, tenant);
+  const confirmed = { ...before.fields, confirm: 'on' };
+  expect((await bob.go(0, `${settings}?/policy`, { form: confirmed })).status).toBe(403);
+  const operator = new Browser();
+  await operator.go(0, `/t/${tenant}/login/api-key`, { form: { apiKey: journey.peerOwnerKey } });
+  const recovery = await operator.go(1, `${settings}?/policy`, { form: confirmed });
+  expect(recovery.status).toBe(403);
+  const refusal = await recovery.text();
+  expect(refusal).toContain('WYRD_AUTH_403_RECENT_LOGIN_REQUIRED');
+  // The refusal offers a company sign-in; nothing is replayed after it.
+  expect(refusal).toContain(`href="/t/${tenant}/login"`);
+  expect((await policyOf(alice, 0)).required).toBe(false);
+
+  // The confirmed change from replica 0 is the persisted policy on replica 1.
+  const enabled = await alice.go(0, `${settings}?/policy`, { form: confirmed });
+  expect(enabled.status, await enabled.clone().text()).toBe(200);
+  const after = await policyOf(alice, 1);
+  expect(after.required).toBe(true);
+  expect(after.fields.require).toBe('false');
+  expect(Number(after.fields.revision)).toBe(Number(before.fields.revision) + 1);
+  const login = await (await alice.go(1, `/t/${tenant}/login`)).text();
+  expect(login).not.toContain('name="password"');
+
+  // A form read before the change is stale: it conflicts and changes nothing.
+  const stale = await alice.go(1, `${settings}?/policy`, { form: { ...confirmed, require: 'false' } });
+  expect(stale.status).toBe(409);
+  expect(await stale.text()).toContain('WYRD_SPEC_409_CONFLICT');
+  expect((await policyOf(alice, 0)).required).toBe(true);
+
+  // Ordinary Disable with the fresh company sign-in, confirmed.
+  const disabled = await alice.go(1, `${settings}?/policy`, { form: { ...after.fields, confirm: 'on' } });
+  expect(disabled.status).toBe(200);
+  expect((await policyOf(alice, 0)).required).toBe(false);
 }, journeyTimeout);

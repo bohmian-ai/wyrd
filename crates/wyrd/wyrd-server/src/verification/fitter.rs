@@ -398,6 +398,7 @@ impl BaselineFitter {
             &reconciliation_caller(tenant),
             &claimed.data_card_uid,
             DATA_ARTIFACT,
+            None,
         )
         .await
         .map_err(|error| {

@@ -63,21 +63,21 @@ A schedule runs as the Service's own account, and only while that account has re
 <LangTab lang="python">
 
 ```bash
-uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+uv run wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```bash
-pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+pnpm wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 </LangTab>

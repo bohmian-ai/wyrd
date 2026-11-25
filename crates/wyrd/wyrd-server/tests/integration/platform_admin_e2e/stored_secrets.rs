@@ -1133,14 +1133,16 @@ async fn removing_a_key_refuses_its_envelopes_until_it_is_restored() {
         json!({ "mode": "routine" }),
     )
     .await;
-    // Each tenant owner's renewal already resealed it; the pass moves the rest.
+    // Each tenant owner's renewal already resealed it, and the first platform
+    // sign-in start sealed the derivation key under k2; the pass moves the
+    // rest.
     assert_eq!(
         (
             &restored["current"],
             &restored["changed"],
             &restored["remaining"]
         ),
-        (&json!(4), &json!(1), &json!(0)),
+        (&json!(5), &json!(1), &json!(0)),
         "{restored}"
     );
     srv.shutdown().await.expect("server shuts down");
@@ -1840,4 +1842,122 @@ async fn a_restart_keeps_a_configured_issuer_secret_it_cannot_open() {
     assert_eq!(envelope_parts(&configured_envelope(&srv).await).0, "k4");
     assert_eq!(resolved_auth(&srv).await, "post configured-1");
     srv.shutdown().await.expect("server shuts down");
+}
+
+/// Wrapping a configured secret holds no platform transaction. While Transit
+/// delays every request, an SMTP password write leaves no database
+/// transaction open across its pending encrypt; a refused wrap answers `400`
+/// and leaves the committed relay intact; once Transit recovers the same
+/// write stores its complete relay.
+///
+/// # Panics
+/// Panics when a transaction stays open across the wrap, a refused wrap
+/// changes the stored relay, or the resumed write does not persist.
+#[tokio::test]
+async fn a_slow_or_refused_wrap_holds_no_configuration_transaction() {
+    let transit = TransitFixture::start_delayed(std::time::Duration::from_millis(1500)).await;
+    let srv = start(&transit, "k1", &[]).await;
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("platform root initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let relay = |host: &str| {
+        json!({
+            "host": host, "port": 2525, "tls": "none", "username": "relay-user",
+            "password": "relay-password", "sender": "invites@wyrd.test",
+        })
+    };
+    let stored = || async {
+        let resp = srv
+            .oneshot(platform_request(
+                Method::GET,
+                "/platform/mail",
+                &session,
+                None,
+            ))
+            .await
+            .expect("mail read responds");
+        assert_eq!(resp.status(), StatusCode::OK, "mail reads");
+        json_body(resp).await
+    };
+    let write = |host: &str| {
+        srv.oneshot(platform_request(
+            Method::PUT,
+            "/platform/mail",
+            &session,
+            Some(relay(host)),
+        ))
+    };
+    // Backends of this database idle inside a transaction for longer than a
+    // statement takes: an open transaction waiting on something else.
+    let held = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND state = 'idle in transaction'
+                AND xact_start < statement_timestamp() - interval '500 milliseconds'",
+        )
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("activity reads")
+    };
+
+    let resp = write("first.relay.test")
+        .await
+        .expect("mail write responds");
+    assert_eq!(resp.status(), StatusCode::OK, "first relay stores");
+    let committed = stored().await;
+    assert_eq!(
+        committed["relay"]["host"], "first.relay.test",
+        "{committed}"
+    );
+
+    // 1. While the wrap is pending, no transaction is held open for it.
+    let encrypts = transit.requests("encrypt").await;
+    let (resp, open) = tokio::join!(write("second.relay.test"), async {
+        while transit.requests("encrypt").await == encrypts {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        held().await
+    });
+    assert_eq!(open, 0, "no transaction is held across the pending wrap");
+    let resp = resp.expect("mail write responds");
+    assert_eq!(resp.status(), StatusCode::OK, "the delayed write stores");
+    assert_eq!(stored().await["relay"]["host"], "second.relay.test");
+
+    // 2. A refused wrap stores nothing and keeps the committed relay.
+    transit.set_available(false);
+    let resp = write("third.relay.test")
+        .await
+        .expect("mail write responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a refused wrap is refused"
+    );
+    let kept = stored().await;
+    assert_eq!(
+        kept["relay"],
+        json!({
+            "host": "second.relay.test", "port": 2525, "tls": "none",
+            "username": "relay-user", "password_set": true, "sender": "invites@wyrd.test",
+        }),
+        "the committed relay is unchanged: {kept}"
+    );
+
+    // 3. Once Transit recovers, the same write stores its complete relay.
+    transit.set_available(true);
+    let resp = write("third.relay.test")
+        .await
+        .expect("mail write responds");
+    assert_eq!(resp.status(), StatusCode::OK, "the resumed write stores");
+    assert_eq!(
+        stored().await["relay"],
+        json!({
+            "host": "third.relay.test", "port": 2525, "tls": "none",
+            "username": "relay-user", "password_set": true, "sender": "invites@wyrd.test",
+        }),
+        "the resumed relay is complete"
+    );
 }

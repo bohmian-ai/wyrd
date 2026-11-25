@@ -115,11 +115,16 @@ fn ui_dir() -> PathBuf {
 /// never read from request headers), and wait until it answers. `extra_ca` is the
 /// PEM file Node adds to its trust store, so a replica given the TLS
 /// terminator's `https:` origin verifies it through the ordinary native
-/// `fetch` path.
+/// `fetch` path. `extra_env` adds deployment settings to the process.
 ///
 /// # Panics
 /// Panics when the build output is missing or the process never answers.
-async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::Path>) -> Bff {
+async fn start_bff(
+    server_url: &str,
+    origin: &str,
+    extra_ca: Option<&std::path::Path>,
+    extra_env: &[(&str, &str)],
+) -> Bff {
     let ui = ui_dir();
     assert!(
         ui.join("build/index.js").is_file(),
@@ -137,6 +142,7 @@ async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::
         .env("PORT", port.to_string())
         .env("ORIGIN", origin)
         .env("WYRD_SERVER_URL", server_url)
+        .envs(extra_env.iter().copied())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -153,6 +159,94 @@ async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("BFF on port {port} never answered");
+}
+
+/// The client-address header the official image names: its bundled nginx
+/// states each visitor's TCP address in `X-Real-IP`, replacing any value the
+/// browser sent.
+const CLIENT_ADDRESS_HEADER: &str = "x-real-ip";
+
+/// A production BFF started as the official image starts it is the trusted
+/// ingress of its server: behind the bundled nginx, which states each
+/// visitor in `X-Real-IP`, it carries that visitor's address to a replica
+/// trusting the BFF's loopback peer, on both its page-action calls and its
+/// forwarded `/auth/*` requests. Each distinct visitor fails into its own
+/// password source window, never the BFF's own address, and a forwarding
+/// chain the browser forges chooses no window.
+///
+/// # Panics
+/// Panics when the replica or BFF fails to start or a stored window differs.
+async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
+    let replica = Box::pin(
+        srv.start_bound_replica(
+            WyrdTestServerBuilder::default()
+                .with_trusted_ingress_for_test(&["127.0.0.1/32", "::1/128"], CLIENT_ADDRESS_HEADER),
+        ),
+    )
+    .await
+    .expect("trusted-ingress replica starts");
+    let bff = start_bff(
+        replica.base_url().expect("bound replica has a URL"),
+        origin,
+        None,
+        // The client-address settings the official entrypoint passes its BFF:
+        // adapter-node reads the visitor from the header the server trusts.
+        &[
+            ("WYRD_CLIENT_ADDRESS_HEADER", CLIENT_ADDRESS_HEADER),
+            ("ADDRESS_HEADER", CLIENT_ADDRESS_HEADER),
+        ],
+    )
+    .await;
+    let tenant = srv.pg_fixture().tenant_slug().to_owned();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client builds");
+    for visitor in ["198.51.100.31", "198.51.100.32"] {
+        client
+            .post(format!("{}/t/{tenant}/login?/password", bff.url))
+            .header("origin", origin)
+            .header(CLIENT_ADDRESS_HEADER, visitor)
+            .header("x-forwarded-for", "203.0.113.9")
+            .form(&[("username", "nobody"), ("password", "not-the-password")])
+            .send()
+            .await
+            .expect("the BFF answers the sign-in action");
+    }
+    client
+        .post(format!("{}/auth/browser/password/login", bff.url))
+        .header("origin", origin)
+        .header(CLIENT_ADDRESS_HEADER, "198.51.100.33")
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&json!({ "tenant": tenant, "username": "nobody", "password": "not-the-password" }))
+        .send()
+        .await
+        .expect("the BFF forwards the sign-in request");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let windows: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT subject, failures FROM wyrd.auth_password_attempts \
+          WHERE scope = 'source' ORDER BY subject",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("source windows read");
+    assert_eq!(
+        windows,
+        [
+            ("198.51.100.31".to_owned(), 1),
+            ("198.51.100.32".to_owned(), 1),
+            ("198.51.100.33".to_owned(), 1),
+        ],
+        "each visitor fails into its own window"
+    );
+    drop(bff);
+    replica
+        .shutdown()
+        .await
+        .expect("trusted-ingress replica shuts down");
 }
 
 /// Node TLS terminator: accepts TLS with `TLS_KEY`/`TLS_CERT` on `TLS_PORT`
@@ -467,7 +561,7 @@ async fn production_ui_bff_journey() {
         DEX_ALICE,
     )
     .await;
-    sso_tenant(
+    let peer_owner_key = sso_tenant(
         &srv,
         &server,
         &host,
@@ -491,8 +585,9 @@ async fn production_ui_bff_journey() {
     // serves crosses a real TLS hop to the other server replica.
     let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
     let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
-    let first = start_bff(&server, &origin, None).await;
-    let second = start_bff(&terminator.url, &origin, Some(&ca)).await;
+    let first = start_bff(&server, &origin, None, &[]).await;
+    let second = start_bff(&terminator.url, &origin, Some(&ca), &[]).await;
+    bff_preserves_trusted_sources(&srv, &origin).await;
     let fixture = json!({
         "origin": origin,
         "servers": [server, replica_url],
@@ -509,6 +604,7 @@ async fn production_ui_bff_journey() {
         },
         "replacementTenant": REPLACEMENT_TENANT,
         "replacementOwnerKey": replacement_owner_key,
+        "peerOwnerKey": peer_owner_key,
         "users": {
             "admin": { "username": "alice", "password": "alice-password" },
             "reader": { "username": "bob", "password": "wyrd-test" },
@@ -541,6 +637,124 @@ async fn production_ui_bff_journey() {
     assert!(
         status.success(),
         "the production UI journey failed: {status}"
+    );
+}
+
+/// Establish the deployment's platform root and exchange its disclosed
+/// credential for an operator bearer token at the bound `server`, as an
+/// operator does once after installing.
+///
+/// # Panics
+/// Panics when initialization discloses no credential or the exchange fails.
+async fn operator_token(srv: &WyrdTestServer, server: &str) -> String {
+    let mut disclosure = Vec::new();
+    wyrd_server::boot::init::initialize_platform_root(&srv.operator_pool(), &mut disclosure)
+        .await
+        .expect("the deployment initializes");
+    let disclosed = String::from_utf8(disclosure).expect("the disclosure is UTF-8");
+    let root = disclosed
+        .lines()
+        .find(|line| line.starts_with("wyrd_global_"))
+        .expect("initialization discloses its credential");
+    let body: Value = reqwest::Client::new()
+        .post(format!("{server}/auth/platform/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", root),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+        ])
+        .send()
+        .await
+        .expect("token endpoint answers")
+        .json()
+        .await
+        .expect("token body is JSON");
+    body["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the platform credential exchanges: {body}"))
+        .to_owned()
+}
+
+/// The production onboarding UI journey: a real Chromium at the public
+/// origin of a production BFF in front of one bound Wyrd server, with the
+/// repository Mailpit as the deployment's mail relay, and the journey's own
+/// fake Google and fake Turnstile Siteverify as the deployment's provider
+/// endpoints.
+///
+/// The Vitest journey `src/lib/server/auth/onboarding.integration.test.ts`
+/// configures the relay and signup through the platform API with the
+/// operator token, then drives the root, signup, email-proof, workspace,
+/// discovery, recovery-contact and reset pages, and Google and challenged
+/// workspace signup, as a visitor would, reading
+/// each mailed link or code from Mailpit. Rust owns every proof, cookie and
+/// session; the pages only render and call the browser's `/auth/*` leg.
+///
+/// # Panics
+/// Panics when setup fails, Mailpit is not provisioned, or the Vitest
+/// journey does not pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Mailpit and a built UI; run via `mise run test:identity:ui`"]
+async fn onboarding_ui_journey() {
+    let smtp = std::env::var("WYRD_TEST_MAILPIT_SMTP")
+        .expect("WYRD_TEST_MAILPIT_SMTP is set by scripts/postgres/with-test-postgres.sh");
+    let mail_api = std::env::var("WYRD_TEST_MAILPIT_API").expect("WYRD_TEST_MAILPIT_API is set");
+    let (smtp_host, smtp_port) = smtp.rsplit_once(':').expect("Mailpit SMTP is host:port");
+    let host = format!("localhost:{}", free_port());
+    let origin = format!("http://{host}");
+    // The journeys serve a fake Google and a fake Siteverify on these ports.
+    let google = format!("http://127.0.0.1:{}", free_port());
+    let siteverify = format!("http://127.0.0.1:{}/siteverify", free_port());
+    let srv = WyrdTestServerBuilder::default()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.clone()),
+            turnstile_siteverify_url: Some(siteverify.clone()),
+            ..Default::default()
+        })
+        .start_bound()
+        .await
+        .expect("server starts");
+    let server = srv.base_url().expect("bound server has a URL").to_owned();
+    let operator = operator_token(&srv, &server).await;
+    let bff = start_bff(&server, &origin, None, &[]).await;
+    let fixture = json!({
+        "origin": origin,
+        "bff": bff.url,
+        "server": server,
+        "operator": operator,
+        "google": google,
+        "siteverify": siteverify,
+        "mail": {
+            "host": smtp_host,
+            "port": smtp_port.parse::<u16>().expect("Mailpit SMTP port"),
+            "api": mail_api,
+        },
+    });
+    let mut vitest = Command::new("pnpm");
+    vitest
+        .current_dir(ui_dir())
+        .args([
+            "exec",
+            "vitest",
+            "run",
+            "src/lib/server/auth/onboarding.integration.test.ts",
+        ])
+        .env("WYRD_UI_INTEGRATION", "1")
+        .env("WYRD_UI_ONBOARDING", fixture.to_string());
+    if let Ok(filter) = std::env::var("WYRD_UI_FILTER") {
+        vitest.args(["-t", &filter]);
+    }
+    let status = tokio::task::spawn_blocking(move || vitest.status())
+        .await
+        .expect("vitest task joins")
+        .expect("vitest runs");
+    drop(bff);
+    srv.shutdown().await.expect("server shuts down");
+    assert!(
+        status.success(),
+        "the onboarding UI journey failed: {status}"
     );
 }
 

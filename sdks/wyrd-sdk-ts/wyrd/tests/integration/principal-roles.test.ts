@@ -10,6 +10,13 @@ import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import { Bifrost, Cards, Principals, WyrdClient, WyrdState } from "wyrd-ai";
+import type {
+  AccessOperation,
+  AccessSummary,
+  CreateRoleBindingRequest,
+  PrincipalKind,
+  PrincipalSummary,
+} from "wyrd-ai";
 
 import { observedServiceTest as test } from "../support/observed-service.js";
 import { declared, fixture, runtimeAccount } from "../support/server.js";
@@ -22,6 +29,9 @@ const TENANT_WIDE = "SELECT COUNT(*) AS n FROM bifrost.drift.observations";
 /** A Card only an author can register. */
 const AUTHORED = fixture("cards/gateway_inference/ask-prompt.yaml");
 
+/** The one operation the custom roles in these tests carry. */
+const READS: AccessOperation[] = [{ resource: "cards", action: "read" }];
+
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
 const ROOT_REFUSED = { code: "WYRD_AUTH_401_WORKLOAD_UID_REFUSED" };
@@ -30,8 +40,25 @@ const KEY_REFUSED = { code: "WYRD_AUTH_401_API_KEY_INVALID" };
 
 /** Create the unrestricted Service account `name` holding only `workload`; its principal id and key. */
 async function issue(name: string): Promise<{ principal: string; key: string }> {
-  const created = await (await Principals.connect()).createServicePrincipal({ name, roles: ["workload"] });
+  const created = await (await Principals.connect()).createServicePrincipal({
+    name,
+    assignments: [{ role: "workload", scope: "all" }],
+  });
   return { principal: created.principal_id, key: created.credential };
+}
+
+/** A request binding `role` tenant-wide to one account. */
+function bindAll(id: string, kind: PrincipalKind, role: string): CreateRoleBindingRequest {
+  return { subject: { principal: { id, kind } }, role, scope: "all" };
+}
+
+/** Each grant's role and source kind, in role, then source order; the summary promises no order. */
+function grants(access: AccessSummary): [string, string][] {
+  return access.grants
+    .map((grant): [string, string] => [grant.role, grant.source.kind])
+    .sort(([role, source], [otherRole, otherSource]) =>
+      role === otherRole ? source.localeCompare(otherSource) : role.localeCompare(otherRole),
+    );
 }
 
 /** Register `AUTHORED` through a fresh client, so it carries the key's next token. */
@@ -39,38 +66,40 @@ async function author(key: string): Promise<unknown> {
   return (await Cards.connect({ client: WyrdClient.connect({ credential: key }) })).declareFromPath(AUTHORED);
 }
 
-test("granted editor reaches the next token until revoked", async ({ bundle: _ }) => {
+test("bound editor reaches the next request until unbound", async ({ bundle: _ }) => {
   const { principal, key } = await issue("granted-editor");
   const principals = await Principals.connect();
 
   const [found] = (await principals.list({ kind: "service", name: "granted-editor" })).principals;
   expect(found?.principal_id).toBe(principal);
   expect(found?.workload_restriction).toEqual({ mode: "unrestricted" });
-  expect((await principals.roles(principal)).roles).toEqual([{ role: "workload", source: "direct" }]);
+  expect(grants(await principals.access(principal))).toEqual([["workload", "direct"]]);
   const reader = await Bifrost.connect({ client: WyrdClient.connect({ credential: key }) });
   expect((await reader.sql(TENANT_WIDE)).numRows).toBe(1);
   await reader.shutdown();
   await expect(author(key)).rejects.toMatchObject(DENIED);
 
-  const granted = await principals.grantRole(principal, "editor");
-  expect(granted.changed).toBe(true);
-  expect(granted.roles).toEqual([
-    { role: "editor", source: "direct" },
-    { role: "workload", source: "direct" },
+  const granted = await principals.bind(bindAll(principal, "service", "editor"));
+  expect(granted.scope).toBe("all");
+  expect((await principals.bind(bindAll(principal, "service", "editor"))).id).toBe(granted.id);
+  expect(grants(await principals.access(principal))).toEqual([
+    ["editor", "direct"],
+    ["workload", "direct"],
   ]);
-  expect((await principals.grantRole(principal, "editor")).changed).toBe(false);
   await author(key);
 
-  expect((await principals.revokeRole(principal, "editor")).changed).toBe(true);
+  await principals.unbind(granted.id);
+  expect(grants(await principals.access(principal))).toEqual([["workload", "direct"]]);
   await expect(author(key)).rejects.toMatchObject(DENIED);
 });
 
 test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
   const { principal, key } = await issue("own-roles");
+  const [workload] = (await (await Principals.connect()).access(principal)).grants;
   const own = await Principals.connect({ client: WyrdClient.connect({ credential: key }) });
 
-  await expect(own.grantRole(principal, "editor")).rejects.toMatchObject(DENIED);
-  await expect(own.revokeRole(principal, "workload")).rejects.toMatchObject(DENIED);
+  await expect(own.bind(bindAll(principal, "service", "editor"))).rejects.toMatchObject(DENIED);
+  await expect(own.unbind(workload?.binding_id ?? "")).rejects.toMatchObject(DENIED);
 });
 
 test("direct and idp user assignments coexist", async ({ server }) => {
@@ -82,15 +111,81 @@ test("direct and idp user assignments coexist", async ({ server }) => {
   expect(page.next).toBeNull();
   expect(page.principals[0]?.workload_restriction).toBeNull();
 
-  const granted = await principals.grantRole(user, "viewer");
-  expect(granted.changed).toBe(true);
-  expect(granted.roles).toEqual([
-    { role: "viewer", source: "direct" },
-    { role: "viewer", source: "idp" },
+  const granted = await principals.bind(bindAll(user, "user", "viewer"));
+  expect(grants(await principals.access(user))).toEqual([
+    ["viewer", "direct"],
+    ["viewer", "provider"],
   ]);
-  const revoked = await principals.revokeRole(user, "viewer");
-  expect(revoked.changed).toBe(true);
-  expect(revoked.roles).toEqual([{ role: "viewer", source: "idp" }]);
+  await principals.unbind(granted.id);
+  expect(grants(await principals.access(user))).toEqual([["viewer", "provider"]]);
+});
+
+test("a role filter pages this tenants holders with their counts", async ({ server }) => {
+  const principals = await Principals.connect();
+  await principals.putRole("ledger_reader", { operations: READS });
+  const users = new Set(["ann", "bo"].map((name) => server.bootstrapUser(["ledger_reader"], name)));
+  const service = await issue("ledger-service");
+  await principals.bind(bindAll(service.principal, "service", "ledger_reader"));
+  // Another tenant's holder of a same-named role is never counted or listed.
+  const other = server.seedTenant("ledger-other");
+  const foreign = await Principals.connect({
+    client: WyrdClient.connect({ credential: server.bootstrapServiceInTenant(other, ["admin"], "other-admin") }),
+  });
+  await foreign.putRole("ledger_reader", { operations: READS });
+  await foreign.createServicePrincipal({ name: "stranger", assignments: [{ role: "ledger_reader", scope: "all" }] });
+
+  const seen: PrincipalSummary[] = [];
+  let after: string | null = null;
+  do {
+    const page = await principals.list({ role: "ledger_reader", limit: 1, after });
+    expect(page.counts).toEqual({ active: 3, suspended: 0 });
+    seen.push(...page.principals);
+    after = page.next ?? null;
+  } while (after);
+
+  const byId = new Map(seen.map((found) => [found.principal_id, found]));
+  expect(new Set(byId.keys())).toEqual(new Set([...users, service.principal]));
+  expect(byId.get(service.principal)).toMatchObject({
+    authentication: null,
+    roles: [
+      { role: "ledger_reader", scope: "all" },
+      { role: "workload", scope: "all" },
+    ],
+  });
+  for (const user of users) {
+    expect(byId.get(user)).toMatchObject({
+      authentication: "sso",
+      display_name: null,
+      roles: [{ role: "ledger_reader", scope: "all" }],
+    });
+  }
+});
+
+test("a role nobody holds lists no one", async () => {
+  const nobody = await (await Principals.connect()).list({ role: "no_such_role" });
+  expect(nobody.principals).toEqual([]);
+  expect(nobody.counts).toEqual({ active: 0, suspended: 0 });
+});
+
+test("roles carry their description and member count", async ({ server }) => {
+  const principals = await Principals.connect();
+  const created = await principals.putRole("summary_reader", { operations: READS, description: "Reads ledger Cards" });
+  expect(created).toMatchObject({ description: "Reads ledger Cards", member_count: 0 });
+
+  server.bootstrapUser(["summary_reader"], "summary-holder");
+  const roles = new Map((await principals.roles()).roles.map((role) => [role.name, role]));
+  expect(roles.get("summary_reader")?.member_count).toBe(1);
+  expect(roles.get("viewer")?.description).toBe("Read Cards, executions, artifacts and tables");
+
+  // The role is replaced whole: a request without a description clears it.
+  const cleared = await principals.putRole("summary_reader", { operations: READS });
+  expect(cleared).toMatchObject({ description: null, member_count: 1 });
+});
+
+test("a built in role refuses a new description", async () => {
+  await expect(
+    (await Principals.connect()).putRole("viewer", { operations: READS, description: "Mine now" }),
+  ).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
 });
 
 test("users manage personal keys", async ({ server }) => {
@@ -104,6 +199,8 @@ test("users manage personal keys", async ({ server }) => {
     principal_kind: "user",
     username: "keeper",
     authentication: "password",
+    display_name: null,
+    email: null,
   });
   expect(me.permissions).toEqual([...ceiling].sort());
 
@@ -222,4 +319,19 @@ test("a rooted service acts within its callers authority", async ({ server, stat
     "observed-service",
   );
   await expect((await Principals.connect({ client: delegated })).list()).rejects.toMatchObject(DENIED);
+});
+
+test("a family bound viewer reads only that family", async ({ bundle: _ }) => {
+  const admin = await Cards.connect();
+  const payments = declared(await admin.declareFromPath(fixture("cards/repository_declaration/code-review.yaml")));
+  const other = declared(await admin.declareFromPath(fixture("cards/repository_declaration/unrelated.yaml")));
+  const created = await (await Principals.connect()).createServicePrincipal({
+    name: "payments-reader",
+    assignments: [{ role: "viewer", scope: { card: { family: { kind: "Verifier", name: "code-review" } } } }],
+  });
+  const own = await Cards.connect({ client: WyrdClient.connect({ credential: created.credential }) });
+
+  expect((await own.list({ kind: "Verifier" })).items.map((card) => card.name)).toEqual(["code-review"]);
+  expect(await own.get(payments)).toMatchObject({ metadata: { name: "code-review" } });
+  await expect(own.get(other)).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
 });

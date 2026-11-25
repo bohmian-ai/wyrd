@@ -282,9 +282,12 @@ mod pg_tests {
     ///
     /// The execution waits for `ci` and lists the pending `signoff`
     /// occurrence. Published CI resumes it, but it still waits for the
-    /// approval alone. A viewer's decision is refused; an editor's approval
-    /// returns the durable receipt, replays on retry, and the execution
-    /// passes under its original ID with the decision listed.
+    /// approval alone. A viewer's and an editor's decisions are refused. An
+    /// approver bound only on the shared Verifier reads the Repository-owned
+    /// execution as unknown and cannot decide it; with a separate read of the
+    /// Repository family it reads the pending approval, and its approval
+    /// returns the durable receipt, replays on retry, and the execution passes
+    /// under its original ID with the decision listed.
     ///
     /// # Panics
     /// Panics when the occurrence is not pending, a decision or refusal
@@ -347,12 +350,67 @@ mod pg_tests {
             .expect_err("a viewer cannot approve");
         assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 
-        let approver = as_principal("signoff_editor", "editor").await;
+        let refused = as_principal("signoff_editor", "editor")
+            .await
+            .decide(approval, ApprovalDecision::Approved, None)
+            .await
+            .expect_err("an editor cannot approve");
+        assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+        // An approver bound only on the shared Verifier cannot read the
+        // Repository-owned execution, so it neither sees nor decides it.
+        let deployment = &opened.deployment;
+        let id = *opened.execution.id();
+        let family = |kind: &str, name: &str| serde_json::json!({"card": {"family": {"kind": kind, "name": name}}});
+        let on_verifier = [
+            serde_json::json!({"resource": "verifier", "action": "approve", "scope": family("Verifier", "signoff")}),
+            serde_json::json!({"resource": "cards", "action": "read", "scope": family("Verifier", "signoff")}),
+        ];
+        let connect = |key: String| async move {
+            Execution::connect_with(id, &deployment.client(&key))
+                .await
+                .expect("the execution handle connects")
+        };
+        let verifier_only = connect(
+            deployment
+                .granted_key("signoff_on_verifier", &on_verifier)
+                .await,
+        )
+        .await;
+        let unseen = verifier_only
+            .status()
+            .await
+            .expect_err("the execution is unseen");
+        assert_eq!(unseen.code(), "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
+        let refused = verifier_only
+            .decide(approval, ApprovalDecision::Approved, None)
+            .await
+            .expect_err("a Verifier-only approver cannot decide");
+        assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+        // With a separate read of the Repository family it reads the pending
+        // approval and approves.
+        let mut scoped = on_verifier.to_vec();
+        scoped.extend([
+            serde_json::json!({"resource": "cards", "action": "read", "scope": family("Repository", "web")}),
+            serde_json::json!({"resource": "executions", "action": "read", "scope": family("Repository", "web")}),
+        ]);
+        let approver = connect(
+            deployment
+                .granted_key("signoff_scoped_approver", &scoped)
+                .await,
+        )
+        .await;
+        let seen = approver
+            .status()
+            .await
+            .expect("the scoped approver reads the execution");
+        assert_eq!(seen.approvals[0].status, ApprovalStatus::Pending);
         let reason = Some("reviewed the diff".to_owned());
         let receipt = approver
             .decide(approval, ApprovalDecision::Approved, reason.clone())
             .await
-            .expect("the editor approves");
+            .expect("the approver approves");
         assert_eq!(receipt.approval_id, approval);
         assert_eq!(receipt.status, ApprovalStatus::Approved);
         assert_eq!(receipt.reason, reason);

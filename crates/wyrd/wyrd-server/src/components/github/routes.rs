@@ -1,6 +1,6 @@
 //! HTTP projection of the tenant GitHub connection.
 //!
-//! Five tenant operations under `/v1/integrations/github`, authenticated like
+//! Six tenant operations under `/v1/integrations/github`, authenticated like
 //! every other tenant route (a browser session reaches setup and callback),
 //! and one webhook that authenticates by GitHub's signature instead. Each
 //! handler parses its typed input and delegates to [`GithubConnections`].
@@ -17,13 +17,14 @@ use utoipa_axum::routes;
 use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::github_connection::{
     GithubCallbackQuery, GithubConnectRequest, GithubConnectResponse, GithubConnectionView,
-    GithubSetupQuery,
+    GithubPullRequestReviewRequest, GithubPullRequestReviewResponse, GithubSetupQuery,
 };
 
 use super::service::{GithubConnections, TRANSACTION_TTL, not_configured};
 use crate::auth::browser::{cookie_header, cookie_pairs};
 use crate::auth::oauth::no_store;
 use crate::components::auth::Caller;
+use crate::components::cards::routes::extract_required_idempotency_key;
 use crate::http::error::{WyrdErrorResponse, body_rejection, query_rejection};
 use crate::state::AppState;
 
@@ -39,6 +40,7 @@ pub fn github_router() -> OpenApiRouter<AppState> {
         .routes(routes!(connect))
         .routes(routes!(setup))
         .routes(routes!(callback))
+        .routes(routes!(review_pull_request))
 }
 
 /// Build the signature-authenticated GitHub webhook route for the `/v1`
@@ -51,7 +53,7 @@ pub fn github_webhook_router() -> OpenApiRouter<AppState> {
 ///
 /// # Errors
 /// Returns a stable Wyrd error for a body that is not empty, missing
-/// `identity_connections:write`, no configured App, or a failed write.
+/// `github_connections:write`, no configured App, or a failed write.
 #[utoipa::path(
     post,
     path = "/integrations/github/connect",
@@ -62,7 +64,7 @@ pub fn github_webhook_router() -> OpenApiRouter<AppState> {
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable credential \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks identity_connections:write \
+        (status = 403, description = "The principal lacks github_connections:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 503, description = "No GitHub App is configured, or the registry is \
           unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
@@ -84,10 +86,68 @@ async fn connect(
     Ok((StatusCode::CREATED, Json(receipt)))
 }
 
+/// Request a fresh review of one connected pull request by its selected
+/// Repository's whole `pull_request` binding set.
+///
+/// # Errors
+/// Returns a stable Wyrd error for a malformed body or key, another host,
+/// a missing permission, a pull request that cannot be reviewed now, a
+/// repository the connection does not reach, or a retryable unavailability.
+#[utoipa::path(
+    post,
+    path = "/integrations/github/pull-requests/reviews",
+    request_body = GithubPullRequestReviewRequest,
+    params(("Idempotency-Key" = String, Header, description = "Names the request: a retry with \
+        the same key for the same pull request returns the same generation and members; a \
+        distinct key admits a new generation", example = "review-pr-21-001")),
+    responses(
+        (status = 202, description = "Every member durably admitted or settled",
+         body = GithubPullRequestReviewResponse),
+        (status = 400, description = "The body, key or host is invalid \
+          (WYRD_SPEC_400_VALIDATION, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED, \
+          WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_GITHUB_400_INVALID_REQUEST)",
+         body = WyrdProblem),
+        (status = 401, description = "The request carried no usable credential \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks cards:read, or verifier:read or \
+          verifier:run on a selected Verifier, or the repository is not selected \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE)",
+         body = WyrdProblem),
+        (status = 404, description = "The tenant has no GitHub installation \
+          (WYRD_GITHUB_404_NOT_CONNECTED)", body = WyrdProblem),
+        (status = 409, description = "The pull request is missing, closed or draft, or its \
+          selected policy binds no pull requests (WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE), \
+          or the connection changed meanwhile (WYRD_GITHUB_409_CONNECTION_CONFLICT)",
+         body = WyrdProblem),
+        (status = 503, description = "GitHub, the accountable authority or the Verifier queue is \
+          unavailable; retry under the same key (WYRD_GITHUB_503_PROVIDER_UNAVAILABLE, \
+          WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_GITHUB_503_NOT_CONFIGURED)",
+         body = WyrdProblem)
+    ),
+    tag = "GitHub"
+)]
+#[tracing::instrument(
+    skip(state, caller, headers, body),
+    fields(operation = "github_connection.review_pull_request")
+)]
+async fn review_pull_request(
+    State(state): State<AppState>,
+    caller: Caller,
+    headers: HeaderMap,
+    body: Result<Json<GithubPullRequestReviewRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<GithubPullRequestReviewResponse>), WyrdErrorResponse> {
+    let key = extract_required_idempotency_key(&headers)?;
+    let Json(request) = body.map_err(|rejection| body_rejection(&rejection))?;
+    let accepted = GithubConnections::new(&state)
+        .review_pull_request(&caller, &request, &key)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
+}
+
 /// Read the tenant's redacted GitHub connection.
 ///
 /// # Errors
-/// Returns a stable Wyrd error for missing `identity_connections:write`, no
+/// Returns a stable Wyrd error for missing `github_connections:read`, no
 /// configured App, or a failed read.
 #[utoipa::path(
     get,
@@ -96,7 +156,7 @@ async fn connect(
         (status = 200, description = "The redacted connection", body = GithubConnectionView),
         (status = 401, description = "The request carried no usable credential \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks identity_connections:write \
+        (status = 403, description = "The principal lacks github_connections:read \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 503, description = "No GitHub App is configured, or the registry is \
           unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
@@ -115,7 +175,7 @@ async fn get_connection(
 /// Fence the tenant's GitHub work and release its installation.
 ///
 /// # Errors
-/// Returns a stable Wyrd error for missing `identity_connections:write`, no
+/// Returns a stable Wyrd error for missing `github_connections:write`, no
 /// configured App, no association, or a failed write.
 #[utoipa::path(
     delete,
@@ -124,7 +184,7 @@ async fn get_connection(
         (status = 200, description = "Released", body = GithubConnectionView),
         (status = 401, description = "The request carried no usable credential \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks identity_connections:write \
+        (status = 403, description = "The principal lacks github_connections:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No installation is associated \
           (WYRD_GITHUB_404_NOT_CONNECTED)", body = WyrdProblem),
@@ -152,7 +212,7 @@ async fn disconnect(
 ///
 /// # Errors
 /// Returns a stable Wyrd error for a malformed query, missing
-/// `identity_connections:write`, a transaction this browser session cannot
+/// `github_connections:write`, a transaction this browser session cannot
 /// bind, no configured App, or a failed write.
 #[utoipa::path(
     get,
@@ -168,7 +228,7 @@ async fn disconnect(
           (WYRD_SPEC_400_VALIDATION, WYRD_GITHUB_400_INVALID_REQUEST)", body = WyrdProblem),
         (status = 401, description = "The browser has no Wyrd session \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks identity_connections:write, or \
+        (status = 403, description = "The principal lacks github_connections:write, or \
           the transaction is not valid for this session \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_GITHUB_403_CONNECTION_REFUSED)",
           body = WyrdProblem),
@@ -212,7 +272,7 @@ async fn setup(
 ///
 /// # Errors
 /// Returns a stable Wyrd error for a malformed query, missing
-/// `identity_connections:write`, a refused or conflicting association, no
+/// `github_connections:write`, a refused or conflicting association, no
 /// configured App, an unreachable GitHub, or a failed write.
 #[utoipa::path(
     get,
@@ -230,7 +290,7 @@ async fn setup(
           (WYRD_SPEC_400_VALIDATION, WYRD_GITHUB_400_INVALID_REQUEST)", body = WyrdProblem),
         (status = 401, description = "The browser has no Wyrd session \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks identity_connections:write, or \
+        (status = 403, description = "The principal lacks github_connections:write, or \
           a connection check refused (WYRD_PERMISSION_403_DENIED_RBAC, \
           WYRD_GITHUB_403_CONNECTION_REFUSED)", body = WyrdProblem),
         (status = 409, description = "The connection changed, the tenant holds another \

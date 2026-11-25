@@ -12,7 +12,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
-use wyrd_spec::envelope::CardKind;
+use wyrd_runtime::permission::{Action, CardPermissionScope, PermissionScope, Resource};
+use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey};
 use wyrd_spec::reference::CardRef;
@@ -21,12 +22,16 @@ use wyrd_spec::registry::{
     GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
+use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_sql::queries::cards::{card_scopes, find_card_by_ref};
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::cards::service::{self, CardFiles};
+use crate::components::cards::service::{
+    self, CardFiles, conceal_absence, no_visible_card, require_object,
+};
 use crate::http::error::WyrdErrorResponse;
-use crate::state::AppState;
+use crate::state::{AppState, registry_db_error};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -86,26 +91,23 @@ async fn get_card_http(
 ///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
-/// [`WyrdError::RegistryCardNotFound`] when the UID is absent or of another
-/// kind, and the registry errors of [`service::get_card_by_uid`].
+/// [`WyrdError::RegistryCardNotFound`], with the one detail of
+/// [`no_visible_card`], when the UID is absent, hidden, or of another kind,
+/// and the other registry errors of [`service::get_card_by_uid`].
 pub(crate) async fn get_card_for(
     state: &AppState,
     caller: &Caller,
     kind: &CardKind,
     card_uid: &CardUid,
 ) -> Result<GetCardResponse, WyrdError> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_read(),
-        "card.read.uid",
-        &format!("card:{card_uid}"),
-    )?;
-    let response = service::get_card_by_uid(state, caller, card_uid).await?;
+    let objects =
+        authorize_card_objects(state, caller, "card.read.uid", &format!("card:{card_uid}"))?;
+    let response = service::get_card_by_uid(state, caller, card_uid)
+        .await
+        .map_err(conceal_absence)?;
+    require_visible(objects.as_deref(), &response.card)?;
     if &response.card.kind != kind {
-        return Err(WyrdError::registry_card_not_found(
-            "card UID is not in the requested kind namespace",
-        ));
+        return Err(no_visible_card());
     }
     Ok(response)
 }
@@ -179,43 +181,42 @@ pub(crate) async fn get_card_by_ref_for(
 ///
 /// # Errors
 /// Returns the errors of [`authorize_card_ref`],
-/// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
-/// and the errors of [`service::get_card_objects_by_ref`].
+/// [`WyrdError::RegistryCardNotFound`], with the one detail of
+/// [`no_visible_card`], when the Card is absent or hidden or the named UID is
+/// another Card's, and the other errors of
+/// [`service::get_card_objects_by_ref`].
 pub(crate) async fn get_card_objects_by_ref_for(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
 ) -> Result<(GetCardResponse, CardFiles), WyrdError> {
-    authorize_card_ref(state, caller, card_ref)?;
-    let (response, files) = service::get_card_objects_by_ref(state, caller, card_ref).await?;
+    let objects = authorize_card_ref(state, caller, card_ref)?;
+    let (response, files) = service::get_card_objects_by_ref(state, caller, card_ref)
+        .await
+        .map_err(conceal_absence)?;
+    require_visible(objects.as_deref(), &response.card)?;
     if let Some(uid) = &card_ref.uid
         && response.card.metadata.uid.as_ref() != Some(uid)
     {
-        return Err(WyrdError::registry_card_not_found(
-            "card UID does not match the referenced identity",
-        ));
+        return Err(no_visible_card());
     }
     Ok((response, files))
 }
 
 /// Authorize and audit the caller's `cards:read` of one exact Card
-/// reference, the decision every read of that reference makes.
+/// reference, the decision every read of that reference makes, returning
+/// the Card objects of [`authorize_card_objects`] for the read to apply
+/// through [`require_visible`].
 ///
 /// # Errors
-/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`.
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read` at any
+/// scope.
 pub(crate) fn authorize_card_ref(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
-) -> Result<(), WyrdError> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_read(),
-        "card.read.ref",
-        &card_resource(card_ref),
-    )?;
-    Ok(())
+) -> Result<Option<Vec<CardPermissionScope>>, WyrdError> {
+    authorize_card_objects(state, caller, "card.read.ref", &card_resource(card_ref))
 }
 
 /// Resolve the newest stable Active Card in an identity line.
@@ -225,8 +226,10 @@ pub(crate) fn authorize_card_ref(
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind or
-/// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`, and the
-/// not-found and availability errors of [`service::get_latest_card`].
+/// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`,
+/// `WYRD_REGISTRY_404_CARD_NOT_FOUND`, with the one detail of
+/// [`no_visible_card`], for an absent or hidden line, and the availability
+/// errors of [`service::get_latest_card`].
 #[utoipa::path(
     get,
     path = "/cards/{kind}/{name}/latest",
@@ -260,16 +263,17 @@ async fn get_latest_card_http(
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
     let kind = parse_card_kind(&kind)?;
     let name = parse_name(&name)?;
-    authorize_card_read(
+    let objects = authorize_card_read(
         &state,
         &caller,
         "card.read.latest",
         &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    service::get_latest_card(&state, &caller, kind, name)
+    let response = service::get_latest_card(&state, &caller, kind, name)
         .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+        .map_err(conceal_absence)?;
+    require_visible(objects.as_deref(), &response.card)?;
+    Ok(Json(response))
 }
 
 /// List versions in one exact Card identity line.
@@ -314,16 +318,23 @@ async fn list_versions_http(
     let query = card_query(query)?;
     let kind = parse_card_kind(&kind)?;
     let name = parse_name(&name)?;
-    authorize_card_read(
+    let objects = authorize_card_read(
         &state,
         &caller,
         "card.read.versions",
         &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    service::list_card_versions(&state, &caller, kind, name, query.include_prerelease)
-        .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+    service::list_card_versions(
+        &state,
+        &caller,
+        kind,
+        name,
+        query.include_prerelease,
+        objects.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(WyrdErrorResponse::from)
 }
 
 /// List tenant-visible Card summaries with keyset pagination.
@@ -383,8 +394,8 @@ pub(crate) async fn list_cards_for(
     caller: &Caller,
     request: ListCardsRequest,
 ) -> Result<ListCardsResponse, WyrdError> {
-    authorize_card_read(state, caller, "card.read.list", "cards")?;
-    service::list_cards(state, caller, request).await
+    let objects = authorize_card_objects(state, caller, "card.read.list", "cards")?;
+    service::list_cards(state, caller, request, objects).await
 }
 
 /// List server-authoritative stored artifacts for one Card.
@@ -417,13 +428,13 @@ async fn list_artifacts_http(
     Path(card_uid): Path<String>,
 ) -> Result<Json<wyrd_spec::registry::ArtifactInventoryResponse>, WyrdErrorResponse> {
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_read(
+    let objects = authorize_card_read(
         &state,
         &caller,
         "card.read.artifacts",
         &format!("card:{card_uid}"),
     )?;
-    service::list_card_artifacts(&state, &caller, &card_uid)
+    service::list_card_artifacts(&state, &caller, &card_uid, objects.as_deref())
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -443,7 +454,7 @@ async fn list_artifacts_http(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal may not register Cards, or may not \
+        (status = 403, description = "The principal may not write a submitted Card's family, or may not \
           invoke the Operators a binding's `on_failure` names \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -474,14 +485,16 @@ async fn list_artifacts_http(
 /// inline or referenced, also needs `operators:invoke`: the frozen Operator is
 /// later dispatched by the system without another end-user decision, so the
 /// declaring caller is the one authorized to create that outbound action.
-/// Operator-free declaration evaluates `card:write` alone.
+/// Operator-free declaration evaluates `cards:write` alone, decided on the
+/// family of every submitted Card.
 ///
 /// Every verdict is staged exactly once on the process audit outbox as soon as
 /// it is decided, before the `Idempotency-Key` is read or the declaration
 /// runs, so it is recorded whatever the declaration's outcome.
 ///
 /// # Errors
-/// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, or without
+/// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `cards:write` on every
+/// submitted family, or without
 /// `operators:invoke` for an Operator-bearing request, a validation
 /// error for a missing or invalid `Idempotency-Key` or Card body, an
 /// idempotency or version conflict, and registry or storage unavailability.
@@ -509,7 +522,7 @@ pub(crate) async fn declare_card_http(
         // access token and the `Caller` extractor has materialized its principal.
         // This check is intentionally route-local: authentication answers "who is
         // calling?" while this capability check answers "may they declare cards?".
-        authorize_card_write(&state, &caller, "card.declaration.create", "cards")?;
+        service::authorize_declared_families(&state, &caller, &body)?;
         if service::dispatches_operators(&body) {
             audit::authorize(
                 &state,
@@ -533,7 +546,8 @@ pub(crate) async fn declare_card_http(
 /// The server rechecks every manifest and stores the immutable Card blob before
 /// activating the Card. Repeating the request with the declaration key is an
 /// idempotent Active no-op; provider URLs and transfer details never cross
-/// this lifecycle boundary.
+/// this lifecycle boundary. `cards:write` is decided on the Card's family or
+/// exact version before anything is read back from storage.
 #[utoipa::path(
     post,
     path = "/cards/{card_uid}/complete",
@@ -547,7 +561,7 @@ pub(crate) async fn declare_card_http(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal may not write Cards \
+        (status = 403, description = "The principal may not write this Card \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
@@ -577,12 +591,14 @@ async fn complete_card_http(
 ) -> Result<Json<DeclareCardResponse>, WyrdErrorResponse> {
     let idempotency_key = extract_required_idempotency_key(&headers)?;
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_write(
+    authorize_card_uid(
         &state,
         &caller,
+        &Permission::card_write(),
         "card.declaration.complete",
-        &format!("card:{card_uid}"),
-    )?;
+        &card_uid,
+    )
+    .await?;
     let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -591,12 +607,13 @@ async fn complete_card_http(
 
 /// Delete one Card by its exact UID.
 ///
-/// The `card:write` verdict is staged exactly once before the soft-delete
-/// runs, whatever its outcome. Storage cleanup runs after the delete commits.
+/// `cards:delete` is decided on the Card's family or exact version, and the
+/// verdict is staged exactly once before the soft-delete runs, whatever its
+/// outcome. Storage cleanup runs after the delete commits.
 ///
 /// # Errors
 /// Returns a validation error for an invalid kind or UID,
-/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, not found, an inbound-reference
+/// `WYRD_PERMISSION_403_DENIED_RBAC` without `cards:delete` covering the Card, not found, an inbound-reference
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
@@ -611,7 +628,7 @@ async fn complete_card_http(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal may not delete Cards \
+        (status = 403, description = "The principal may not delete this Card \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
@@ -639,12 +656,14 @@ async fn delete_card_http(
         ))
     })?;
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_write(
+    authorize_card_uid(
         &state,
         &caller,
+        &Permission::card_delete(),
         "card.declaration.delete",
-        &format!("card:{card_uid}"),
-    )?;
+        &card_uid,
+    )
+    .await?;
     service::delete_card_with_kind(&state, &caller, &card_uid, kind)
         .await
         .map(Json)
@@ -653,8 +672,10 @@ async fn delete_card_http(
 
 /// Delete one Card by its exact kind/name/version identity.
 ///
-/// The `card:write` verdict is staged exactly once before the soft-delete
-/// runs, whatever its outcome. Storage cleanup runs after the delete commits.
+/// `cards:delete` is decided on the live version's exact scope, or on its
+/// family when no live version exists, and the verdict is staged exactly
+/// once before the soft-delete runs, whatever its outcome. Storage cleanup
+/// runs after the delete commits.
 ///
 /// The query is decoded strictly: a removed `space` selector, or any other
 /// unknown key, is refused before authorization, so it never deletes a Card.
@@ -662,8 +683,8 @@ async fn delete_card_http(
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` for an unknown, missing, or mistyped
 /// query key, a validation error for an invalid kind, name, or version,
-/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, not found, an inbound-reference
-/// conflict, registry unavailability, and incomplete storage cleanup.
+/// `WYRD_PERMISSION_403_DENIED_RBAC` without `cards:delete` covering the Card, not found,
+/// an inbound-reference conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
     path = "/cards/by-ref",
@@ -678,7 +699,7 @@ async fn delete_card_http(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal may not delete Cards \
+        (status = 403, description = "The principal may not delete this Card \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
@@ -701,16 +722,57 @@ async fn delete_card_by_ref_http(
     query: Result<Query<CardRefQuery>, QueryRejection>,
 ) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
     let card_ref = card_query(query)?.into_card_ref()?;
-    authorize_card_write(
+    let scope = delete_scope(&state, &caller, &card_ref).await?;
+    authorize_card_at(
         &state,
         &caller,
+        &Permission::card_delete(),
         "card.declaration.delete",
         &card_resource(&card_ref),
+        scope,
     )?;
     service::delete_card_by_ref(&state, &caller, &card_ref)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
+}
+
+/// The scope a by-reference delete of `card_ref` is decided at: the live
+/// version's exact scope when the registry has one, else its family.
+///
+/// A family or tenant-wide deleter is therefore decided the same way for a
+/// live, already deleted or unknown version and reaches the delete's own
+/// not-found or idempotent answer; an exact-version deleter is covered only
+/// for the live version it names. A caller holding `cards:delete` at no
+/// scope causes no lookup.
+///
+/// # Errors
+/// Returns registry errors from the one lookup statement.
+async fn delete_scope(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<CardPermissionScope, WyrdError> {
+    let family = CardPermissionScope::family(card_ref.kind.clone(), card_ref.name.clone());
+    if !caller
+        .principal
+        .effective_permissions
+        .covers_operation(&Resource::Cards, &Action::Delete)
+    {
+        return Ok(family);
+    }
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let live = find_card_by_ref(
+        &mut conn,
+        card_ref.kind.clone(),
+        &card_ref.name,
+        &card_ref.version,
+    )
+    .await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(live.map_or(family, |row| {
+        CardPermissionScope::version(row.kind, row.name, row.card_uid)
+    }))
 }
 
 /// Exact `kind`/`name`/`version` selector of the `by-ref` read and delete routes.
@@ -812,28 +874,70 @@ pub(crate) fn card_resource(card_ref: &CardRef) -> String {
     )
 }
 
-/// Evaluate and audit `card:write` for one receiving registry route.
+/// Evaluate and audit `required` on one Card family or exact version.
 ///
-/// The route-local check answers "may this principal change cards?" after
-/// authentication answered "who is calling?". Delegating to [`audit::authorize`]
-/// stages the verdict exactly once, before the route proceeds or refuses.
+/// A caller holding the operation at no scope is refused before anything is
+/// read, so it learns nothing about which Cards exist. Otherwise one
+/// decision at `scope` covers tenant-wide, family and exact-version grants
+/// alike, and is staged on the audit outbox before the route proceeds.
 ///
 /// # Errors
-/// Returns the public permission error when the caller lacks `card:write`.
-fn authorize_card_write(
+/// Returns the public permission error when no grant covers `required` at
+/// `scope`.
+pub(crate) fn authorize_card_at(
     state: &AppState,
     caller: &Caller,
+    required: &Permission,
     operation: &str,
     resource: &str,
-) -> Result<(), WyrdErrorResponse> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_write(),
-        operation,
-        resource,
-    )
-    .map_err(WyrdErrorResponse::from)
+    scope: CardPermissionScope,
+) -> Result<(), WyrdError> {
+    let anywhere = caller
+        .principal
+        .effective_permissions
+        .covers_operation(&required.resource, &required.action);
+    let required = if anywhere {
+        required.at(PermissionScope::Card(scope))
+    } else {
+        required.clone()
+    };
+    audit::authorize(state, caller, &required, operation, resource)
+}
+
+/// Evaluate and audit `required` on the registered Card `card_uid`, at the
+/// exact scope the registry records for it, retained tombstones included.
+///
+/// A caller holding the operation at no scope is refused before the lookup;
+/// otherwise the lookup is one registry statement on this write path.
+///
+/// # Errors
+/// Returns the public permission error without a covering grant,
+/// `WYRD_REGISTRY_404_CARD_NOT_FOUND` when the UID names no Card of the
+/// tenant, and registry errors.
+pub(crate) async fn authorize_card_uid(
+    state: &AppState,
+    caller: &Caller,
+    required: &Permission,
+    operation: &str,
+    card_uid: &CardUid,
+) -> Result<(), WyrdError> {
+    let resource = format!("card:{card_uid}");
+    if !caller
+        .principal
+        .effective_permissions
+        .covers_operation(&required.resource, &required.action)
+    {
+        return audit::authorize(state, caller, required, operation, &resource);
+    }
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let scope = card_scopes(&mut conn, std::slice::from_ref(card_uid))
+        .await?
+        .remove(card_uid);
+    conn.commit().await.map_err(registry_db_error)?;
+    let scope = scope.ok_or_else(|| {
+        WyrdError::registry_card_not_found(format!("card {card_uid} was not found"))
+    })?;
+    authorize_card_at(state, caller, required, operation, &resource, scope)
 }
 
 /// Evaluate and audit `card:read` for one receiving registry route.
@@ -848,9 +952,67 @@ fn authorize_card_read(
     caller: &Caller,
     operation: &str,
     resource: &str,
-) -> Result<(), WyrdErrorResponse> {
-    audit::authorize(state, caller, &Permission::card_read(), operation, resource)
-        .map_err(WyrdErrorResponse::from)
+) -> Result<Option<Vec<CardPermissionScope>>, WyrdErrorResponse> {
+    authorize_card_objects(state, caller, operation, resource).map_err(WyrdErrorResponse::from)
+}
+
+/// Authorize and audit `cards:read` for `operation` on `resource`, returning
+/// the Card objects the read reaches: `None` for every Card, otherwise the
+/// caller's granted families and exact versions, which the read applies
+/// before building any result.
+///
+/// A caller with no Card read at any scope is refused; a scoped caller is
+/// admitted and every hidden Card answers as not found.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read` at any
+/// scope.
+pub(crate) fn authorize_card_objects(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    resource: &str,
+) -> Result<Option<Vec<CardPermissionScope>>, WyrdError> {
+    let objects = caller
+        .principal
+        .effective_permissions
+        .card_objects(&Resource::Cards, &Action::Read);
+    match objects {
+        Some(objects) if !objects.is_empty() => {
+            let allowed = audit::audit_event(
+                caller,
+                operation,
+                resource,
+                &Permission::card_read().to_string(),
+                AuditOutcome::Allowed,
+            );
+            state
+                .bifrost
+                .scribe_outbox()
+                .stage(caller.data_tenant_id, allowed);
+            Ok(Some(objects))
+        }
+        objects => audit::authorize(state, caller, &Permission::card_read(), operation, resource)
+            .map(|()| objects),
+    }
+}
+
+/// Refuse `card` as not found when it is outside a scoped reader's
+/// `objects`, so an inaccessible Card and an unknown one look the same.
+///
+/// # Errors
+/// Returns the errors of [`require_object`].
+pub(crate) fn require_visible(
+    objects: Option<&[CardPermissionScope]>,
+    card: &Card,
+) -> Result<(), WyrdError> {
+    let required = match &card.metadata.uid {
+        Some(uid) => {
+            CardPermissionScope::version(card.kind.clone(), card.metadata.name.clone(), uid.clone())
+        }
+        None => CardPermissionScope::family(card.kind.clone(), card.metadata.name.clone()),
+    };
+    require_object(objects, &required)
 }
 
 fn parse_card_kind(value: &str) -> Result<CardKind, WyrdErrorResponse> {
@@ -877,19 +1039,24 @@ fn parse_card_uid(value: &str) -> Result<CardUid, WyrdErrorResponse> {
     })
 }
 
-/// Extract and validate the required declaration idempotency key.
+/// Extract and validate a required idempotency key.
 ///
-/// Declaration requires a caller-supplied key because the server cannot infer
-/// whether two otherwise identical requests are a retry or an intentional new
-/// operation. The service combines this key with the principal and canonical
-/// request hash to provide exactly-once declaration semantics.
-fn extract_required_idempotency_key(
+/// Declaration, and every other request whose identical retries and
+/// intentional repeats the server cannot tell apart, such as a fresh pull
+/// request review, requires a caller-supplied key. The declaration service
+/// combines it with the principal and canonical request hash to provide
+/// exactly-once declaration semantics.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED`-family errors for a
+/// missing, non-UTF-8 or invalid key.
+pub(crate) fn extract_required_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<IdempotencyKey, WyrdErrorResponse> {
     let value = headers
         .get(header::HeaderName::from_static(IDEMPOTENCY_KEY_HEADER))
         .ok_or_else(|| WyrdError::RegistryIdempotencyKeyRequired {
-            message: "Idempotency-Key header is required for card lifecycle requests".to_owned(),
+            message: "Idempotency-Key header is required for this request".to_owned(),
             details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
         })?;
     let value = value

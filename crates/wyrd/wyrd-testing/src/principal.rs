@@ -69,3 +69,32 @@ impl Bootstrap {
         }
     }
 }
+
+/// The bound within which a committed access change reaches every healthy
+/// replica's authority cache.
+///
+/// The committing request does not mark its own replica's cache; the change
+/// arrives by notification, so an observation of it is bounded, not
+/// immediate.
+pub const AUTHORITY_PROPAGATION: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Probe until the observation equals `expected` or [`AUTHORITY_PROPAGATION`]
+/// elapses, and return the last observation.
+///
+/// Callers assert on the result, so a change that never propagates fails with
+/// what was last observed.
+pub async fn within_propagation<T, F, Fut>(expected: &T, mut probe: F) -> T
+where
+    T: PartialEq,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let deadline = tokio::time::Instant::now() + AUTHORITY_PROPAGATION;
+    loop {
+        let observed = probe().await;
+        if &observed == expected || tokio::time::Instant::now() >= deadline {
+            return observed;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

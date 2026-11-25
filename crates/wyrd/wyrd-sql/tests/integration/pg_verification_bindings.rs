@@ -59,7 +59,6 @@ fn actor(fixture: &PgFixture) -> Principal {
         PrincipalId::new(Uuid::now_v7()),
         PrincipalKind::User,
         fixture.data_tenant_id(),
-        Vec::new(),
         PermissionSet::new(),
     )
 }

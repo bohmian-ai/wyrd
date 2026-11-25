@@ -16,7 +16,10 @@ use tempfile::TempDir;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_ai::auth::Principals;
+use wyrd_ai::auth::{
+    BindingSubject, CreateRoleBindingRequest, PermissionScope, PrincipalId, PrincipalKindTag,
+    Principals, RoleBindingQuery,
+};
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::gateway_admin::{GatewayCaptureMode, GatewayCapturePolicyWrite};
@@ -26,7 +29,7 @@ use wyrd_ai::{
     Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
     SpanRecord, VerificationVerdict, WyrdClient, WyrdError,
 };
-use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
+use wyrd_spec::auth::{BifrostPermissionScope, BifrostSchemaScope, RevokePrincipalRequest};
 use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::execution::VerificationExecutionState;
 use wyrd_spec::verification::{VerificationExecutionStatus, VerifierReadiness};
@@ -2063,10 +2066,7 @@ async fn grouped_coding_uses_declared_sources() {
         .await
         .parse()
         .expect("principal id");
-    principals
-        .grant_role(&principal, "live_reader")
-        .await
-        .expect("the Service may read spans live");
+    bind_service(&principals, principal, "live_reader").await;
     let group = GroupId::new("session-1").expect("group id");
     let (dispatch, provider) = service_telemetry(&coding.client);
     let session = tracing::dispatcher::with_default(&dispatch, || {
@@ -2217,15 +2217,23 @@ async fn grouped_coding_uses_declared_sources() {
                 all("bifrost_record", "write"),
                 all("tool", "invoke"),
                 all("gateway", "invoke"),
-                json!({
-                    "resource": "bifrost_query",
-                    "action": "read",
-                    "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "verification" } } },
-                }),
             ],
         )
         .await
         .expect("role seeds");
+    deployment
+        .server()
+        .seed_role(
+            "verification_query",
+            &[json!({ "resource": "bifrost_query", "action": "read", "scope": "all" })],
+        )
+        .await
+        .expect("role seeds");
+    let verification_schema =
+        PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
+            catalog: "bifrost".to_owned(),
+            schema: "verification".to_owned(),
+        }));
     let mut after = judged.execution_id;
     for (granted, revoked, denial) in [
         (None, "live_reader", "lacks Tool/Invoke"),
@@ -2236,15 +2244,29 @@ async fn grouped_coding_uses_declared_sources() {
         ),
     ] {
         if let Some(role) = granted {
-            principals
-                .grant_role(&principal, role)
-                .await
-                .expect("the role is granted");
+            bind_service(&principals, principal, role).await;
+            bind_service_at(
+                &principals,
+                principal,
+                "verification_query",
+                verification_schema.clone(),
+            )
+            .await;
         }
-        principals
-            .revoke_role(&principal, revoked)
+        let bound = principals
+            .bindings(&RoleBindingQuery {
+                principal_id: Some(principal),
+                role: Some(revoked.to_owned()),
+                ..RoleBindingQuery::default()
+            })
             .await
-            .expect("the role is revoked");
+            .expect("bindings list");
+        for binding in bound.bindings {
+            principals
+                .unbind(&binding.id)
+                .await
+                .expect("the role is unbound");
+        }
         let later = GroupId::new(format!("session-{revoked}")).expect("group id");
         run.observe()
             .group_id(later.clone())
@@ -3343,4 +3365,35 @@ async fn verification_staging_refuses_and_recovers() {
         "the burst judgments, the normal calls, the recovered and grouped calls, and the group's selector; nothing of the refused calls"
     );
     assistant.deployment.shutdown().await;
+}
+
+/// Bind `role` tenant-wide to the Service `principal`.
+///
+/// # Panics
+/// Panics when the administrator's bind is refused.
+async fn bind_service(principals: &Principals, principal: PrincipalId, role: &str) {
+    bind_service_at(principals, principal, role, PermissionScope::All).await;
+}
+
+/// Bind `role` at `scope` to the Service `principal`.
+///
+/// # Panics
+/// Panics when the administrator's bind is refused.
+async fn bind_service_at(
+    principals: &Principals,
+    principal: PrincipalId,
+    role: &str,
+    scope: PermissionScope,
+) {
+    principals
+        .bind(&CreateRoleBindingRequest {
+            subject: BindingSubject::Principal {
+                id: principal,
+                kind: PrincipalKindTag::Service,
+            },
+            role: role.to_owned(),
+            scope,
+        })
+        .await
+        .expect("the role is bound");
 }

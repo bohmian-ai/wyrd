@@ -46,8 +46,8 @@ pub struct RevokeArgs {
 
 /// Suspend one principal so every issuance path refuses its next token.
 ///
-/// A token it already holds is a five-minute permission snapshot and lapses
-/// at expiry; nothing is checked per request.
+/// A token it already holds spends current account authority, so it is
+/// refused once the change propagates, within five seconds.
 ///
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] when the id is not a principal

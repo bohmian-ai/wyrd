@@ -69,6 +69,51 @@ pub async fn seed_active_human_connection(
     .map_err(SqlError::from)
 }
 
+/// Grant `subject` exactly `permissions`: each becomes one custom role
+/// holding its operation, bound at its scope. Advances the tenant's
+/// authorization revision once.
+///
+/// Authority lives only in bindings, so tests that need an account to hold
+/// specific permissions seed them the way an administrator would.
+///
+/// # Errors
+/// Returns [`SqlError`] when a write fails.
+pub async fn bind_test_permissions(
+    conn: &mut TenantConn<'_>,
+    subject: wyrd_sql::queries::auth::SubjectColumns,
+    permissions: &[wyrd_spec::auth::Permission],
+) -> Result<(), SqlError> {
+    use wyrd_sql::queries::auth::{
+        advance_authorization_revision, insert_role, insert_role_binding,
+    };
+    for permission in permissions {
+        let role_id = uuid::Uuid::now_v7();
+        let operations = serde_json::json!([{
+            "resource": permission.resource,
+            "action": permission.action,
+        }]);
+        insert_role(
+            conn,
+            role_id,
+            &format!("test_{}", role_id.simple()),
+            &operations,
+            false,
+        )
+        .await?;
+        insert_role_binding(
+            conn,
+            uuid::Uuid::now_v7(),
+            role_id,
+            subject,
+            &permission.scope,
+            wyrd_spec::auth::RoleSource::Direct,
+        )
+        .await?;
+    }
+    advance_authorization_revision(conn).await?;
+    Ok(())
+}
+
 /// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {
     /// Runtime Wyrd handle that opens RLS-bound tenant transactions.

@@ -30,6 +30,7 @@ use wyrd_spec::auth::{
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::CardRef;
+use wyrd_testing::principal::within_propagation;
 use wyrd_testing::{
     Bootstrap, KeycloakAdmin, OidcIssuerFixture, WyrdTestServer, WyrdTestServerBuilder,
     provider_sign_in,
@@ -756,14 +757,14 @@ async fn ttl_expiry_journey() {
 // ─── Revocation journey ───────────────────────────────────────────────────────
 
 /// Mint a token, reach a real `/v1/cards` `200`, revoke the principal via
-/// admin, and show revocation governs issuance: the principal's durable key can
-/// no longer exchange, while the token it already holds keeps its immutable
-/// authority until its short expiry.
+/// admin, and show revocation governs issuance and current authority: the
+/// principal's durable key can no longer exchange, and the token it already
+/// holds is refused at its next request.
 ///
 /// # Panics
 /// Panics when bootstrap or key exchange fails, the revoke `POST` does not
 /// succeed, the revoked key can still exchange, or the pre-revocation token
-/// stops reaching `200` before its expiry.
+/// is not refused with `401`.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revocation_journey() {
@@ -826,9 +827,18 @@ async fn revocation_journey() {
         "a revoked principal cannot exchange its key again"
     );
 
-    // The token minted before revocation is a self-contained snapshot, so it
-    // keeps authorizing until it expires rather than being introspected.
-    assert_v1_delegated_write_ok(&srv, &target_token, "revoke-window").await;
+    // The token minted before revocation spends the account's current
+    // authority, so the revoked account is refused once the change propagates.
+    assert_eq!(
+        within_propagation(&StatusCode::UNAUTHORIZED, || card_write_status(
+            &srv,
+            &target_token,
+            "revoke-window"
+        ))
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked account's earlier token is refused"
+    );
 }
 
 /// Non-admin cannot revoke a principal — must return 403.
@@ -2266,14 +2276,14 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
 /// journey drives the served path an operator actually uses: log in, use the
 /// access token, revoke the User principal through `/v1/principals/{id}/revoke`,
 /// and then show the session cannot continue — the rotated refresh token no longer
-/// renews — while the access token already issued keeps its
-/// snapshot authority only until its five-minute expiry.
+/// renews — and the access token already issued is refused at its next
+/// request.
 ///
 /// # Panics
 /// Panics when login yields no access or refresh token, admin bootstrap or
 /// exchange fails, the revoke `POST` does not succeed, the issued access token
-/// stops reaching `200` inside its window, or the refresh rotation is not `401`
-/// or returns any successor token.
+/// is not refused with `401`, or the refresh rotation is not refused or returns
+/// any successor token.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revoking_a_human_kills_the_session_refresh_authority() {
@@ -2346,8 +2356,18 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
         revoke_resp.status()
     );
 
-    // The access token is a self-contained snapshot and lapses at expiry.
-    assert_v1_delegated_write_ok(&srv, &access_token, "human-revoke-window").await;
+    // The access token spends the account's current authority, so the
+    // revoked human is refused once the change propagates.
+    assert_eq!(
+        within_propagation(&StatusCode::UNAUTHORIZED, || card_write_status(
+            &srv,
+            &access_token,
+            "human-revoke-window"
+        ))
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked human's earlier access token is refused"
+    );
 
     // The refresh half is retired in the same transaction, so renewal is
     // refused and mints nothing for the session to continue under.
@@ -3581,7 +3601,7 @@ async fn tenant_connection_session_cutoff_journey() {
                       WHERE principal_id = $1::uuid),
                     (SELECT count(*) FROM wyrd.auth_browser_sessions
                       WHERE principal_id = $1::uuid),
-                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid)",
+                    (SELECT count(*) FROM wyrd.auth_role_bindings WHERE user_id = $1::uuid)",
         )
         .bind(&principal)
         .fetch_one(&superuser)
@@ -3716,7 +3736,7 @@ async fn user_role_count(srv: &WyrdTestServer, principal_id: &str) -> i64 {
         .pg_fixture()
         .superuser_pool()
         .expect("superuser pool opens");
-    sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid")
+    sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_role_bindings WHERE user_id = $1::uuid")
         .bind(principal_id)
         .fetch_one(&superuser)
         .await
@@ -4444,7 +4464,7 @@ async fn tenant_callback_refusal_journey() {
     let persisted: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1), \
                 (SELECT count(*) FROM wyrd.auth_user_identities WHERE data_tenant_id = $1), \
-                (SELECT count(*) FROM wyrd.auth_user_roles WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_role_bindings WHERE data_tenant_id = $1 AND user_id IS NOT NULL), \
                 (SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE data_tenant_id = $1), \
                 (SELECT count(*) FROM wyrd.auth_browser_sessions WHERE data_tenant_id = $1)",
     )

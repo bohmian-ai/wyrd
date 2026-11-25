@@ -7,9 +7,11 @@ use secrecy::{ExposeSecret, SecretString};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpConfig;
 use wyrd_client::{Platform, WyrdClient};
-use wyrd_spec::auth::CreateTenantRequest;
+use wyrd_server::components::platform::provisioning::LocalAdmin;
+use wyrd_spec::auth::{CreateTenantRequest, SecretBearer, TenantHumanAdmin};
 use wyrd_sql::OperatorPool;
 use wyrd_sql::queries::platform::tenants::list_tenants;
+use zeroize::Zeroize as _;
 
 use wyrd_server::ServerBootError;
 use wyrd_server::app::{BootExit, run};
@@ -197,6 +199,17 @@ struct SetupArgs {
     /// Running Wyrd server that provisions the tenant through its platform API.
     #[arg(long, env = "WYRD_SERVER_URL", default_value = "http://127.0.0.1:8080")]
     server: String,
+    /// Username of the tenant's first human administrator, who signs in with
+    /// a password and needs neither SMTP nor an identity provider.
+    #[arg(long)]
+    admin_username: String,
+    /// Read the administrator password from the first line of stdin instead
+    /// of a hidden terminal prompt.
+    #[arg(long)]
+    admin_password_stdin: bool,
+    /// Optional profile email for the administrator. It stays unverified.
+    #[arg(long)]
+    admin_email: Option<String>,
 }
 
 /// Run the binary as a Monty pool worker when the pool spawned it with
@@ -380,10 +393,16 @@ const PLATFORM_CREDENTIAL_ENV: &str = "WYRD_PLATFORM_CREDENTIAL";
 /// already exists, the credential to act with comes from
 /// `WYRD_PLATFORM_CREDENTIAL`.
 ///
+/// The tenant's named human administrator is read and validated before the
+/// root or the tenant is touched, so refused input claims nothing. Its
+/// password comes from stdin or a hidden prompt and is never printed; a
+/// resumed setup keeps the administrator an interrupted one created.
+///
 /// # Errors
 /// Returns [`BootExit::Config`] when the DSNs are missing, the slug is not a
-/// valid tenant slug, or the root exists and `WYRD_PLATFORM_CREDENTIAL` is
-/// unset. Returns [`BootExit::Other`] when the directory read, root
+/// valid tenant slug, the administrator password cannot be read or the
+/// administrator input is refused, or the root exists and
+/// `WYRD_PLATFORM_CREDENTIAL` is unset. Returns [`BootExit::Other`] when the directory read, root
 /// initialization, the platform session exchange, or tenant provisioning
 /// fails. A failure leaves every committed step in place for a rerun.
 async fn setup(args: SetupArgs) -> Result<(), BootExit> {
@@ -405,6 +424,18 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
         return Ok(());
     }
 
+    let human_admin = TenantHumanAdmin {
+        username: args.admin_username,
+        password: SecretBearer::new(
+            admin_password(args.admin_password_stdin)
+                .map_err(|e| BootExit::Config(Box::new(e)))?
+                .expose_secret()
+                .to_owned(),
+        ),
+        email: args.admin_email,
+    };
+    LocalAdmin::check(&human_admin).map_err(|e| BootExit::Config(Box::new(e)))?;
+
     let credential = root_credential(&pool).await?;
     let client = WyrdClient::with_config(ClientConfig {
         http: HttpConfig {
@@ -421,6 +452,7 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
         .create_tenant(&CreateTenantRequest {
             slug,
             display_name: args.display_name.unwrap_or_else(|| args.tenant.clone()),
+            human_admin: Some(human_admin),
         })
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
@@ -429,7 +461,48 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
     println!("admin_principal_id: {}", created.admin.principal_id);
     println!("admin_credential: {}", created.admin.credential.expose());
     println!("This is the only time the tenant credential is shown. Store it now.");
+    if let Some(human) = created.human_admin {
+        println!("admin_username: {}", human.username);
+        println!("login_url: {}", human.login_url);
+    }
     Ok(())
+}
+
+/// The administrator password: the first line of stdin when `from_stdin`,
+/// else typed at a terminal prompt with echo off.
+///
+/// # Errors
+/// Returns an IO error when stdin cannot be read, when it is not a terminal
+/// and `from_stdin` is unset, or when the terminal's echo cannot be changed.
+fn admin_password(from_stdin: bool) -> std::io::Result<SecretString> {
+    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+    use std::io::{BufRead as _, IsTerminal as _};
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    if from_stdin {
+        stdin.lock().read_line(&mut line)?;
+    } else {
+        if !stdin.is_terminal() {
+            return Err(std::io::Error::other(
+                "stdin is not a terminal to prompt for the administrator password; \
+                 pass --admin-password-stdin and write the password to stdin",
+            ));
+        }
+        eprint!("Administrator password: ");
+        let shown = tcgetattr(&stdin)?;
+        let mut hidden = shown.clone();
+        hidden.local_modes.remove(LocalModes::ECHO);
+        tcsetattr(&stdin, OptionalActions::Now, &hidden)?;
+        let read = stdin.lock().read_line(&mut line);
+        let restored = tcsetattr(&stdin, OptionalActions::Now, &shown);
+        eprintln!();
+        read?;
+        restored?;
+    }
+    let password = SecretString::from(line.trim_end_matches(['\r', '\n']).to_owned());
+    line.zeroize();
+    Ok(password)
 }
 
 /// Initialize the platform root, or read the operator's existing credential.

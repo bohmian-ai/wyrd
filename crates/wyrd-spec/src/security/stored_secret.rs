@@ -103,6 +103,14 @@ pub enum StoredSecretStore {
     GatewayCredential,
     /// Operator connection secrets.
     OperatorConnection,
+    /// Shared social sign-in provider client secrets.
+    SocialProvider,
+    /// The application-mail SMTP relay password.
+    ApplicationMail,
+    /// The signup challenge secret.
+    SignupChallenge,
+    /// The platform derivation key.
+    DerivationKey,
 }
 
 /// Why one envelope did not move.

@@ -36,6 +36,11 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # The container superuser plays the DBA; Wyrd never receives its credential.
 psql_owner() { docker exec -i "$pg" psql -v ON_ERROR_STOP=1 -qAt -U wyrd_owner -d wyrd "$@"; }
+# `wyrd-server setup` for tenant acme with its first human administrator, whose password comes from stdin.
+setup_acme() {
+  printf 'acme-admin-local\n' \
+    | docker exec -i "$app" wyrd-server setup --tenant acme --admin-username acme-admin --admin-password-stdin
+}
 
 serving_mounts=(-v "$volume:/var/lib/wyrd" -v "$keys:/run/wyrd:ro")
 
@@ -66,6 +71,29 @@ ui_sign_in() {
   [[ $answer == "303 $http/t/acme" ]] || fail "API-key sign-in through nginx: $answer"
   [[ "$(curl -sS -o /dev/null -w '%{http_code}' -b "$jar" -H 'accept: text/html' "$http/t/acme")" == 200 ]] \
     || fail "signed-in tenant page through nginx"
+}
+
+# The platform console's pages answer from the UI at nginx's public origin,
+# ahead of the server's `/platform/*` API: `/platform` is the entry, and
+# `/platform/ui` and its subtree send a browser without a console session to
+# it. The console's browser API and the platform API keep the server's
+# answers.
+platform_console_routes() {
+  local path answer
+  curl -fsS -H 'accept: text/html' "$http/platform" | grep -E '<h1[^>]*>Platform admin</h1>' >/dev/null \
+    || fail "platform entry page through nginx"
+  for path in /platform/ui /platform/ui/providers /platform/ui/callback; do
+    answer="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' -H 'accept: text/html' "$http$path")"
+    [[ $answer == 303* || $answer == "200 text/html"* ]] || fail "$path through nginx answered from the server: $answer"
+  done
+  answer="$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -H 'accept: text/html' "$http/platform/ui/providers")"
+  [[ $answer == "303 $http/platform" ]] || fail "console page without a session through nginx: $answer"
+  curl -fsS "$http/platform/browser/methods" | grep '"password":true' >/dev/null \
+    || fail "platform sign-in methods through nginx"
+  for path in /platform/browser/session /platform/tenants; do
+    answer="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$http$path")"
+    [[ $answer == "401 application/problem+json"* ]] || fail "$path through nginx: $answer"
+  done
 }
 
 # One child's unsolicited exit ends the container: the BFF is killed and the

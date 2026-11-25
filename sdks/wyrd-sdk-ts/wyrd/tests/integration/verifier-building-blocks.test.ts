@@ -70,7 +70,7 @@ const FOLLOWS =
 const BREAKS =
   '{"outcome":"failed","reason":"contradicts the policy","citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}';
 
-/** The judge's Verdict for an answer containing `UNCITED`: a pass with no citation, which must not count as one. */
+/** The judge's Verdict for an answer containing `UNCITED`: a pass with no citation, which counts as authored. */
 const UNCITED = '{"outcome":"passed","reason":"trust me","citations":[]}';
 
 /** The judge's Verdict for an answer containing `JUDGE-FOREIGN-CITE`: a pass citing a JSON pointer the answer does not have. */
@@ -90,6 +90,13 @@ const TOOLS = ["cards.get", "bifrost.query", "code.run"] as const;
 /** The stable code of a permission denial, carried by every denied tool call's error. */
 const DENIED = "WYRD_PERMISSION_403_DENIED_RBAC";
 
+/**
+ * The stable code of a query the caller may make but whose table no grant
+ * covers: Card read admits the query surface for managed verification rows,
+ * and an ordinary telemetry table still needs its own query grant.
+ */
+const QUERY_FORBIDDEN = "WYRD_VALA_403_QUERY_FORBIDDEN";
+
 /** The permissions every `tool-review` principal holds: run any Verifier and invoke the gateway its investigator calls the model through. */
 const VERIFIES = ["verifier:run", "gateway:invoke"];
 
@@ -99,7 +106,7 @@ const INVESTIGATION = [
     card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0" },
   }),
   toolCall("call-query", TOOLS[1], {
-    sql: "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
+    sql: "SELECT name FROM bifrost.traces.spans LIMIT 1",
     max_rows: 1,
   }),
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
@@ -376,8 +383,8 @@ function investigate(desk: PolicyDesk, client: WyrdClient, question: string): Pr
 /**
  * Assert the investigation of `question` finished after calling each of
  * {@link TOOLS} once, in order, where exactly the `allowed` calls returned
- * output and every other call was denied with {@link DENIED} and returned
- * nothing. The model's tool turn shows the policy desk's Card only when the
+ * output and every other call was denied and returned nothing: a denied
+ * `bifrost.query` carries `queryDenial`, any other {@link DENIED}. The model's tool turn shows the policy desk's Card only when the
  * Card read was allowed.
  */
 async function assertTools(
@@ -385,6 +392,7 @@ async function assertTools(
   result: VerificationResult,
   question: string,
   allowed: readonly string[],
+  queryDenial: string = DENIED,
 ): Promise<void> {
   const investigated = await step(result, "investigate");
   expect(investigated.status, question).toBe("succeeded");
@@ -399,7 +407,7 @@ async function assertTools(
       expect(call.output_sha256, `${question} ${call.tool}`).toBeTruthy();
       expect(call.returned_bytes, `${question} ${call.tool}`).toBeGreaterThan(0);
     } else {
-      expect(call.error ?? "", `${question} ${call.tool}`).toContain(DENIED);
+      expect(call.error ?? "", `${question} ${call.tool}`).toContain(call.tool === TOOLS[1] ? queryDenial : DENIED);
       expect([call.output_sha256 ?? null, call.returned_bytes], `${question} ${call.tool}`).toEqual([null, 0]);
     }
   }
@@ -582,11 +590,11 @@ test("judge verdict fails the agent check", async ({ desk }) => {
   expect(result.outcome.verdict).toBe("failed");
 });
 
-test("uncited judge verdict cannot pass", async ({ desk }) => {
+test("uncited judge verdict passes as authored", async ({ desk }) => {
   const result = await reviewNow(desk, review("UNCITED: refunds follow our policy.", 50));
 
-  expect(requirement(result, "follows-policy").outcome).not.toBe("passed");
-  expect(result.outcome.verdict).not.toBe("passed");
+  const judged = requirement(result, "follows-policy");
+  expect([judged.outcome, judged.reason, judged.citations ?? []]).toEqual(["passed", "trust me", []]);
 });
 
 test("raising code check cannot pass", async ({ desk }) => {
@@ -921,16 +929,16 @@ test("code check fails with citations and is inconclusive otherwise", async ({ d
 });
 
 test("hosted tools need the tool and domain grants", async ({ server, provider, desk }) => {
-  for (const [name, extra, allowed] of [
-    ["all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS],
-    ["no_tool_grant", ["cards:read", "bifrost_query:read"], []],
-    ["no_domain_grant", ["tool:invoke", "cards:read"], [TOOLS[0], TOOLS[2]]],
+  for (const [name, extra, allowed, queryDenial] of [
+    ["all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS, DENIED],
+    ["no_tool_grant", ["cards:read", "bifrost_query:read"], [], DENIED],
+    ["no_domain_grant", ["tool:invoke", "cards:read"], [TOOLS[0], TOOLS[2]], QUERY_FORBIDDEN],
   ] as const) {
     const credential = server.scopedApiKey(name, [...VERIFIES, ...extra]);
 
     const result = await investigate(desk, WyrdClient.connect({ credential }), name);
 
-    await assertTools(provider, result, name, allowed);
+    await assertTools(provider, result, name, allowed, queryDenial);
   }
   const credential = server.scopedApiKey("card_tool_only", grants({ tool: TOOLS[0] }));
   const result = await investigate(desk, WyrdClient.connect({ credential }), "card_tool_only");
@@ -1057,7 +1065,7 @@ test("code_mode_reduces_evidence_and_preserves_citations", async ({ server, prov
         [TOOLS[1], false],
         [TOOLS[0], true],
       ],
-      `query ${DENIED} repaired True`,
+      `query ${QUERY_FORBIDDEN} repaired True`,
     ],
     [
       "NESTED all_tools",
@@ -1081,7 +1089,7 @@ test("code_mode_reduces_evidence_and_preserves_citations", async ({ server, prov
       name,
     ).toEqual([["model", TOOLS[2], true], ...children.map(([tool, allowed]) => ["code", tool, allowed])]);
     for (const call of calls.filter((each) => each.error != null)) {
-      expect(call.error, name).toContain(DENIED);
+      expect(call.error, name).toContain(QUERY_FORBIDDEN);
       expect([call.output_sha256 ?? null, call.returned_bytes], name).toEqual([null, 0]);
     }
     const turn = provider.received.find(

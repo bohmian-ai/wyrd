@@ -1,13 +1,13 @@
 ---
 title: Permissions
 browserTitle: Grant and inspect permissions | Wyrd
-description: See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
+description: See a principal's access, bind or remove a role at an explicit scope, cut a principal off, and confirm the result in the audit log.
 pillar: wyrd
 section: Operate
 order: 4
 ---
 
-Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant.
+Bind a role at a scope to give a principal more access, remove the binding to take it away, and read the audit log to confirm what the server decided. Every grant names its scope: `all` for the whole tenant, or one Card family such as `Repository/payments`.
 
 ## Prerequisites
 
@@ -16,65 +16,46 @@ Grant a role to give a principal more access, revoke it to take access away, and
 
 If you are not sure which role you need, [Identity and access](/understand/identity-and-authorization/#roles) lists what each built-in role allows.
 
-## 1. Find the principal and its roles
+## 1. Find the principal and its access
 
 The CLI uses your saved endpoint, or `--server` / `WYRD_SERVER_URL`:
 
 ```bash
 wyrd principal list --kind service
-wyrd principal role list --principal <principal-id>
+wyrd principal access show --principal <principal-id>
 ```
 
-A Service account holds the roles it was created with; [Deploy a Service from CI](/operate/deploy-a-service-from-ci/) creates one with `editor` and one with `workload`. A tenant administrator holds `admin`.
+`show` prints one `grant` line per binding, with its binding ID, `role:scope`, and source (`direct`, `provider`, or `group:<name>`), then the combined permissions. A Service account holds the grants it was created with; [Deploy a Service from CI](/operate/deploy-a-service-from-ci/) creates one with `editor:all` and one with `workload:all`. A tenant administrator holds `admin:all`.
 
-## 2. Grant or revoke a role
+## 2. Bind or remove a role
+
+A grant is `ROLE:SCOPE`. The scope is required: `all`, `KIND/NAME` for a Card family and its future versions, or `KIND/NAME@UID` for one exact version.
 
 ```bash
-wyrd principal role grant --principal <principal-id> --role editor
-wyrd principal role revoke --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind service --grant editor:all
+wyrd principal access grant --principal <principal-id> --kind user --grant viewer:Repository/payments
+wyrd principal access revoke --binding <binding-id>
 ```
 
-The same call from an SDK:
+`grant` prints the binding: its ID, `role:scope`, subject, and source. `revoke` takes that binding ID, which `show` also lists.
 
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
+Every SDK's `Principals` handle makes the same three calls, `bind`, `access`, and `unbind`, with the same request fields, and so do the `principals.bind`, `principals.access`, and `principals.unbind` [MCP tools](/reference/mcp-tools/#principal-access).
 
-```python
-from wyrd.auth import Principals
+A bind is idempotent: binding the same role at the same scope again returns the same binding.
 
-principals = Principals()
-result = principals.grant_role(principal_id, "editor")
-print(result["changed"], result["roles"])
-```
+The change reaches running servers within about 5 seconds, including on credentials and tokens the principal already holds; nothing needs to sign in again or renew a token. Removing one binding leaves any other binding that grants the same access, such as `admin:all` or a group or identity-provider binding. A provider binding cannot be removed here; change the group mapping instead.
 
-</LangTab>
-<LangTab lang="rust">
+## In the UI
 
-```rust
-use wyrd_ai::auth::Principals;
+**Settings**, then **Access**, does the same work in the browser for a signed-in tenant administrator. It has four tabs:
 
-let principals = Principals::connect().await?;
-let result = principals.grant_role(&principal_id, "editor").await?;
-println!("{} {:?}", result.changed, result.roles);
-```
+- **Users** and **Service accounts** list the accounts. Select one to see each binding with its role, scope and source, and the combined permissions. Grant a role at a scope there, or remove a direct binding. A new Service account's key, and each key you issue later, is shown once.
+- **Roles** lists the built-in roles and creates, edits and deletes custom ones.
+- **Groups** creates groups, changes their members, and grants a group a role at a scope. Members inherit it.
 
-</LangTab>
-<LangTab lang="typescript">
+No scope is preselected. A Card family covers every version of that Card, including later ones; an exact version covers only that one. A grant the server refuses saves nothing.
 
-```typescript
-import { Principals } from "wyrd-ai";
-
-const principals = await Principals.connect();
-const result = await principals.grantRole(principalId, "editor");
-console.log(result.changed, result.roles);
-```
-
-</LangTab>
-</LangTabs>
-
-A grant is idempotent: granting a role the principal already holds returns `changed: false` and the unchanged role list.
-
-The change reaches a running service within 5 minutes, when its access token is next renewed. Revoking a role that a person also gets from an identity-provider group does not remove it; change the group mapping instead.
+A person who opens a page they have no access to sees **Copy access request**. It copies their account, the tenant, the action and the link they opened, for them to send you in your own channel. Wyrd sends nothing and keeps no record of it, and the text is the same whether the target is hidden or does not exist.
 
 ## 3. Cut a principal off
 
@@ -104,6 +85,6 @@ Run it with any SDK's `Bifrost.sql`, or the `bifrost.query` MCP tool. A refused 
 
 | Error code | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential does not hold `admin` | Use the tenant administrator's credential |
+| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential is not a tenant administrator's | Use the tenant administrator's credential |
 | `WYRD_AUTH_401_CREDENTIAL_REVOKED` | The principal or its tenant is suspended | Ask a tenant or platform administrator to restore it |
-| The service still has the old access | Its token was issued before the change | Wait up to 5 minutes for the next renewal |
+| The principal still has the old access after 5 seconds | Another binding still grants it | Run `wyrd principal access show` and remove or change the binding that still grants it |

@@ -1,4 +1,5 @@
 import { env } from '$env/dynamic/private';
+import { getRequestEvent } from '$app/server';
 import { problem } from './problem';
 
 /** `localhost` or a literal loopback address, as normalized by the URL parser. */
@@ -47,21 +48,50 @@ const dropped = [
   'x-real-ip'
 ];
 
+/**
+ * State the visitor's address in the deployment's client-address header
+ * (`WYRD_CLIENT_ADDRESS_HEADER`, the name the server reads from its trusted
+ * ingress), replacing any value the browser sent. The address is the one
+ * adapter-node establishes for the current request, so a deployment that lists
+ * this BFF as trusted ingress keys admission by visitor rather than by this
+ * process. Without the setting nothing is added.
+ */
+export function stateSource(headers: Headers): void {
+  const name = env.WYRD_CLIENT_ADDRESS_HEADER?.trim();
+  if (name) headers.set(name, getRequestEvent().getClientAddress());
+}
+
 /** The server's sign-in binding cookie, which every forwarded `/auth/*` request carries. */
 const loginCookie = 'wyrd_login';
 
-/** Prefix of the server's tenant session cookies, which only `/auth/browser/*` requests carry. */
+/**
+ * The server's onboarding flow cookies: signup proof and completion,
+ * workspace discovery, and recovery-contact proof. Rust scopes each one to
+ * its own `/auth/*` path, so the browser sends it only there.
+ */
+const flowCookies = ['wyrd_signup', 'wyrd_signup_email', 'wyrd_discovery', 'wyrd_contact'];
+
+/** Every cookie a forwarded `/auth/*` request may carry by exact name. */
+const forwardedCookies: ReadonlySet<string> = new Set([loginCookie, ...flowCookies]);
+
+/**
+ * Prefix of the server's tenant session cookies, which only `/auth/browser/*`
+ * and the CLI login approval at `/auth/device` carry.
+ */
 const sessionPrefix = 'wyrd_session_';
 
 /**
  * Send one browser `/auth/*` request to the configured Wyrd server and return
  * its answer unchanged: method, path and query, body, the server's own cookies,
  * redirects (never followed here), and error responses. Every request carries
- * the login binding; the browser-session operations also carry the tenant
- * session cookies, which the server alone selects, validates, and revokes.
+ * the login binding and the onboarding flow cookies; the browser-session operations and the CLI login approval
+ * also carry the tenant session cookies, which the server alone selects,
+ * validates, and revokes. That lets a signed-in person approve a terminal's
+ * code without a provider.
  * `url` is the request's public URL as this BFF established it, so the server
  * derives sign-in redirects and callbacks from the origin the browser actually
- * reached, never from a forwarded header the browser sent. A server that
+ * reached, never from a forwarded header the browser sent, and the visitor's
+ * address goes as {@link stateSource} states it. A server that
  * cannot be reached is the stable `upstream` problem.
  */
 export async function forwardAuth(
@@ -72,17 +102,20 @@ export async function forwardAuth(
   const headers = new Headers(request.headers);
   for (const name of dropped) headers.delete(name);
   // Unrelated application cookies never ride a forwarded request.
-  const sessions = url.pathname.startsWith('/auth/browser/');
+  const sessions = url.pathname.startsWith('/auth/browser/') || url.pathname === '/auth/device';
   const forwarded = (request.headers.get('cookie') ?? '')
     .split(';')
     .map((pair) => pair.trim())
     .filter(
-      (pair) => pair.startsWith(`${loginCookie}=`) || (sessions && pair.startsWith(sessionPrefix))
+      (pair) =>
+        forwardedCookies.has(pair.split('=', 1)[0]) ||
+        (sessions && pair.startsWith(sessionPrefix))
     );
   if (forwarded.length) headers.set('cookie', forwarded.join('; '));
   else headers.delete('cookie');
   headers.set('x-forwarded-host', url.host);
   headers.set('x-forwarded-proto', url.protocol.slice(0, -1));
+  stateSource(headers);
   const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body;
   let answer: Response;
   try {

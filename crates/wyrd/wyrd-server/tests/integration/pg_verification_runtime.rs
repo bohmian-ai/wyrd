@@ -287,6 +287,43 @@ impl Harness {
             .collect()
     }
 
+    /// The status words the runtime recorded for `execution` once the outbox
+    /// settles, ordered by occurrence, each submitted batch counted once.
+    ///
+    /// # Panics
+    /// Panics when a submitted execution-events batch does not decode.
+    async fn statuses(&self, execution: ExecutionId) -> Vec<String> {
+        let mut batches = std::collections::HashSet::new();
+        let mut statuses = Vec::new();
+        for sent in sent_to(&self.fault, EVENTS).await {
+            if !batches.insert(sent.batch_id) {
+                continue;
+            }
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&sent.bytes), None)
+                    .expect("a sent batch is an Arrow IPC stream");
+            for batch in reader {
+                let batch = batch.expect("the stream decodes");
+                let text = |column: &str, row: usize| {
+                    arrow::util::display::array_value_to_string(
+                        batch.column_by_name(column).expect("the column is present"),
+                        row,
+                    )
+                    .expect("the value renders")
+                };
+                for row in 0..batch.num_rows() {
+                    if text("event", row) == "status"
+                        && text("execution_id", row) == execution.to_string()
+                    {
+                        statuses.push((text("occurred_at", row), text("status", row)));
+                    }
+                }
+            }
+        }
+        statuses.sort();
+        statuses.into_iter().map(|(_, status)| status).collect()
+    }
+
     /// Settle the runtime's result outbox, flush the server's Scribe, and
     /// count the tenant's durable rows per `namespace.table`.
     ///
@@ -1543,6 +1580,13 @@ async fn retryable_engine_failures_exhaust_to_errored() {
     assert_eq!(row.attempts, 3);
     assert_eq!(row.error_code.as_deref(), Some("engine_unavailable"));
     assert!(harness.writes().await.is_empty());
+    assert_eq!(
+        harness.statuses(run).await,
+        [
+            "running", "retrying", "running", "retrying", "running", "errored"
+        ],
+        "each claim and settlement records its status, and exhaustion records errored"
+    );
     runtime.stop().await;
 }
 
@@ -2612,9 +2656,13 @@ async fn held_persistence_bounds_queued_custody_by_claim_permits() {
 /// compute while their claims are held, so they complete together; every
 /// run then commits through the batched statement on its first attempt.
 ///
+/// Each run records `completed` once: the failed batch rolled back and
+/// staged nothing.
+///
 /// # Panics
-/// Panics when the fault cannot be installed, no batch failed, or any run
-/// commits through the single-run statement or retries its attempt.
+/// Panics when the fault cannot be installed, no batch failed, any run
+/// commits through the single-run statement or retries its attempt, or a
+/// run's status history differs.
 #[tokio::test]
 async fn failed_group_commits_retry_as_groups() {
     let harness = Harness::start().await;
@@ -2670,6 +2718,67 @@ async fn failed_group_commits_retry_as_groups() {
     assert_eq!(
         paths, expected,
         "every run commits once through the batched statement"
+    );
+    for run in &runs {
+        assert_eq!(
+            harness.statuses(*run).await,
+            ["running", "completed"],
+            "{run} records completed once, for its committed batch only"
+        );
+    }
+}
+
+/// A completion whose group-commit flush task is gone settles alone and
+/// still records its `completed` status.
+///
+/// The test crashes the flush task holding the run's completion, so the run
+/// gets no reply and completes through the runner's single settlement. A
+/// test-only trigger records which statement completed it.
+///
+/// # Panics
+/// Panics when the path recorder cannot be installed, the run does not
+/// complete through the single-run statement, or it records another history.
+#[tokio::test]
+async fn a_completion_without_its_flush_task_settles_alone_and_records_completed() {
+    let harness = Harness::start().await;
+    for statement in [
+        "CREATE TABLE public.completion_paths (execution_id uuid NOT NULL, batched boolean NOT NULL)",
+        "CREATE FUNCTION public.record_completion_path() RETURNS trigger LANGUAGE plpgsql \
+         SECURITY DEFINER AS $$ BEGIN INSERT INTO public.completion_paths VALUES \
+         (NEW.execution_id, current_query() LIKE '%complete_verifier_executions%'); \
+         RETURN NEW; END $$",
+        "CREATE TRIGGER record_completion_path BEFORE UPDATE ON wyrd.verifier_executions \
+         FOR EACH ROW WHEN (NEW.status = 'completed') \
+         EXECUTE FUNCTION public.record_completion_path()",
+    ] {
+        sqlx::query(statement)
+            .execute(&harness.assertion)
+            .await
+            .expect("the path recorder installs");
+    }
+    let script = EngineScript::default();
+    let run = harness.submit().await;
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let crash = CapabilityCrash::default();
+    crash.crash_next_completion_flush();
+    let runtime = RunningRuntime::spawn(harness.runtime(&Harness::limits(), &script, &crash));
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 1, "the fallback settles the same attempt");
+    runtime.stop().await;
+    let paths: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT execution_id, batched FROM public.completion_paths")
+            .fetch_all(&harness.assertion)
+            .await
+            .expect("the completion paths read");
+    assert_eq!(
+        paths,
+        [(run.as_uuid(), false)],
+        "the run completed through the single-run statement"
+    );
+    assert_eq!(
+        harness.statuses(run).await,
+        ["running", "completed"],
+        "the single settlement records the completion"
     );
 }
 
@@ -2815,6 +2924,9 @@ async fn terminal_failures_use_one_acknowledged_settlement() {
             harness.expire(run).await;
         }
         wait_until("the claim", || script.entered() == entered + claims).await;
+        // Flush the claim's `running` status row, so the hold takes the
+        // failure's state revision.
+        harness.fault.sent().await;
         let hold = harness.fault.hold_next(EVENTS);
         if !timeout {
             script.release();
@@ -3897,6 +4009,11 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
     assert_eq!(expires, None, "the released run holds no live lease");
     assert_eq!(script.entered(), 0, "the released claim never executed");
     assert!(harness.writes().await.is_empty(), "nothing published");
+    assert_eq!(
+        harness.statuses(run).await,
+        ["running", "pending"],
+        "the release records the status it returned the run to"
+    );
 
     sqlx::query("DROP TRIGGER test_hold_claim_commit ON wyrd.verifier_executions")
         .execute(&harness.assertion)
@@ -4267,16 +4384,21 @@ async fn the_runner_claims_no_more_than_its_execution_slots() {
 async fn a_parked_attempt_keeps_its_claim_until_acknowledged() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
+    script.hold();
     let run = harness.submit().await;
     script.push(EngineOutcome::Parked(
         [SlotName::new("ci").expect("slot name")].into(),
         Vec::new(),
     ));
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    wait_until("the claim", || script.entered() == 1).await;
+    // Flush the claim's `running` status row, so the stall takes the park.
+    harness.fault.sent().await;
     let stall = harness
         .server
         .stall_next_bifrost_write_into("bifrost.verification.execution_events")
         .expect("Scribe stalls");
-    let runtime = harness.spawn(&Harness::limits(), &script);
+    script.release();
     stall.wait_entered().await;
     let pool = harness.assertion.clone();
     let leased = || {
@@ -5864,8 +5986,7 @@ async fn accepted_authority_survives_account_and_context_changes() {
         !frozen
             .principal
             .effective_permissions
-            .iter()
-            .any(|permission| *permission == wyrd_runtime::Permission::wildcard()),
+            .contains(&wyrd_runtime::Permission::wildcard()),
         "the User's admin wildcard never passes the actor's roles"
     );
 
@@ -6106,7 +6227,7 @@ async fn only_associated_account_activity_activates_exact_root() {
         "/v1/principals",
         Some(serde_json::json!({
             "name": "fam-runtime-next",
-            "roles": ["editor"],
+            "assignments": [{ "role": "editor", "scope": "all" }],
             "workload_restriction": { "mode": "family", "kind": "Service", "name": "fam" },
         })),
     )

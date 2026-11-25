@@ -17,7 +17,7 @@ use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{CredentialAssignment, GatewayTenantSnapshot, ManagedSecretBinding};
 use wyrd_kms::{KmsError, WyrdKms};
-use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
@@ -157,7 +157,6 @@ pub(super) fn caller(
             PrincipalId::new(Uuid::nil()),
             PrincipalKind::User,
             tenant,
-            Vec::<RoleRef>::new(),
             PermissionSet::from_iter(permissions),
         ),
         request_id: RequestId::now_v7(),
@@ -625,13 +624,21 @@ async fn gateway_managed_secret_renewal_keeps_the_key_and_loses_races() {
     .expect("a fresh load opens the stored envelope");
     assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(SUBMITTED));
 
+    // The replacement seals through an undelayed key service, so it commits
+    // while the renewal's reseal is still in flight; through the delayed one
+    // both writes would wait the same 300 ms and either could commit first.
+    let prompt = wyrd_testing::kms::TransitFixture::start().await;
+    let prompt_kms =
+        Arc::new(WyrdKms::new(&prompt.config("gw", &[]), false).expect("transit facade"));
+    let prompt_state = with_kms(test_state(&fixture).await, &fixture, &prompt_kms);
+    let replacer = GatewayAdministration::new(&prompt_state);
     let encrypts = transit.requests("encrypt").await;
     let renewal = gateway.renew_credential_encryption(&admin, &name);
     let replacement = async {
         while transit.requests("encrypt").await <= encrypts {
             tokio::task::yield_now().await;
         }
-        gateway
+        replacer
             .put_credential(&admin, &name, managed("managed", REPLACED))
             .await
     };

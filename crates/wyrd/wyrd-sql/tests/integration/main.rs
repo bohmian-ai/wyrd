@@ -5,6 +5,8 @@
 //! nextest selects a surface with `-E 'test(/^<module>::/)'`.
 
 mod pg_admin_principals;
+/// Verified-contact revision history.
+mod pg_auth_contacts;
 mod pg_cards_declare;
 /// Code-review cache metadata: pointer publication, collection claims and context expiry.
 mod pg_code_review_cache;
@@ -12,10 +14,13 @@ mod pg_drift_baselines;
 mod pg_gateway_usage;
 /// Tenant GitHub installation slots, revision fences and login state.
 mod pg_github_installations;
+/// Required company SSO and its credential sweep.
+mod pg_login_policy;
 mod pg_login_state;
 mod pg_migration;
 mod pg_operator_connections;
 mod pg_platform_identity;
+mod pg_platform_social;
 mod pg_query_compile;
 /// Cross-tenant stored-secret maintenance slots.
 mod pg_stored_secrets;

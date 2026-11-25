@@ -13,10 +13,11 @@ use std::path::Path;
 use schemars::SchemaGenerator;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CredentialListQuery, CredentialListResponse, CurrentUserProfile, GatewayAccess,
-    IssuedCredential, IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage,
-    PrincipalQuery, PrincipalRoles, RevokePrincipalRequest, RoleAssignmentChange, TokenAudience,
+    AbsoluteUrl, AccessSummary, CallbackQuery, CreateGroupRequest, CreateRoleBindingRequest,
+    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListQuery,
+    CredentialListResponse, CurrentUserProfile, GatewayAccess, GroupList, IssuedCredential,
+    IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage, PrincipalQuery, PutRoleRequest,
+    RevokePrincipalRequest, RoleBindingList, RoleBindingQuery, RoleList, TokenAudience,
     TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
@@ -58,7 +59,10 @@ use wyrd_spec::gateway::{
     GatewayFallbackPolicy, GatewayGovernancePolicy, ProviderCredentialView,
     ProviderCredentialWrite, ProviderDeployment,
 };
-use wyrd_spec::github_connection::{GithubConnectResponse, GithubConnectionView};
+use wyrd_spec::github_connection::{
+    GithubConnectResponse, GithubConnectionView, GithubPullRequestReviewRequest,
+    GithubPullRequestReviewResponse,
+};
 use wyrd_spec::operator_connection::{
     CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
@@ -266,8 +270,14 @@ fn contracts() -> Value {
         CredentialListResponse,
         CredentialListQuery,
         CurrentUserProfile,
-        PrincipalRoles,
-        RoleAssignmentChange,
+        AccessSummary,
+        CreateRoleBindingRequest,
+        RoleBindingList,
+        RoleBindingQuery,
+        RoleList,
+        PutRoleRequest,
+        GroupList,
+        CreateGroupRequest,
         PrincipalPage,
         PrincipalQuery,
         SecretRef,
@@ -336,6 +346,8 @@ fn contracts() -> Value {
         OperatorConnectionView,
         GithubConnectResponse,
         GithubConnectionView,
+        GithubPullRequestReviewRequest,
+        GithubPullRequestReviewResponse,
         SpanRecord,
     )
     .into_iter()
@@ -428,6 +440,27 @@ fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
         (
             "passwordAttempts",
             WyrdError::PasswordAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "signInAttempts",
+            WyrdError::SignInAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "emailAttempts",
+            WyrdError::EmailAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "methodUnavailable",
+            WyrdError::MethodUnavailable {
                 message: String::new(),
                 details: json!({}),
             },

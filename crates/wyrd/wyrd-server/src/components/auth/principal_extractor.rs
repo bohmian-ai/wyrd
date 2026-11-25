@@ -123,10 +123,11 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
     /// routes authenticate identically to `/v1`.
     ///
     /// # Errors
-    /// Returns `401` when the access-token header is missing or verification
-    /// fails, `400` when the token is malformed, and `503` when no token
-    /// verifier is configured.
-    /// Resolution completes before the returned future is polled.
+    /// Returns `401` when the access-token header is missing, verification
+    /// fails or the account is no longer active, `400` when the token is
+    /// malformed, and `503` when no token verifier is configured or current
+    /// authority is unavailable. Verification completes before the returned
+    /// future is polled; authorization runs when it is.
     fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
@@ -134,20 +135,24 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         // Fast path: require_authenticated (post-verify) is the sole trusted producer
         // of this extension. Any future insertion site must verify before inserting;
         // reading an unverified principal here would be a silent auth bypass.
-        let resolved = parts
+        let pending = parts
             .extensions
             .get::<AuthenticatedPrincipal>()
-            .map_or_else(
-                || {
-                    verify_authenticated_principal(
-                        state.auth.token_verifier.as_deref(),
-                        &parts.headers,
-                        wyrd_auth_verify::TokenAudience::Wyrd,
-                    )
-                },
-                |principal| Ok(principal.clone()),
-            );
-        std::future::ready(resolved)
+            .cloned()
+            .ok_or_else(|| {
+                verify_authenticated_principal(
+                    state.auth.token_verifier.as_deref(),
+                    &parts.headers,
+                    wyrd_auth_verify::TokenAudience::Wyrd,
+                )
+            });
+        let state = state.clone();
+        async move {
+            match pending {
+                Ok(principal) => Ok(principal),
+                Err(bearer) => Ok(bearer?.authorize(&state).await?),
+            }
+        }
     }
 }
 
@@ -218,11 +223,12 @@ mod pg_tests {
                 principal_id,
                 PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 PermissionSet::default(),
             ),
+            permission_ceiling: None,
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
+            iat: chrono::Utc::now(),
         }));
         // No token header — fallback path would reject with Unauthenticated;
         // extension hit must short-circuit and return the stored principal.
@@ -323,7 +329,7 @@ mod pg_tests {
     }
 
     /// Mint a direct (non-delegated) Wyrd-audience access token for a fresh
-    /// User principal in `tenant`, expiring after `ttl`.
+    /// live User principal in `tenant`, expiring after `ttl`.
     ///
     /// # Panics
     /// Panics when `state` has no issuing key or the token fails to mint.
@@ -337,6 +343,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
         };
+        crate::test_support::admit_accounts(state, tenant, &[principal.id], &[]);
         state
             .auth
             .issuing_key
@@ -345,8 +352,7 @@ mod pg_tests {
             .issue_access_token(
                 wyrd_auth_issue::AccessGrant {
                     principal,
-                    roles: vec![],
-                    permissions: wyrd_runtime::PermissionSet::new(),
+                    permission_ceiling: None,
                     card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
                     workload_uid: None,
                     credential_id: None,
@@ -360,7 +366,8 @@ mod pg_tests {
 
     /// Mint an access token whose outer `act` names the Service `initiator`,
     /// running under its own root, as the sole actor working for `subject`;
-    /// the delegated Card access is the empty exact intersection.
+    /// the delegated Card access is the empty exact intersection. Both
+    /// accounts are live.
     ///
     /// # Panics
     /// Panics when `state` has no issuing key or the token fails to mint.
@@ -370,6 +377,7 @@ mod pg_tests {
         initiator: PrincipalId,
         subject: PrincipalId,
     ) -> String {
+        crate::test_support::admit_accounts(state, tenant, &[subject], &[initiator]);
         let actor = wyrd_auth_verify::ActClaim {
             sub: initiator.to_string(),
             principal: TokenPrincipalRef {
@@ -394,8 +402,7 @@ mod pg_tests {
                         kind: PrincipalKindTag::User,
                         tenant_id: tenant,
                     },
-                    roles: vec![],
-                    permissions: wyrd_runtime::PermissionSet::new(),
+                    permission_ceiling: None,
                     card_access: wyrd_spec::auth::CardAccess::Scoped { cards: Vec::new() },
                     workload_uid: None,
                     credential_id: None,

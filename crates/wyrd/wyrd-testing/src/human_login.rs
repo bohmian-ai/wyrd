@@ -231,6 +231,161 @@ impl HumanSso {
             .expect("sign-in URL parses")
     }
 
+    /// Complete one CLI device login for `tenant` as the local User
+    /// `username`, with no identity provider: authorize a device code, sign
+    /// in with the local password, approve the user code on the verification
+    /// page with that fresh browser session, and redeem the device code.
+    ///
+    /// # Panics
+    /// Panics when any step fails or the device code is never redeemed.
+    pub async fn local_cli_login(
+        &self,
+        tenant: &str,
+        username: &str,
+        password: &str,
+    ) -> TokenResponse {
+        let tenant: TenantSlug = tenant.parse().expect("tenant route key parses");
+        let device = self
+            .exchange
+            .device_authorization(&tenant)
+            .await
+            .expect("the device login begins");
+        let (browser, cookie) = self.password_session(&tenant, username, password).await;
+        let approved = browser
+            .post(format!("{}/auth/device", self.server))
+            .header(reqwest::header::ORIGIN, HUMAN_PUBLIC_ORIGIN)
+            .header(reqwest::header::COOKIE, cookie)
+            .form(&[
+                ("tenant", tenant.as_str()),
+                ("user_code", device.user_code().secret()),
+                ("decision", "approve"),
+            ])
+            .send()
+            .await
+            .expect("verification page answers");
+        let status = approved.status();
+        let page = approved.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "local approval answered {status}: {page}"
+        );
+        self.exchange
+            .device_access_token(&device)
+            .await
+            .expect("the device code redeems")
+    }
+
+    /// Sign the local User `username` in to `tenant` with `password` through
+    /// the browser password route; returns the browser and its session
+    /// cookie pair.
+    ///
+    /// # Panics
+    /// Panics when the client cannot be built or the login is refused.
+    async fn password_session(
+        &self,
+        tenant: &TenantSlug,
+        username: &str,
+        password: &str,
+    ) -> (reqwest::Client, String) {
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(forwarded_host())
+            .build()
+            .expect("client builds");
+        let login = browser
+            .post(format!("{}/auth/browser/password/login", self.server))
+            .header(reqwest::header::ORIGIN, HUMAN_PUBLIC_ORIGIN)
+            .json(&serde_json::json!({
+                "tenant": tenant.as_str(),
+                "username": username,
+                "password": password,
+            }))
+            .send()
+            .await
+            .expect("password login answers");
+        assert!(
+            login.status().is_success(),
+            "password login answered {}",
+            login.status()
+        );
+        let cookie = login
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .filter(|pair| pair.starts_with("wyrd_session_"))
+            })
+            .expect("password login sets a session cookie")
+            .to_owned();
+        (browser, cookie)
+    }
+
+    /// Change the local User `username`'s password in `tenant` from
+    /// `current` to `new` through the browser password routes, as the
+    /// account page does.
+    ///
+    /// # Panics
+    /// Panics when the sign-in or the change is refused.
+    pub async fn change_local_password(
+        &self,
+        tenant: &str,
+        username: &str,
+        current: &str,
+        new: &str,
+    ) {
+        let tenant: TenantSlug = tenant.parse().expect("tenant route key parses");
+        let (browser, cookie) = self.password_session(&tenant, username, current).await;
+        let changed = browser
+            .post(format!("{}/auth/browser/password/change", self.server))
+            .header(reqwest::header::ORIGIN, HUMAN_PUBLIC_ORIGIN)
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&serde_json::json!({
+                "tenant": tenant.as_str(),
+                "current_password": current,
+                "new_password": new,
+            }))
+            .send()
+            .await
+            .expect("password change answers");
+        let status = changed.status();
+        assert!(
+            status.is_success(),
+            "password change answered {status}: {}",
+            changed.text().await.unwrap_or_default()
+        );
+    }
+
+    /// Log the local User `username` in to `tenant` through the CLI device
+    /// login, with no identity provider, and save the credential under
+    /// `config_home`, exactly as `wyrd auth login` does.
+    ///
+    /// # Panics
+    /// Panics when the login or the save fails.
+    pub async fn save_local_login(
+        &self,
+        config_home: &Path,
+        tenant: &str,
+        username: &str,
+        password: &str,
+    ) -> SavedLogin {
+        let token = self.local_cli_login(tenant, username, password).await;
+        let record = SavedLogin::from_token(
+            self.origin(),
+            tenant.parse().expect("tenant route key parses"),
+            token,
+        )
+        .expect("the login carries a refresh token");
+        saved_logins(config_home)
+            .save(record.clone())
+            .expect("the login saves");
+        record
+    }
+
     /// Log `username` in to `tenant` through the CLI device login and save
     /// the credential under `config_home`, exactly as `wyrd auth login` does.
     ///

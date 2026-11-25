@@ -13,6 +13,7 @@ use wyrd_spec::vala::{AuditDetail, RevocationReason};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
+use crate::scribe_outbox::stage_cancelled;
 use crate::state::AppState;
 use wyrd_auth::revoke::revoke_principal_in_conn;
 use wyrd_sql::TenantConn;
@@ -20,8 +21,8 @@ use wyrd_sql::TenantConn;
 /// Revoke one principal under the caller's tenant.
 ///
 /// Revocation suspends the principal, so every tenant issuance path refuses its
-/// next token; a token it already holds lapses at its five-minute expiry. Its
-/// unfinished Verifier executions are cancelled in the same commit.
+/// next token; a token it already holds is refused once the change
+/// propagates, within five seconds. Its unfinished Verifier executions are cancelled in the same commit.
 ///
 /// Revocation is an administrative authorization boundary: the
 /// `service_accounts:write` verdict is audited for both outcomes. Either
@@ -112,10 +113,18 @@ pub async fn revoke_principal(
     if let Err(error) = &outcome
         && !matches!(error, WyrdError::PrincipalNotFound { .. })
     {
-        return outcome.map_err(WyrdErrorResponse::from);
+        return outcome.map(drop).map_err(WyrdErrorResponse::from);
     }
+    let occurred_at = chrono::Utc::now();
     conn.commit().await.map_err(internal_error)?;
-    outcome.map_err(WyrdErrorResponse::from)
+    let cancelled = outcome.map_err(WyrdErrorResponse::from)?;
+    stage_cancelled(
+        state.bifrost.scribe_outbox(),
+        tenant,
+        cancelled,
+        occurred_at,
+    );
+    Ok(())
 }
 
 async fn acquire_conn(

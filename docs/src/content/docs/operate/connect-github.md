@@ -86,4 +86,4 @@ To release the installation, run `wyrd github disconnect`. Wyrd stops starting G
 
 ## Next
 
-- [Grant and inspect permissions](/operate/grant-and-inspect-permissions/): connecting needs `identity_connections:write`, which `admin` holds.
+- [Grant and inspect permissions](/operate/grant-and-inspect-permissions/): reading the connection needs `github_connections:read` and connecting or disconnecting `github_connections:write`; `admin` holds both. Neither grants OIDC administration or any Card.

@@ -1,8 +1,8 @@
 //! `PyO3` boundary for the shared tenant GitHub connection handle.
 //!
 //! Each method calls [`wyrd_client::GithubConnection`] with the GIL released
-//! and returns the server's redacted view or connect receipt as plain Python
-//! values. Association, authorization, and audit stay on the server; nothing
+//! and returns the server's redacted view, connect receipt or accepted review
+//! as plain Python values. Association, authorization, and audit stay on the server; nothing
 //! here holds a GitHub token, code, or key.
 
 use pyo3::prelude::*;
@@ -12,7 +12,8 @@ use wyrd_utils::py::WyrdPyResult;
 
 use crate::operators::to_python;
 
-/// Python-facing GitHub connection handle: begin, get, disconnect.
+/// Python-facing GitHub connection handle: begin, get, disconnect, and
+/// review a pull request.
 ///
 /// Every call blocks the calling thread with the GIL released and returns the
 /// server's redacted connection view or connect receipt; no call ever returns
@@ -109,6 +110,49 @@ impl GithubConnection {
     fn disconnect(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let view = crate::trace::block_on(py, self.handle(py)?.disconnect())?;
         to_python(py, &view)
+    }
+
+    /// Request a fresh review of one connected pull request by its selected
+    /// Repository's whole `pull_request` binding set under `idempotency_key`,
+    /// and return the accepted generation and member execution IDs.
+    ///
+    /// # Arguments
+    /// * `host` - The connection's GitHub host.
+    /// * `repository_id` - GitHub's numeric id of the base repository.
+    /// * `number` - The pull request number.
+    /// * `idempotency_key` - Names the request; a retry with the same key
+    ///   returns the same generation.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` for an invalid repository id, and with the server's
+    /// stable error when the request is refused or fails.
+    #[pyo3(signature = (*, host, repository_id, number, idempotency_key))]
+    fn review_pull_request(
+        &self,
+        py: Python<'_>,
+        host: String,
+        repository_id: String,
+        number: u64,
+        idempotency_key: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let repository_id =
+            wyrd_client::github::RepositoryId::new(repository_id).map_err(|error| {
+                wyrd_client::github::WyrdError::Validation {
+                    message: format!("repository_id is invalid: {error}"),
+                    details: serde_json::json!({ "field": "repository_id" }),
+                }
+            })?;
+        let request = wyrd_client::github::GithubPullRequestReviewRequest {
+            host,
+            repository_id,
+            number,
+        };
+        let accepted = crate::trace::block_on(
+            py,
+            self.handle(py)?
+                .review_pull_request(&request, idempotency_key),
+        )?;
+        to_python(py, &accepted)
     }
 }
 

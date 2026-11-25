@@ -22,7 +22,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     return refuse(inputProblem('Panel', { path: ['range', ...issue.path], message: issue.message }));
   }
   const loaded = await loadPanel(body.component, body.input, {
-    executor: nodeExecutor(session.client()),
+    executor: nodeExecutor(session.client(), (path) => session.api('GET', path)),
     range: range.data,
     signal: request.signal
   });

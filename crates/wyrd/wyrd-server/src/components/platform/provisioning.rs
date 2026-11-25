@@ -13,25 +13,34 @@
 //! tenant that is visibly incomplete rather than one that looks live and has no
 //! way in.
 
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
+use wyrd_auth::passwords::{canonical_username, hash_password, is_email_address, new_password};
 use wyrd_auth::platform_authz::{
     PLATFORM_TENANTS_RESOURCE, PlatformAuthorization, PlatformAuthzError, tenant_resource,
     tenant_slug_resource,
 };
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_auth::social::SignupCredential;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    Attribution, CreateTenantRequest, CreateTenantResponse, ProvisionedTenant,
-    ProvisionedTenantAdmin, SecretBearer, TenantListResponse,
+    Attribution, CreateTenantRequest, CreateTenantResponse, ProvisionedHumanAdmin,
+    ProvisionedTenant, ProvisionedTenantAdmin, SecretBearer, TenantHumanAdmin, TenantListResponse,
+};
+use wyrd_spec::error::WyrdError;
+use wyrd_sql::queries::auth::{
+    SubjectColumns, advance_authorization_revision, insert_api_key, insert_role_binding,
+    insert_service_account, list_api_key_metadata, provision_system_principal, revoke_api_key,
+    role_by_name, tenant_admin_principal_id,
 };
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, insert_api_key, insert_service_account, list_api_key_metadata,
-    provision_system_principal, revoke_api_key, role_by_name, tenant_admin_principal_id,
+    first_local_user, insert_local_user, insert_user, insert_user_identity,
+    insert_verified_contact, linked_identity, set_password_hash,
 };
 use wyrd_sql::queries::platform::provisioning::{
-    insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed, set_tenant_suspended,
+    claim_signup_tenant, insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
+    set_tenant_suspended,
 };
 use wyrd_sql::queries::platform::tenants::{list_tenants, tenant_by_id};
 use wyrd_sql::row_types::platform::TenantRow;
@@ -58,6 +67,30 @@ const TENANT_ADMIN_ROLE: &str = "admin";
 /// Lifetime of the initial tenant-administrator credential.
 const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration = std::time::Duration::from_hours(8760);
 
+/// Slugs a self-service signup may not claim, so no workspace can pose as
+/// the service operator or its support, sign-in or mail surfaces. Operators
+/// creating tenants through the platform API are not restricted.
+const RESERVED_SIGNUP_SLUGS: &[&str] = &[
+    "admin",
+    "administrator",
+    "api",
+    "app",
+    "auth",
+    "billing",
+    "help",
+    "login",
+    "mail",
+    "platform",
+    "root",
+    "security",
+    "signup",
+    "status",
+    "support",
+    "system",
+    "www",
+    "wyrd",
+];
+
 /// Tenant provisioning failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
@@ -73,6 +106,10 @@ pub enum ProvisionError {
     /// discover which tenants exist.
     #[error("no active tenant to act on")]
     TenantUnavailable,
+    /// The signup's creator already owns the owned-workspace cap of
+    /// unretired signup-created tenants.
+    #[error("the owned-workspace cap is reached")]
+    WorkspaceLimit,
     /// A store write failed; the tenant is left visibly incomplete.
     #[error("tenant provisioning failed: {0}")]
     Store(String),
@@ -91,6 +128,120 @@ impl From<PlatformAuthzError> for ProvisionError {
             PlatformAuthzError::Transaction(error) => Self::Store(error.to_string()),
         }
     }
+}
+
+/// The proven person a public signup makes its new tenant's administrator.
+#[derive(Debug, Clone, Copy)]
+pub struct HumanOwner<'a> {
+    /// The signup attempt the tenant claim names.
+    pub attempt: Uuid,
+    /// How the administrator signs in: a linked provider identity or a
+    /// tenant-local password.
+    pub credential: &'a SignupCredential,
+    /// The identity's keyed creator pseudonym, kept on the tenant.
+    pub creator_key: &'a [u8; 32],
+}
+
+/// A validated named local human administrator the operator flow creates
+/// beside its administrative service account.
+///
+/// Built by [`LocalAdmin::admit`] before the tenant is claimed, so a refused
+/// username, password or email claims nothing.
+pub struct LocalAdmin {
+    /// The canonical username.
+    username: String,
+    /// The password's PHC verifier.
+    verifier: String,
+    /// The optional unverified profile email.
+    email: Option<String>,
+    /// Where the administrator signs in.
+    login_url: String,
+}
+
+impl Debug for LocalAdmin {
+    /// Prints the username only; the verifier and email stay out of logs.
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("LocalAdmin")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalAdmin {
+    /// Check `request` against the username, password and email rules
+    /// without deriving a verifier; setup runs this before it claims
+    /// anything.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] naming the refused field.
+    pub fn check(request: &TenantHumanAdmin) -> Result<(), WyrdError> {
+        Self::parts(request).map(|_| ())
+    }
+
+    /// Validate `request` and derive its password verifier, for an
+    /// administrator who signs in at `login_url`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] naming the refused field, and
+    /// [`WyrdError::Internal`] when derivation fails.
+    pub async fn admit(request: &TenantHumanAdmin, login_url: String) -> Result<Self, WyrdError> {
+        let (username, password, email) = Self::parts(request)?;
+        Ok(Self {
+            username,
+            verifier: hash_password(password).await?,
+            email,
+            login_url,
+        })
+    }
+
+    /// The canonical username, the policy-admitted password and the trimmed
+    /// email of `request`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] naming the refused field.
+    fn parts(
+        request: &TenantHumanAdmin,
+    ) -> Result<(String, SecretString, Option<String>), WyrdError> {
+        let username = canonical_username(&request.username)?;
+        let password = new_password(
+            &SecretString::from(request.password.expose().to_owned()),
+            "human_admin.password",
+        )?;
+        let email = match request.email.as_deref().map(str::trim) {
+            None => None,
+            Some(email) if is_email_address(email) => Some(email.to_owned()),
+            Some(_) => {
+                return Err(WyrdError::Validation {
+                    message: "human_admin.email is not an email address".to_owned(),
+                    details: serde_json::json!({ "field": "human_admin.email" }),
+                });
+            }
+        };
+        Ok((username, password, email))
+    }
+}
+
+/// The tenant administrator a provisioning run establishes.
+enum TenantOwner<'a> {
+    /// The operator flow's administrative service account and its one-time
+    /// key, and the named local human administrator when one was asked for.
+    Bootstrap(Option<&'a LocalAdmin>),
+    /// A signup's proven person, as a tenant User.
+    Human(HumanOwner<'a>),
+}
+
+/// What [`TenantOwner`] provisioning established.
+enum Established {
+    /// The administrative service account and its credential, and the named
+    /// human administrator when one was asked for.
+    Bootstrap(ProvisionedTenantAdmin, Option<ProvisionedHumanAdmin>),
+    /// The administrator User and the linked identity it signs in through.
+    Human {
+        /// The administrator User.
+        user_id: Uuid,
+        /// Its linked provider identity; `None` for a local password User.
+        identity_id: Option<Uuid>,
+    },
 }
 
 /// Provisions tenants on behalf of an authorized platform caller.
@@ -192,7 +343,8 @@ impl TenantProvisioning {
         Ok(data_tenant_id)
     }
 
-    /// Make a claimed tenant usable and return its one-time admin credential.
+    /// Make a claimed tenant usable and return its one-time admin credential,
+    /// creating `human_admin` as a local administrator User when given.
     ///
     /// The second phase, run against the tenant connection the caller acquired
     /// for the id [`Self::claim`] returned. The tenant-scoped work commits on
@@ -210,7 +362,7 @@ impl TenantProvisioning {
     /// against the directory row names both causes.
     #[tracing::instrument(
         level = "info",
-        skip(self, caller, conn),
+        skip(self, caller, human_admin, conn),
         fields(tenant = %data_tenant_id, slug = %request.slug),
         err
     )]
@@ -219,47 +371,164 @@ impl TenantProvisioning {
         caller: &PlatformCaller,
         data_tenant_id: DataTenantId,
         request: CreateTenantRequest,
+        human_admin: Option<LocalAdmin>,
         conn: Result<TenantConn<'_>, SqlError>,
     ) -> Result<CreateTenantResponse, ProvisionError> {
-        let established = match conn.map_err(|e| ProvisionError::Store(e.to_string())) {
-            Ok(conn) => {
-                self.establish_and_promote(
-                    conn,
-                    data_tenant_id,
-                    Attribution::direct(caller.principal_id()),
-                )
+        let conn = match conn {
+            Ok(conn) => conn,
+            Err(error) => {
+                return Err(self
+                    .retire(data_tenant_id, ProvisionError::Store(error.to_string()))
+                    .await);
+            }
+        };
+        let established = self
+            .complete(
+                data_tenant_id,
+                conn,
+                TenantOwner::Bootstrap(human_admin.as_ref()),
+                Attribution::direct(caller.principal_id()),
+            )
+            .await?;
+        let Established::Bootstrap(admin, human_admin) = established else {
+            return Err(ProvisionError::Store(
+                "bootstrap provisioning established no credential".to_owned(),
+            ));
+        };
+        Ok(CreateTenantResponse {
+            tenant: ProvisionedTenant {
+                id: data_tenant_id,
+                slug: request.slug,
+                display_name: request.display_name,
+                status: "active".to_owned(),
+            },
+            admin,
+            human_admin,
+        })
+    }
+
+    /// Claim `request`'s slug for the public signup `owner.attempt`, or
+    /// resume that attempt's own interrupted claim of it.
+    ///
+    /// No platform permission is evaluated: a proven, admitted signup
+    /// confers exactly the authority to create this one tenant.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::SlugTaken`] when the slug belongs to
+    /// another tenant or claim or is reserved, [`ProvisionError::WorkspaceLimit`] when the
+    /// creator is at the owned-workspace cap, and [`ProvisionError::Store`]
+    /// when the write fails.
+    #[tracing::instrument(level = "info", skip(self, owner), fields(slug = %request.slug), err)]
+    pub async fn claim_for_signup(
+        &self,
+        owner: &HumanOwner<'_>,
+        request: &CreateTenantRequest,
+    ) -> Result<DataTenantId, ProvisionError> {
+        // A reserved slug answers exactly as a taken one, so a refusal says
+        // only that the name is unavailable.
+        if RESERVED_SIGNUP_SLUGS.contains(&request.slug.as_str()) {
+            return Err(ProvisionError::SlugTaken);
+        }
+        let proposed = DataTenantId::new_v7();
+        claim_signup_tenant(
+            &self.operator,
+            proposed,
+            request.slug.as_str(),
+            &request.display_name,
+            owner.attempt,
+            owner.creator_key,
+        )
+        .await
+        .map_err(slug_or_store)?
+        .map(|claim| claim.tenant_id(proposed))
+        .ok_or(ProvisionError::WorkspaceLimit)
+    }
+
+    /// Make a signup-claimed tenant usable with `owner` as its administrator
+    /// User, and return that User and its linked identity, if any.
+    ///
+    /// The same initialization, promotion and failure handling as
+    /// [`Self::provision`], except that the administrator is the proven
+    /// person bound to the tenant `admin` role, and no service account or
+    /// key is created. A resumed attempt keeps the User a failed one
+    /// committed; a local one takes the resumed completion's password.
+    ///
+    /// # Errors
+    /// As [`Self::provision`].
+    #[tracing::instrument(level = "info", skip(self, owner, conn), fields(tenant = %data_tenant_id), err)]
+    pub async fn provision_for_signup(
+        &self,
+        data_tenant_id: DataTenantId,
+        owner: HumanOwner<'_>,
+        conn: Result<TenantConn<'_>, SqlError>,
+    ) -> Result<(Uuid, Option<Uuid>), ProvisionError> {
+        let resumed = match conn {
+            Ok(mut conn) => existing_owner(&mut conn, owner.credential)
                 .await
-            }
-            Err(error) => Err(error),
+                .map(|linked| (conn, linked))
+                .map_err(|e| ProvisionError::Store(e.to_string())),
+            Err(error) => Err(ProvisionError::Store(error.to_string())),
         };
-
-        let error = match established {
-            Ok(admin) => {
-                return Ok(CreateTenantResponse {
-                    tenant: ProvisionedTenant {
-                        id: data_tenant_id,
-                        slug: request.slug,
-                        display_name: request.display_name,
-                        status: "active".to_owned(),
-                    },
-                    admin,
-                });
-            }
-            Err(error) => error,
+        let (conn, linked) = match resumed {
+            Ok(resumed) => resumed,
+            Err(error) => return Err(self.retire(data_tenant_id, error).await),
         };
+        // The creator is the attributed author of everything initialized
+        // for it, on a resumed attempt as on the first.
+        let user_id = linked.map_or_else(Uuid::now_v7, |(user_id, _)| user_id);
+        let attribution = Attribution::direct(wyrd_spec::auth::PrincipalId::new(user_id));
+        match self
+            .complete(data_tenant_id, conn, TenantOwner::Human(owner), attribution)
+            .await?
+        {
+            Established::Human {
+                user_id,
+                identity_id,
+            } => Ok((user_id, identity_id)),
+            Established::Bootstrap(..) => Err(ProvisionError::Store(
+                "signup provisioning established no User".to_owned(),
+            )),
+        }
+    }
 
+    /// Establish `owner` and promote the tenant, or mark it failed.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Store`] when any stage fails, after
+    /// [`Self::retire`].
+    async fn complete(
+        &self,
+        data_tenant_id: DataTenantId,
+        conn: TenantConn<'_>,
+        owner: TenantOwner<'_>,
+        attribution: Attribution,
+    ) -> Result<Established, ProvisionError> {
+        match self
+            .establish_and_promote(conn, data_tenant_id, owner, attribution)
+            .await
+        {
+            Ok(established) => Ok(established),
+            Err(error) => Err(self.retire(data_tenant_id, error).await),
+        }
+    }
+
+    /// Mark a claimed tenant failed because of `error`, and return the error
+    /// to report.
+    ///
+    /// Any failure — including a failure to acquire the connection at all —
+    /// marks the tenant failed rather than leaving it to look live; the row
+    /// is already committed, and only this owner knows how to retire it.
+    async fn retire(&self, data_tenant_id: DataTenantId, error: ProvisionError) -> ProvisionError {
         // Marking the tenant failed is what makes the slug retryable, so
         // failing to record it is surfaced rather than swallowed: the caller
         // otherwise retries against a row that will not be adopted until it
         // goes stale.
-        if let Err(mark) =
-            mark_tenant_failed(&self.operator, data_tenant_id, &error.to_string()).await
-        {
-            return Err(ProvisionError::Store(format!(
+        match mark_tenant_failed(&self.operator, data_tenant_id, &error.to_string()).await {
+            Ok(()) => error,
+            Err(mark) => ProvisionError::Store(format!(
                 "{error}; the tenant could not be marked failed: {mark}"
-            )));
+            )),
         }
-        Err(error)
     }
 
     /// Establish the tenant's administration and built-in tables, then
@@ -279,10 +548,11 @@ impl TenantProvisioning {
         &self,
         conn: TenantConn<'_>,
         data_tenant_id: DataTenantId,
+        owner: TenantOwner<'_>,
         attribution: Attribution,
-    ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
+    ) -> Result<Established, ProvisionError> {
         let admin = self
-            .establish_tenant_administration(conn, data_tenant_id, attribution)
+            .establish_tenant_administration(conn, data_tenant_id, owner, attribution)
             .await?;
         self.builtins
             .ensure_tenant(data_tenant_id, attribution)
@@ -362,7 +632,8 @@ impl TenantProvisioning {
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
     /// `tenants:suspend`, [`ProvisionError::TenantUnavailable`] when the tenant
-    /// is not in the state the transition requires, and
+    /// is not in the state the transition requires or is the platform system
+    /// tenant, and
     /// [`ProvisionError::Store`] when the write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn set_suspended(
@@ -389,9 +660,12 @@ impl TenantProvisioning {
         // nothing, but the permission was still evaluated, so the decision
         // commits alone before the stable refusal. A failed write commits
         // neither.
-        let applied = set_tenant_suspended(&mut decision, tenant_id, suspended)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        // The platform's own system tenant owns platform-plane audit and is
+        // never suspended; it is refused like any tenant not open to action.
+        let applied = tenant_id != DataTenantId::SYSTEM_OWNER
+            && set_tenant_suspended(&mut decision, tenant_id, suspended)
+                .await
+                .map_err(|e| ProvisionError::Store(e.to_string()))?;
         decision
             .commit()
             .await
@@ -436,11 +710,11 @@ impl TenantProvisioning {
     /// Create the tenant's administrative principal, roles, and credential,
     /// and its internal verification-result writer.
     ///
-    /// One tenant-scoped transaction: the principal, its builtin roles, its
-    /// administrative grant, its credential, and the credentialless SYSTEM
-    /// writer all commit together, so the tenant either has a complete way in
-    /// or none at all. SYSTEM provisioning is idempotent, so a resumed attempt
-    /// keeps the writer a failed one already created.
+    /// One tenant-scoped transaction: the builtin roles, the credentialless
+    /// SYSTEM writer and `owner` with its administrative grant all commit
+    /// together, so the tenant either has a complete way in or none at all.
+    /// SYSTEM provisioning is idempotent, so a resumed attempt keeps the
+    /// writer a failed one already created.
     ///
     /// # Errors
     /// Returns [`ProvisionError::Store`] when any write fails.
@@ -448,15 +722,138 @@ impl TenantProvisioning {
         &self,
         mut conn: TenantConn<'_>,
         data_tenant_id: DataTenantId,
+        owner: TenantOwner<'_>,
         attribution: Attribution,
-    ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
+    ) -> Result<Established, ProvisionError> {
         seed_builtin_roles_for_tenant(&mut conn, data_tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
         provision_system_principal(&mut conn, attribution)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        let owner = match owner {
+            TenantOwner::Bootstrap(human) => {
+                return self
+                    .establish_bootstrap_admin(conn, data_tenant_id, human, attribution)
+                    .await
+                    .map(|(admin, human)| Established::Bootstrap(admin, human));
+            }
+            TenantOwner::Human(owner) => owner,
+        };
+        // A resumed attempt finds the User a failed one committed together
+        // with its sign-in and grant, and keeps it.
+        let existing = existing_owner(&mut conn, owner.credential)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        let store = |e: sqlx::Error| ProvisionError::Store(e.to_string());
+        if let Some((user_id, identity_id)) = existing {
+            if let SignupCredential::Local { verifier, .. } = owner.credential {
+                set_password_hash(&mut conn, user_id, verifier, false)
+                    .await
+                    .map_err(store)?;
+            }
+            conn.commit()
+                .await
+                .map_err(|e| ProvisionError::Store(e.to_string()))?;
+            return Ok(Established::Human {
+                user_id,
+                identity_id,
+            });
+        }
+        let user_id = attribution.sub_principal_id.as_uuid();
+        let identity_id = match owner.credential {
+            SignupCredential::Social {
+                issuer,
+                subject,
+                email,
+                ..
+            } => {
+                insert_user(&mut conn, user_id, Some(email), "oidc", None)
+                    .await
+                    .map_err(store)?;
+                Some(
+                    insert_user_identity(&mut conn, issuer, subject, user_id)
+                        .await
+                        .map_err(store)?,
+                )
+            }
+            SignupCredential::Local {
+                username, verifier, ..
+            } => {
+                insert_local_user(&mut conn, user_id, username, verifier, None)
+                    .await
+                    .map_err(store)?;
+                None
+            }
+        };
+        insert_verified_contact(&mut conn, user_id, owner.credential.contact())
+            .await
+            .map_err(store)?;
+        self.grant_admin(
+            &mut conn,
+            SubjectColumns {
+                user_id: Some(user_id),
+                ..SubjectColumns::default()
+            },
+        )
+        .await?;
+        conn.commit()
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        Ok(Established::Human {
+            user_id,
+            identity_id,
+        })
+    }
 
+    /// Bind the tenant `admin` role to `subject` at tenant scope and advance
+    /// the authorization revision.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Store`] when the role is missing or a write
+    /// fails.
+    async fn grant_admin(
+        &self,
+        conn: &mut TenantConn<'_>,
+        subject: SubjectColumns,
+    ) -> Result<(), ProvisionError> {
+        let role = role_by_name(conn, TENANT_ADMIN_ROLE)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?
+            .ok_or_else(|| ProvisionError::Store("tenant admin role was not seeded".to_owned()))?;
+        insert_role_binding(
+            conn,
+            Uuid::now_v7(),
+            role.id,
+            subject,
+            &wyrd_spec::auth::PermissionScope::All,
+            wyrd_spec::auth::RoleSource::Direct,
+        )
+        .await
+        .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        advance_authorization_revision(conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| ProvisionError::Store(e.to_string()))
+    }
+
+    /// The operator flow's administrator: the administrative service
+    /// account, its grant and its one-time credential, and `human` as an
+    /// administrator User, all in one tenant transaction.
+    ///
+    /// A resumed attempt keeps the local User a failed one committed, with
+    /// its original password: the tenant's first local User is its human
+    /// administrator until activation.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Store`] when any write fails.
+    async fn establish_bootstrap_admin(
+        &self,
+        mut conn: TenantConn<'_>,
+        data_tenant_id: DataTenantId,
+        human: Option<&LocalAdmin>,
+        attribution: Attribution,
+    ) -> Result<(ProvisionedTenantAdmin, Option<ProvisionedHumanAdmin>), ProvisionError> {
         // A resumed attempt may find the administrative principal already
         // created by the failed one. Reusing it is what keeps the tenant's
         // identity stable across the retry; creating a second would leave the
@@ -495,13 +892,14 @@ impl TenantProvisioning {
             principal_id
         };
 
-        let role = role_by_name(&mut conn, TENANT_ADMIN_ROLE)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?
-            .ok_or_else(|| ProvisionError::Store("tenant admin role was not seeded".to_owned()))?;
-        grant_role_to_service_account(&mut conn, principal_id, role.id)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        self.grant_admin(
+            &mut conn,
+            SubjectColumns {
+                service_account_id: Some(principal_id),
+                ..SubjectColumns::default()
+            },
+        )
+        .await?;
 
         let plaintext = wyrd_auth::issue_api_key::WyrdApiKey::generate(data_tenant_id);
         let key_hash = wyrd_auth_issue::hash_secret(plaintext.secret.expose_secret());
@@ -517,13 +915,64 @@ impl TenantProvisioning {
         .await
         .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
+        let human = match human {
+            Some(human) => Some(self.establish_local_admin(&mut conn, human).await?),
+            None => None,
+        };
+
         conn.commit()
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
-        Ok(ProvisionedTenantAdmin {
-            principal_id: wyrd_spec::auth::PrincipalId::new(principal_id),
-            credential: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
+        Ok((
+            ProvisionedTenantAdmin {
+                principal_id: wyrd_spec::auth::PrincipalId::new(principal_id),
+                credential: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
+            },
+            human,
+        ))
+    }
+
+    /// Create `human` as an administrator User on `conn`, or keep the local
+    /// User an interrupted attempt already committed without resetting its
+    /// password. The caller commits.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Store`] when a read or write fails.
+    async fn establish_local_admin(
+        &self,
+        conn: &mut TenantConn<'_>,
+        human: &LocalAdmin,
+    ) -> Result<ProvisionedHumanAdmin, ProvisionError> {
+        let store = |e: sqlx::Error| ProvisionError::Store(e.to_string());
+        let (user_id, username) =
+            if let Some(existing) = first_local_user(conn).await.map_err(store)? {
+                (existing.id, existing.username)
+            } else {
+                let user_id = Uuid::now_v7();
+                insert_local_user(
+                    conn,
+                    user_id,
+                    &human.username,
+                    &human.verifier,
+                    human.email.as_deref(),
+                )
+                .await
+                .map_err(store)?;
+                self.grant_admin(
+                    conn,
+                    SubjectColumns {
+                        user_id: Some(user_id),
+                        ..SubjectColumns::default()
+                    },
+                )
+                .await?;
+                (user_id, human.username.clone())
+            };
+        Ok(ProvisionedHumanAdmin {
+            principal_id: wyrd_spec::auth::PrincipalId::new(user_id),
+            username,
+            login_url: human.login_url.clone(),
         })
     }
 }
@@ -561,5 +1010,29 @@ fn summarize(row: TenantRow) -> Result<ProvisionedTenant, ProvisionError> {
             .map_err(|e: wyrd_spec::ids::IdError| ProvisionError::Store(e.to_string()))?,
         display_name: row.display_name,
         status: row.status,
+    })
+}
+
+/// The User, and its linked identity if any, that an earlier interrupted run
+/// of this signup already created for `credential`; `None` on a first run.
+///
+/// A local owner is the tenant's one local User, so a retry under another
+/// username keeps the original administrator rather than adding a second.
+///
+/// # Errors
+/// Returns a SQLx error when the read fails.
+async fn existing_owner(
+    conn: &mut TenantConn<'_>,
+    credential: &SignupCredential,
+) -> Result<Option<(Uuid, Option<Uuid>)>, sqlx::Error> {
+    Ok(match credential {
+        SignupCredential::Social {
+            issuer, subject, ..
+        } => linked_identity(conn, issuer, subject)
+            .await?
+            .map(|linked| (linked.user_id, Some(linked.id))),
+        SignupCredential::Local { .. } => {
+            first_local_user(conn).await?.map(|local| (local.id, None))
+        }
     })
 }

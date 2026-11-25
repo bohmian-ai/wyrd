@@ -23,7 +23,7 @@ Ship a Service with two keys: one for CI, which declares the Service and pulls i
 Once per tenant, as an administrator:
 
 ```bash
-wyrd principal credential create-principal --name ci-deploy --role editor
+wyrd principal credential create-principal --name ci-deploy --grant editor:all
 ```
 
 ```text
@@ -32,14 +32,14 @@ credential: <key>
 This is the only time the credential is shown. Store it now.
 ```
 
-Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
+Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor:all` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
 
 ## 2. Create the Service's account
 
 Once per Service, not once per release:
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 Store this credential where your deployment reads secrets. `workload` records evidence and runs Verifiers, but cannot change a Card, so a leaked runtime key cannot change what your Service is verified against. `--workload-name checkout` limits the key to releases of `checkout`, and makes it the account that scheduled Verifiers for `checkout` run as.

@@ -4,9 +4,10 @@
 //! without a queue row, and a direct execution, which has no state, from its
 //! published `direct` input record and result. The Verifier is the queue
 //! row's while one exists, else the one the state or the direct result
-//! recorded, and `verifier:read` is authorized on exactly that Verifier
-//! before anything is returned, so a grant scoped to one Verifier inspects
-//! only its executions. Invocation and publication history is queued-only: a
+//! recorded. A read authorizes `executions:read` on the execution's trusted
+//! parent before anything is returned, so a grant scoped to one Card family
+//! inspects only its executions, and deleting a Card never hides the
+//! history retained under it. Invocation and publication history is queued-only: a
 //! direct execution has none and those reads answer not found. Cancellation
 //! needs the queue row and authorizes `verifier:run` on its Verifier. An
 //! absent or other-tenant execution is the same not-found.
@@ -25,7 +26,9 @@ use wyrd_runtime::Permission;
 use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
 
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::ids::{ApprovalId, ExecutionId, VerificationResultId};
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
@@ -42,7 +45,7 @@ use wyrd_spec::verification::{
     PublicationName, TaskId, VerificationExecutionStatus, VerificationVerdict,
 };
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::cards::get_card_for_reconciliation;
 use wyrd_sql::queries::verifier_executions::ExecutionStatus;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
@@ -51,11 +54,12 @@ use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::github::delivery::GithubDeliveries;
+use crate::scribe_outbox::ScribeWrite;
 use crate::state::registry_db_error;
 use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
-use crate::verification::inputs::{DirectResult, InputOrigin, InputResolver};
+use crate::verification::inputs::{DirectResult, InputResolver};
 use crate::verification::state::{RunState, StateError};
 
 /// Audit operation of an invocation page read.
@@ -402,17 +406,18 @@ pub(super) fn execution_not_found(execution_id: ExecutionId) -> WyrdError {
 }
 
 impl<'a> VerificationControl<'a> {
-    /// Refuse, and audit the refusal, when `caller` holds no Verifier grant
-    /// for `action` at any scope, before anything is read.
+    /// Refuse, and audit the refusal, when `caller` holds no `resource`
+    /// grant for `action` at any scope, before anything is read.
     ///
     /// A caller who may never inspect or cancel cannot learn which
     /// execution IDs exist.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without any such grant.
-    pub(super) fn require_verifier(
+    pub(super) fn require_operation(
         &self,
         caller: &Caller,
+        resource_kind: Resource,
         action: Action,
         operation: &str,
         resource: &str,
@@ -420,12 +425,12 @@ impl<'a> VerificationControl<'a> {
         if caller
             .principal
             .effective_permissions
-            .covers_operation(&Resource::Verifier, &action)
+            .covers_operation(&resource_kind, &action)
         {
             return Ok(());
         }
         let any = Permission {
-            resource: Resource::Verifier,
+            resource: resource_kind,
             action,
             scope: PermissionScope::All,
         };
@@ -447,7 +452,13 @@ impl<'a> VerificationControl<'a> {
         operation: &str,
     ) -> Result<(TenantConn<'a>, ExecutionStatus), WyrdError> {
         let resource = format!("verification.execution:{execution_id}");
-        self.require_verifier(caller, action.clone(), operation, &resource)?;
+        self.require_operation(
+            caller,
+            Resource::Verifier,
+            action.clone(),
+            operation,
+            &resource,
+        )?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -458,10 +469,14 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(|| execution_not_found(execution_id))?;
+        let verifier = status
+            .verifier_scope
+            .clone()
+            .ok_or_else(|| execution_not_found(execution_id))?;
         let required = Permission {
             resource: Resource::Verifier,
             action,
-            scope: PermissionScope::Verifier(status.verifier_card_uid.clone()),
+            scope: PermissionScope::Card(verifier),
         };
         audit::authorize(self.state, caller, &required, operation, &resource)?;
         Ok((conn, status))
@@ -469,27 +484,27 @@ impl<'a> VerificationControl<'a> {
 
     /// Read `execution_id`'s queue row, when it still has one, and its
     /// accepted state and revision as the tenant's SYSTEM principal serving
-    /// `caller`, then authorize Verifier `action` for `operation` on the queue
-    /// row's Verifier, or the Verifier the state recorded, before returning
-    /// either. An execution with no accepted revision yet has fresh state at
-    /// revision 0. `query` is the record reader.
+    /// `caller`, then authorize `operation` before returning either. An
+    /// execution with no accepted revision yet has fresh state at revision
+    /// 0. `query` is the record reader.
     ///
-    /// Inspection passes `read`; an approval decision passes `approve`, which
-    /// needs nothing else. A pull-request execution read also needs
-    /// repository read, `cards:read`,
-    /// decided and audited after `verifier:read`. Whether it is one is read
-    /// from the queue row's PR pins, or, once the row is gone, from the
-    /// accepted input record's origin; an input record not yet visible
-    /// decides nothing and the read is unavailable.
+    /// Inspection passes `read`, which needs `executions:read` on the
+    /// execution's trusted parent: the verified Card, which is the
+    /// Repository for pull-request work. An approval decision passes
+    /// `approve`, which needs `verifier:approve` on the exact Verifier and
+    /// then the same parent read. Both scopes come from the registered queue
+    /// row Cards, the accepted identity, or the direct result's exact Cards;
+    /// an unprovable one is not found.
     ///
     /// An execution with neither a queue row nor accepted state is read as
     /// direct work through its published `direct` result and both exact
     /// Cards; until they are visible, or once a Card is gone, it is not found.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without a grant,
-    /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has
-    /// neither a queue row nor an accepted state for the execution, a
+    /// Returns [`WyrdError::PermissionDeniedRbac`] when a decision lacks a
+    /// grant, [`WyrdError::VerificationExecutionNotFound`] when the tenant has
+    /// neither a queue row nor an accepted state for the execution or a
+    /// reader cannot read its trusted parent, a
     /// registry error when a read fails, and
     /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the accepted state
     /// cannot be read now.
@@ -502,7 +517,12 @@ impl<'a> VerificationControl<'a> {
     ) -> Result<Retained, WyrdError> {
         let resource = format!("verification.execution:{execution_id}");
         let reading = action == Action::Read;
-        self.require_verifier(caller, action.clone(), operation, &resource)?;
+        let prefilter = if reading {
+            Resource::Executions
+        } else {
+            Resource::Verifier
+        };
+        self.require_operation(caller, prefilter, action.clone(), operation, &resource)?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -523,55 +543,58 @@ impl<'a> VerificationControl<'a> {
         )
         .await?;
         let mut direct = None;
-        let verifier = match (&queued, &state.identity) {
-            (Some(queued), _) => queued.verifier_card_uid.clone(),
-            (None, Some(identity)) => identity
-                .verifier
+        let exact = |reference: &CardRef| {
+            reference
                 .uid
                 .clone()
-                .ok_or_else(|| execution_not_found(execution_id))?,
+                .map(|uid| CardPermissionScope::exact(reference, uid))
+        };
+        // The trusted scopes come from the queue row's registered Cards, or
+        // the accepted identity, or the published direct result's exact
+        // Cards; never from caller input. An unprovable one hides the
+        // execution.
+        let (verifier, parent) = match (&queued, &state.identity) {
+            (Some(queued), _) => (queued.verifier_scope.clone(), queued.card_scope.clone()),
+            (None, Some(identity)) => (exact(&identity.verifier), exact(&identity.subject)),
             (None, None) => {
                 let found = InputResolver::new(&query, None)
                     .direct(execution_id)
                     .await?
                     .ok_or_else(|| execution_not_found(execution_id))?;
-                let verifier = found.verifier_card_uid.clone();
+                let found = self.direct_identity(caller, execution_id, found).await?;
+                let scopes = (exact(&found.1.verifier), exact(&found.1.subject));
                 direct = Some(found);
-                verifier
+                scopes
             }
         };
-        let required = Permission {
-            resource: Resource::Verifier,
-            action,
-            scope: PermissionScope::Verifier(verifier),
+        let (Some(verifier), Some(parent)) = (verifier, parent) else {
+            return Err(execution_not_found(execution_id));
         };
-        audit::authorize(self.state, caller, &required, operation, &resource)?;
-        let pull_request = match &queued {
-            _ if !reading => false,
-            Some(queued) => queued.state.pull_request.is_some(),
-            None if direct.is_some() => false,
-            None => {
-                InputResolver::new(&query, None)
-                    .record(execution_id)
-                    .await?
-                    .ok_or(BifrostError::QueryVisibilityUnavailable)?
-                    .origin
-                    == InputOrigin::PullRequest
-            }
-        };
-        if pull_request {
-            audit::authorize(
-                self.state,
-                caller,
-                &Permission::card_read(),
-                operation,
-                &resource,
-            )?;
+        if !reading {
+            let required = Permission {
+                resource: Resource::Verifier,
+                action,
+                scope: PermissionScope::Card(verifier),
+            };
+            audit::authorize(self.state, caller, &required, operation, &resource)?;
         }
-        let direct = match direct {
-            Some(found) => Some(self.direct_identity(caller, execution_id, found).await?),
-            None => None,
-        };
+        // Reading, and deciding an approval, both need the execution's
+        // trusted parent to be readable. A reader denied it sees the same
+        // not-found an unknown execution gives; the denial is still audited.
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::executions_read(parent),
+            operation,
+            &resource,
+        )
+        .map_err(|error| {
+            if reading {
+                execution_not_found(execution_id)
+            } else {
+                error
+            }
+        })?;
         let approvals: Vec<ApprovalId> = state
             .approvals
             .iter()
@@ -685,12 +708,15 @@ impl<'a> VerificationControl<'a> {
     }
 
     /// The result and exact identity of direct execution `execution_id`
-    /// from its published `found` summary, reading both Cards, deleted ones
-    /// included, in the caller's tenant.
+    /// from its published `found` summary, reading both Cards in the
+    /// caller's tenant with their retained tombstones, so a deleted subject
+    /// or Verifier keeps the execution's exact original identity. Public Card
+    /// reads still hide deleted definitions.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationExecutionNotFound`] when either Card
-    /// is gone, and a registry error when a read fails.
+    /// was never registered in the tenant, and a registry error when a read
+    /// fails.
     async fn direct_identity(
         &self,
         caller: &Caller,
@@ -701,7 +727,7 @@ impl<'a> VerificationControl<'a> {
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
-        let mut card = async |uid| match get_card_by_uid(&mut conn, uid).await {
+        let mut card = async |uid| match get_card_for_reconciliation(&mut conn, uid).await {
             Ok(row) => Ok(exact_ref(&row)),
             Err(WyrdError::RegistryCardNotFound { .. }) => Err(execution_not_found(execution_id)),
             Err(error) => Err(error),
@@ -862,8 +888,8 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Cloud backends answer with a presigned URL. The local backend has
     /// none, so its plan points at [`Self::content`]'s root-relative route,
-    /// which authorizes `verifier:read` again rather than the Card read the
-    /// local blob route requires.
+    /// which authorizes `executions:read` on the trusted parent again rather
+    /// than the Card read the local blob route requires.
     ///
     /// # Errors
     /// The errors of [`Self::file`] and the storage planning error.
@@ -1028,11 +1054,12 @@ impl<'a> VerificationControl<'a> {
     /// Cancel queued `execution_id` and answer its status after the
     /// cancellation fence commits.
     ///
-    /// Unfinished work settles `cancelled` with its terminal delivery due,
-    /// which the runner records in the execution's state; a `pull_request`
-    /// execution's GitHub delivery of the cancellation starts in the
-    /// background once that commits. Settled work keeps its status, result,
-    /// and publications, so a repeat answers the current status.
+    /// Unfinished work settles `cancelled` with its terminal delivery due.
+    /// Once that commits, its `cancelled` status row is staged on the Scribe
+    /// outbox without waiting, and a `pull_request` execution's GitHub
+    /// delivery of the cancellation starts in the background. Settled work
+    /// keeps its status, result, and publications, so a repeat answers the
+    /// current status and stages nothing.
     ///
     /// # Errors
     /// [`WyrdError::VerificationWrongTarget`] on a target that does not run
@@ -1058,7 +1085,21 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(|| execution_not_found(execution_id))?;
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        if cancelled {
+            self.state.bifrost.scribe_outbox().stage(
+                caller.data_tenant_id,
+                ScribeWrite::status(
+                    execution_id,
+                    &status.verifier_card_uid,
+                    &status.card_uid,
+                    VerificationExecutionStatus::Cancelled,
+                    status.attribution,
+                    occurred_at,
+                ),
+            );
+        }
         if cancelled && status.state.pull_request.is_some() {
             GithubDeliveries::spawn(self.state.clone(), caller.data_tenant_id, execution_id);
         }

@@ -11,9 +11,19 @@ function tool(request: WireRequest): { name: string; arguments: Record<string, u
   const { op, ...rest } = request;
   switch (op) {
     case 'cards.get_by_ref':
+    case 'cards.get_by_uid':
       return { name: 'cards.get', arguments: rest, value: (content) => content.card };
+    case 'github.get_connection':
+      return { name: 'github_connection.get', arguments: {} };
     case 'verification.get_execution':
+    case 'verification.get_execution_details':
+    case 'verification.list_invocations':
+    case 'verification.list_publications':
+    case 'verification.get_publication':
     case 'cards.list':
+    // No MCP tool lists a Card's files or reads a retained file's text yet; the host's refusal of the call is the read's outcome.
+    case 'cards.list_artifacts':
+    case 'verification.read_publication_text':
     case 'bifrost.query':
     case 'bifrost.list_tables':
     case 'bifrost.describe_table':

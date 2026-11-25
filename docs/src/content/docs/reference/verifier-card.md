@@ -187,7 +187,7 @@ An `agent` or `code` check returns a verdict:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
+A citation names the original slot, the `attachment_<n>` slot a fixed workspace file reports in `sources`, or `pull_request`, never an extract step or `/work` file. `pull_request` is the original source of a successful `extract` with `extractor: pull_request`: every value derived from that step's output reaches it, and its `json_pointer` locators resolve against that execution's extraction, such as `{"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}}`. A Verifier using that extractor cannot declare an input named `pull_request`. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. A valid verdict keeps its outcome, including a `passed` verdict with no citations. A citation of a slot the check does not reach, or of a location its evidence does not have, makes the requirement `inconclusive` with a reason starting `invalid citation:`; the verdict is not kept. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
 
 ### Custom data
 
@@ -230,6 +230,7 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `graph` | `depends_on` forms a cycle |
 | `media_as_text` | A `media` slot is bound to an Agent text placeholder |
 | `extract_source` | An `extract` step names both or neither of `from` and `extractor`, or `from` is not a whole `media` slot |
+| `source_slot` | A Verifier with an `extract` step using `extractor: pull_request` declares an input named `pull_request` |
 | `extract_format` | An `extract` step reads a slot with a format it cannot extract |
 | `operator` | An operator's parameters are invalid, such as a bad regex |
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |

@@ -39,20 +39,20 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status with its compact result | Read one execution |
-| `verification.get_execution_details` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
-| `verification.list_invocations` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
-| `verification.list_publications` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
-| `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
-| `verification.download_publication` | `verifier:read` on the execution's Verifier | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
+| `verification.get_execution` | `executions:read` on the execution's trusted parent | `{execution_id}` → execution status with its compact result | Read one execution |
+| `verification.get_execution_details` | `executions:read` on the execution's trusted parent | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
+| `verification.list_invocations` | `executions:read` on the execution's trusted parent | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
+| `verification.list_publications` | `executions:read` on the execution's trusted parent | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
+| `verification.get_publication` | `executions:read` on the execution's trusted parent | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
+| `verification.download_publication` | `executions:read` on the execution's trusted parent | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
 | `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
 | `verification.publish_evidence` | `verifier:run` on each subscribed Verifier | `{repository: "owner/name", tags: {commit}, input, value}` → `{evidence_id, repository, tags, input, status, matched_subscriptions, recorded_at}` | Publish a deferred input for one commit; waiting executions resume; `status` is `accepted` or `replayed` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 | `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
-| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `cards:read` on its subject | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
+| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `executions:read` on its trusted parent | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
 
-`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. An execution's trusted parent is fixed when the work is accepted: the subject Card, the Verifier for direct work with no subject, or the Repository for pull request work; a grant on the Verifier that ran does not unlock it. An execution whose parent the caller cannot read answers not found. `verification.execute` refuses a scheduled drift Verifier.
 
 ## Bifrost
 
@@ -86,6 +86,25 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 
 A token already minted from a revoked credential lapses within five minutes.
 
+## Principal access
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `principals.access` | `service_accounts:write` | `{principal_id}` → AccessSummary | Read an account's grants, their sources, and combined permissions |
+| `principals.list_roles` | `service_accounts:write` | `{}` → RoleList | List built-in and custom roles |
+| `principals.list_bindings` | `service_accounts:write` | `{principal_id?, group_id?, role?}` → RoleBindingList | List role bindings, optionally for one account, group, or role |
+| `principals.list_groups` | `service_accounts:write` | `{}` → GroupList | List local groups and their members |
+| `principals.put_role` | `*` | `{role, operations}` → RoleView | Create or replace a custom role |
+| `principals.delete_role` | `*` | `{role}` → RoleView | Delete a custom role no binding references |
+| `principals.bind` | `*` | CreateRoleBindingRequest → RoleBindingView | Bind a role to an account or group at an explicit scope |
+| `principals.unbind` | `*` | `{binding_id}` → RoleBindingView | Remove a directly administered binding |
+| `principals.create_group` | `*` | `{name}` → GroupView | Create an empty local group |
+| `principals.delete_group` | `*` | `{group_id}` → GroupView | Delete a group with its memberships and bindings |
+| `principals.add_group_member` | `*` | `{group_id, principal_id}` → GroupView | Add an account to a group |
+| `principals.remove_group_member` | `*` | `{group_id, principal_id}` → GroupView | Remove an account from a group |
+
+A binding change reaches the subject's existing credentials within about five seconds.
+
 ## Operator connections
 
 | Tool | Permission | Input → output | Purpose |
@@ -98,15 +117,17 @@ A token already minted from a revoked credential lapses within five minutes.
 
 ## GitHub connection
 
-The read is listed for every caller; the writes are listed only for a caller
-holding `identity_connections:write`. GitHub's setup and OAuth callback are
+The read is listed for every caller; connect and disconnect are listed only for
+a caller holding `github_connections:write`, and the review request only for
+one holding any `verifier:run`. GitHub's setup and OAuth callback are
 browser redirects, not tools.
 
 | Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
-| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
-| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+| `github_connection.get` | `github_connections:read` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `github_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `github_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+| `github_connection.review_pull_request` | `cards:read`; `verifier:run` on every selected Verifier | `{host, repository_id, number, idempotency_key}` → GithubPullRequestReviewResponse | Request a fresh review of an open, ready pull request by its Repository's whole binding set; a retry of the key returns the same generation and members |
 
 ## Gateway administration
 

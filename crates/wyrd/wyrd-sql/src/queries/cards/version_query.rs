@@ -3,10 +3,12 @@
 
 use sqlx::{Postgres, QueryBuilder};
 use wyrd_semver::{VersionBlock, VersionRange};
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardName;
 
+use crate::queries::cards::list::push_visible;
 use crate::queries::cards::registry_db_error;
 use crate::queries::cards::version_sql::push_bounds;
 use crate::row_types::cards::{CARD_ROW_COLUMNS, CardRow, ParsedCardRow};
@@ -60,17 +62,19 @@ pub async fn get_latest_card_by_range(
     })
 }
 
-/// List versions registered in a `(kind, name)` line, newest first.
+/// List versions registered in a `(kind, name)` line, newest first, keeping
+/// only the `visible` Cards when the caller's read is scoped.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors or
 /// `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when a stored version fails to parse.
-#[tracing::instrument(skip(conn), fields(tenant_id = %conn.data_tenant_id(), kind = ?kind, name = %name, include_prerelease))]
+#[tracing::instrument(skip(conn, visible), fields(tenant_id = %conn.data_tenant_id(), kind = ?kind, name = %name, include_prerelease))]
 pub async fn list_versions(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
     name: &CardName,
     include_prerelease: bool,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<Vec<VersionBlock>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT version FROM wyrd.cards \
@@ -80,6 +84,9 @@ pub async fn list_versions(
     qb.push(" AND name = ").push_bind(name.as_str());
     if !include_prerelease {
         qb.push(" AND NOT version_is_prerelease");
+    }
+    if let Some(visible) = visible {
+        push_visible(&mut qb, visible);
     }
     qb.push(
         " ORDER BY version_major DESC, version_minor DESC, version_patch DESC, \

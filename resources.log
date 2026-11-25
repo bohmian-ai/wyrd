@@ -1,0 +1,1269 @@
+=== resources 2026-11-25T23:07:23Z sample=1
+cpu(interval) us=12% sy=6% id=56% wa=26% | procs runnable=0 blocked=2 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=14470MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=34.77 full avg10=33.96 ] 
+dm cow-root: 0 312473567 snapshot 27367432/462890625 106432;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=118134272000B inodes_avail=19038614
+disk /mnt (mount /) avail=118134272000B inodes_avail=19038614
+overlap ld.bfd=0 lld=0 rustc=0
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+   2002    1983 Runner.Worker   216152 1.5
+   1966    1964 provjobd1521989 149536 0.6
+   1983    1926 Runner.Listener 99572  0.3
+   1406       1 dockerd         88844  1.3
+  16318   16313 mise            49980  0.1
+  16374   16357 docker-compose  48156  0.7
+   1131       1 containerd      45008  0.0
+    517       1 multipathd      43804  0.0
+    998       1 snapd           42460  0.0
+  16357   16348 docker          27968  0.2
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+   2002    1983 Runner.Worker   216152 1.5
+   1406       1 dockerd         88844  1.3
+    119       2 kworker/u16:3-e     0  0.9
+  16374   16357 docker-compose  48156  0.7
+   1966    1964 provjobd1521989 149536 0.6
+      1       0 systemd         14016  0.4
+   1983    1926 Runner.Listener 99572  0.3
+  16454       1 systemd-timedat  7760  0.3
+  16357   16348 docker          27968  0.2
+     15       2 pr/ttyS0            0  0.2
+=== resources 2026-11-25T23:07:33Z sample=2
+cpu(interval) us=16% sy=5% id=73% wa=6% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13782MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=19.83 full avg10=19.46 ] 
+dm cow-root: 0 312473567 snapshot 27505288/462890625 107040;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=117570973696B inodes_avail=19002839
+disk /mnt (mount /) avail=117570973696B inodes_avail=19002839
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  17301   17291 rustc           589196 99.1
+   2002    1983 Runner.Worker   217784 1.4
+   1966    1964 provjobd1521989 164340 0.6
+  17291   17213 cargo           150020 9.0
+   1983    1926 Runner.Listener 99576  0.3
+   1406       1 dockerd         84704  1.3
+  16612   16563 postgres        68040  0.5
+  16318   16313 mise            49980  0.0
+  17188   17007 mise            49884  0.3
+   1131       1 containerd      47492  0.1
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  17301   17291 rustc           589468 99.4
+  17291   17213 cargo           150020 9.0
+   2002    1983 Runner.Worker   217784 1.4
+   1406       1 dockerd         84704  1.3
+    119       2 kworker/u16:3-e     0  0.8
+  17213   17211 cargo-nextest   38044  0.7
+   1966    1964 provjobd1521989 164340 0.6
+  16612   16563 postgres        68040  0.5
+      1       0 systemd         14016  0.4
+   1983    1926 Runner.Listener 99576  0.3
+=== resources 2026-11-25T23:07:43Z sample=3
+cpu(interval) us=37% sy=3% id=60% wa=0% | procs runnable=2 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13291MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=7.30 full avg10=7.16 ] 
+dm cow-root: 0 312473567 snapshot 27554944/462890625 107232;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=117509754880B inodes_avail=19002832
+disk /mnt (mount /) avail=117509754880B inodes_avail=19002832
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  17491   17291 rustc           1223108 99.2
+   2002    1983 Runner.Worker   218788 1.4
+  17291   17213 cargo           150032 2.5
+   1966    1964 provjobd1521989 145708 0.7
+   1983    1926 Runner.Listener 99572  0.3
+   1406       1 dockerd         84724  1.3
+  16612   16563 postgres        68040  0.2
+  16318   16313 mise            49980  0.0
+  17188   17007 mise            49884  0.1
+   1131       1 containerd      48020  0.1
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  17491   17291 rustc           1223536 99.1
+  17291   17213 cargo           150032 2.5
+   2002    1983 Runner.Worker   218788 1.4
+   1406       1 dockerd         84724  1.3
+    119       2 kworker/u16:3-e     0  0.8
+   1966    1964 provjobd1521989 145708 0.7
+      1       0 systemd         14016  0.4
+   1983    1926 Runner.Listener 99572  0.3
+     15       2 pr/ttyS0            0  0.2
+  16612   16563 postgres        68040  0.2
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=3.42% mem=97.52MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=2.50% mem=7.02MiB / 15.33GiB
+=== resources 2026-11-25T23:07:53Z sample=4
+cpu(interval) us=25% sy=2% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12783MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=2.68 full avg10=2.63 ] 
+dm cow-root: 0 312473567 snapshot 27554944/462890625 107232;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=117509750784B inodes_avail=19002836
+disk /mnt (mount /) avail=117509750784B inodes_avail=19002836
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  17491   17291 rustc           1790796 99.6
+   2002    1983 Runner.Worker   220220 1.4
+  17291   17213 cargo           150032 1.5
+   1966    1964 provjobd1521989 145784 0.7
+   1983    1926 Runner.Listener 100588 0.3
+   1406       1 dockerd         84844  1.3
+  16612   16563 postgres        68040  0.1
+  16318   16313 mise            49980  0.0
+  17188   17007 mise            49884  0.0
+   1131       1 containerd      48800  0.1
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  17491   17291 rustc           1790988 99.6
+  17291   17213 cargo           150032 1.5
+   2002    1983 Runner.Worker   220220 1.4
+   1406       1 dockerd         84844  1.3
+    119       2 kworker/u16:3-e     0  0.8
+   1966    1964 provjobd1521989 145784 0.7
+      1       0 systemd         14016  0.4
+   1983    1926 Runner.Listener 100588 0.3
+     15       2 pr/ttyS0            0  0.2
+    125       2 kworker/u16:6-e     0  0.2
+=== resources 2026-11-25T23:08:03Z sample=5
+cpu(interval) us=55% sy=5% id=40% wa=0% | procs runnable=7 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12080MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=2.07 full avg10=0.97 ] 
+dm cow-root: 0 312473567 snapshot 28601536/462890625 111304;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=117389344768B inodes_avail=19002812
+disk /mnt (mount /) avail=117389344768B inodes_avail=19002812
+overlap ld.bfd=0 lld=0 rustc=2
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  17491   17291 rustc           2340828 128
+  18125   17291 rustc           600312 93.1
+   2002    1983 Runner.Worker   219432 1.3
+  17291   17213 cargo           150040 1.0
+   1966    1964 provjobd1521989 138616 0.7
+   1983    1926 Runner.Listener 100344 0.3
+   1406       1 dockerd         85052  1.2
+  16612   16563 postgres        68040  0.1
+  16318   16313 mise            49980  0.0
+  17188   17007 mise            49884  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  17491   17291 rustc           2342272 128
+  18125   17291 rustc           602064 93.1
+   2002    1983 Runner.Worker   219432 1.3
+   1406       1 dockerd         85052  1.2
+  17291   17213 cargo           150040 1.0
+    119       2 kworker/u16:3-f     0  0.8
+   1966    1964 provjobd1521989 138616 0.7
+      1       0 systemd         14016  0.4
+   1983    1926 Runner.Listener 100344 0.3
+     15       2 pr/ttyS0            0  0.2
+=== resources 2026-11-25T23:08:13Z sample=6
+cpu(interval) us=51% sy=5% id=44% wa=0% | procs runnable=2 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12997MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.76 full avg10=0.35 ] 
+dm cow-root: 0 312473567 snapshot 28721584/462890625 111768;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=117200064512B inodes_avail=19002768
+disk /mnt (mount /) avail=117200064512B inodes_avail=19002768
+overlap ld.bfd=1 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  18518   18517 ld.bfd          648336 99.1
+  18390   17291 rustc           596556 133
+   2002    1983 Runner.Worker   220412 1.3
+  17291   17213 cargo           150160 0.8
+   1966    1964 provjobd1521989 138788 0.7
+   1983    1926 Runner.Listener 100344 0.3
+   1406       1 dockerd         85152  1.2
+  16612   16563 postgres        68040  0.1
+  16318   16313 mise            49980  0.0
+  17188   17007 mise            49884  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  18390   17291 rustc           596556 132
+  18518   18517 ld.bfd          652036 99.1
+  18552   18551 git-remote-http 17136 16.6
+   2002    1983 Runner.Worker   220412 1.3
+   1406       1 dockerd         85152  1.2
+  17291   17213 cargo           150160 0.8
+  18516   18390 cc               2756  0.8
+    119       2 kworker/u16:3-e     0  0.8
+   1966    1964 provjobd1521989 138788 0.7
+      1       0 systemd         14016  0.4
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=4.25% mem=98.2MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=2.36% mem=6.75MiB / 15.33GiB
+=== resources 2026-11-25T23:08:23Z sample=7
+cpu(interval) us=36% sy=7% id=57% wa=0% | procs runnable=2 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13559MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.28 full avg10=0.12 ] 
+dm cow-root: 0 312473567 snapshot 28721600/462890625 111768;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116993249280B inodes_avail=19002677
+disk /mnt (mount /) avail=116993249280B inodes_avail=19002677
+overlap ld.bfd=0 lld=0 rustc=2
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           422804 96.9
+  18926   18879 rustc           403028 96.0
+   2002    1983 Runner.Worker   224640 1.3
+  18879   17007 cargo           180316 21.2
+   1966    1964 provjobd1521989 138788 0.7
+   1983    1926 Runner.Listener 98788  0.3
+   1406       1 dockerd         85164  1.2
+  16612   16563 postgres        68040  0.1
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           424204 96.9
+  18926   18879 rustc           403036 96.1
+  18879   17007 cargo           180316 21.0
+   2002    1983 Runner.Worker   224640 1.3
+   1406       1 dockerd         85164  1.2
+    119       2 kworker/u16:3-e     0  0.7
+   1966    1964 provjobd1521989 138788 0.7
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 98788  0.3
+     15       2 pr/ttyS0            0  0.2
+=== resources 2026-11-25T23:08:33Z sample=8
+cpu(interval) us=31% sy=2% id=66% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12901MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.10 full avg10=0.04 ] 
+dm cow-root: 0 312473567 snapshot 28845992/462890625 112256;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116981501952B inodes_avail=19002666
+disk /mnt (mount /) avail=116981501952B inodes_avail=19002666
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           1389256 99.5
+   2002    1983 Runner.Worker   224656 1.2
+  18879   17007 cargo           180324 4.0
+   1966    1964 provjobd1521989 139540 0.7
+   1983    1926 Runner.Listener 98784  0.3
+   1406       1 dockerd         85180  1.2
+  16612   16563 postgres        68040  0.1
+   1131       1 containerd      50276  0.1
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           1389412 99.4
+  18879   17007 cargo           180324 4.0
+   2002    1983 Runner.Worker   224656 1.2
+   1406       1 dockerd         85180  1.2
+   1966    1964 provjobd1521989 139540 0.7
+    119       2 kworker/u16:3-e     0  0.7
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 98784  0.3
+     15       2 pr/ttyS0            0  0.2
+    125       2 kworker/u16:6-e     0  0.2
+=== resources 2026-11-25T23:08:43Z sample=9
+cpu(interval) us=25% sy=2% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12574MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.03 full avg10=0.01 ] 
+dm cow-root: 0 312473567 snapshot 29271752/462890625 113912;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116981485568B inodes_avail=19002666
+disk /mnt (mount /) avail=116981485568B inodes_avail=19002666
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           1979124 99.7
+   2002    1983 Runner.Worker   224652 1.2
+  18879   17007 cargo           180324 2.2
+   1966    1964 provjobd1521989 139608 0.8
+   1983    1926 Runner.Listener 98784  0.3
+   1406       1 dockerd         85364  1.1
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50408  0.1
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           1981208 99.7
+  18879   17007 cargo           180324 2.2
+   2002    1983 Runner.Worker   224652 1.2
+   1406       1 dockerd         85364  1.1
+   1966    1964 provjobd1521989 139608 0.8
+    119       2 kworker/u16:3-e     0  0.7
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 98784  0.3
+     15       2 pr/ttyS0            0  0.2
+     48       2 kworker/u16:1-e     0  0.2
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=3.89% mem=110.6MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=7.191MiB / 15.33GiB
+=== resources 2026-11-25T23:08:53Z sample=10
+cpu(interval) us=56% sy=5% id=39% wa=0% | procs runnable=6 blocked=0 | swap si=0KiB/s so=5KiB/s
+mem total=15701MiB available=11778MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.14 full avg10=0.00 ] io[some avg10=0.01 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 29717784/462890625 115648;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116856524800B inodes_avail=19002578
+disk /mnt (mount /) avail=116856524800B inodes_avail=19002578
+overlap ld.bfd=0 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           2345676 99.0
+  19750   18879 rustc           613528 94.8
+  19883   18879 rustc           508112 96.0
+  19874   18879 rustc           478348 92.2
+   2002    1983 Runner.Worker   201596 1.2
+  18879   17007 cargo           180336 1.7
+   1966    1964 provjobd1521989 138308 0.8
+   1406       1 dockerd         86692  1.1
+   1983    1926 Runner.Listener 80512  0.3
+  16612   16563 postgres        68040  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           2347376 99.0
+  19883   18879 rustc           513664 96.1
+  19750   18879 rustc           614060 94.6
+  19874   18879 rustc           476104 92.4
+  19958   19945 runc:[2:INIT]   11120 50.0
+  18879   17007 cargo           180336 1.7
+   2002    1983 Runner.Worker   201596 1.2
+   1406       1 dockerd         86692  1.1
+   1966    1964 provjobd1521989 138308 0.8
+    119       2 kworker/u16:3-e     0  0.7
+=== resources 2026-11-25T23:09:03Z sample=11
+cpu(interval) us=91% sy=8% id=1% wa=0% | procs runnable=6 blocked=0 | swap si=0KiB/s so=3KiB/s
+mem total=15701MiB available=11711MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.05 full avg10=0.00 ] io[some avg10=0.16 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 29760280/462890625 115808;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116673953792B inodes_avail=19002492
+disk /mnt (mount /) avail=116673953792B inodes_avail=19002492
+overlap ld.bfd=0 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           2311172 98.6
+  20294   18879 rustc           834836 96.4
+  20284   18879 rustc           639432 95.5
+  20364   18879 rustc           353964 93.3
+   2002    1983 Runner.Worker   201596 1.2
+  18879   17007 cargo           180444 1.5
+   1966    1964 provjobd1521989 138368 0.9
+   1406       1 dockerd         86976  1.1
+   1983    1926 Runner.Listener 81456  0.3
+  16612   16563 postgres        68040  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  18918   18879 rustc           2312344 98.6
+  20294   18879 rustc           842124 96.8
+  20284   18879 rustc           639760 95.2
+  20364   18879 rustc           357516 93.6
+  18879   17007 cargo           180444 1.5
+   2002    1983 Runner.Worker   201596 1.2
+   1406       1 dockerd         86976  1.1
+   1966    1964 provjobd1521989 138368 0.9
+    119       2 kworker/u16:3-e     0  0.7
+      1       0 systemd         14016  0.3
+=== resources 2026-11-25T23:09:13Z sample=12
+cpu(interval) us=78% sy=6% id=17% wa=0% | procs runnable=2 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13462MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.01 full avg10=0.00 ] io[some avg10=0.06 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 29760288/462890625 115808;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116474269696B inodes_avail=19002484
+disk /mnt (mount /) avail=116474269696B inodes_avail=19002484
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  20294   18879 rustc           1369064 97.7
+   2002    1983 Runner.Worker   201568 1.1
+  18879   17007 cargo           180504 1.2
+   1966    1964 provjobd1521989 138368 1.0
+   1406       1 dockerd         87096  1.1
+   1983    1926 Runner.Listener 81448  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50396  0.1
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  20294   18879 rustc           1369064 97.6
+  18879   17007 cargo           180504 1.2
+   2002    1983 Runner.Worker   201568 1.1
+   1406       1 dockerd         87096  1.1
+   1966    1964 provjobd1521989 138368 1.0
+    119       2 kworker/u16:3-e     0  0.6
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 81448  0.2
+     15       2 pr/ttyS0            0  0.2
+     48       2 kworker/u16:1-e     0  0.2
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=0.04% mem=111.2MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=2.35% mem=7.137MiB / 15.33GiB
+=== resources 2026-11-25T23:09:23Z sample=13
+cpu(interval) us=26% sy=1% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13376MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.02 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 29874712/462890625 116256;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116468187136B inodes_avail=19002474
+disk /mnt (mount /) avail=116468187136B inodes_avail=19002474
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  20294   18879 rustc           1524964 98.6
+   2002    1983 Runner.Worker   201588 1.1
+  18879   17007 cargo           180504 1.0
+   1966    1964 provjobd1521989 139612 1.0
+   1406       1 dockerd         87172  1.1
+   1983    1926 Runner.Listener 81588  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50488  0.1
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  20294   18879 rustc           1524964 98.6
+   2002    1983 Runner.Worker   201588 1.1
+   1406       1 dockerd         87172  1.1
+   1966    1964 provjobd1521989 139612 1.0
+  18879   17007 cargo           180504 1.0
+    119       2 kworker/u16:3-e     0  0.6
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 81588  0.2
+     15       2 pr/ttyS0            0  0.2
+     48       2 kworker/u16:1-e     0  0.2
+=== resources 2026-11-25T23:09:33Z sample=14
+cpu(interval) us=33% sy=2% id=64% wa=0% | procs runnable=5 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12562MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 30160104/462890625 117368;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116437659648B inodes_avail=19002469
+disk /mnt (mount /) avail=116437659648B inodes_avail=19002469
+overlap ld.bfd=0 lld=0 rustc=2
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  20294   18879 rustc           2165192 105
+  21155   18879 rustc           644328 96.5
+   2002    1983 Runner.Worker   201588 1.1
+  18879   17007 cargo           180580 0.9
+   1966    1964 provjobd1521989 140156 1.1
+   1406       1 dockerd         87428  1.1
+   1983    1926 Runner.Listener 81664  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50540  0.1
+  17007   16348 mise            50240  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  20294   18879 rustc           2169784 105
+  21155   18879 rustc           647020 96.5
+   2002    1983 Runner.Worker   201588 1.1
+   1406       1 dockerd         87428  1.1
+   1966    1964 provjobd1521989 140156 1.1
+  18879   17007 cargo           180580 0.9
+    119       2 kworker/u16:3-e     0  0.6
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 81664  0.2
+     15       2 pr/ttyS0            0  0.2
+=== resources 2026-11-25T23:09:43Z sample=15
+cpu(interval) us=53% sy=4% id=43% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13278MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 30284528/462890625 117848;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305399808B inodes_avail=19002469
+disk /mnt (mount /) avail=116305399808B inodes_avail=19002469
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           1501128 98.7
+   2002    1983 Runner.Worker   201596 1.1
+  18879   17007 cargo           180580 0.8
+   1966    1964 provjobd1521989 139800 1.1
+   1406       1 dockerd         87608  1.0
+   1983    1926 Runner.Listener 81656  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50592  0.1
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           1501296 98.7
+   1966    1964 provjobd1521989 139800 1.1
+   2002    1983 Runner.Worker   201596 1.1
+   1406       1 dockerd         87608  1.0
+  18879   17007 cargo           180580 0.8
+    119       2 kworker/u16:3-e     0  0.6
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 81656  0.2
+     48       2 kworker/u16:1-e     0  0.2
+     15       2 pr/ttyS0            0  0.2
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=3.81% mem=111.3MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=8.078MiB / 15.33GiB
+=== resources 2026-11-25T23:09:53Z sample=16
+cpu(interval) us=26% sy=2% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=13088MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 30751736/462890625 119672;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305383424B inodes_avail=19002469
+disk /mnt (mount /) avail=116305383424B inodes_avail=19002469
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           1864844 99.2
+   2002    1983 Runner.Worker   201496 1.1
+  18879   17007 cargo           180580 0.7
+   1966    1964 provjobd1521989 139800 1.1
+   1406       1 dockerd         87716  1.0
+   1983    1926 Runner.Listener 82784  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50972  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           1864844 99.2
+   1966    1964 provjobd1521989 139800 1.1
+   2002    1983 Runner.Worker   201496 1.1
+   1406       1 dockerd         87716  1.0
+  18879   17007 cargo           180580 0.7
+    119       2 kworker/u16:3-e     0  0.6
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 82784  0.2
+     48       2 kworker/u16:1-e     0  0.2
+     15       2 pr/ttyS0            0  0.2
+=== resources 2026-11-25T23:10:03Z sample=17
+cpu(interval) us=26% sy=1% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12974MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 30798856/462890625 119848;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305375232B inodes_avail=19002469
+disk /mnt (mount /) avail=116305375232B inodes_avail=19002469
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2040712 99.5
+   2002    1983 Runner.Worker   201500 1.0
+  18879   17007 cargo           180580 0.6
+   1966    1964 provjobd1521989 139800 1.1
+   1406       1 dockerd         87736  1.0
+   1983    1926 Runner.Listener 82784  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      51056  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2040712 99.5
+   1966    1964 provjobd1521989 139800 1.1
+   2002    1983 Runner.Worker   201500 1.0
+   1406       1 dockerd         87736  1.0
+  18879   17007 cargo           180580 0.6
+    119       2 kworker/u16:3-e     0  0.6
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 82784  0.2
+   1131       1 containerd      51056  0.2
+     48       2 kworker/u16:1-e     0  0.1
+=== resources 2026-11-25T23:10:13Z sample=18
+cpu(interval) us=26% sy=2% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12753MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31082824/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305346560B inodes_avail=19002469
+disk /mnt (mount /) avail=116305346560B inodes_avail=19002469
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2249464 99.6
+   2002    1983 Runner.Worker   201536 1.0
+  18879   17007 cargo           180580 0.5
+   1966    1964 provjobd1521989 139948 1.2
+   1406       1 dockerd         88016  1.0
+   1983    1926 Runner.Listener 82784  0.2
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      51004  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2249464 99.6
+   1966    1964 provjobd1521989 139948 1.2
+   2002    1983 Runner.Worker   201536 1.0
+   1406       1 dockerd         88016  1.0
+    119       2 kworker/u16:3-e     0  0.6
+  18879   17007 cargo           180580 0.5
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 82784  0.2
+   1131       1 containerd      51004  0.2
+     48       2 kworker/u16:1-e     0  0.1
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=0.00% mem=111.7MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=7.793MiB / 15.33GiB
+=== resources 2026-11-25T23:10:23Z sample=19
+cpu(interval) us=26% sy=1% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12743MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31082840/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305313792B inodes_avail=19002461
+disk /mnt (mount /) avail=116305313792B inodes_avail=19002461
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2289536 99.6
+   2002    1983 Runner.Worker   201652 1.0
+  18879   17007 cargo           180580 0.5
+   1966    1964 provjobd1521989 139976 1.2
+   1983    1926 Runner.Listener 90140  0.2
+   1406       1 dockerd         88188  1.0
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      51008  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2289536 99.6
+   1966    1964 provjobd1521989 139976 1.2
+   2002    1983 Runner.Worker   201652 1.0
+   1406       1 dockerd         88188  1.0
+    119       2 kworker/u16:3-e     0  0.6
+  18879   17007 cargo           180580 0.5
+      1       0 systemd         14016  0.3
+   1983    1926 Runner.Listener 90140  0.2
+   1131       1 containerd      51008  0.2
+     48       2 kworker/u16:1-e     0  0.1
+=== resources 2026-11-25T23:10:33Z sample=20
+cpu(interval) us=26% sy=1% id=73% wa=0% | procs runnable=4 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12717MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31082840/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305293312B inodes_avail=19002461
+disk /mnt (mount /) avail=116305293312B inodes_avail=19002461
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2308616 99.7
+   2002    1983 Runner.Worker   201656 1.0
+  18879   17007 cargo           180580 0.5
+   1966    1964 provjobd1521989 139976 1.3
+   1983    1926 Runner.Listener 90140  0.2
+   1406       1 dockerd         88280  1.0
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50812  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2308616 99.7
+   1966    1964 provjobd1521989 139976 1.3
+   2002    1983 Runner.Worker   201656 1.0
+   1406       1 dockerd         88280  1.0
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.5
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 90140  0.2
+   1131       1 containerd      50812  0.2
+  16563       1 containerd-shim 12468  0.1
+=== resources 2026-11-25T23:10:43Z sample=21
+cpu(interval) us=26% sy=1% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12713MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31082928/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116305276928B inodes_avail=19002461
+disk /mnt (mount /) avail=116305276928B inodes_avail=19002461
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2321548 99.7
+   2002    1983 Runner.Worker   201628 1.0
+  18879   17007 cargo           180580 0.4
+   1966    1964 provjobd1521989 140560 1.3
+   1983    1926 Runner.Listener 89224  0.2
+   1406       1 dockerd         88300  1.0
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50880  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2321548 99.7
+   1966    1964 provjobd1521989 140560 1.3
+   1406       1 dockerd         88300  1.0
+   2002    1983 Runner.Worker   201628 1.0
+    119       2 kworker/u16:3-f     0  0.5
+  18879   17007 cargo           180580 0.4
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89224  0.2
+   1131       1 containerd      50880  0.2
+  16563       1 containerd-shim 12556  0.1
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=4.16% mem=111.2MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=2.50% mem=7.641MiB / 15.33GiB
+=== resources 2026-11-25T23:10:53Z sample=22
+cpu(interval) us=26% sy=2% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12305MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31082976/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270600192B inodes_avail=19002459
+disk /mnt (mount /) avail=116270600192B inodes_avail=19002459
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2862540 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.4
+   1966    1964 provjobd1521989 140560 1.3
+   1983    1926 Runner.Listener 89420  0.2
+   1406       1 dockerd         88312  1.0
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50908  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           2864188 99.8
+   1966    1964 provjobd1521989 140560 1.3
+   1406       1 dockerd         88312  1.0
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.4
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89420  0.2
+   1131       1 containerd      50908  0.2
+  16563       1 containerd-shim 12524  0.1
+=== resources 2026-11-25T23:11:03Z sample=23
+cpu(interval) us=25% sy=2% id=73% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=11556MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31083072/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270579712B inodes_avail=19002459
+disk /mnt (mount /) avail=116270579712B inodes_avail=19002459
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           3634772 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.4
+   1966    1964 provjobd1521989 140560 1.4
+   1983    1926 Runner.Listener 89420  0.2
+   1406       1 dockerd         88332  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50916  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           3640944 99.8
+   1966    1964 provjobd1521989 140560 1.4
+   1406       1 dockerd         88332  0.9
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.4
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89420  0.2
+   1131       1 containerd      50916  0.2
+  16563       1 containerd-shim 12528  0.1
+=== resources 2026-11-25T23:11:13Z sample=24
+cpu(interval) us=25% sy=2% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=10615MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31083072/462890625 120960;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270579712B inodes_avail=19002459
+disk /mnt (mount /) avail=116270579712B inodes_avail=19002459
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           4598916 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.3
+   1966    1964 provjobd1521989 140248 1.4
+   1983    1926 Runner.Listener 89420  0.2
+   1406       1 dockerd         88336  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50932  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           4599088 99.8
+   1966    1964 provjobd1521989 140248 1.4
+   1406       1 dockerd         88336  0.9
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.3
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89420  0.2
+   1131       1 containerd      50932  0.2
+  16563       1 containerd-shim 12676  0.1
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=0.00% mem=111.4MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=2.61% mem=7.945MiB / 15.33GiB
+=== resources 2026-11-25T23:11:23Z sample=25
+cpu(interval) us=26% sy=2% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=9840MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151080/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270534656B inodes_avail=19002454
+disk /mnt (mount /) avail=116270534656B inodes_avail=19002454
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           5397712 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.3
+   1966    1964 provjobd1521989 140248 1.5
+   1983    1926 Runner.Listener 89420  0.2
+   1406       1 dockerd         88456  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50944  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           5397908 99.8
+   1966    1964 provjobd1521989 140248 1.5
+   1406       1 dockerd         88456  0.9
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.3
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89420  0.2
+   1131       1 containerd      50944  0.2
+  16563       1 containerd-shim 12632  0.1
+=== resources 2026-11-25T23:11:33Z sample=26
+cpu(interval) us=26% sy=2% id=72% wa=0% | procs runnable=2 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=9322MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151088/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270518272B inodes_avail=19002454
+disk /mnt (mount /) avail=116270518272B inodes_avail=19002454
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           5938988 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.3
+   1966    1964 provjobd1521989 139608 1.5
+   1983    1926 Runner.Listener 89536  0.2
+   1406       1 dockerd         88456  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50948  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           5938988 99.8
+   1966    1964 provjobd1521989 139608 1.5
+   1406       1 dockerd         88456  0.9
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.3
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89536  0.2
+   1131       1 containerd      50948  0.2
+  16563       1 containerd-shim 12572  0.1
+=== resources 2026-11-25T23:11:43Z sample=27
+cpu(interval) us=26% sy=2% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=9318MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151088/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270518272B inodes_avail=19002454
+disk /mnt (mount /) avail=116270518272B inodes_avail=19002454
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           5965104 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.3
+   1966    1964 provjobd1521989 139608 1.6
+   1983    1926 Runner.Listener 89532  0.2
+   1406       1 dockerd         88464  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50960  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           5965104 99.8
+   1966    1964 provjobd1521989 139608 1.6
+   1406       1 dockerd         88464  0.9
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.3
+      1       0 systemd         14016  0.2
+   1131       1 containerd      50960  0.2
+   1983    1926 Runner.Listener 89532  0.2
+  16563       1 containerd-shim 12596  0.1
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=0.00% mem=112.4MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=7.527MiB / 15.33GiB
+=== resources 2026-11-25T23:11:53Z sample=28
+cpu(interval) us=26% sy=2% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=9126MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151224/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270493696B inodes_avail=19002454
+disk /mnt (mount /) avail=116270493696B inodes_avail=19002454
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           6142988 99.8
+   2002    1983 Runner.Worker   201876 0.9
+  18879   17007 cargo           180580 0.3
+   1966    1964 provjobd1521989 139608 1.7
+   1983    1926 Runner.Listener 89880  0.2
+   1406       1 dockerd         88472  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50960  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           6143000 99.8
+   1966    1964 provjobd1521989 139608 1.7
+   1406       1 dockerd         88472  0.9
+   2002    1983 Runner.Worker   201876 0.9
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.3
+      1       0 systemd         14016  0.2
+   1131       1 containerd      50960  0.2
+   1983    1926 Runner.Listener 89880  0.2
+  16563       1 containerd-shim 12600  0.1
+=== resources 2026-11-25T23:12:03Z sample=29
+cpu(interval) us=26% sy=2% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=8744MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151240/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270493696B inodes_avail=19002454
+disk /mnt (mount /) avail=116270493696B inodes_avail=19002454
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           6523764 99.8
+   2002    1983 Runner.Worker   201896 0.8
+  18879   17007 cargo           180580 0.3
+   1966    1964 provjobd1521989 161228 1.7
+   1983    1926 Runner.Listener 89880  0.2
+   1406       1 dockerd         88480  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50972  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           6523768 99.8
+   1966    1964 provjobd1521989 161228 1.7
+   1406       1 dockerd         88480  0.9
+   2002    1983 Runner.Worker   201896 0.8
+    119       2 kworker/u16:3-e     0  0.5
+  18879   17007 cargo           180580 0.3
+      1       0 systemd         14016  0.2
+   1131       1 containerd      50972  0.2
+   1983    1926 Runner.Listener 89880  0.2
+  16563       1 containerd-shim 12480  0.1
+=== resources 2026-11-25T23:12:13Z sample=30
+cpu(interval) us=26% sy=2% id=72% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=8489MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151248/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116270473216B inodes_avail=19002454
+disk /mnt (mount /) avail=116270473216B inodes_avail=19002454
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           6798424 99.8
+   2002    1983 Runner.Worker   201896 0.8
+  18879   17007 cargo           180580 0.2
+   1966    1964 provjobd1521989 164608 1.8
+   1983    1926 Runner.Listener 89880  0.2
+   1406       1 dockerd         88484  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50984  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           6798424 99.8
+   1966    1964 provjobd1521989 164608 1.8
+   1406       1 dockerd         88484  0.9
+   2002    1983 Runner.Worker   201896 0.8
+    119       2 kworker/u16:3-e     0  0.4
+  18879   17007 cargo           180580 0.2
+   1131       1 containerd      50984  0.2
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89880  0.2
+  16563       1 containerd-shim 12468  0.1
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=3.88% mem=112.5MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=7.727MiB / 15.33GiB
+=== resources 2026-11-25T23:12:23Z sample=31
+cpu(interval) us=33% sy=3% id=64% wa=0% | procs runnable=4 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=7637MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151296/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116260306944B inodes_avail=19002446
+disk /mnt (mount /) avail=116260306944B inodes_avail=19002446
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           7759080 101
+   2002    1983 Runner.Worker   201956 0.8
+  18879   17007 cargo           180580 0.2
+   1966    1964 provjobd1521989 169452 1.9
+   1983    1926 Runner.Listener 89880  0.2
+   1406       1 dockerd         88488  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      51028  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           7772284 101
+   1966    1964 provjobd1521989 169452 1.9
+   1406       1 dockerd         88488  0.9
+   2002    1983 Runner.Worker   201956 0.8
+    119       2 kworker/u16:3-e     0  0.4
+  18879   17007 cargo           180580 0.2
+   1131       1 containerd      51028  0.2
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89880  0.2
+  16563       1 containerd-shim 12532  0.1
+=== resources 2026-11-25T23:12:33Z sample=32
+cpu(interval) us=81% sy=6% id=12% wa=0% | procs runnable=3 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=7532MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.00 full avg10=0.00 ] 
+dm cow-root: 0 312473567 snapshot 31151320/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=116026810368B inodes_avail=19002436
+disk /mnt (mount /) avail=116026810368B inodes_avail=19002436
+overlap ld.bfd=0 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           7760392 114
+   2002    1983 Runner.Worker   201952 0.8
+  18879   17007 cargo           180580 0.2
+   1966    1964 provjobd1521989 172732 2.0
+   1983    1926 Runner.Listener 89884  0.2
+   1406       1 dockerd         88508  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      51040  0.2
+  17007   16348 mise            50240  0.0
+  16318   16313 mise            49980  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  21155   18879 rustc           7711488 114
+   1966    1964 provjobd1521989 172732 2.0
+   1406       1 dockerd         88508  0.9
+   2002    1983 Runner.Worker   201952 0.8
+    119       2 kworker/u16:3-f     0  0.4
+  18879   17007 cargo           180580 0.2
+   1131       1 containerd      51040  0.2
+      1       0 systemd         14016  0.2
+   1983    1926 Runner.Listener 89884  0.2
+  16563       1 containerd-shim 12592  0.1
+=== resources 2026-11-25T23:12:43Z sample=33
+cpu(interval) us=40% sy=8% id=50% wa=2% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=11837MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=4.89 full avg10=4.89 ] 
+dm cow-root: 0 312473567 snapshot 31151424/462890625 121224;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=115802861568B inodes_avail=19002430
+disk /mnt (mount /) avail=115802861568B inodes_avail=19002430
+overlap ld.bfd=1 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  25841   25840 ld.bfd          2101720 83.0
+  25785   18879 rustc           302052 22.9
+   2002    1983 Runner.Worker   201776 0.8
+  18879   17007 cargo           180552 0.2
+   1966    1964 provjobd1521989 174908 2.0
+   1983    1926 Runner.Listener 89704  0.2
+   1406       1 dockerd         88724  0.9
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50776  0.2
+  17007   16348 mise            50160  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  25841   25840 ld.bfd          2105052 83.1
+  25785   18879 rustc           302052 22.9
+   1966    1964 provjobd1521989 174908 2.0
+   1406       1 dockerd         88724  0.9
+   2002    1983 Runner.Worker   201776 0.8
+    119       2 kworker/u16:3-e     0  0.4
+  18879   17007 cargo           180552 0.2
+   1131       1 containerd      50776  0.2
+      1       0 systemd         14000  0.2
+   1983    1926 Runner.Listener 89704  0.2
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=3.32% mem=112.8MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=7.973MiB / 15.33GiB
+=== resources 2026-11-25T23:12:53Z sample=34
+cpu(interval) us=19% sy=6% id=73% wa=3% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=9279MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=5.29 full avg10=5.29 ] 
+dm cow-root: 0 312473567 snapshot 31322824/462890625 121888;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=115802861568B inodes_avail=19002430
+disk /mnt (mount /) avail=115802861568B inodes_avail=19002430
+overlap ld.bfd=1 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  25841   25840 ld.bfd          4914728 86.5
+  25785   18879 rustc           302052 7.5
+   2002    1983 Runner.Worker   202928 0.8
+  18879   17007 cargo           180552 0.2
+   1966    1964 provjobd1521989 153992 2.0
+   1983    1926 Runner.Listener 90152  0.2
+   1406       1 dockerd         89092  0.8
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50820  0.2
+  17007   16348 mise            50160  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  25841   25840 ld.bfd          4918584 86.4
+  25785   18879 rustc           302052 7.5
+   1966    1964 provjobd1521989 153992 2.0
+   1406       1 dockerd         89092  0.8
+   2002    1983 Runner.Worker   202928 0.8
+    119       2 kworker/u16:3-e     0  0.4
+   1131       1 containerd      50820  0.2
+  18879   17007 cargo           180552 0.2
+      1       0 systemd         14000  0.2
+   1983    1926 Runner.Listener 90152  0.2
+=== resources 2026-11-25T23:13:03Z sample=35
+cpu(interval) us=18% sy=9% id=72% wa=1% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=8662MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=3.16 full avg10=3.16 ] 
+dm cow-root: 0 312473567 snapshot 32063280/462890625 124768;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=114970943488B inodes_avail=19002430
+disk /mnt (mount /) avail=114970943488B inodes_avail=19002430
+overlap ld.bfd=1 lld=0 rustc=1
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  25841   25840 ld.bfd          5687344 90.7
+  25785   18879 rustc           302052 4.5
+   2002    1983 Runner.Worker   202928 0.8
+  18879   17007 cargo           180552 0.2
+   1966    1964 provjobd1521989 140904 2.1
+   1983    1926 Runner.Listener 90156  0.2
+   1406       1 dockerd         89156  0.8
+  16612   16563 postgres        68040  0.0
+   1131       1 containerd      50832  0.2
+  17007   16348 mise            50160  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  25841   25840 ld.bfd          5687852 90.7
+  25785   18879 rustc           302052 4.4
+   1966    1964 provjobd1521989 140904 2.1
+   1406       1 dockerd         89156  0.8
+   2002    1983 Runner.Worker   202928 0.8
+    119       2 kworker/u16:3-e     0  0.4
+   1131       1 containerd      50832  0.2
+  18879   17007 cargo           180552 0.2
+      1       0 systemd         14000  0.2
+   1983    1926 Runner.Listener 90156  0.2
+=== resources 2026-11-25T23:13:13Z sample=36
+cpu(interval) us=50% sy=10% id=39% wa=1% | procs runnable=6 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12283MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=1.69 full avg10=1.51 ] 
+dm cow-root: 0 312473567 snapshot 32916224/462890625 128088;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=114422857728B inodes_avail=19002318
+disk /mnt (mount /) avail=114422857728B inodes_avail=19002318
+overlap ld.bfd=1 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  26639   26586 rustc           953568 95.8
+  26644   26586 rustc           875092 97.1
+  26718   26586 rustc           463840 98.0
+   2002    1983 Runner.Worker   202920 0.8
+  26586   26512 cargo           200084 11.2
+  26651   26586 rustc           150208 12.5
+   1966    1964 provjobd1521989 143332 2.1
+   1983    1926 Runner.Listener 90152  0.2
+   1406       1 dockerd         89192  0.8
+  16612   16563 postgres        68040  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  26718   26586 rustc           464208 97.4
+  26644   26586 rustc           876076 96.9
+  26639   26586 rustc           955104 95.8
+  26586   26512 cargo           200084 11.1
+   1966    1964 provjobd1521989 143332 2.1
+   1406       1 dockerd         89192  0.8
+   2002    1983 Runner.Worker   202920 0.8
+  26512   17007 cargo-nextest   37600  0.6
+    119       2 kworker/u16:3-e     0  0.4
+   1131       1 containerd      50836  0.2
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=5.55% mem=113.1MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=2.89% mem=7.715MiB / 15.33GiB
+=== resources 2026-11-25T23:13:23Z sample=37
+cpu(interval) us=92% sy=7% id=1% wa=0% | procs runnable=4 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=11574MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=0.62 full avg10=0.55 ] 
+dm cow-root: 0 312473567 snapshot 32916240/462890625 128088;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=114289541120B inodes_avail=19002265
+disk /mnt (mount /) avail=114289541120B inodes_avail=19002265
+overlap ld.bfd=1 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  26797   26586 rustc           1615852 95.5
+  26639   26586 rustc           755048 94.9
+  26984   26586 rustc           716628 95.0
+  26718   26586 rustc           571900 89.2
+  27081   27080 ld.bfd          531592 96.2
+   2002    1983 Runner.Worker   202920 0.8
+  26586   26512 cargo           200084 3.8
+   1966    1964 provjobd1521989 140632 2.1
+   1983    1926 Runner.Listener 90160  0.2
+   1406       1 dockerd         89700  0.8
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  26797   26586 rustc           1615896 95.6
+  26984   26586 rustc           717248 94.8
+  26639   26586 rustc           663092 94.8
+  27081   27080 ld.bfd          538184 94.0
+  26718   26586 rustc           571900 88.9
+  26586   26512 cargo           200084 3.8
+   1966    1964 provjobd1521989 140640 2.1
+  27079   26718 cc               2752  1.1
+   1406       1 dockerd         89700  0.8
+   2002    1983 Runner.Worker   202920 0.8
+=== resources 2026-11-25T23:13:33Z sample=38
+cpu(interval) us=87% sy=13% id=0% wa=0% | procs runnable=5 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=9371MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.00 full avg10=0.00 ] io[some avg10=1.23 full avg10=0.20 ] 
+dm cow-root: 0 312473567 snapshot 33785504/462890625 131472;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=113998188544B inodes_avail=19002253
+disk /mnt (mount /) avail=113998188544B inodes_avail=19002253
+overlap ld.bfd=2 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  27199   27198 ld.bfd          1870580 95.5
+  27137   26586 rustc           1664596 96.4
+  27246   26586 rustc           1042992 93.9
+  27347   27346 ld.bfd          945696 94.5
+  26797   26586 rustc           739412 86.7
+  26984   26586 rustc           323236 39.1
+   2002    1983 Runner.Worker   202920 0.8
+  26586   26512 cargo           200120 2.4
+   1966    1964 provjobd1521989 141040 2.2
+   1983    1926 Runner.Listener 90228  0.2
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  27137   26586 rustc           1665584 96.4
+  27199   27198 ld.bfd          1870704 95.7
+  27246   26586 rustc           1043916 94.0
+  27347   27346 ld.bfd          949444 93.9
+  26797   26586 rustc           739412 86.7
+  26984   26586 rustc           323236 39.1
+  26586   26512 cargo           200120 2.4
+   1966    1964 provjobd1521989 141040 2.2
+  27345   26797 cc               2880  1.0
+   1406       1 dockerd         89700  0.8
+=== resources 2026-11-25T23:13:43Z sample=39
+cpu(interval) us=79% sy=19% id=0% wa=1% | procs runnable=4 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=7651MiB | swap used=0MiB free=3071MiB
+psi memory[some avg10=0.65 full avg10=0.39 ] io[some avg10=2.42 full avg10=0.41 ] 
+dm cow-root: 0 312473567 snapshot 35141272/462890625 136752;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=113644589056B inodes_avail=19002219
+disk /mnt (mount /) avail=113644589056B inodes_avail=19002219
+overlap ld.bfd=3 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  27347   27346 ld.bfd          4145932 84.7
+  27137   26586 rustc           779204 90.0
+  26797   26586 rustc           739412 57.8
+  27664   26586 rustc           675132 97.1
+  27246   26586 rustc           606576 93.1
+  27661   27660 ld.bfd          573776 90.9
+  27688   27687 ld.bfd          222500 83.7
+   2002    1983 Runner.Worker   202920 0.8
+  26586   26512 cargo           200136 1.8
+   1966    1964 provjobd1521989 142980 2.3
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  27664   26586 rustc           680336 95.8
+  27246   26586 rustc           606576 92.8
+  27137   26586 rustc           779204 89.9
+  27661   27660 ld.bfd          573776 89.6
+  27347   27346 ld.bfd          4151628 84.7
+  27688   27687 ld.bfd          241400 82.9
+  26797   26586 rustc           739412 57.8
+   1966    1964 provjobd1521989 142980 2.3
+  27667   27246 cc               2804  2.0
+  26586   26512 cargo           200136 1.8
+docker:
+wyrd-test-16346-16352-wyrd-postgres-1 cpu=0.00% mem=127.2MiB / 15.33GiB
+wyrd-test-16346-16352-wyrd-mailpit-1 cpu=0.00% mem=7.594MiB / 15.33GiB
+=== resources 2026-11-25T23:13:53Z sample=40
+cpu(interval) us=50% sy=49% id=0% wa=1% | procs runnable=5 blocked=0 | swap si=45960KiB/s so=340705KiB/s
+mem total=15701MiB available=4352MiB | swap used=3071MiB free=0MiB
+psi memory[some avg10=19.28 full avg10=17.58 ] io[some avg10=3.71 full avg10=0.72 ] 
+dm cow-root: 0 312473567 snapshot 36355968/462890625 141472;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=113628295168B inodes_avail=19002195
+disk /mnt (mount /) avail=113628295168B inodes_avail=19002195
+overlap ld.bfd=4 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  27347   27346 ld.bfd          4312720 81.9
+  27661   27660 ld.bfd          2341312 64.1
+  27688   27687 ld.bfd          1694072 73.8
+  27879   27878 ld.bfd          932232 76.9
+  27664   26586 rustc           374832 51.7
+  26797   26586 rustc           255548 43.1
+  27137   26586 rustc           223772 59.4
+  27246   26586 rustc           153348 57.3
+   1966    1964 provjobd1521989 97972  2.4
+  16612   16563 postgres        49456  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  27347   27346 ld.bfd          4313860 81.9
+  27879   27878 ld.bfd          938180 77.3
+  27688   27687 ld.bfd          1695956 73.8
+  27661   27660 ld.bfd          2344636 64.2
+  27137   26586 rustc           223772 59.4
+  27246   26586 rustc           153348 57.2
+  27664   26586 rustc           374832 51.6
+  26797   26586 rustc           255548 43.1
+  27942   16314 bash             2284 17.8
+   1966    1964 provjobd1521989 97972  2.4
+=== resources 2026-11-25T23:14:03Z sample=41
+cpu(interval) us=48% sy=39% id=1% wa=11% | procs runnable=5 blocked=0 | swap si=57256KiB/s so=96797KiB/s
+mem total=15701MiB available=1212MiB | swap used=3043MiB free=28MiB
+psi memory[some avg10=17.98 full avg10=16.16 ] io[some avg10=11.45 full avg10=7.80 ] 
+dm cow-root: 0 312473567 snapshot 36942312/462890625 143760;
+disk /home/runner/work/wyrd/wyrd (mount /) avail=113401901056B inodes_avail=19002213
+disk /mnt (mount /) avail=113401901056B inodes_avail=19002213
+overlap ld.bfd=3 lld=0 rustc=4
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  27347   27346 ld.bfd          4716004 78.9
+  27661   27660 ld.bfd          3956500 65.3
+  27879   27878 ld.bfd          3769056 68.9
+  28102   26586 rustc           685068 67.7
+  27664   26586 rustc           184272 26.8
+   1966    1964 provjobd1521989 96880  2.6
+    517       1 multipathd      42900  0.0
+  26797   26586 rustc           37224 34.4
+   1983    1926 Runner.Listener 34996  0.2
+   1406       1 dockerd         32504  0.8
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  27347   27346 ld.bfd          4716004 79.0
+  27879   27878 ld.bfd          3773156 68.9
+  28102   26586 rustc           686484 67.5
+  27661   27660 ld.bfd          3957276 65.3
+  27137   26586 rustc            3060 44.4
+  26797   26586 rustc           37224 34.4
+  27664   26586 rustc           184272 26.7
+  28173   16314 bash             2276  4.3
+   1966    1964 provjobd1521989 96880  2.6
+     70       2 kswapd0             0  1.6

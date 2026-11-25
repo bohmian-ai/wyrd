@@ -1,0 +1,16 @@
+Filesystem        1B-blocks        Used   Available Use% Mounted on
+/dev/root      154894188544 63641903104 91235508224  42% /
+tmpfs            8380170240       86016  8380084224   1% /dev/shm
+tmpfs            3352072192     1048576  3351023616   1% /run
+tmpfs               5242880           0     5242880   0% /run/lock
+efivarfs          134217728       31795   134180813   1% /sys/firmware/efi/efivars
+/dev/sda16        923156480    88518656   769994752  11% /boot
+/dev/sda15        109395456     6399488   102995968   6% /boot/efi
+tmpfs            1676034048       12288  1676021760   1% /run/user/1001
+
+               total        used        free      shared  buff/cache   available
+Mem:     16760344576  1087270912 14618087424    48365568  1410957312 15673073664
+Swap:     3221221376           0  3221221376
+
+NAME      TYPE       SIZE USED PRIO
+/swapfile file 3221221376    0   -1

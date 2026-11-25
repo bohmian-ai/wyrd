@@ -77,15 +77,6 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'package(wyrd-testing) and binary(capacity) and (test(=tests::a_stalled_tenant_setup_stops_the_run_by_its_deadline) or test(=tests::a_slow_replica_stop_leaves_the_runtime_free))'
 test-group = 'release-server-ports'
-# Both development-review journeys run scripts/dev/example-app.sh prepare on
-# the one shared target/dev/wyrd-example-py checkout, and one binds MockServer's
-# fixed port 1080. Run together, the second fails on git's index.lock.
-[test-groups.dev-example-app]
-max-threads = 1
-
-[[profile.default.overrides]]
-filter = 'package(wyrd-server) and binary(integration) and test(/^pg_dev_repository_review::/)'
-test-group = 'dev-example-app'
 # Every other server-booting test starts its own WyrdTestServer. A server
 # opens one set of serving pools and its fixture keeps another, each capped by
 # scripts/postgres/with-test-postgres.sh: an 8-connection app pool

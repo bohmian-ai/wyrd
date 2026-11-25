@@ -15,7 +15,6 @@ mod pg_card_declaration_route;
 mod pg_code_review_cache;
 mod pg_deferred_evidence;
 /// `dev:full`'s pull request review bootstrap over the development MockServer.
-mod pg_dev_repository_review;
 /// The durable publication backend of queued Verifier work.
 #[cfg(feature = "test-support")]
 mod pg_durable_verifier_work;

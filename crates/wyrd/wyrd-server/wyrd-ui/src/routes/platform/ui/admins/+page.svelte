@@ -11,7 +11,6 @@
 <header class="pagehead"><div><h1>Admins</h1><p>People who can change this deployment.</p></div></header>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-
 <div class="tablewrap" role="region" aria-label="Admins" tabindex="0">
   <table>
     <thead><tr><th>Name</th><th>Signs in with</th><th>Status</th><th><span class="sr-only">Session</span></th></tr></thead>

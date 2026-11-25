@@ -488,15 +488,35 @@ test('production SSO crosses replicas', async () => {
   expect((await second.go(1, `/t/${sso}`)).status).toBe(200);
   expect((await second.go(0, `/t/${sso}`)).status).toBe(200);
 
-  // The admin may deactivate; every session signed in through that connection ends at once.
+  // Deactivate and Remove are links to a confirmation stating their impact, never an
+  // immediate post; opening either and cancelling it changes nothing.
+  const page = await (await alice.go(0, settings)).text();
+  expect(page).toContain(`href="${settings}?confirm=deactivate"`);
+  expect(page).not.toContain('action="?/deactivate"');
+  expect(page).not.toContain('action="?/remove"');
+  for (const asked of ['deactivate', 'remove']) {
+    const confirm = await (await alice.go(1, `${settings}?confirm=${asked}`)).text();
+    expect(confirm, asked).toContain(`action="?/${asked}"`);
+    expect(confirm, asked).toContain('can no longer get in');
+  }
+  expect(await (await alice.go(0, settings)).text()).toContain('Danger zone');
+  for (const [browser, replica] of [[alice, 1], [bob, 0], [second, 1]] as const)
+    expect((await browser.go(replica, `/t/${sso}`)).status).toBe(200);
+
+  // Confirmed, the admin deactivates; every session signed in through that connection ends at once.
   const deactivated = await alice.go(1, `${settings}?/deactivate`, { form: {} });
   expect(deactivated.status).not.toBe(403);
   expect(deactivated.status).toBeLessThan(500);
   await expectSessionEnded(alice, 0, sso);
   await expectSessionEnded(bob, 1, sso);
   await expectSessionEnded(second, 0, sso);
-  // The operator's recovery session rests on its key, not the connection, and stays live.
-  expect((await operator.go(0, settings)).status).toBe(200);
+  // The operator's recovery session rests on its key, not the connection, and stays live,
+  // and its reload shows no Active connection left to deactivate.
+  const after = await operator.go(0, settings);
+  expect(after.status).toBe(200);
+  const reloaded = await after.text();
+  expect(reloaded).not.toContain('Danger zone');
+  expect(reloaded).toContain('Not set up');
 }, journeyTimeout + 30_000);
 
 test('OIDC-off credential UI', async () => {
@@ -701,7 +721,7 @@ test('production provider replacement settings', async () => {
     });
   /** The rendered connections' ids and the candidate revision. */
   const connections = async () => {
-    const html = await (await alice.go(1, settings)).text();
+    const html = await (await alice.go(1, `${settings}?confirm=remove`)).text();
     return {
       ids: [...html.matchAll(/name="id" value="([0-9a-f-]{36})"/g)].map(([, id]) => id),
       revision: /action="\?\/test"[^>]*>[\s\S]*?name="revision" value="(\d+)"/.exec(html)?.[1]
@@ -785,6 +805,24 @@ test('production provider replacement settings', async () => {
   // Removing the retired connection leaves the replacement's session live.
   expect((await replaced.go(0, settings)).status).toBe(200);
   expect((await replaced.go(1, settings)).status).toBe(200);
+
+  // The owner, signed in with its recovery key, removes the Active connection through its
+  // confirmation: cancelling keeps it, confirming deletes it and ends its sessions.
+  const owner = new Browser();
+  const ownerLogin = await owner.go(0, `/t/${tenant}/login/api-key`, { form: { apiKey: journey.replacementOwnerKey } });
+  expect(ownerLogin.headers.get('location')).toBe(`/t/${tenant}`);
+  const confirm = await (await owner.go(1, `${settings}?confirm=remove`)).text();
+  expect(confirm).toContain('Remove company SSO?');
+  expect(confirm).toContain('client secret are deleted');
+  const active = /action="\?\/remove"[^>]*>[\s\S]*?name="id" value="([0-9a-f-]{36})"/.exec(confirm)?.[1];
+  expect(active).toBe(view.active?.id);
+  expect(await (await owner.go(0, settings)).text()).toContain('Danger zone');
+  expect((await replaced.go(1, `/t/${tenant}`)).status).toBe(200);
+  expect((await owner.go(1, `${settings}?/remove`, { form: { id: active! } })).status).toBe(200);
+  const reloaded = await (await owner.go(0, settings)).text();
+  expect(reloaded).not.toContain('Danger zone');
+  expect(reloaded).toContain('Not set up');
+  await expectSessionEnded(replaced, 0, tenant);
 }, journeyTimeout);
 
 test('production SSO account settings', async () => {

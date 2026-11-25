@@ -3007,7 +3007,7 @@ test('an administrator manages direct and custom-role grants in People and Roles
   try {
     /** Post one access form action directly, as a request that skipped the page's own controls. */
     const post = async (action: string, form: Record<string, string>) =>
-      ((await (await page.request.post(`${base}/settings/people?/${action}`, { form, headers: { origin: ui.base } })).json()) as { type: string; status: number });
+      ((await (await page.request.post(`${base}/settings/people?/${action}`, { form, headers: formPost })).json()) as { type: string; status: number });
     await page.goto(`${base}/settings/people`);
 
     // An invitation that names no scope is refused: nobody is enrolled with a tenant-wide default.
@@ -3135,7 +3135,7 @@ test('an administrator suspends a User and a Service account in Settings, and th
     // A signed-in viewer posts the action directly: the server refuses it and the account stays active.
     const direct = await bystander.request.post(`${base}/settings/service-accounts?/suspend`, {
       form: { principalId: service.principal_id, principalKind: 'service', reason: 'not mine to stop' },
-      headers: { origin: ui.base }
+      headers: formPost
     });
     const refusal = (await direct.json()) as { type: string; status: number; data: string };
     expect(refusal).toMatchObject({ type: 'failure', status: 403 });
@@ -3416,6 +3416,238 @@ test('People and Service accounts work from the keyboard and fit a phone and a d
 });
 
 
+/** The tenant API as `apiKey`: JSON calls that answer status and body. */
+async function tenantApi(serverUrl: string, apiKey: string) {
+  const token = await WyrdClient.connect({ serverUrl, credential: apiKey }).accessToken();
+  return async (method: string, path: string, body?: unknown) => {
+    const response = await fetch(`${serverUrl}/v1${path}`, {
+      method,
+      headers: { 'x-wyrd-access-token': `Bearer ${token}`, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    const text = await response.text();
+    return { status: response.status, body: (text ? JSON.parse(text) : null) as unknown };
+  };
+}
+
+/** The open overlay named `name` is modal: focus starts inside it, and Shift+Tab and Tab never leave it. */
+async function expectModal(page: Page, name: string) {
+  await page.getByRole('dialog', { name }).waitFor();
+  const inside = () => page.evaluate(() => Boolean(document.querySelector('dialog[open]')?.contains(document.activeElement)));
+  expect(await inside()).toBe(true);
+  for (const key of ['Shift+Tab', 'Shift+Tab', ...Array<string>(10).fill('Tab')]) {
+    await page.keyboard.press(key);
+    expect(await inside(), key).toBe(true);
+  }
+}
+
+/**
+ * At 390px in light and dark, the table region named `name` takes keyboard
+ * focus and scrolls its overflowing columns inside itself, never the page.
+ */
+async function expectScrollRegion(page: Page, name: string) {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const mode of ['light', 'dark'] as const) {
+    await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+    const region = page.getByRole('region', { name, exact: true });
+    await region.evaluate((node) => (node.scrollLeft = 0));
+    await region.focus();
+    expect(await region.evaluate((node) => node === document.activeElement), `${name} ${mode}`).toBe(true);
+    expect(await region.evaluate((node) => node.scrollWidth > node.clientWidth), `${name} ${mode} overflows`).toBe(true);
+    await page.keyboard.press('ArrowRight');
+    await expect.poll(() => region.evaluate((node) => node.scrollLeft)).toBeGreaterThan(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  }
+  await page.setViewportSize({ width: 1280, height: 720 });
+}
+
+/**
+ * The administrator manages every owner's secret from Settings → Secrets:
+ * a provider key is added, replaced, renewed and revoked; each Operator
+ * connection's secret shape is replaced; each owner renews. Values go in once
+ * and no page ever carries one; cancelling writes nothing; a reader's direct
+ * post, another workspace's session and an owner's refusal change nothing
+ * and never report success.
+ */
+test('an administrator manages each owner\'s secrets in Settings, and cancels, refusals and failures change nothing', async ({ server, ui }) => {
+  const tenantKey = 'ui-secrets';
+  const tenant = server.seedTenant(tenantKey);
+  const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-secrets-admin');
+  const readerKey = server.bootstrapServiceInTenant(tenant, [], 'ui-secrets-reader');
+  const api = await tenantApi(ui.serverUrl, adminKey);
+  const values = ['xoxb-ui-seed', 'basic-ui-seed', 'header-ui-seed', 'issuer-ui-seed', 'human-ui-seed'];
+  for (const [path, body] of [
+    ['/operator-connections', { provider: 'slack', name: 'ops-slack', workspace_id: 'T0001', bot_token: values[0] }],
+    ['/operator-connections', { provider: 'http', name: 'ops-basic', origin: 'https://hooks.example.test', auth: { scheme: 'basic', username: 'ops', password: values[1] } }],
+    ['/operator-connections', { provider: 'http', name: 'ops-header', origin: 'https://hooks.example.test', auth: { scheme: 'header', name: 'X-Api-Key', value: values[2] } }],
+    ['/admin/trusted-issuers', { issuer: google.issuer, expected_audience: 'wyrd', client_id: 'workload-client', client_auth: 'SecretPost', client_secret: values[3], claim_mapping: { subject: 'sub' }, principal_kind: 'workload' }]
+  ] as const) {
+    const created = await api('POST', path, body);
+    expect(created.status, `${path} ${JSON.stringify(created.body)}`).toBeLessThan(300);
+  }
+  const staged = await api('PUT', '/identity/oidc/candidate', {
+    issuer: google.issuer, client_id: 'human-client', client_auth: 'SecretPost', client_secret: values[4],
+    claim_mapping: { subject: 'sub', email: 'email' }, group_role_map: {}
+  });
+  expect(staged.status, JSON.stringify(staged.body)).toBeLessThan(300);
+  const connections = async () => (await api('GET', '/operator-connections')).body as { connection_id: string; name: string; updated_at: string }[];
+  const updated = async (name: string) => (await connections()).find((view) => view.name === name)?.updated_at;
+  const credentials = async () => (await api('GET', '/admin/gateway/provider-credentials')).body as { name: string; state: string; rotated_at: string | null }[];
+
+  const page = await signIn(ui.browser, ui.base, tenantKey, adminKey);
+  const secrets = `${ui.base}/t/${tenantKey}/settings/secrets`;
+  /** A plain HTML form post, as a browser without script sends one. */
+  const formPost = { origin: ui.base, accept: 'text/html' };
+  const notice = page.getByRole('status').filter({ hasText: '✓' });
+  const row = (name: string) => page.getByRole('region', { name: 'Secrets' }).getByRole('row').filter({ hasText: name });
+  const renew = async (name: string) => {
+    const target = row(name);
+    await target.locator('summary').click();
+    await target.getByRole('button', { name: /Renew encryption/ }).click();
+    await expect.poll(() => notice.textContent()).toContain('Encryption renewed. The value is unchanged.');
+  };
+  try {
+    // Every owner's secret is listed from its owner, and the stored values are nowhere in the page.
+    await page.goto(secrets);
+    for (const [name, kind] of [['ops-slack', 'Operator connection · Slack'], ['ops-basic', 'Operator connection · HTTP'], ['ops-header', 'Operator connection · HTTP']])
+      expect(await row(name).textContent()).toContain(kind);
+    const host = new URL(google.issuer).host;
+    expect(await row('Trusted issuer client secret').textContent()).toContain(host);
+    expect(await row('Company SSO client secret').textContent()).toContain('Not on yet');
+
+    // Add provider key is a modal drawer; Escape and Cancel close it and store nothing.
+    const add = page.getByRole('link', { name: 'Add provider key' });
+    await add.click();
+    await expectModal(page, 'Add provider key');
+    await page.getByLabel('Name').fill('openai-main');
+    await page.getByLabel('API key').fill('sk-ui-cancelled');
+    await page.keyboard.press('Escape');
+    await page.getByRole('dialog', { name: 'Add provider key' }).waitFor({ state: 'detached' });
+    expect(page.url()).toBe(secrets);
+    await expect.poll(() => page.evaluate(() => document.activeElement?.textContent?.trim() ?? '')).toContain('Add provider key');
+    await add.click();
+    await page.getByRole('dialog', { name: 'Add provider key' }).getByRole('link', { name: 'Cancel' }).click();
+    await page.getByRole('dialog', { name: 'Add provider key' }).waitFor({ state: 'detached' });
+    expect(await credentials()).toEqual([]);
+
+    // Saved, it is Active from the owner, and no page carries its value.
+    await add.click();
+    await page.getByLabel('Name').fill('openai-main');
+    await page.getByLabel('Provider', { exact: true }).selectOption('openai');
+    await page.getByLabel('API key').fill('sk-ui-first');
+    await page.getByRole('button', { name: 'Save key' }).click();
+    await expect.poll(() => notice.textContent()).toContain('openai-main saved.');
+    const [first] = await credentials();
+    expect(first).toMatchObject({ name: 'openai-main', state: 'active' });
+    await page.goto(secrets);
+    expect(await row('openai-main').textContent()).toContain('Active');
+
+    // A distinct value replaces it in place; the owner records the rotation.
+    await row('openai-main').getByRole('link', { name: 'Replace' }).click();
+    await page.getByLabel('API key').fill('sk-ui-second');
+    await page.getByRole('dialog', { name: 'Replace openai-main' }).getByRole('button', { name: 'Replace' }).click();
+    await expect.poll(() => notice.textContent()).toContain('Secret replaced. The new value is in use.');
+    const [second] = await credentials();
+    expect(second.rotated_at).not.toBeNull();
+    expect(second.rotated_at).not.toBe(first.rotated_at);
+
+    // Each Operator secret shape is replaced through its owner: a Slack token, HTTP basic and a named header.
+    for (const [name, fill] of [
+      ['ops-slack', async () => page.getByLabel('Bot token').fill('xoxb-ui-next')],
+      ['ops-basic', async () => { await page.getByLabel('Username').fill('ops-next'); await page.getByLabel('Password').fill('basic-ui-next'); }],
+      ['ops-header', async () => page.getByLabel('Value of X-Api-Key').fill('header-ui-next')]
+    ] as const) {
+      const before = await updated(name);
+      await page.goto(secrets);
+      await row(name).getByRole('link', { name: 'Replace' }).click();
+      await fill();
+      await page.getByRole('dialog', { name: `Replace ${name}` }).getByRole('button', { name: 'Replace' }).click();
+      await expect.poll(() => notice.textContent()).toContain('Secret replaced. The new value is in use.');
+      expect(await updated(name), name).not.toBe(before);
+    }
+    // The trusted issuer's client secret is replaced the same way.
+    await page.goto(secrets);
+    await row('Trusted issuer client secret').getByRole('link', { name: 'Replace' }).click();
+    await page.getByLabel('Client secret').fill('issuer-ui-next');
+    await page.getByRole('dialog', { name: /^Replace / }).getByRole('button', { name: 'Replace' }).click();
+    await expect.poll(() => notice.textContent()).toContain('Secret replaced. The new value is in use.');
+
+    // Every owner renews its encryption; the company SSO secret is replaced by staging, so it links to Sign-in.
+    for (const name of ['openai-main', 'ops-slack', 'Trusted issuer client secret', 'Company SSO client secret']) {
+      await page.goto(secrets);
+      await renew(name);
+    }
+    expect(await row('Company SSO client secret').getByRole('link', { name: 'Replace' }).getAttribute('href')).toBe(`/t/${tenantKey}/settings/sign-in?setup=2`);
+
+    // Revoke confirms first: its dialog is modal, Cancel keeps the key Active, and confirming ends it.
+    await page.goto(secrets);
+    await row('openai-main').locator('summary').click();
+    await row('openai-main').getByRole('link', { name: 'Revoke…' }).click();
+    await expectModal(page, 'Revoke openai-main?');
+    await page.getByRole('dialog', { name: 'Revoke openai-main?' }).getByRole('link', { name: 'Cancel' }).click();
+    await page.getByRole('dialog', { name: 'Revoke openai-main?' }).waitFor({ state: 'detached' });
+    expect((await credentials())[0].state).toBe('active');
+    await page.goto(secrets);
+    await row('openai-main').locator('summary').click();
+    await row('openai-main').getByRole('link', { name: 'Revoke…' }).click();
+    await page.getByRole('button', { name: 'Revoke key' }).click();
+    await expect.poll(() => notice.textContent()).toContain('openai-main revoked.');
+    expect((await credentials())[0].state).toBe('revoked');
+    await page.goto(secrets);
+    expect(await row('openai-main').textContent()).toContain('Revoked');
+    expect(await row('openai-main').getByRole('link', { name: 'Replace' }).count()).toBe(0);
+
+    // The owner refuses replacing a revoked key: the page shows its safe problem, never success.
+    const [revoked] = await credentials();
+    const refused = await page.request.post(`${secrets}?/replace`, {
+      headers: formPost,
+      form: { owner: 'provider', key: 'openai-main', provider: 'openai', value: 'sk-ui-refused' }
+    });
+    expect(refused.status()).toBeGreaterThanOrEqual(400);
+    expect(refused.status()).toBeLessThan(500);
+    const refusal = await refused.text();
+    expect(refusal).toContain('Nothing was changed.');
+    expect(refusal).not.toContain('Secret replaced');
+    expect((await credentials())[0]).toEqual(revoked);
+
+    // No page this journey rendered carries a value it stored.
+    const rendered = await serverHtml(page, secrets);
+    for (const value of [...values, 'sk-ui-first', 'sk-ui-second', 'xoxb-ui-next', 'basic-ui-next', 'header-ui-next', 'issuer-ui-next', 'sk-ui-cancelled', 'sk-ui-refused'])
+      expect(rendered).not.toContain(value);
+
+    // The populated inventory scrolls inside its own region on a phone, in light and dark.
+    await expectScrollRegion(page, 'Secrets');
+
+    // A reader's direct post and another workspace's session change nothing.
+    const slack = await updated('ops-slack');
+    const slackId = (await connections()).find((view) => view.name === 'ops-slack')!.connection_id;
+    const reader = await signIn(ui.browser, ui.base, tenantKey, readerKey);
+    const foreign = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+    try {
+      const denied = await reader.request.post(`${secrets}?/renew`, { headers: formPost, form: { owner: 'operator', key: slackId } });
+      expect(denied.status()).toBe(403);
+      expect(await denied.text()).not.toContain('Encryption renewed');
+      const replaced = await reader.request.post(`${secrets}?/replace`, { headers: formPost, form: { owner: 'issuer', key: google.issuer, value: 'issuer-ui-reader' } });
+      expect(replaced.status()).toBe(403);
+      const crossed = await foreign.request.post(`${secrets}?/revoke`, { headers: formPost, form: { key: 'openai-main' }, maxRedirects: 0 });
+      expect(crossed.status()).toBeGreaterThanOrEqual(300);
+      expect(crossed.status()).toBeLessThan(500);
+      // Its own workspace's owner does not know this one's connection id.
+      const own = await foreign.request.post(`${ui.base}/t/${TENANT}/settings/secrets?/renew`, { headers: formPost, form: { owner: 'operator', key: slackId } });
+      expect(own.status()).toBeGreaterThanOrEqual(400);
+      expect(own.status()).toBeLessThan(500);
+      expect(await own.text()).not.toContain('Encryption renewed');
+      expect(await updated('ops-slack')).toBe(slack);
+    } finally {
+      await reader.context().close();
+      await foreign.context().close();
+    }
+  } finally {
+    await page.context().close();
+  }
+});
+
+
 const google = process.env.WYRD_UI_INTEGRATION ? await startFakeGoogle() : { issuer: 'http://127.0.0.1:9', account: { sub: '', email: '' } };
 /** A deployment whose shared Google sign-in is the fake Google. */
 const withGoogle = serverTest({ googleIssuer: google.issuer, perTest: true });
@@ -3456,7 +3688,10 @@ async function enableGoogle(serverUrl: string, rootCredential: string): Promise<
  * the invited access; after signing out they continue with Google to the
  * same account; a second link opened with the same Google account is told
  * to sign in instead; and a Google account with no invitation is told it has
- * no account.
+ * no account. Throughout, the shell, Your account and People name her by
+ * Google's name over her own email: a changed name shows after her next
+ * sign-in, an omitted one keeps the stored name, a nameless account falls
+ * back to its email, and another workspace's named User never shows.
  */
 withGoogle('an invited person joins with Google and returns with Google', async ({ server }) => {
   await enableGoogle(server.baseUrl, server.initializePlatformRoot());
@@ -3480,9 +3715,29 @@ withGoogle('an invited person joins with Google and returns with Google', async 
       return (await links.first().textContent()) ?? '';
     };
 
+    /** `person`'s shell and Your account, and the administrator's People row, name them `name` over `email`. */
+    const named = async (person: Page, name: string, email: string) => {
+      await person.goto(base);
+      expect(await person.locator('.me .who b').textContent()).toBe(name);
+      expect(await person.locator('.me .who span').textContent()).toBe(email);
+      await person.goto(`${base}/settings/account`);
+      const profile = await person.getByTestId('profile').textContent();
+      expect(profile).toContain(name);
+      expect(profile).toContain(email);
+      await page.goto(`${base}/settings/people`);
+      const row = page.getByRole('row').filter({ hasText: email });
+      expect(await row.count()).toBe(1);
+      expect(await row.locator('td b').first().textContent()).toBe(name);
+    };
+    const signOut = async (person: Page) => {
+      await person.goto(`${base}/settings/account`);
+      await person.getByRole('button', { name: 'Sign out' }).click();
+      await person.waitForURL(/\/login$/);
+    };
+
     // Ana opens her link and joins with a Google account whose email is not the invited one.
     const link = await inviteOne('ana@example.test');
-    google.account = { sub: 'google-ana', email: 'ana.personal@gmail.test' };
+    google.account = { sub: 'google-ana', email: 'ana.personal@gmail.test', name: 'Ana Lima' };
     const ana = await (await browser.newContext()).newPage();
     await ana.goto(link);
     await ana.getByRole('button', { name: 'Join with Google' }).click();
@@ -3494,14 +3749,26 @@ withGoogle('an invited person joins with Google and returns with Google', async 
       { role: 'viewer', scope: payments, source: 'direct' }
     ]);
 
-    // She signs out and continues with Google to the same account.
+    await named(ana, 'Ana Lima', 'ana.personal@gmail.test');
+
+    // She signs out and continues with Google to the same account; Google now sends a
+    // changed name, which every consumer shows.
     await ana.locator('.me .who').click();
     await ana.getByRole('button', { name: 'Sign out' }).click();
     await ana.waitForURL(/\/login$/);
+    google.account = { sub: 'google-ana', email: 'ana.personal@gmail.test', name: 'Ana Souza' };
     await ana.getByRole('button', { name: 'Continue with Google' }).click();
     await ana.waitForURL(base);
     const users = (await principals.list({ kind: 'user' })).principals;
     expect(users.filter((principal) => principal.email === 'ana.personal@gmail.test')).toHaveLength(1);
+    await named(ana, 'Ana Souza', 'ana.personal@gmail.test');
+
+    // A sign-in whose token omits the name keeps the stored one.
+    await signOut(ana);
+    google.account = { sub: 'google-ana', email: 'ana.personal@gmail.test' };
+    await ana.getByRole('button', { name: 'Continue with Google' }).click();
+    await ana.waitForURL(base);
+    await named(ana, 'Ana Souza', 'ana.personal@gmail.test');
 
     // A second link opened with the same Google account is told to sign in, and the link stays live.
     const second = await inviteOne('ana.again@example.test');
@@ -3519,6 +3786,29 @@ withGoogle('an invited person joins with Google and returns with Google', async 
     await stranger.waitForURL(`${base}/login?login=no_account`);
     await expect.poll(() => stranger.getByText(`No account in ${tenant} uses that sign-in.`, { exact: false }).count()).toBe(1);
     expect((await principals.list({ kind: 'user' })).principals).toHaveLength(users.length);
+
+    // A Google account that sends no name is named by its email.
+    const nameless = await inviteOne('bo@example.test');
+    google.account = { sub: 'google-bo', email: 'bo@gmail.test' };
+    const bo = await (await browser.newContext()).newPage();
+    await bo.goto(nameless);
+    await bo.getByRole('button', { name: 'Join with Google' }).click();
+    await bo.waitForURL(base);
+    await named(bo, 'bo@gmail.test', 'bo@gmail.test');
+
+    // Another workspace's named Google User never shows in this one's People.
+    const foreign = server.seedTenant('ui-google-foreign');
+    const foreignKey = server.bootstrapServiceInTenant(foreign, ['admin'], 'google_ui_foreign_admin');
+    const elsewhere = `${bff.url}/t/ui-google-foreign`;
+    google.account = { sub: 'google-foreign', email: 'foreign@gmail.test', name: 'Faye Foreign' };
+    const faye = await (await browser.newContext()).newPage();
+    await faye.goto(`${elsewhere}/signup#invitation=${await invitation(server.baseUrl, foreignKey, 'viewer')}`);
+    await faye.getByRole('button', { name: 'Join with Google' }).click();
+    await faye.waitForURL(elsewhere);
+    expect(await faye.locator('.me .who b').textContent()).toBe('Faye Foreign');
+    await page.goto(`${base}/settings/people`);
+    expect(await page.getByText('Faye Foreign').count()).toBe(0);
+    expect(await page.getByText('foreign@gmail.test').count()).toBe(0);
   } finally {
     await browser.close();
     bff.stop();
@@ -3643,8 +3933,10 @@ withConsole('a platform operator signs in to the console with a password', async
     await page.waitForURL(`${bff.url}/platform/ui/workspaces`);
     expect(await page.getByRole('table').textContent()).toContain(server.tenantSlug);
     expect(await page.getByTestId(`status-${server.tenantSlug}`).textContent()).toContain('Active');
+    await expectScrollRegion(page, 'Workspaces');
     await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Admins' }).click();
     await page.waitForURL(`${bff.url}/platform/ui/admins`);
+    await expectScrollRegion(page, 'Admins');
     const you = page.getByRole('row').filter({ hasText: '(you)' });
     expect(await you.getByTestId('operator').textContent()).toBe('ops-oncall');
     expect(await you.textContent()).toContain('Password');

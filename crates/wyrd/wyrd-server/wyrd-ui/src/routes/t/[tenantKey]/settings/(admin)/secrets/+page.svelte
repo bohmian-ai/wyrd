@@ -70,7 +70,6 @@
   </div>
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-
   <div class="tablewrap" role="region" aria-label="Secrets" tabindex="0">
     <table>
       <thead><tr><th>Name</th><th>Used by</th><th>Last rotated</th><th>Status</th><th class="right"><span class="sr-only">Actions</span></th></tr></thead>

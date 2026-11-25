@@ -2,9 +2,9 @@
   An administration drawer or confirmation dialog whose open state lives in
   the URL: the page renders it when its query parameter is present, and the
   backdrop, the close control and Escape all go to `close`, which writes
-  nothing. It is a native modal <dialog>, so the page behind it is inert and
-  Tab stays inside; closing returns focus to whatever opened it. Styled by
-  console.css.
+  nothing. It is a native modal <dialog>, so the page behind it is inert;
+  Tab and Shift+Tab wrap at its ends rather than leaving the document, and
+  closing returns focus to whatever opened it. Styled by console.css.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
@@ -41,6 +41,20 @@
     event.preventDefault();
     leave();
   }
+  const STOPS = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex="0"]';
+  /** Wrap Tab at the overlay's last stop and Shift+Tab at its first, or from the overlay itself. */
+  function onkeydown(event: KeyboardEvent) {
+    if (event.key !== 'Tab') return;
+    const node = event.currentTarget as HTMLDialogElement;
+    const stops = [...node.querySelectorAll<HTMLElement>(STOPS)].filter((stop) => stop.checkVisibility());
+    if (!stops.length) return;
+    const [first, last] = [stops[0], stops[stops.length - 1]];
+    const at = document.activeElement;
+    if (event.shiftKey ? at === first || at === node : at === last) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+  }
   /** A backdrop click lands on the dialog itself but outside its box. */
   function onclick(event: MouseEvent) {
     const node = event.currentTarget as HTMLDialogElement;
@@ -51,7 +65,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -- Escape is the keyboard equivalent. -->
 {#if kind === 'drawer'}
-  <dialog class="drawer" aria-label={title} tabindex="-1" use:modal {oncancel} {onclick}>
+  <dialog class="drawer" aria-label={title} tabindex="-1" use:modal {oncancel} {onclick} {onkeydown}>
     <header>
       {#if heading}{@render heading()}{:else}<h2>{title}</h2>{/if}
       <a class="iconbtn" href={close} aria-label="Close" data-sveltekit-noscroll data-sveltekit-keepfocus>✕</a>
@@ -60,7 +74,7 @@
     {#if footer}<footer>{@render footer()}</footer>{/if}
   </dialog>
 {:else}
-  <dialog class="dialog" aria-labelledby="{uid}-title" tabindex="-1" use:modal {oncancel} {onclick}>
+  <dialog class="dialog" aria-labelledby="{uid}-title" tabindex="-1" use:modal {oncancel} {onclick} {onkeydown}>
     <div class="body">
       <h2 id="{uid}-title">{title}</h2>
       {@render children()}

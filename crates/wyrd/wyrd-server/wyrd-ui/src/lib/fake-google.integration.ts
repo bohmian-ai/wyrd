@@ -6,7 +6,7 @@ import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 
 /** The Google account the fake Google signs in next. */
-export type GoogleAccount = { sub: string; email: string; email_verified?: boolean };
+export type GoogleAccount = { sub: string; email: string; email_verified?: boolean; name?: string };
 
 /**
  * A loopback stand-in for Google's OpenID provider, as Wyrd's controlled
@@ -14,7 +14,7 @@ export type GoogleAccount = { sub: string; email: string; email_verified?: boole
  * the caller's redirect URI, and `/token` answers an EdDSA-signed ID token
  * echoing that request's client and nonce. It listens on `port`, or on any
  * free port when `port` is 0. An account's email is verified unless it says
- * otherwise.
+ * otherwise; its `name` claim is sent only when it has one.
  */
 export async function startFakeGoogle(port = 0): Promise<{ issuer: string; account: GoogleAccount }> {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
@@ -62,7 +62,8 @@ export async function startFakeGoogle(port = 0): Promise<{ issuer: string; accou
         const now = Math.floor(Date.now() / 1000);
         const signed = `${encode({ alg: 'EdDSA', typ: 'JWT', kid: 'fake-google' })}.${encode({
           iss: google.issuer, aud: grant.aud, sub: grant.account.sub, email: grant.account.email,
-          email_verified: grant.account.email_verified ?? true, nonce: grant.nonce, iat: now, exp: now + 300, auth_time: now
+          email_verified: grant.account.email_verified ?? true, nonce: grant.nonce, iat: now, exp: now + 300, auth_time: now,
+          ...(grant.account.name ? { name: grant.account.name } : {})
         })}`;
         json({
           access_token: randomUUID(), token_type: 'Bearer', expires_in: 300,

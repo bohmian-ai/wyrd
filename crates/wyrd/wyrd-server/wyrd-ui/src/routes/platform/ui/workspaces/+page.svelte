@@ -17,7 +17,6 @@
 <div role="status" aria-live="polite">{#if form?.notice}<p class="done" data-testid="notice"><span class="ok">✓</span> {form.notice}</p>{/if}</div>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
-
 <div class="tablewrap" role="region" aria-label="Workspaces" tabindex="0">
   <table>
     <thead><tr><th>Workspace</th><th>Key</th><th>Status</th><th><span class="sr-only">Change</span></th></tr></thead>

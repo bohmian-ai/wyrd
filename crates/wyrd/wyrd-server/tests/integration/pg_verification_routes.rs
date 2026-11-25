@@ -568,7 +568,11 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 ///
 /// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
 /// unwritten, and so unacknowledged, and hold the whole reserved share (two
-/// of three slots) deterministically.
+/// of three slots) deterministically. The keyed request waits until a probe
+/// reservation is refused, which is when both fills hold their slots;
+/// `pending()` cannot say so, because it also counts each fill's unreserved
+/// permission audit. A probe is taken and returned with no await between, so
+/// on this single-threaded runtime it never holds a slot a fill needs.
 ///
 /// Both counts are ordered after the requests before them through
 /// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
@@ -599,7 +603,7 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
     };
     let refusal = async {
         stall.wait_entered().await;
-        while outbox.pending() < 2 {
+        while outbox.reserve(1).is_ok() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let refused = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;

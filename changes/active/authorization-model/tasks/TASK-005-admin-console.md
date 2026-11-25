@@ -252,7 +252,8 @@ SDK journeys. Record actual new test names and exact focused commands once added
 - Tier 2: `pg_principal_roles::directory_projects_names_methods_roles_and_counts`
   (`pg_principal_roles.rs:847`), `pg_admin_principals::pg_tests::role_holders_filter_count_and_member_count_alike`
   (`pg_admin_principals.rs:1257`), `pg_openapi_contract::principal_read_projections_publish_their_contract`
-  (`pg_openapi_contract.rs:644`); platform console cookie scheme `wyrdPlatformBrowserSession` on the three console
+  (`pg_openapi_contract.rs:652`; the PR 244 merge had dropped it, so it did not run before R1 restored it in
+  `860acd5c4`); platform console cookie scheme `wyrdPlatformBrowserSession` on the three console
   session routes (`de7635a14`, merged from PR 244 in `8cc9b03d3`, replacing this task's
   `f24b3d6a5`).
 - Rust SDK: `principal_roles::administrators_read_people_roles_and_counts`
@@ -458,7 +459,9 @@ branch's `dev:full` and example-app pin (`b7b63ea14`): `codegen:check`,
 `ui:check`, `docs:check`, the `development environment lifecycle` journey and
 `git diff --check` passed. `test:wyrd`: 3032/3034; the capacity sweep teardown
 test raced its paused clock and is fixed; `pg_verification_routes::staging_refusal_recovers_the_same_enqueue_identity`
-passes alone and timed out (504) once under the full lane's load.
+timed out (504) once in the full lane. The cause was a race in the test's gate, not load or production code; it was
+fixed in R1 (see `review/task-005-78cd99091-20261124/TASK-005-R1-complete-console-safety-and-proof.md`, scenario 6).
+A clean `test:wyrd` aggregate remains open for integrated verification.
 
 Remaining differences; the maintainer approved all twelve as listed (2026-11-24):
 1. The rail keeps the disabled "Find or ask…" control from the shared shell.

@@ -1,0 +1,13 @@
+Filesystem         1B-blocks        Used    Available Use% Mounted on
+/dev/root       154894188544 30563221504 124314189824  20% /
+tmpfs             8380170240       86016   8380084224   1% /dev/shm
+tmpfs             3352072192     1036288   3351035904   1% /run
+tmpfs                5242880           0      5242880   0% /run/lock
+/dev/nvme0n1p16    923156480    88518656    769994752  11% /boot
+/dev/nvme0n1p15    109395456     6399488    102995968   6% /boot/efi
+tmpfs             1676034048       12288   1676021760   1% /run/user/1001
+
+               total        used        free      shared  buff/cache   available
+Mem:     16760344576  1023250432 14022123520    48652288  2084990976 15737094144
+Swap:              0           0           0
+

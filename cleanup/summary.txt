@@ -1,0 +1,4 @@
+removed packages: 142
+named libraries that disappeared: 0
+runner ldd entries newly unresolved: 0
+removed packages that owned a named library: 0

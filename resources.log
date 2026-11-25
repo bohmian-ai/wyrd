@@ -1,0 +1,109 @@
+=== resources 2026-11-25T20:00:11Z sample=1
+cpu(interval) us=57% sy=6% id=37% wa=0% | procs runnable=8 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12733MiB | swap used=0MiB free=16383MiB
+disk /home/runner/work/wyrd/wyrd (mount /) avail=100815757312B inodes_avail=19015203
+disk /mnt (mount /) avail=100815757312B inodes_avail=19015203
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  16468   16412 rustc           842592 99.2
+  16420   16412 rustc           739420 98.3
+  16476   16412 rustc           642756 99.3
+  16494   16412 rustc           439036 97.5
+   1997    1978 Runner.Worker   225180 1.2
+  16412   16365 cargo           154960 4.4
+   1965    1962 provjobd2791326 119056 0.5
+   1978    1924 Runner.Listener 101280 0.3
+   1417       1 dockerd         71764  0.0
+  16337   16332 mise            50220  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  16476   16412 rustc           644312 99.3
+  16468   16412 rustc           843532 99.2
+  16420   16412 rustc           740288 98.3
+  16494   16412 rustc           441000 97.2
+  16412   16365 cargo           154960 4.4
+   1997    1978 Runner.Worker   225180 1.2
+    119       2 kworker/u16:3-f     0  0.7
+   1965    1962 provjobd2791326 119056 0.5
+  16365   16337 cargo-nextest   38100  0.3
+      1       0 systemd         14016  0.3
+=== resources 2026-11-25T20:00:21Z sample=2
+cpu(interval) us=74% sy=9% id=17% wa=0% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12687MiB | swap used=0MiB free=16383MiB
+disk /home/runner/work/wyrd/wyrd (mount /) avail=100527411200B inodes_avail=19015187
+disk /mnt (mount /) avail=100527411200B inodes_avail=19015187
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  16476   16412 rustc           1302892 98.8
+   1997    1978 Runner.Worker   225188 1.2
+  16412   16365 cargo           155012 2.1
+   1965    1962 provjobd2791326 116932 0.5
+   1978    1924 Runner.Listener 105572 0.3
+   1417       1 dockerd         71764  0.0
+  16337   16332 mise            50220  0.0
+    522       1 multipathd      43804  0.0
+   1159       1 containerd      43268  0.0
+    998       1 snapd           42148  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  16476   16412 rustc           1303096 98.8
+  16412   16365 cargo           155012 2.1
+   1997    1978 Runner.Worker   225188 1.2
+    119       2 kworker/u16:3-e     0  0.7
+   1965    1962 provjobd2791326 116932 0.5
+      1       0 systemd         14016  0.3
+   1978    1924 Runner.Listener 105572 0.3
+     45       2 pr/ttyS0            0  0.2
+  16365   16337 cargo-nextest   38100  0.2
+    121       2 kworker/u16:4-e     0  0.1
+=== resources 2026-11-25T20:00:31Z sample=3
+cpu(interval) us=25% sy=3% id=62% wa=11% | procs runnable=1 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12470MiB | swap used=0MiB free=16383MiB
+disk /home/runner/work/wyrd/wyrd (mount /) avail=100525826048B inodes_avail=19015185
+disk /mnt (mount /) avail=100525826048B inodes_avail=19015185
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  16476   16412 rustc           1946340 99.3
+   1997    1978 Runner.Worker   225188 1.1
+  16412   16365 cargo           155012 1.3
+   1965    1962 provjobd2791326 116992 0.5
+   1978    1924 Runner.Listener 106900 0.3
+   1417       1 dockerd         71764  0.0
+  16337   16332 mise            50220  0.0
+    522       1 multipathd      43804  0.0
+   1159       1 containerd      43320  0.0
+    998       1 snapd           42148  0.0
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  16476   16412 rustc           1946408 99.3
+  16412   16365 cargo           155012 1.3
+   1997    1978 Runner.Worker   225188 1.1
+    119       2 kworker/u16:3-f     0  0.7
+   1965    1962 provjobd2791326 116992 0.5
+      1       0 systemd         14016  0.3
+   1978    1924 Runner.Listener 106900 0.3
+  15807       2 kworker/u16:5-e     0  0.2
+     45       2 pr/ttyS0            0  0.2
+     12       2 kworker/u16:0-e     0  0.1
+docker:
+=== resources 2026-11-25T20:00:41Z sample=4
+cpu(interval) us=66% sy=8% id=24% wa=3% | procs runnable=5 blocked=0 | swap si=0KiB/s so=0KiB/s
+mem total=15701MiB available=12816MiB | swap used=0MiB free=16383MiB
+disk /home/runner/work/wyrd/wyrd (mount /) avail=100282454016B inodes_avail=19015086
+disk /mnt (mount /) avail=100282454016B inodes_avail=19015086
+top rss (pid ppid name rss_kib cpu%_lifetime_avg):
+  16776   16412 rustc           587216 97.0
+  16810   16809 ld.bfd          413212 100
+  16823   16822 ld.bfd          398380 100
+  16816   16815 ld.bfd          389212 100
+  16775   16412 rustc           242852 63.0
+   1997    1978 Runner.Worker   224616 1.1
+  16778   16412 rustc           195704 42.8
+  16777   16412 rustc           185936 48.2
+  16412   16365 cargo           155068 1.1
+   1965    1962 provjobd2791326 116644 0.6
+top cpu (pid ppid name rss_kib cpu%_lifetime_avg):
+  16810   16809 ld.bfd          418660 98.8
+  16823   16822 ld.bfd          417020 98.3
+  16816   16815 ld.bfd          389212 97.3
+  16776   16412 rustc           590436 95.9
+  16775   16412 rustc           242852 61.6
+  16777   16412 rustc           185936 47.0
+  16778   16412 rustc           195704 41.8
+   1997    1978 Runner.Worker   224616 1.1
+  16412   16365 cargo           155068 1.1
+    119       2 kworker/u16:3-f     0  0.7

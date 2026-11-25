@@ -1,0 +1,258 @@
+21:07:04 [34m[test:wyrd][0m [1m$ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:wyrd:inner'[0m
+21:07:09  mailpit Pulling 
+21:07:09  postgres Pulling 
+21:07:09  2d35ebdb57d9 Pulling fs layer 
+21:07:09  b143aff5074c Pulling fs layer 
+21:07:09  e38fa431e774 Pulling fs layer 
+21:07:09  e38fa431e774 Downloading [====>                                              ]  16.38kB/173.3kB
+21:07:09  b143aff5074c Downloading [>                                                  ]  113.4kB/10.16MB
+21:07:09  e38fa431e774 Downloading [==================================================>]  173.3kB/173.3kB
+21:07:09  e38fa431e774 Verifying Checksum 
+21:07:09  e38fa431e774 Download complete 
+21:07:09  2d35ebdb57d9 Downloading [>                                                  ]  50.67kB/3.802MB
+21:07:09  40748add9f4f Pulling fs layer 
+21:07:09  1be8baae3c53 Pulling fs layer 
+21:07:09  e91b6b814ba6 Pulling fs layer 
+21:07:09  46e4f78fd254 Pulling fs layer 
+21:07:09  111f378001d9 Pulling fs layer 
+21:07:09  c362828e9ca3 Pulling fs layer 
+21:07:09  9be9d0609035 Pulling fs layer 
+21:07:09  72bd85048465 Pulling fs layer 
+21:07:09  3b9319a24e33 Pulling fs layer 
+21:07:09  cc2ed79b34db Pulling fs layer 
+21:07:09  34ff39ac908b Pulling fs layer 
+21:07:09  91d82016f303 Pulling fs layer 
+21:07:09  cfa3776983f1 Pulling fs layer 
+21:07:09  1be8baae3c53 Waiting 
+21:07:09  e91b6b814ba6 Waiting 
+21:07:09  3b9319a24e33 Waiting 
+21:07:09  cc2ed79b34db Waiting 
+21:07:09  34ff39ac908b Waiting 
+21:07:09  91d82016f303 Waiting 
+21:07:09  cfa3776983f1 Waiting 
+21:07:09  46e4f78fd254 Waiting 
+21:07:09  111f378001d9 Waiting 
+21:07:09  c362828e9ca3 Waiting 
+21:07:09  9be9d0609035 Waiting 
+21:07:09  72bd85048465 Waiting 
+21:07:09  2d35ebdb57d9 Downloading [==================================================>]  3.802MB/3.802MB
+21:07:09  2d35ebdb57d9 Verifying Checksum 
+21:07:09  2d35ebdb57d9 Download complete 
+21:07:09  2d35ebdb57d9 Extracting [>                                                  ]  65.54kB/3.802MB
+21:07:09  1be8baae3c53 Downloading [==================================================>]  1.329kB/1.329kB
+21:07:09  1be8baae3c53 Download complete 
+21:07:09  40748add9f4f Downloading [>                                                  ]  311.8kB/29.84MB
+21:07:09  b143aff5074c Downloading [==================================================>]  10.16MB/10.16MB
+21:07:09  b143aff5074c Verifying Checksum 
+21:07:09  b143aff5074c Download complete 
+21:07:09  2d35ebdb57d9 Extracting [==================================================>]  3.802MB/3.802MB
+21:07:09  2d35ebdb57d9 Pull complete 
+21:07:09  b143aff5074c Extracting [>                                                  ]  131.1kB/10.16MB
+21:07:09  e91b6b814ba6 Downloading [>                                                  ]  68.08kB/6.443MB
+21:07:09  46e4f78fd254 Downloading [>                                                  ]  16.38kB/1.258MB
+21:07:09  46e4f78fd254 Verifying Checksum 
+21:07:09  46e4f78fd254 Download complete 
+21:07:09  e91b6b814ba6 Verifying Checksum 
+21:07:09  e91b6b814ba6 Download complete 
+21:07:09  40748add9f4f Downloading [======================>                            ]  13.16MB/29.84MB
+21:07:09  111f378001d9 Downloading [>                                                  ]  87.17kB/8.204MB
+21:07:09  b143aff5074c Extracting [============================================>      ]  9.044MB/10.16MB
+21:07:09  c362828e9ca3 Downloading [>                                                  ]  16.38kB/1.312MB
+21:07:09  c362828e9ca3 Downloading [==================================================>]  1.312MB/1.312MB
+21:07:09  c362828e9ca3 Verifying Checksum 
+21:07:09  c362828e9ca3 Download complete 
+21:07:09  b143aff5074c Extracting [==================================================>]  10.16MB/10.16MB
+21:07:09  b143aff5074c Pull complete 
+21:07:09  e38fa431e774 Extracting [=========>                                         ]  32.77kB/173.3kB
+21:07:09  e38fa431e774 Extracting [==================================================>]  173.3kB/173.3kB
+21:07:09  e38fa431e774 Extracting [==================================================>]  173.3kB/173.3kB
+21:07:09  111f378001d9 Verifying Checksum 
+21:07:09  111f378001d9 Download complete 
+21:07:09  9be9d0609035 Downloading [==================================================>]     116B/116B
+21:07:09  9be9d0609035 Verifying Checksum 
+21:07:09  9be9d0609035 Download complete 
+21:07:09  40748add9f4f Downloading [========================================>          ]  24.26MB/29.84MB
+21:07:09  e38fa431e774 Pull complete 
+21:07:09  mailpit Pulled 
+21:07:09  72bd85048465 Downloading [==================================================>]   3.14kB/3.14kB
+21:07:09  72bd85048465 Verifying Checksum 
+21:07:09  72bd85048465 Download complete 
+21:07:09  3b9319a24e33 Downloading [>                                                  ]  525.8kB/119.1MB
+21:07:09  40748add9f4f Verifying Checksum 
+21:07:09  40748add9f4f Download complete 
+21:07:09  cc2ed79b34db Downloading [==================================================>]  10.11kB/10.11kB
+21:07:09  cc2ed79b34db Verifying Checksum 
+21:07:09  cc2ed79b34db Download complete 
+21:07:09  40748add9f4f Extracting [>                                                  ]  327.7kB/29.84MB
+21:07:09  34ff39ac908b Downloading [==================================================>]     164B/164B
+21:07:09  34ff39ac908b Download complete 
+21:07:09  91d82016f303 Downloading [==================================================>]  6.101kB/6.101kB
+21:07:09  91d82016f303 Verifying Checksum 
+21:07:09  91d82016f303 Download complete 
+21:07:09  3b9319a24e33 Downloading [=====>                                             ]     14MB/119.1MB
+21:07:09  cfa3776983f1 Downloading [==================================================>]     184B/184B
+21:07:09  cfa3776983f1 Verifying Checksum 
+21:07:09  cfa3776983f1 Download complete 
+21:07:09  40748add9f4f Extracting [===============>                                   ]  9.175MB/29.84MB
+21:07:09  3b9319a24e33 Downloading [==========>                                        ]  24.11MB/119.1MB
+21:07:09  40748add9f4f Extracting [==========================>                        ]  15.73MB/29.84MB
+21:07:09  3b9319a24e33 Downloading [==============>                                    ]  33.68MB/119.1MB
+21:07:10  40748add9f4f Extracting [==========================================>        ]  25.56MB/29.84MB
+21:07:10  3b9319a24e33 Downloading [==================>                                ]  44.87MB/119.1MB
+21:07:10  40748add9f4f Extracting [===============================================>   ]  28.51MB/29.84MB
+21:07:10  3b9319a24e33 Downloading [=======================>                           ]     55MB/119.1MB
+21:07:10  40748add9f4f Extracting [=================================================> ]  29.82MB/29.84MB
+21:07:10  40748add9f4f Extracting [==================================================>]  29.84MB/29.84MB
+21:07:10  3b9319a24e33 Downloading [===========================>                       ]  65.11MB/119.1MB
+21:07:10  40748add9f4f Pull complete 
+21:07:10  1be8baae3c53 Extracting [==================================================>]  1.329kB/1.329kB
+21:07:10  1be8baae3c53 Extracting [==================================================>]  1.329kB/1.329kB
+21:07:10  1be8baae3c53 Pull complete 
+21:07:10  e91b6b814ba6 Extracting [>                                                  ]  65.54kB/6.443MB
+21:07:10  e91b6b814ba6 Extracting [==================================================>]  6.443MB/6.443MB
+21:07:10  3b9319a24e33 Downloading [===============================>                   ]  75.21MB/119.1MB
+21:07:10  e91b6b814ba6 Pull complete 
+21:07:10  46e4f78fd254 Extracting [=>                                                 ]  32.77kB/1.258MB
+21:07:10  46e4f78fd254 Extracting [==================================================>]  1.258MB/1.258MB
+21:07:10  46e4f78fd254 Extracting [==================================================>]  1.258MB/1.258MB
+21:07:10  46e4f78fd254 Pull complete 
+21:07:10  111f378001d9 Extracting [>                                                  ]   98.3kB/8.204MB
+21:07:10  3b9319a24e33 Downloading [===================================>               ]  85.32MB/119.1MB
+21:07:10  111f378001d9 Extracting [===================================>               ]  5.898MB/8.204MB
+21:07:10  111f378001d9 Extracting [==================================================>]  8.204MB/8.204MB
+21:07:10  111f378001d9 Pull complete 
+21:07:10  c362828e9ca3 Extracting [=>                                                 ]  32.77kB/1.312MB
+21:07:10  3b9319a24e33 Downloading [========================================>          ]  95.43MB/119.1MB
+21:07:10  c362828e9ca3 Extracting [==================================================>]  1.312MB/1.312MB
+21:07:10  c362828e9ca3 Pull complete 
+21:07:10  9be9d0609035 Extracting [==================================================>]     116B/116B
+21:07:10  9be9d0609035 Extracting [==================================================>]     116B/116B
+21:07:10  9be9d0609035 Pull complete 
+21:07:10  72bd85048465 Extracting [==================================================>]   3.14kB/3.14kB
+21:07:10  72bd85048465 Extracting [==================================================>]   3.14kB/3.14kB
+21:07:10  72bd85048465 Pull complete 
+21:07:10  3b9319a24e33 Downloading [============================================>      ]  105.5MB/119.1MB
+21:07:10  3b9319a24e33 Downloading [================================================>  ]  115.6MB/119.1MB
+21:07:10  3b9319a24e33 Verifying Checksum 
+21:07:10  3b9319a24e33 Download complete 
+21:07:10  3b9319a24e33 Extracting [>                                                  ]  557.1kB/119.1MB
+21:07:10  3b9319a24e33 Extracting [===>                                               ]   9.47MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [=======>                                           ]  17.27MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [==========>                                        ]  24.51MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [==============>                                    ]  33.98MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [==================>                                ]  44.56MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [=======================>                           ]  55.15MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [==========================>                        ]  62.39MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [===============================>                   ]  74.09MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [===================================>               ]  84.12MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [=======================================>           ]  94.14MB/119.1MB
+21:07:11  3b9319a24e33 Extracting [==========================================>        ]  101.4MB/119.1MB
+21:07:12  3b9319a24e33 Extracting [=============================================>     ]  107.5MB/119.1MB
+21:07:12  3b9319a24e33 Extracting [===============================================>   ]  113.6MB/119.1MB
+21:07:12  3b9319a24e33 Extracting [=================================================> ]    117MB/119.1MB
+21:07:12  3b9319a24e33 Extracting [=================================================> ]  118.1MB/119.1MB
+21:07:12  3b9319a24e33 Extracting [==================================================>]  119.1MB/119.1MB
+21:07:12  3b9319a24e33 Pull complete 
+21:07:12  cc2ed79b34db Extracting [==================================================>]  10.11kB/10.11kB
+21:07:12  cc2ed79b34db Extracting [==================================================>]  10.11kB/10.11kB
+21:07:12  cc2ed79b34db Pull complete 
+21:07:12  34ff39ac908b Extracting [==================================================>]     164B/164B
+21:07:12  34ff39ac908b Extracting [==================================================>]     164B/164B
+21:07:12  34ff39ac908b Pull complete 
+21:07:12  91d82016f303 Extracting [==================================================>]  6.101kB/6.101kB
+21:07:12  91d82016f303 Extracting [==================================================>]  6.101kB/6.101kB
+21:07:12  91d82016f303 Pull complete 
+21:07:12  cfa3776983f1 Extracting [==================================================>]     184B/184B
+21:07:12  cfa3776983f1 Extracting [==================================================>]     184B/184B
+21:07:12  cfa3776983f1 Pull complete 
+21:07:12  postgres Pulled 
+21:07:12  Network wyrd-test-16391-16397-wyrd_default  Creating
+21:07:12  Network wyrd-test-16391-16397-wyrd_default  Created
+21:07:12  Container wyrd-test-16391-16397-wyrd-mailpit-1  Creating
+21:07:12  Container wyrd-test-16391-16397-wyrd-postgres-1  Creating
+21:07:15  Container wyrd-test-16391-16397-wyrd-mailpit-1  Created
+21:07:15  Container wyrd-test-16391-16397-wyrd-postgres-1  Created
+21:07:15  Container wyrd-test-16391-16397-wyrd-postgres-1  Starting
+21:07:15  Container wyrd-test-16391-16397-wyrd-mailpit-1  Starting
+21:07:15  Container wyrd-test-16391-16397-wyrd-postgres-1  Started
+21:07:15  Container wyrd-test-16391-16397-wyrd-mailpit-1  Started
+21:07:15  Container wyrd-test-16391-16397-wyrd-postgres-1  Waiting
+21:07:15  Container wyrd-test-16391-16397-wyrd-mailpit-1  Waiting
+21:07:17  Container wyrd-test-16391-16397-wyrd-mailpit-1  Healthy
+21:07:18  Container wyrd-test-16391-16397-wyrd-postgres-1  Healthy
+21:07:18 [36m[db:migrate:all:inner][0m [1m$ cargo nextest run --locked -p wyrd-sql --test integration -E 'test(=pg_migration::pg_tests::migrations_apply_and_are_idempotent)'[0m
+21:07:18     Updating crates.io index
+21:07:20    Compiling wyrd-skald-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-spec)
+21:07:20    Compiling wyrd-semver v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-semver)
+21:07:20    Compiling wyrd-error-derive v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-error-derive)
+21:07:21    Compiling wyrd-tls v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-tls)
+21:07:21    Compiling workspace-hack v0.4.1 (/home/runner/work/wyrd/wyrd/crates/shared/workspace-hack)
+21:07:25    Compiling wyrd-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd-spec)
+21:07:47    Compiling wyrd-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-runtime)
+21:07:48    Compiling wyrd-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-sql)
+21:07:54    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+21:07:55    Compiling wyrd-dev-fixtures v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-dev-fixtures)
+21:08:05     Finished `test` profile [unoptimized + debuginfo] target(s) in 45.32s
+21:08:05 ────────────
+21:08:05  Nextest run ID cb9248dd-01e6-4b89-9914-01348b497e7c with nextest profile: default
+21:08:05     Starting 1 test across 1 binary (149 tests skipped)
+21:08:06         PASS [   0.367s] (1/1) wyrd-sql::integration pg_migration::pg_tests::migrations_apply_and_are_idempotent
+21:08:06 ────────────
+21:08:06      Summary [   0.368s] 1 test run: 1 passed, 149 skipped
+21:08:06    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+21:08:11     Finished `test` profile [unoptimized + debuginfo] target(s) in 4.76s
+21:08:11 ────────────
+21:08:11  Nextest run ID 052f605b-6b91-49e5-9952-5ab5cfaaff91 with nextest profile: default
+21:08:11     Starting 1 test across 1 binary (70 tests skipped)
+21:08:11         PASS [   0.155s] (1/1) vala-sql::integration pg_migration::pg_tests::vala_migrations_apply_and_are_idempotent
+21:08:11 ────────────
+21:08:11      Summary [   0.156s] 1 test run: 1 passed, 70 skipped
+21:08:11 [35m[build:server][0m [1m$ cargo build --locked -p wyrd-server --bin wyrd-server -p workspace-hack -p wyrd-testing[0m
+21:08:12    Compiling wyrd-semver v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-semver)
+21:08:12    Compiling wyrd-benchmark v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-benchmark)
+21:08:12    Compiling wyrd-spec v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd-spec)
+21:08:13    Compiling wyrd-tonic v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-tonic)
+21:08:13    Compiling wyrd-crypt v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-crypt)
+21:08:13    Compiling wyrd-skald-providers v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-providers)
+21:08:15    Compiling wyrd-vault v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-vault)
+21:08:16    Compiling wyrd-skald-cache v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-cache)
+21:08:16    Compiling wyrd-skald-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-runtime)
+21:08:17    Compiling wyrd-version v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-version)
+21:08:37    Compiling wyrd-utils v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-utils)
+21:08:37    Compiling wyrd-runtime v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-runtime)
+21:08:38    Compiling wyrd-interfaces v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-interfaces)
+21:08:38    Compiling wyrd-skald-prompt v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-prompt)
+21:08:38    Compiling wyrd-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-sql)
+21:08:44    Compiling wyrd-auth-oidc v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-oidc)
+21:08:45    Compiling wyrd-auth-verify v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-verify)
+21:08:46    Compiling vala-sql v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-sql)
+21:08:48    Compiling wyrd-telemetry v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-telemetry)
+21:08:49    Compiling wyrd-types v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-types)
+21:08:49    Compiling wyrd-config v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-config)
+21:08:49    Compiling wyrd-queue v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-queue)
+21:08:50    Compiling wyrd-kms v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-kms)
+21:08:51    Compiling wyrd-skald-tool v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-tool)
+21:08:51    Compiling wyrd-skald-agent v0.4.2 (/home/runner/work/wyrd/wyrd/crates/skald/skald-agent)
+21:08:52    Compiling wyrd-cards v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-cards)
+21:08:52    Compiling wyrd-loader v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-loader)
+21:08:53    Compiling wyrd-storage v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-storage)
+21:08:54    Compiling wyrd-auth-issue v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-auth-issue)
+21:08:54    Compiling vala-drift v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-drift)
+21:08:54    Compiling vala-verify v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-verify)
+21:08:55    Compiling vala-bifrost-redux v0.4.2 (/home/runner/work/wyrd/wyrd/crates/vala/vala-bifrost-redux)
+21:08:56    Compiling wyrd-auth v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-auth)
+21:09:00    Compiling wyrd-client v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-client)
+21:09:07    Compiling wyrd-gateway v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-gateway)
+21:09:22    Compiling wyrd-server v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-server)
+21:12:38     Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 26s
+21:12:38 [35m[build:server][0m [1m$ "${CARGO_TARGET_DIR:-target}/debug/wyrd-server" --version[0m
+21:12:38 wyrd-server 0.4.2
+21:12:38 [36m[1m[test:wyrd:inner][0m [1m$ bash scripts/run-family-tests.sh wyrd[0m
+21:12:38 testing wyrd packages: wyrd  wyrd-interfaces  wyrd-spec  wyrd-auth  wyrd-sql  wyrd-kms  wyrd-cards  wyrd-config  wyrd-cli  wyrd-tonic  wyrd-storage  wyrd-testing  wyrd-gateway  wyrd-server  wyrd-mcp
+21:12:39    Compiling wyrd-dev-fixtures v0.4.2 (/home/runner/work/wyrd/wyrd/crates/shared/wyrd-dev-fixtures)
+21:12:39    Compiling wyrd-testing v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-testing)
+21:12:39    Compiling wyrd-mcp v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-mcp)
+21:12:39    Compiling wyrd-cli v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-cli)
+21:12:46    Compiling wyrd v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd)
+21:12:46    Compiling wyrd-config v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-config)
+21:15:07    Compiling wyrd-storage v0.4.2 (/home/runner/work/wyrd/wyrd/crates/wyrd/wyrd-storage)

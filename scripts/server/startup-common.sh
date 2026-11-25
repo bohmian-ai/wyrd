@@ -36,6 +36,11 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # The container superuser plays the DBA; Wyrd never receives its credential.
 psql_owner() { docker exec -i "$pg" psql -v ON_ERROR_STOP=1 -qAt -U wyrd_owner -d wyrd "$@"; }
+# `wyrd-server setup` for tenant acme with its first human administrator, whose password comes from stdin.
+setup_acme() {
+  printf 'acme-admin-local\n' \
+    | docker exec -i "$app" wyrd-server setup --tenant acme --admin-username acme-admin --admin-password-stdin
+}
 
 serving_mounts=(-v "$volume:/var/lib/wyrd" -v "$keys:/run/wyrd:ro")
 

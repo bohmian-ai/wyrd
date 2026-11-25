@@ -19,7 +19,7 @@ serving_env=(
 echo "== dev journey: migrate, serve, setup"
 docker run --rm --network "$net" "${serving_env[@]:0:2}" "$image" wyrd-server migrate
 start_app development
-api_key="$(docker exec "$app" wyrd-server setup --tenant acme | sed -n 's/^admin_credential: //p')"
+api_key="$(setup_acme | sed -n 's/^admin_credential: //p')"
 [[ -n $api_key ]] || fail "setup disclosed no tenant credential"
 
 echo "== dev journey: sign in to the UI, then lose the UI"

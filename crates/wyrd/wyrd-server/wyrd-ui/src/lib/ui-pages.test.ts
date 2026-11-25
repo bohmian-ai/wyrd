@@ -938,6 +938,7 @@ import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[reposit
 import { load as loadGithub } from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.server';
 import GithubPage from '../routes/t/[tenantKey]/settings/(admin)/integrations/github/+page.svelte';
 import { load as loadSecrets } from '../routes/t/[tenantKey]/settings/(admin)/secrets/+page.server';
+import StoredSecretsPage from '../routes/platform/ui/secrets/+page.svelte';
 import { connectionExecutor } from '$lib/ui-fixtures';
 import { EventEmitter } from 'node:events';
 import { GET as getObserveSupport } from '../routes/t/[tenantKey]/observe/support/+server';
@@ -1414,4 +1415,15 @@ test('a refused provider proof has no code to show, so the problem shows none', 
   const problem = page.getByRole('alert');
   expect(problem).toHaveTextContent('Sign-in was not confirmed');
   expect(problem.querySelector('code')).toBeNull();
+});
+
+test('a maintenance run that leaves failures lists them in a named, keyboard-reachable scroll region', () => {
+  const report = { current: 3, changed: 1, remaining: 1, bounded: false, failures: [{ store: 'operator_connections', data_tenant_id: 'tenant-a', owner: 'ops-slack', reason: 'key_unavailable' }] };
+  const page = render(StoredSecretsPage, {
+    props: { data: {}, form: { report } } as never,
+    context: new Map([['console-reauth', { guard: () => async () => undefined }]])
+  });
+  const region = page.getByRole('region', { name: 'Rotation failures' });
+  expect(region).toHaveAttribute('tabindex', '0');
+  expect(within(region).getByRole('table')).toHaveTextContent('key_unavailable');
 });

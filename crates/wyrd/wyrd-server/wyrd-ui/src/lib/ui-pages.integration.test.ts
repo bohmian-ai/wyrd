@@ -3007,7 +3007,7 @@ test('an administrator manages direct and custom-role grants in People and Roles
   try {
     /** Post one access form action directly, as a request that skipped the page's own controls. */
     const post = async (action: string, form: Record<string, string>) =>
-      ((await (await page.request.post(`${base}/settings/people?/${action}`, { form, headers: formPost })).json()) as { type: string; status: number });
+      ((await (await page.request.post(`${base}/settings/people?/${action}`, { form, headers: { origin: ui.base } })).json()) as { type: string; status: number });
     await page.goto(`${base}/settings/people`);
 
     // An invitation that names no scope is refused: nobody is enrolled with a tenant-wide default.
@@ -3135,7 +3135,7 @@ test('an administrator suspends a User and a Service account in Settings, and th
     // A signed-in viewer posts the action directly: the server refuses it and the account stays active.
     const direct = await bystander.request.post(`${base}/settings/service-accounts?/suspend`, {
       form: { principalId: service.principal_id, principalKind: 'service', reason: 'not mine to stop' },
-      headers: formPost
+      headers: { origin: ui.base }
     });
     const refusal = (await direct.json()) as { type: string; status: number; data: string };
     expect(refusal).toMatchObject({ type: 'failure', status: 403 });

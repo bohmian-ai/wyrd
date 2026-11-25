@@ -34,6 +34,11 @@
   const step = $derived(candidate ? (asked === 2 ? 2 : tested ? 4 : 3) : asked === 1 || asked === 2 ? asked : 0);
   /** The confirmation opens only for the change the policy can take next. */
   const confirming = $derived(policy?.connection && page.url.searchParams.get('confirm') === (required ? 'allow' : 'require'));
+  /** Deactivate and Remove confirm their impact first; Deactivate waits until company SSO is no longer required. */
+  const ending = $derived.by(() => {
+    const wanted = page.url.searchParams.get('confirm');
+    return active && (wanted === 'remove' || (wanted === 'deactivate' && !required)) ? wanted : null;
+  });
   const locked = $derived(policy?.users_without_company_identity ?? 0);
   const people = (count: number) => `${count} ${count === 1 ? 'person' : 'people'}`;
   const host = (issuer: string) => issuer.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -264,19 +269,33 @@
       <div class="row">
         <div class="label"><b>Deactivate company SSO</b><span>People who sign in through {host(active.issuer)} can no longer get in, and their sessions end. Turn off Require company SSO first.</span></div>
         <div class="ctl">
-          <form method="POST" action="?/deactivate"><button class="app-control danger" type="submit" disabled={required}>Deactivate</button></form>
+          {#if required}<button class="app-control danger" type="button" disabled>Deactivate</button>{:else}<a class="app-control danger" href="{base}?confirm=deactivate" data-sveltekit-noscroll>Deactivate</a>{/if}
         </div>
       </div>
       <div class="row">
         <div class="label"><b>Remove company SSO</b><span>Deletes this connection. Setting up company SSO again starts from the first step.</span></div>
         <div class="ctl">
-          <form method="POST" action="?/remove">
-            <input type="hidden" name="id" value={active.id} />
-            <button class="app-control danger" type="submit">Remove</button>
-          </form>
+          <a class="app-control danger" href="{base}?confirm=remove" data-sveltekit-noscroll>Remove</a>
         </div>
       </div>
     </section>
+  {/if}
+
+  {#if ending && active}
+    <Overlay kind="dialog" title={ending === 'remove' ? 'Remove company SSO?' : 'Deactivate company SSO?'} close={base}>
+      <form id="ending" method="POST" action="?/{ending}">
+        {#if ending === 'remove'}<input type="hidden" name="id" value={active.id} />{/if}
+        <p>This takes effect immediately:</p>
+        <ul class="impact">
+          <li>People who sign in through {host(active.issuer)} can no longer get in to {data.tenant.name}, and their sessions end.</li>
+          {#if ending === 'remove'}<li>The connection and its client secret are deleted. Setting up company SSO again starts from the first step.</li>{/if}
+        </ul>
+      </form>
+      {#snippet footer()}
+        <a class="app-control" href={base} data-sveltekit-noscroll>Cancel</a>
+        <button class="app-control danger fill" type="submit" form="ending">{ending === 'remove' ? 'Remove company SSO' : 'Deactivate company SSO'}</button>
+      {/snippet}
+    </Overlay>
   {/if}
 
   {#if confirming && policy.connection}
@@ -308,8 +327,7 @@
 
 <style>
   .card > header form,
-  .buttons form,
-  .ctl form {
+  .buttons form {
     display: contents;
   }
   .steps {

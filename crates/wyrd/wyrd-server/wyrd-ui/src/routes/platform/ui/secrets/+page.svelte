@@ -50,7 +50,8 @@
     <div class="row"><div class="label"><b>Remaining</b><span>Failed, changed during the run, or past the run's time budget.</span></div><div class="ctl mono">{report.remaining}</div></div>
   </section>
   {#if report.failures.length}
-    <div class="tablewrap">
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
+    <div class="tablewrap" role="region" aria-label="Rotation failures" tabindex="0">
       <table>
         <thead><tr><th>Store</th><th>Owner</th><th>Reason</th></tr></thead>
         <tbody>

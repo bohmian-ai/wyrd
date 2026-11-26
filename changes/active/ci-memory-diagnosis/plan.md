@@ -9,7 +9,7 @@ Do not turn each step into another task or require RED/GREEN cycles.
 
 ## TASK-001 — Diagnose the RunsOn failure and restore efficient CI
 
-Status: in progress (steps 1–2 done; step 3 prepared, not run)
+Status: in progress (step 3 run: lld build passed; family aggregate failed on one test)
 Dependencies: none
 
 ### Outcome
@@ -344,3 +344,109 @@ Recorder corrections before the first push (maintainer review):
 Pending authorization:
 - Commit and push of `ci-debug`, which triggers the run.
 - `lints-test`, `nightly` and `diagnose-rust-ci` remain disabled.
+
+#### Step 3 — RunsOn lld run 45843864434 (commit 5ce0a1c97)
+
+Evidence (local, gitignored): `.dev/ci-memory-diagnosis/remote/45843864434/`
+holds `job.log` (job 139992303642) and `artifact/`. The artifact contains
+`runs/build`, `runs/families` and `dmesg.txt`.
+
+Conclusion: job `failure`. The build step passed; the family step failed with
+exit 100.
+
+Host:
+- RunsOn x86_64, 8 CPUs, 31.5 GiB RAM, 16 GiB swapfile.
+- Kernel 7.0.0-1018-aws.
+- `RUSTFLAGS`, the linker variable and `CARGO_BUILD_JOBS` all unset.
+- Cache `test-lld` missed, as expected; the target directory was empty at
+  start.
+- Installed linkers: rust-lld 23.1.1 and GNU ld 2.42.
+
+Reproducer:
+- Exit 0, `Finished … in 12m 00s`, from a cold target.
+- 364 samples.
+- Lowest available memory 21620 MiB (15:05:02).
+- Highest swap 601 MiB.
+- Highest memory PSI avg10 2.86; highest I/O PSI avg10 53.92.
+- No kernel OOM lines in `oom.txt` or `dmesg.txt`.
+- Largest processes:
+
+  | Process | Peak RSS |
+  |---|---|
+  | `wyrd_server` lib-test rustc | 7.9 GB |
+  | `wyrd_server` lib rustc | 7.7 GB |
+  | one `rust-lld` link | 5.3 GB |
+
+- Up to 15 linker-class processes (drivers plus `rust-lld`) and 8 rustc ran at
+  once. The summed RSS of 21 GB overcounts shared and mapped pages, and is
+  contradicted by the 21.6 GB still available at the same sample.
+- Compared with the archived BFD run: lowest available 21.6 GB here against
+  2.2 GB there; swap 0.6 GB here against more than 12 GB there.
+
+lld confirmation: every executable in `target/debug/deps` carries the `LLD`
+`.comment`, and the check step passed.
+
+Family aggregate:
+- `test:wyrd` ran 3033 tests in 597 s: 3032 passed, 1 failed, 365 skipped.
+- The failure:
+  `wyrd-server verification::hosted::workspace::pg_tests::workspace_cleans_up_on_drop`
+  panicked at `crates/wyrd/wyrd-server/src/verification/hosted/workspace/pg_tests.rs:102`.
+  - Message: "the emptied directory is reused".
+  - left `/tmp/.tmpTYmkVI/.tmpjZIm8J/inputs`; right
+    `/tmp/.tmpTYmkVI/.tmp8Ekl1V/inputs`.
+  - The reopened workspace got a new directory instead of reusing the
+    emptied one.
+- mise stopped at that failure, so `test:skald`, `test:vala` and
+  `test:shared` did not run.
+- Family memory: lowest available 26278 MiB; highest swap 305 MiB; no OOM.
+- Reuse: the family step compiled only 9 workspace crates and no third-party
+  crate: `wyrd-semver`, `wyrd-spec` (twice), `wyrd-runtime`, `wyrd-sql`,
+  `vala-sql` (twice), `wyrd-dev-fixtures`, `wyrd-cli`.
+
+Limitations:
+- nextest starts test processes in their own process groups, so test-process
+  RSS is outside the recorder's per-process lines. System availability covers
+  them.
+- The test failure has no memory, OOM or linker signal. Whether lld affects it
+  is unverified.
+
+Status:
+- The lld candidate removes the observed memory exhaustion in the reproducer.
+- It is not verified as a fix until the family aggregate passes.
+- No setting changed after this run.
+
+#### Workspace recycling race fix
+
+Cause (maintainer analysis, confirmed):
+- In `Workspace::drop` (`crates/wyrd/wyrd-server/src/verification/hosted/workspace.rs`),
+  `scratch.release()` ran before the emptied root was pushed onto the free
+  list.
+- `workspace_cleans_up_on_drop` wakes on that release, so it could reopen
+  before the push and get a fresh directory.
+
+Fix:
+- The free-list push now happens before `scratch.release()`, and the drop
+  rustdoc says so.
+- The emptied-before-release invariant is unchanged: `empty_root` still
+  succeeds before both.
+- A reopen that runs between the push and the release only briefly
+  overcounts scratch, which is conservative.
+
+Local reproduction and verification:
+- macOS, test Postgres from `scripts/postgres/with-test-postgres.sh`, target
+  `.dev/ci-memory-diagnosis/target`.
+- Pre-fix binary `wyrd_server-f4bf70d1c982b169 --exact …workspace_cleans_up_on_drop`,
+  40 sequential runs: 39 passed, 1 failed with "the emptied directory is
+  reused".
+- Fixed build:
+  `cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::hosted::workspace::pg_tests::workspace_cleans_up_on_drop)' --stress-count 300 --no-fail-fast`.
+  - 163 passed and none had a reuse failure. At the pre-fix 1/40 rate, 163
+    clean passes would happen by chance about 1.6% of the time.
+  - The other 137 iterations all failed inside the shared Postgres fixture
+    start (`could not write init file` / `No space left on device`), because
+    the local Docker disk is full; they never reached the assertion.
+  - Log: `.dev/ci-memory-diagnosis/local-stress-fixed.log`.
+  - The late 11 s failures in the earlier pre-fix nextest stress run show the
+    same disk-exhaustion pattern.
+- No sleeps, retries or assertion changes. `cargo fmt --all --check` is
+  clean.

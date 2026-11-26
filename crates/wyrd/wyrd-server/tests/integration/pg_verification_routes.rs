@@ -566,13 +566,10 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 /// execution, and the tenant holds one execution and one inputs row per
 /// accepted request, none for the refused attempt.
 ///
-/// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
-/// unwritten, and so unacknowledged, and hold the whole reserved share (two
-/// of three slots) deterministically. The keyed request waits until a probe
-/// reservation is refused, which is when both fills hold their slots;
-/// `pending()` cannot say so, because it also counts each fill's unreserved
-/// permission audit. A probe is taken and returned with no await between, so
-/// on this single-threaded runtime it never holds a slot a fill needs.
+/// Two unkeyed enqueues are accepted and settled first. The test then holds
+/// the whole reserved share (two of three slots) in one reservation for the
+/// keyed request, so that request is refused deterministically, and drops the
+/// reservation before the retry.
 ///
 /// Both counts are ordered after the requests before them through
 /// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
@@ -592,34 +589,27 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
     let (_, jwt) = user(&server, "vr-pressure", &["editor"]).await;
     server.flush_bifrost().await.expect("setup settles");
 
-    let stall = server.stall_next_bifrost_write().expect("Scribe stalls");
     let body = fixture.request(&fixture.assertion, json!(1));
-    let outbox = std::sync::Arc::clone(server.state().bifrost.scribe_outbox());
-    let fills = async {
-        tokio::join!(
-            enqueue(&server, &jwt, &body, None),
-            enqueue(&server, &jwt, &body, None)
-        )
-    };
-    let refusal = async {
-        stall.wait_entered().await;
-        while outbox.reserve(1).is_ok() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let refused = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
-        stall.release();
-        refused
-    };
-    let (((ahead, a), (behind, b)), (status, refused)) = tokio::join!(fills, refusal);
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{refused}");
-    assert_eq!(refused["code"], "WYRD_VERIFICATION_429_STAGING_FULL");
-    assert_eq!(refused["details"]["retry_after_seconds"], json!(1));
+    let (ahead, a) = enqueue(&server, &jwt, &body, None).await;
+    let (behind, b) = enqueue(&server, &jwt, &body, None).await;
     assert_eq!(
         (ahead, behind),
         (StatusCode::ACCEPTED, StatusCode::ACCEPTED),
         "the fills are acknowledged once admitted: {a} {b}"
     );
-    stall.wait_completed().await;
+    server.flush_bifrost().await.expect("the fills settle");
+
+    let share = server
+        .state()
+        .bifrost
+        .scribe_outbox()
+        .reserve(2)
+        .expect("the settled share is free");
+    let (status, refused) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    drop(share);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{refused}");
+    assert_eq!(refused["code"], "WYRD_VERIFICATION_429_STAGING_FULL");
+    assert_eq!(refused["details"]["retry_after_seconds"], json!(1));
     server.flush_bifrost().await.expect("the share drains");
     assert_eq!(
         fixture.queued_before_sentinel(&server, &jwt).await,

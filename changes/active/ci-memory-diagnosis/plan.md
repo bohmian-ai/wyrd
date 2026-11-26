@@ -575,3 +575,40 @@ Pending cloud validation (not run):
   ~60-minute target.
 - Step 6: re-enable `lints-test` and `nightly`, then remove `ci-debug.yml`,
   `ci:diagnose-build` and `scripts/ci/diagnose-build.sh`.
+
+#### Test-setup corrections after run 45875513959 attempt 2
+
+Two failures in the run, neither reproduced locally as the CI interleaving:
+- `test_failed_verification_pages_on_call_across_restart[rust]` failed with
+  `no failed window was judged`. The test invoked `cargo run` after recording
+  samples. Compilation can delay program startup beyond that window; the
+  resulting query exclusion was reproduced locally, but the exact CI compile
+  timestamps are unavailable. Now
+  `test:local-dev:journey` builds `failed_verification_dispatches` with the
+  other binaries, and the test runs `target/debug/failed_verification_dispatches`
+  itself. The query, three-minute deadline, webhook and restart assertions
+  are unchanged. The guide is unchanged: `docs:check:commands` refuses
+  `cargo build`. Public example code and guide commands are unchanged.
+- `pg_verification_routes::staging_refusal_recovers_the_same_enqueue_identity`
+  hung for 900 s. The test now accepts and settles both fills, holds
+  `scribe_outbox().reserve(2)` (the whole reserved share at capacity 3)
+  across the keyed request that must return 429, then drops it. The Scribe
+  stall and reserve-probe polling are gone; every assertion and count is
+  unchanged. Production code is unchanged.
+
+Local verification (macOS, scratch target, `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`):
+- `scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all -E 'test(=pg_verification_routes::staging_refusal_recovers_the_same_enqueue_identity)'`:
+  5 of 5 passed, about 4 s each.
+- `cargo build --locked -p wyrd-rust-examples --bin failed_verification_dispatches`
+  succeeded, and so did the mise step's final form with
+  `-p workspace-hack -p wyrd-testing` appended. The pytest run used the binary
+  from the first form. Then the following passed in 146 s, covering
+  the first page, the restart page and both webhook bodies:
+  `scripts/postgres/with-test-postgres.sh -- python -m pytest -o pythonpath= -q -m local_dev 'tests/integration/test_local_development.py::test_failed_verification_pages_on_call_across_restart[rust]'`.
+  It used the root checkout's venv and UI build through temporary symlinks,
+  which were removed afterwards.
+- `check:ci-selection` (70 + 7), `rustfmt --check`, `ruff format --check`,
+  `ruff check`, `docs:check:commands` and `git diff --check` all passed.
+- Not run: the whole `test:local-dev:journey` lane, the `[python]` and
+  `[typescript]` parameters, and any cloud run.

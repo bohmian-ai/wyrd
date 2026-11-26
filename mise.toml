@@ -166,6 +166,8 @@ run = [
   # --tests puts the dev-only workspace-hack in the graph, so these binaries
   # share the test builds' third-party artifacts instead of rebuilding them.
   "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
+  # The Failures guide's Rust program runs inside a timed window, so it is built here.
+  "cargo build --locked -p wyrd-rust-examples --bin failed_verification_dispatches -p workspace-hack -p wyrd-testing",
   # `wyrd init` launches the installed production UI build.
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile",
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build",

@@ -70,6 +70,8 @@ jobs:
         uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
+          # The family lanes never run uv, so there may be nothing to cache.
+          ignore-nothing-to-cache: true
           python-version: "3.13"
 
       - name: Install Rust components

@@ -450,3 +450,44 @@ Local reproduction and verification:
     same disk-exhaustion pattern.
 - No sleeps, retries or assertion changes. `cargo fmt --all --check` is
   clean.
+
+#### Step 3 — RunsOn lld run 45859766688 (commit 5085fe95b): reproducer and families pass
+
+Evidence: `.dev/ci-memory-diagnosis/remote/45859766688/` holds `job.log`
+(job 140047415573) and `artifact/`.
+
+Job conclusion: `failure`, solely from the `Post Install uv and Python` step.
+Its error: "Cache path /home/runner/.cache/uv does not exist on disk". The
+family lanes never ran uv, and this workflow omitted lints-test's
+`ignore-nothing-to-cache: true`. That line is now restored in `ci-debug.yml`,
+uncommitted and not rerun. Every build and test step succeeded.
+
+- Runner: RunsOn m8 (8 CPUs, 32 GiB). The cache `test-lld` was not found, so
+  the build was cold. The cache is never saved by design.
+- Reproducer:
+  - Exit 0, `Finished … in 10m 55s`.
+  - Lowest available memory 19092 MiB; highest swap 699 MiB.
+  - No kernel OOM lines.
+- lld check passed.
+- `gate:rust:families` exit 0 in 847 s; no OOM.
+  - Lowest available memory 25849 MiB; highest swap 83 MiB.
+  - 26 workspace-crate `Compiling` lines.
+  - Per lane:
+
+    | Lane | Tests run | Result | Time |
+    |---|---|---|---|
+    | `test:wyrd` | 3033 | all pass, 365 skipped | 589 s, 586 s of it test execution |
+    | `test:skald` | 365 | all pass | 1 s |
+    | `test:vala` | 1359 | all pass, 23 skipped | 78 s of tests |
+    | `test:shared` | 879 | all pass, 231 skipped | 29 s of tests |
+
+  - `workspace_cleans_up_on_drop` passed.
+- Whole job: 16:33:13–16:59:36 (26 min).
+
+Result:
+- The lld candidate meets the experiment's success criteria: the reproducer
+  and the family aggregate pass on RunsOn with lld confirmed and no OOM.
+- The historical BFD OOM is attributed to the eight concurrent BFD links
+  measured in the archived run. The earlier GitHub-hosted runner losses
+  remain unexplained.
+- Steps 4–6 not started.

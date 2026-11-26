@@ -1,6 +1,6 @@
 # CI build memory diagnosis
 
-Status: exploring — resumed after completed local investigation and archived Linux evidence audit
+Status: exploring — lld build and families verified; normal CI routing and cost proposal resumed
 
 ## Problem
 
@@ -40,63 +40,125 @@ mutation or expensive run by itself.
 
 ## Proposed implementation
 
-Steps 1 and 2 of TASK-001 are complete. Preserve that work and its execution
-record. The local Mac baseline passed and established overlapping links as its
-pressure source. Do not repeat it or recreate the deleted experimental branch.
+The diagnostic build and all four family lanes now pass with lld. Move to the
+normal workflow revision; do not repeat the diagnostic merely to fix its uv
+post-job cache error. Do not describe journeys as validated: the diagnostic
+ran families, not gateway, Bifrost or the other journeys.
 
-### Next experiment: verify lld on the actual Linux test path
+Proposed bounded revision, following the maintainer's instruction to use
+RunsOn only where needed:
 
-The archived Linux BFD/lld comparison supplies the baseline evidence previously
-thought missing. Do not launch another unchanged BFD baseline or job-cap matrix.
-Prepare one temporary `ci-debug.yml`, with one RunsOn x86_64 job, using the
-existing diagnostic recorder. Keep 8 CPUs / 32 GiB RAM / 100 GB disk, cleanup,
-swap, toolchain and line-table profile. Change only linker selection for the
-candidate: disable forced BFD and verify a linked output identifies lld.
-Keep Cargo concurrency uncapped during this experiment so a job cap does not
-obscure the effect. Production concurrency is a subsequent measured decision.
+1. Remove the forced BFD selection from shared `setup-rust-ci`. Keep the pinned
+   Rust toolchain, existing profile, cleanup, swap and feature alignment.
+   Establish effective build flags before cache restoration and use an lld
+   cache namespace so old BFD entries cannot masquerade as compatible hits.
+2. In PR/main and nightly workflows, run selected heavy Rust lanes (families,
+   gateway, Bifrost and journeys) sequentially in one RunsOn job with the
+   verified 8 CPU / 32 GiB / 100 GB configuration and S3 cache. Preserve existing
+   change selection: run only the selected lanes, exactly once. Families is
+   verified on this machine; the remaining three lanes still need validation.
+   Keep checks, SDK platform jobs, storage and other jobs on their current
+   GitHub-hosted runners unless actual failures show a need to move them.
+3. Remove the separate `deps` warmer. Invoke existing selected mise lane
+   commands directly, in a single checkout and target directory. Do not add
+   another preliminary whole-workspace build. Cargo builds the artifacts each
+   lane requires and reuses compatible artifacts from prior lanes.
+4. Restore once before those lanes and save once afterward, including workspace
+   crates. Use the existing cache action, with one successful main writer for
+   the RunsOn Rust-test cache. PRs restore main's cache; misses build normally.
+   Keep Clippy/napi caches distinct. Always invoke Cargo regardless of a hit.
+   GitHub and RunsOn S3 caches are separate backends; do not build cross-provider
+   synchronization or introduce a new cache service.
+5. Update selector/aggregation consumers and their tests, required-check
+   references and TESTING.md for the consolidated Rust job. Preserve coverage
+   and failure propagation. Retain cancellation of superseded PR runs.
+6. Validate YAML and CI-selection checks locally, then one normal full Rust
+   path and one warm-cache run. Record lane results, OOM evidence, Cargo rebuild
+   behavior, cache transfer time, total duration and estimated EC2/EBS cost.
+   Re-enable normal workflows and remove temporary diagnostic workflow/task/
+   recorder only after the normal path passes. Leave evidence archived.
 
-Set the effective compiler/linker environment before the cache action. Use a
-new lld-specific diagnostic cache identity; restore once, always invoke Cargo,
-and preserve the target directory throughout the job. Cache misses must build
-normally. Do not reuse an exact BFD cache identity as proof of lld readiness.
-The candidate may start cold; record cache and fingerprint evidence explicitly.
+This is design, not authorization to edit workflow code, push, enable workflows,
+or launch paid runs. The already-existing plan's later steps must be reconciled
+with this current proposal before implementation; preserve its execution record.
 
-First run the existing `mise run ci:diagnose-build` reproducer with whole-build
-recording. If it succeeds, provision the normal family-lane prerequisites and
-run `mise run gate:rust:families` in the same workspace. The aggregate includes
-`test:wyrd`; do not run that leaf separately. Record compilation and linking
-memory during the aggregate as well. Preserve real exit codes and full output;
-upload evidence on failure as well as success. Stop immediately on a failed
-build instead of continuing into tests. Allow 150 minutes for the complete job;
-a timeout is a failed experiment, not an OOM diagnosis.
+### Exact topology and cache changes (proposal; not accepted)
 
-Use a push trigger limited to `ci-debug`, one active run, no matrix or generic
-command inputs. No new cloud run is authorized by this design discussion.
-Prepare the diff and retain the normal workflows' disabled state pending the
-maintainer's implementation/run instruction.
+The maintainer rejected the earlier summary as insufficiently specific. The
+following makes the proposed concurrency change explicit; it is not approval.
 
-### Result and follow-through
+| Current PR/main or nightly gate path | Proposed path |
+| --- | --- |
+| Separate `deps` job blocks all eight gate shards | Delete `deps`; downstream jobs depend only on their selector |
+| Four parallel Rust shards: families, gateway, Bifrost, journeys | One RunsOn job, selected lanes sequentially, same target directory |
+| `gate:checks`, `gate:storage`, `gate:python`, `gate:typescript` | Four independent GitHub-hosted jobs; remain parallel with RunsOn |
+| SDK OS/Python matrices, docs, UI, images | Existing runners, selection and parallelism retained |
+| Nightly isolated Postgres job | Remains independent on GitHub-hosted runner |
 
-Success requires the reproducer AND all family tests to pass on RunsOn, a
-confirmed lld-linked artifact, no kernel OOM, and retained system/process
-measurements. This validates the candidate for the affected build path; it
-does not prove the exact allocation breakdown of the original OOM or explain
-old hosted-runner disconnects. Cache reuse must be shown by actual Cargo
-behavior, not the cache-hit flag. Different feature graphs may legitimately
-rebuild; identify rather than hide those differences.
+A full eight-shard gate therefore becomes five concurrent jobs, not one serial
+pipeline. Only the four Rust shards are consolidated. It sacrifices their
+parallel wall-clock execution to avoid repeating workspace compilation and
+paying for four RunsOn machines. Complete Rust duration remains unmeasured.
+No other job waits for RunsOn merely to obtain a cache.
 
-If the candidate OOMs, identify its dominant processes using the recorder before
-choosing another change. If lld fails to link or tests fail, retain the error
-and investigate that failure; do not silently return to BFD or add a job cap.
-Report the failed approach and options before redesigning.
+`select-ci.py` must partition by owning gate, not a loose name prefix:
+`gate:rust:{families,gateway,bifrost,journeys}` and their partial lane members
+route to RunsOn; the special `verify:bifrost` selection also routes there.
+Preserve `WYRD_TEST_PACKAGES`, lane order, selected coverage, empty selections,
+and the conservative full-gate fallback. Emit the RunsOn lane list separately
+from the remaining GitHub matrix. Do not change local mise gate definitions
+merely to implement runner routing.
 
-After candidate verification, apply the already-agreed CI simplification:
-remove the separate `deps` warmer in PR/nightly, execute lanes sharing the
-Rust test graph sequentially in one workspace, restore/save once, preserve
-Clippy/napi distinctions and all selected coverage. Update selection/aggregation
-consumers, required-job references, tests and TESTING.md together. Preserve the
-feature-alignment fix. Only after validating the affected normal CI path should
-normal workflows be restored and temporary diagnostic code removed.
+`ci-complete` drops `deps` from needs and from its result arguments, includes
+the consolidated Rust job, and continues reporting every selected job's actual
+failure. Intentionally empty job groups may skip; a failed/cancelled selected
+job cannot become success. Update existing selector tests for full/partial/
+Bifrost-only/docs-only selections and exactly-once coverage.
+
+Cache ownership must reflect separate backends, not pretend `test` is shared
+across S3 and GitHub:
+
+| Backend/cache | Restore consumers | Main writer |
+| --- | --- | --- |
+| RunsOn S3 / lld Rust-test cache | Consolidated Rust job | That job after success |
+| GitHub / lld test cache | Existing GitHub storage/Python/native Rust jobs | One selected eligible Linux test-cache matrix job |
+| GitHub / lld Clippy cache | Checks | Checks |
+| GitHub / lld napi cache | Existing TypeScript consumers | Existing designated TypeScript writer |
+| Other OS/image/tool caches | Existing consumers | Existing writers |
+
+On GitHub, mark one eligible test-cache matrix writer now that `deps` is gone;
+retain existing main-only save policy for normal jobs. RunsOn cache includes
+workspace crates. Retain the existing GitHub cache contents initially: extending
+workspace caching everywhere is not required for this change. PR jobs restore
+main caches but do not publish them. First runs on a new identity are cold;
+parallel cold jobs can compile common dependencies independently. Caches speed
+later runs and are not a same-run artifact handoff. No replacement warmer or
+cross-provider copy step is proposed.
+
+Shared setup removes the `bfd-linker` input, BFD step and BFD-specific env
+exports/descriptions. Do not uninstall binutils or delete `ld.bfd` from images.
+Remove the obsolete diagnostic input when removing that workflow. Bump the
+Rust cache namespace once; preserve toolchain/environment/manifest hashing.
+Keep default lld for the verified Linux x64 toolchain; do not claim macOS or
+other targets use lld, or force Linux-specific flags onto them.
+
+### Cost boundary
+
+The maintainer's target is less than $5/month on RunsOn. Actual run
+45859766688 estimated $0.0940 for 26m58s billed time: $0.0823 EC2 and $0.0117
+EBS. Source: `.dev/ci-memory-diagnosis/remote/45859766688/job.log`, lines
+10784–10796. This is an estimate for a cold build plus families, not a full
+Rust gate or the total AWS bill. Roughly 53 such jobs consume $5 before other
+costs. A daily job at that measured price would consume about $2.82 in a
+30-day month before PR/main runs or other costs.
+
+Budget model: license + infrastructure/cache costs + sum of billed job costs.
+Do not promise the target from cache hits or sample rates. Verify the existing
+license and baseline AWS charges, then measure the complete cold/warm Rust job
+and compare expected monthly PR/main/nightly executions against the remaining
+budget. Preserve current triggers while discussing cost; changing coverage or
+nightly frequency needs a maintainer decision. No custom budget scheduler,
+automatic runner fallback or persistent runner pool is proposed.
 
 ## Evidence and rationale
 
@@ -152,24 +214,39 @@ before implementation. Required gates remain suspended, never bypassed.
 
 ## Open questions
 
-The revised next experiment awaits maintainer agreement. Steps 1–2 remain complete.
-The archived evidence identifies concurrent BFD links as the observed Linux
-memory-pressure source; lld is the proposed correction requiring test validation.
-No spec or TDD is required, per the maintainer’s instruction.
+- Confirm the current RunsOn license and whether the $5 target covers all AWS
+  and licensing charges or runner compute alone. Paid licensing exceeds this
+  target by itself; do not infer eligibility from repository visibility.
+- Expected monthly qualifying PR/main executions and nightly usage, needed to
+  assess budget feasibility after the complete Rust path is measured.
+- The maintainer has requested lld adoption and selective RunsOn routing; the
+  exact grouping and cost proposal above remains proposed until agreed.
+
+No spec or TDD is required, per the maintainer's instruction.
 
 ## Handoff
 
-Continue from completed steps 1–2: verify the lld candidate with the recorded
-workspace reproducer and family aggregate on one RunsOn job; apply the bounded
-CI reuse changes; re-enable normal workflows and remove the temporary workflow
-and task after real CI passes. Include source/command/cache state, process and
-system measurements, exit codes, and before/after explanation in the result.
+Resume at the production CI revision, preserving completed diagnostic evidence
+and the independent workspace recycling fix. The experiment's remaining uv
+post-job cache error does not invalidate the passing build and test evidence.
+The next proof is the normal Rust path including journeys, followed by actual
+warm-cache reuse. No workflow or production code was changed during this design.
 
-Validate the recorder with a small child-process command and a deliberate
-nonzero exit, proving descendant capture and exit propagation without synthetic
-load. Validate workflow syntax with actionlint and run `mise run check:ci-selection`
-when CI selection changes. No production implementation or consequential
-experiment has been performed as part of this design.
+## Latest experiment and external cost evidence
+
+Run 45859766688 (source 5085fe95b) completed its cold lld build in 10m55s,
+confirmed lld-linked binaries and passed families (wyrd 3033, skald 365, vala
+1359, shared 879 tests). No kernel OOM; build minimum available RAM 19092 MiB,
+maximum swap 699 MiB. Only the unused uv cache post-step failed. See the plan's
+execution record for retained logs and full limitations.
+
+- [RunsOn pricing](https://runs-on.com/pricing/): free OSS/non-commercial
+  licensing is offered; paid plans start at EUR 300/year. AWS charges are
+  separate. Actual license and installation overhead are not inspected.
+- [RunsOn cache mechanism](https://runs-on.com/docs/performance/caching/how-it-works/):
+  S3 and GitHub-hosted cache backends remain distinct.
+- [RunsOn cost controls](https://runs-on.com/docs/costs/cost-control/): spot
+  costs vary and per-job estimates do not establish a monthly total.
 
 ## Archived Linux comparison audited on 2026-11-26
 

@@ -994,6 +994,11 @@ bash .github/scripts/tests/test-detect-changes.sh
 bash .github/scripts/tests/test-verify-required-jobs.sh
 """
 
+[tasks."ci:diagnose-build"]
+hide = true
+description = "Temporary: record memory of every process in the failing workspace test build"
+run = "bash scripts/ci/diagnose-build.sh"
+
 [tasks."check:tenant-isolation"]
 hide = true
 description = "Assert query and server code reach tenant tables only through TenantConn and never leak raw pools"

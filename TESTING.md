@@ -199,6 +199,19 @@ the SDK platform jobs then run on macOS only because the shards cover Linux. Mai
 release packages; releases build every package.
 `mise run check:ci-selection` pins every route.
 
+The selected `gate:typescript` and `gate:rust:journeys` lanes run in that
+order in one job on a RunsOn 8 CPU / 32 GiB x86_64 runner; every other job,
+including the image and SDK platform jobs, runs on GitHub-hosted runners. A
+complete gate is therefore seven parallel `ci` jobs, and nightly runs the same
+seven plus the isolated Postgres checks. Every job starts after selection with
+no warm-up job, restores one Rust cache (`test`, `clippy`, `napi`, a
+per-architecture `image-*`, or the RunsOn job's `journeys-typescript`), and lets
+Cargo build whatever is still missing. GitHub-hosted jobs use GitHub's cache
+and the RunsOn job uses RunsOn's S3 cache; equal keys on the two never share
+entries. One selected job per cache and backend saves it, on main only. CI
+sets no linker: Rust links with rustc's platform default, except the arm64
+image build, which `scripts/build.sh` links with lld.
+
 ### Checks and codegen
 
 For scoped verification (`gate` already includes its checks):

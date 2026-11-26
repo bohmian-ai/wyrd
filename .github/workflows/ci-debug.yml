@@ -1,5 +1,5 @@
-# Temporary CI memory diagnosis: rustc's default lld instead of forced BFD on
-# RunsOn 8 CPU / 32 GiB. Runs the failing workspace test build under the
+# Temporary CI memory diagnosis: rustc's default lld (shared setup no longer
+# forces BFD) on RunsOn 8 CPU / 32 GiB. Runs the failing workspace test build under the
 # ci:diagnose-build recorder, confirms the test binaries were linked by lld,
 # then runs gate:rust:families in the same workspace under the same recorder.
 # Delete with the recorder once normal CI is restored.
@@ -35,7 +35,6 @@ jobs:
         with:
           docker-images: "false"
           cache-key: test-lld
-          bfd-linker: "false"
 
       - name: Record build configuration
         run: |

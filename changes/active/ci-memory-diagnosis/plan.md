@@ -9,7 +9,7 @@ Do not turn each step into another task or require RED/GREEN cycles.
 
 ## TASK-001 — Diagnose the RunsOn failure and restore efficient CI
 
-Status: in progress (step 3 run: lld build passed; family aggregate failed on one test)
+Status: in progress (step 3 passed on RunsOn; step 5 implemented locally; cloud validation of step 5 and step 6 pending)
 Dependencies: none
 
 ### Outcome
@@ -102,13 +102,16 @@ is required before normal CI is restored.
 
 5. **Apply the verified fix and remove duplicate builds.** Remove the separate
    `deps` warm-up from `lints-test.yml` and `nightly.yml`, including their
-   `needs` references and required-job result arguments. Execute lanes sharing
-   the Rust test graph sequentially in one job/workspace, preserving selected
-   lane membership and order. Restore once and save once after those lanes.
-   Preserve distinct Clippy/napi configurations and existing platform/language
-   coverage. Set the measured concurrency at the CI owner. Configure linker
-   flags before cache restoration. Keep `build:server` feature alignment and
-   `line-tables-only` unless the evidence specifically supports changing them.
+   `needs` references and required-job result arguments. Superseded by the
+   maintainer's accepted topology (design notes): do not serialize the Rust
+   shards; co-locate only `gate:typescript` then `gate:rust:journeys` in one
+   RunsOn job/workspace, preserving selected lane membership and order, and
+   restore once and save once there. Every other shard keeps its own
+   GitHub-hosted job. Remove the forced BFD linker from shared setup and bump
+   the cache namespace; no concurrency cap is set, because the lld run needed
+   none. Preserve distinct Clippy/napi configurations and existing
+   platform/language coverage. Keep `build:server` feature alignment and
+   `line-tables-only`.
 
    Update `select-ci.py`, its existing tests, required-job consumers and the CI
    description in `TESTING.md` as necessary. Do not introduce another warmer,
@@ -491,3 +494,84 @@ Result:
   measured in the archived run. The earlier GitHub-hosted runner losses
   remain unexplained.
 - Steps 4–6 not started.
+
+#### Step 5 — normal CI topology (implemented locally, not run in the cloud)
+
+Base: uncommitted on top of `6ccb8d0941da551d8ee064f7378b5bdc7a788697`
+(`ci-debug`). Step 4 needed no further correction: lld alone passed.
+
+Topology:
+- `select-ci.py::plan_jobs` builds every matrix (full gate, partial,
+  Bifrost-only, `--gate`). The `RUNS_ON` shards (`gate:typescript`, then
+  `gate:rust:journeys`) merge into one entry with `runs_on: true` and cache
+  `journeys-typescript`; on a partial change it holds only their selected
+  lanes, and with neither selected it does not exist. Full gate: 7 `ci` jobs
+  (checks, families, gateway, Bifrost, storage, Python hosted; one RunsOn).
+- `lints-test.yml::ci` and `nightly.yml::gate` pick the runner from
+  `matrix.job.runs_on` (the step-3 RunsOn label, else `ubuntu-24.04`) and run
+  `runs-on/action@v2` only there. Both run lanes one by one with `mise run`
+  in the same checkout; a nonzero lane fails the step. Nightly previously ran
+  `mise run <lanes>` once; it now loops, since the combined job has two lanes.
+- `deps` removed from both workflows, `ci-complete` needs and result
+  arguments. Image, SDK platform, docs and UI jobs are unchanged apart from
+  the UI job's cache save.
+
+Shared setup:
+- BFD input, step and its `RUSTFLAGS`/linker exports removed; `ci-debug.yml`
+  no longer passes `bfd-linker`. No job sets a linker; `scripts/build.sh`
+  still adds lld for arm64 images. binutils untouched.
+- `prefix-key: v1-rust` retires every BFD-linked entry (default `v0-rust`).
+  Nothing changes `CARGO*`/`RUST*` after the cache step, so the key hashes
+  the effective environment.
+- `save-cache: always` and `cache-on-failure` removed: saves happen on main
+  after success only.
+
+Cache identities and writers (main only, after success):
+
+| Backend / key | Writer |
+|---|---|
+| GitHub / `test` / Linux | first selected `test` `ci` job (families on the full gate; `bifrost` when Bifrost-only) |
+| GitHub / `clippy` / Linux | `checks` |
+| GitHub / `napi` / Linux | `ui` (runs whenever the addon or UI changes, and on the full gate) |
+| GitHub / `test`, `napi` / macOS | unchanged: `rust-client`, `typescript` macOS legs |
+| GitHub / `image-<os>` | unchanged: each image leg |
+| RunsOn S3 / `journeys-typescript` | the RunsOn job |
+
+- napi always passes `--target <host triple>` (`@napi-rs/cli` 3.4.1
+  `cli.js:1496`), so addons land in `target/x86_64-unknown-linux-gnu/`.
+  rust-cache v2 caches the whole `target/` and treats triple directories as
+  profiles (`src/cleanup.ts::cleanTargetDir`), so the default `. -> target`
+  mapping already covers both the host test tree and the napi tree, and the
+  image builder's `target/ubuntu-22.04/release`. Files under the builder's
+  `target/ubuntu-22.04/home` are removed by the same cleanup. No `workspaces`
+  input was added. Whether the image cache actually avoids recompilation is
+  unmeasured.
+
+Local verification (macOS, this worktree):
+- `mise run check:ci-selection`: 70 + 7 passed, 0 failed. New cases: full
+  gate and unknown-path fallback and `--gate` each run every shard exactly
+  once, with exactly one RunsOn job (`gate:typescript gate:rust:journeys`)
+  and one writer per cache; journey-only, TypeScript-plus-identity,
+  TypeScript-only (`plan_jobs` directly), Rust-leaf, server-change,
+  Bifrost-only, docs-only and planning-only matrices; workflow assertions for
+  the runner expression, `runs-on/action` guard, lane loop, no `deps`, and the
+  `ci-complete` needs. Reversing `RUNS_ON` made 5 of them fail.
+- `mise x actionlint@latest shellcheck@latest -- actionlint -config-file <runs-on=* label config> -shellcheck shellcheck .github/workflows/{lints-test,nightly,ci-debug}.yml`:
+  clean (1.7.12).
+- `mise x shellcheck@latest -- shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh`:
+  clean, after fixing three existing findings and one new one in
+  `test-detect-changes.sh` (SC2016 ×3, SC2043).
+- `ruff format --diff` shows no change in the touched `select-ci.py` hunks;
+  the file's other pre-existing differences were left alone.
+- `git diff --check` clean. No product code, migration, dependency, feature or
+  test exclusion changed.
+
+Pending cloud validation (not run):
+- A PR whose change takes the full gate: all seven `ci` jobs and the
+  existing image/SDK jobs pass; the RunsOn job starts, restores
+  (cold first) and runs both shards; `ci complete` reflects real results.
+- Then a warm run at identical source to record restore/save size, Cargo
+  third-party rebuilds, RunsOn job price and the critical path against the
+  ~60-minute target.
+- Step 6: re-enable `lints-test` and `nightly`, then remove `ci-debug.yml`,
+  `ci:diagnose-build` and `scripts/ci/diagnose-build.sh`.

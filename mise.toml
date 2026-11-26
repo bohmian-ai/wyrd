@@ -1582,8 +1582,8 @@ run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-
 [tasks."gate"]
 description = """Full repository aggregate for nightly, release, mixed, global, and unclassified changes: every lane,
 each exactly once. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at
-the first failed lane. CI runs each `gate:*` shard as its own parallel job, read from this list, so a lane belongs to
-exactly one shard. The only tests outside gate are the scheduled production-geometry qualifications
+the first failed lane. CI runs each `gate:*` shard as its own parallel job, read from this list, except
+gate:typescript and gate:rust:journeys, which share one RunsOn job; a lane belongs to exactly one shard. The only tests outside gate are the scheduled production-geometry qualifications
 (performance.yml), the live-credential lanes (storage-integration-cloud.yml, the *:smoke:live tasks), and the official
 image journeys (test:server:startup), which build a Linux image and so run only on Linux, in CI's image job."""
 depends = [

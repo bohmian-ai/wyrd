@@ -23,44 +23,23 @@ jobs:
       - id: plan
         run: python3 .github/scripts/select-ci.py --gate
 
-  # Compiles the third-party dependency set once, before any shard starts:
-  # building the workspace's tests compiles every dependency with the features
-  # the shards' test builds use, and the cache keeps only those dependencies.
-  # Each shard restores it from the `test` cache instead of compiling it. An
-  # exact cache hit already holds the set, so the build is skipped.
-  deps:
-    name: deps
-    needs: plan
-    if: needs.plan.outputs.ci_jobs != '[]'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-
-      - id: setup
-        uses: ./.github/actions/setup-rust-ci
-        with:
-          save-cache: always
-
-      - name: Build the shared dependencies
-        if: steps.setup.outputs.cache-hit != 'true'
-        run: >-
-          mise exec -- cargo build --locked --workspace --tests
-          --exclude wyrd-sdk-python --exclude wyrd-sdk-ts --exclude wyrd-sdk-ts-testing
-
-  # The complete gate, one parallel job per `gate:*` shard in mise.toml: the
+  # The complete gate, one parallel job per `gate:*` shard in mise.toml except
+  # the TypeScript and Rust journey shards, which share one RunsOn job: the
   # same jobs a full-gate pull request runs. Live cloud and production-geometry
   # qualification run in their own workflows.
   gate:
     name: nightly ${{ matrix.job.name }}
-    needs: [plan, deps]
-    runs-on: ubuntu-24.04
+    needs: plan
+    runs-on: ${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=32/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         job: ${{ fromJSON(needs.plan.outputs.ci_jobs) }}
     steps:
+      - if: matrix.job.runs_on
+        uses: runs-on/action@v2
+
       - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
@@ -87,7 +66,14 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Run ${{ matrix.job.lanes }}
-        run: mise run ${{ matrix.job.lanes }}
+        env:
+          CI_LANES: ${{ matrix.job.lanes }}
+        run: |
+          for lane in $CI_LANES; do
+            echo "::group::mise run $lane"
+            mise run "$lane"
+            echo "::endgroup::"
+          done
 
   postgres:
     name: isolated Postgres checks

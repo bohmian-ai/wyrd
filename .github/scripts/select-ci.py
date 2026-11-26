@@ -18,12 +18,12 @@ workspace graph, selects the complete gate rather than a smaller plan.
 WYRD_CARGO_METADATA names a prepared `cargo metadata` document for self-tests.
 
 `ci_jobs` is the JSON matrix of the Linux `ci` job: one entry per parallel job,
-each running its space-separated `lanes` and restoring the Rust cache named by
-`cache`. The complete gate runs one job per `gate:*` shard listed in mise.toml,
-so every lane runs exactly once; a partial run groups its selected lanes into
-the same shards, so its jobs run in parallel as the gate's do. The `deps` job builds the workspace tests and
-saves their dependencies as the shared `test` cache before any shard starts; `save` marks the one shard that refreshes
-each other cache from main.
+each running its space-separated `lanes` in order and restoring the Rust cache
+named by `cache`. The complete gate runs one job per `gate:*` shard listed in
+mise.toml, so every lane runs exactly once; a partial run groups its selected
+lanes into the same shards, so its jobs run in parallel as the gate's do. The
+RUNS_ON shards share one job, marked `runs_on`, on a RunsOn runner. `save`
+marks the first job of each cache, which refreshes it from main.
 """
 
 import json
@@ -144,8 +144,13 @@ def read_families(workspace):
 
 
 # Gate shards whose builds differ from the shared Rust test graph keep their own
-# cache: Clippy's check-only artifacts and the napi addons' --target tree.
-SHARD_CACHE = {"gate:checks": "clippy", "gate:typescript": "napi"}
+# cache: Clippy's check-only artifacts.
+SHARD_CACHE = {"gate:checks": "clippy"}
+# Shards whose GitHub-hosted runner lost communication. They run in this order
+# in one RunsOn job, sharing one checkout and target directory and one cache of
+# the test and napi --target trees they build.
+RUNS_ON = ("gate:typescript", "gate:rust:journeys")
+RUNS_ON_CACHE = "journeys-typescript"
 
 
 def gate_shards(root):
@@ -155,16 +160,42 @@ def gate_shards(root):
     return {shard: tasks[shard]["depends"] for shard in tasks["gate"]["depends"]}
 
 
-def gate_jobs(root):
-    """Return one ci job per `gate:*` shard, in mise.toml's gate order."""
-    shards = gate_shards(root)
+def plan_jobs(groups):
+    """Return the ci matrix for (shard, name, lanes) groups in gate order.
+
+    Every group is its own job except the RUNS_ON groups, which merge into one
+    job after the others. The first job of each cache saves it.
+    """
+    hosted = [group for group in groups if group[0] not in RUNS_ON]
+    runs_on = sorted(
+        (group for group in groups if group[0] in RUNS_ON),
+        key=lambda group: RUNS_ON.index(group[0]),
+    )
     jobs = [
-        {"name": shard, "lanes": shard, "cache": SHARD_CACHE.get(shard, "test")}
-        for shard in shards
+        {
+            "name": name,
+            "lanes": " ".join(lanes),
+            "cache": SHARD_CACHE.get(shard, "test"),
+        }
+        for shard, name, lanes in hosted
     ]
-    for cache in {job["cache"] for job in jobs} - {"test"}:
+    if runs_on:
+        jobs.append(
+            {
+                "name": "+".join(name for _, name, _ in runs_on),
+                "lanes": " ".join(lane for *_, lanes in runs_on for lane in lanes),
+                "cache": RUNS_ON_CACHE,
+                "runs_on": True,
+            }
+        )
+    for cache in dict.fromkeys(job["cache"] for job in jobs):
         next(job for job in jobs if job["cache"] == cache)["save"] = True
     return jobs
+
+
+def gate_jobs(root):
+    """Return the complete gate's ci matrix: each `gate:*` shard as one lane."""
+    return plan_jobs([(shard, shard, [shard]) for shard in gate_shards(root)])
 
 
 def ci_jobs(sel, outputs, root):
@@ -176,7 +207,7 @@ def ci_jobs(sel, outputs, root):
     lanes; a lane no shard lists runs as its own job.
     """
     if outputs.get("bifrost_only"):
-        return [{"name": "bifrost", "lanes": "verify:bifrost", "cache": "test"}]
+        return plan_jobs([("verify:bifrost", "bifrost", ["verify:bifrost"])])
     lanes = list(sel.lanes)
     if lanes:
         lanes = ["check", "check:deps", *lanes]
@@ -184,20 +215,14 @@ def ci_jobs(sel, outputs, root):
         lanes.append("test:identity:journey")
     if sel.flags.get("storage"):
         lanes.append("test:storage:matrix")
-    jobs = []
+    groups = []
     for shard, members in gate_shards(root).items():
         chosen = [lane for lane in members if lane in lanes]
         if chosen:
-            jobs.append(
-                {
-                    "name": shard.removeprefix("gate:"),
-                    "lanes": " ".join(chosen),
-                    "cache": SHARD_CACHE.get(shard, "test"),
-                }
-            )
+            groups.append((shard, shard.removeprefix("gate:"), chosen))
         lanes = [lane for lane in lanes if lane not in members]
-    jobs.extend({"name": lane, "lanes": lane, "cache": "test"} for lane in lanes)
-    return jobs
+    groups.extend((lane, lane, [lane]) for lane in lanes)
+    return plan_jobs(groups)
 
 
 def read_metadata(root):

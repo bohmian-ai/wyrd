@@ -77,43 +77,24 @@ jobs:
   # `gate:*` shard in mise.toml, so every lane runs exactly once. Any other
   # change runs format, lint, the boundary checks, and exactly the lanes
   # selected for its affected packages, in parallel jobs grouped as the gate
-  # shards group them.
-  # Compiles the third-party dependency set once, before any shard starts:
-  # building the workspace's tests compiles every dependency with the features
-  # the shards' test builds use, and the cache keeps only those dependencies.
-  # Each shard restores it from the `test` cache instead of compiling it. An
-  # exact cache hit already holds the set, so the build is skipped.
-  deps:
-    name: deps
-    needs: changes
-    if: needs.changes.outputs.ci_jobs != '[]'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-
-      - id: setup
-        uses: ./.github/actions/setup-rust-ci
-        with:
-          save-cache: always
-
-      - name: Build the shared dependencies
-        if: steps.setup.outputs.cache-hit != 'true'
-        run: >-
-          mise exec -- cargo build --locked --workspace --tests
-          --exclude wyrd-sdk-python --exclude wyrd-sdk-ts --exclude wyrd-sdk-ts-testing
-
+  # shards group them. The selected TypeScript and Rust journey lanes run in
+  # that order in one RunsOn job (`runs_on`), whose cache lives in RunsOn's S3;
+  # every other job runs on a GitHub-hosted runner. Every job starts after
+  # selection, restores its cache, and builds whatever its lanes still need.
   ci:
     name: ci (${{ matrix.job.name }})
-    needs: [changes, deps]
+    needs: changes
     if: needs.changes.outputs.ci_jobs != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=16/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         job: ${{ fromJSON(needs.changes.outputs.ci_jobs) }}
     steps:
+      - if: matrix.job.runs_on
+        uses: runs-on/action@v2
+
       - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
@@ -153,6 +134,19 @@ jobs:
             echo "::endgroup::"
             echo "| \`$lane\` | $((SECONDS - started))s |" >> "$GITHUB_STEP_SUMMARY"
           done
+
+      - name: Print Rust SDK journey log
+        if: always() && hashFiles('.dev/ci-logs/rust-sdk-journeys.log') != ''
+        run: cat .dev/ci-logs/rust-sdk-journeys.log
+
+      - name: Upload Rust SDK journey log
+        if: always() && hashFiles('.dev/ci-logs/rust-sdk-journeys.log') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-sdk-journey-log
+          path: .dev/ci-logs/rust-sdk-journeys.log
+          include-hidden-files: true
+          retention-days: 7
 
   rust-client:
     name: rust client (${{ matrix.os }})
@@ -286,10 +280,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The UI typechecks and tests against the built wyrd-ai addon.
+      # The UI typechecks and tests against the built wyrd-ai addon. It runs
+      # whenever the addon changes, so it refreshes the Linux napi cache.
       - uses: ./.github/actions/setup-rust-ci
         with:
           cache-key: napi
+          save-cache: "true"
 
       - name: Typecheck and test the UI
         run: mise run ui:check
@@ -328,7 +324,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui, image]
+    needs: [changes, matrix-plan, ci, rust-client, typescript, python, docs, ui, image]
     # Not always(): a superseded run must stop here, or the next push's run
     # waits for this job before the concurrency group lets it start.
     if: ${{ !cancelled() }}
@@ -343,7 +339,6 @@ jobs:
           .github/scripts/verify-required-jobs.sh
           "${{ needs.changes.result }}"
           "${{ needs.matrix-plan.result }}"
-          "${{ needs.deps.result }}"
           "${{ needs.ci.result }}"
           "${{ needs.rust-client.result }}"
           "${{ needs.typescript.result }}"

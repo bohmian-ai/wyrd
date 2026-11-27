@@ -1348,11 +1348,10 @@ def record_slow_requests(reader: Path, env: dict[str, str], runtime_key: str) ->
 
 DISPATCHES_RUNNERS = {
     "python": [sys.executable, "dispatches.py"],
-    # The Rust program reads no local file; it builds with the repository's toolchain.
+    # The Rust program reads no local file. test:local-dev:journey builds it before
+    # the test, so compiling it never delays the start past the recorded minute.
     "rust": [
-        *("mise", "-C", str(Path(__file__).resolve().parents[4]), "exec", "--"),
-        *("cargo", "run", "--locked", "-q", "-p", "wyrd-rust-examples"),
-        *("--bin", "failed_verification_dispatches"),
+        str(Path(__file__).resolve().parents[4] / "target/debug/failed_verification_dispatches")
     ],
     # Node resolves wyrd-ai and zod from the examples package beside the file.
     "typescript": [

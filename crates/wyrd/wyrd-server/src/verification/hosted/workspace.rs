@@ -476,8 +476,9 @@ impl Drop for Workspace {
     /// Empties or removes the directory before the scratch charge returns,
     /// so the charge never outlives the bytes. A workspace from
     /// [`Workspaces::open`] is emptied on a blocking-pool thread and its
-    /// root goes back to the free list; one that cannot be emptied is
-    /// removed instead. Any other workspace, such as a refused or cancelled
+    /// root goes back to the free list before the charge returns, so a
+    /// caller woken by that return can reopen it; one that cannot be emptied
+    /// is removed instead. Any other workspace, such as a refused or cancelled
     /// open's partial one, is removed here.
     ///
     /// The charge returns only once the directory is confirmed emptied or
@@ -503,10 +504,10 @@ impl Drop for Workspace {
         };
         let recycle = move || match empty_root(&root) {
             Ok(()) => {
-                scratch.release();
                 free.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(root);
+                scratch.release();
             }
             Err(error) => {
                 tracing::warn!(root = %root.display(), %error, "workspace could not be emptied for reuse");

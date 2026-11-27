@@ -310,6 +310,20 @@ async fn act_and_read(assistant: &Assistant) -> (String, Vec<SpanRecord>) {
     .await;
     writer.shutdown().await.expect("the row drains");
     state.shutdown().await.expect("emits drain");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !assistant
+            .deployment
+            .server()
+            .state()
+            .gateway
+            .tasks()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gateway captures finish before the timeline reads");
     tokio::task::block_in_place(|| provider.force_flush()).expect("Service spans export");
 
     let read = assistant.deployment.timeline(&trace).await;

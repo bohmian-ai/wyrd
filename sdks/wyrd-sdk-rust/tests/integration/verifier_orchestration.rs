@@ -2000,8 +2000,23 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             desk.submit("repeat-takeover", json!(question)).await,
         ));
     }
-    for (question, _) in &executions {
+    let draft = TaskId::new("draft").expect("step");
+    for (question, execution) in &executions {
         desk.stalled_in("index=1", question).await;
+        desk.accepted(*execution, |state| {
+            state.publications.iter().any(|accepted| {
+                let producer = &accepted.publication.producer;
+                producer.step_id == draft
+                    && producer.iteration_index == Some(0)
+                    && producer.attempt == 1
+            }) && state.invocations.iter().any(|invocation| {
+                invocation.producer.step_id == draft
+                    && invocation.producer.iteration_index == Some(1)
+                    && invocation.producer.attempt == 1
+                    && invocation.settlement.is_none()
+            })
+        })
+        .await;
     }
     let ids: Vec<ExecutionId> = executions.iter().map(|(_, execution)| *execution).collect();
     let (stalled, desk) = desk.take_over(&ids).await;

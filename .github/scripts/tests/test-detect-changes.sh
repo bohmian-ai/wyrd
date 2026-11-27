@@ -183,40 +183,103 @@ check_selection "Rust SDK change selects its story journeys" \
 check_selection "identity fixture selects the identity journey" "full_gate=false identity=true" \
   "tests/fixtures/identity/dex-config.yaml"
 
-# check_jobs <label> <job-names> <changed-file>...: the ci matrix runs exactly
-# these jobs, in order.
-check_jobs() {
-  local label="$1" want="$2" files outputs got
-  shift 2
+# describe_jobs: reads a ci_jobs matrix on stdin and prints one line per job:
+#   <name>: <lanes> (cache <cache>[, saves cache][, on RunsOn])
+describe_jobs() {
+  python3 -c '
+import json, sys
+for job in json.load(sys.stdin):
+    notes = ["cache " + job["cache"]]
+    if job.get("save"):
+        notes.append("saves cache")
+    if job.get("runs_on"):
+        notes.append("on RunsOn")
+    print("{}: {} ({})".format(job["name"], job["lanes"], ", ".join(notes)))
+'
+}
+
+# jobs_for <changed-file>...: the described ci matrix for a fixed change.
+jobs_for() {
+  local files outputs
   files="$(mktemp)"
   outputs="$(mktemp)"
   printf '%s\n' "$@" > "$files"
   WYRD_CHANGED_FILES="$files" GITHUB_OUTPUT="$outputs" bash "$DETECT" > /dev/null
-  got="$(grep -m1 '^ci_jobs=' "$outputs" | cut -d= -f2- \
-    | python3 -c 'import json,sys; print(" ".join(j["name"] for j in json.load(sys.stdin)))')"
+  grep -m1 '^ci_jobs=' "$outputs" | cut -d= -f2- | describe_jobs
   rm -f "$files" "$outputs"
-  if [[ "$got" == "$want" ]]; then ok "$label"; else fail "$label: got '$got', want '$want'"; fi
 }
 
-gate_shards="$(python3 -c 'import tomllib; print(" ".join(tomllib.load(open("'"$SCRIPT_DIR/../../../mise.toml"'","rb"))["tasks"]["gate"]["depends"]))')"
-check_jobs "full gate runs one job per gate shard" "$gate_shards" "Cargo.lock"
-check_jobs "server change runs its lanes in parallel shard jobs" \
-  "checks rust:families rust:gateway rust:bifrost rust:journeys storage python typescript" \
-  "crates/wyrd/wyrd-server/src/state.rs"
-check_jobs "Rust-only leaf runs only its lanes" "checks rust:families" "crates/wyrd/wyrd/src/lib.rs"
-check_jobs "Bifrost-only runs the Bifrost gate" "bifrost" \
-  "crates/vala/vala-bifrost-redux/src/forge/worker.rs"
-check_jobs "docs-only change runs no ci job" "" "docs/src/index.mdx"
-check_jobs "identity fixture runs only the identity journey" "rust:journeys" \
-  "tests/fixtures/identity/dex-config.yaml"
-check_jobs "TypeScript SDK change runs its lanes and identity" "checks rust:journeys typescript" \
-  "sdks/wyrd-sdk-ts/wyrd/src/index.ts"
-if [[ "$(cd "$SCRIPT_DIR/../../.." && GITHUB_OUTPUT=/dev/stdout python3 .github/scripts/select-ci.py --gate \
-  | cut -d= -f2- | python3 -c 'import json,sys; print(" ".join(j["name"] for j in json.load(sys.stdin)))')" == "$gate_shards" ]]; then
-  ok "nightly runs the same gate shards"
-else
-  fail "select-ci.py --gate must list every gate shard"
-fi
+# expect_jobs <label> <expected> <actual>: the described matrices match exactly.
+expect_jobs() {
+  if [[ "$3" == "$2" ]]; then
+    ok "$1"
+  else
+    fail "$1"
+    printf 'expected:\n%s\nactual:\n%s\n' "$2" "$3"
+  fi
+}
+
+expect_jobs "docs-only change runs no ci job" "" "$(jobs_for docs/src/index.mdx)"
+expect_jobs "planning-only change runs no ci job" "" "$(jobs_for changes/active/example/spec.md)"
+
+expect_jobs "Bifrost-only change runs the Bifrost gate, which saves the test cache" \
+  "bifrost: verify:bifrost (cache test, saves cache)" \
+  "$(jobs_for crates/vala/vala-bifrost-redux/src/forge/worker.rs)"
+
+expect_jobs "Rust-only leaf runs no RunsOn job" \
+  "checks: check check:deps (cache clippy, saves cache)
+rust:families: test:wyrd (cache test, saves cache)" \
+  "$(jobs_for crates/wyrd/wyrd/src/lib.rs)"
+
+expect_jobs "identity fixture runs only the identity journey, on RunsOn" \
+  "rust:journeys: test:identity:journey (cache journeys-typescript, saves cache, on RunsOn)" \
+  "$(jobs_for tests/fixtures/identity/dex-config.yaml)"
+
+expect_jobs "TypeScript SDK change runs its lanes, then the identity journey, in one RunsOn job" \
+  "checks: check check:deps codegen:check (cache clippy, saves cache)
+typescript+rust:journeys: ts:napi:check ts:test:integration test:identity:journey (cache journeys-typescript, saves cache, on RunsOn)" \
+  "$(jobs_for sdks/wyrd-sdk-ts/wyrd/src/index.ts)"
+
+expect_jobs "server change runs hosted shard jobs, one RunsOn job, and one writer per cache" \
+  "checks: check check:deps check:examples codegen:check (cache clippy, saves cache)
+rust:families: test:wyrd test:shared (cache test, saves cache)
+rust:gateway: test:gateway:gate (cache test)
+rust:bifrost: test:bifrost:gate (cache test)
+storage: test:storage:matrix (cache test)
+python: py:test:integration (cache test)
+typescript+rust:journeys: ts:napi:check ts:test:integration test:identity:journey test:rust-sdk:journey test:examples (cache journeys-typescript, saves cache, on RunsOn)" \
+  "$(jobs_for crates/wyrd/wyrd-server/src/state.rs)"
+
+# The complete gate runs every gate shard in mise.toml exactly once: six hosted
+# jobs and one RunsOn job for the TypeScript then Rust journey shards.
+full_gate_jobs="gate:checks: gate:checks (cache clippy, saves cache)
+gate:rust:families: gate:rust:families (cache test, saves cache)
+gate:rust:gateway: gate:rust:gateway (cache test)
+gate:rust:bifrost: gate:rust:bifrost (cache test)
+gate:storage: gate:storage (cache test)
+gate:python: gate:python (cache test)
+gate:typescript+gate:rust:journeys: gate:typescript gate:rust:journeys (cache journeys-typescript, saves cache, on RunsOn)"
+expect_jobs "global change runs the full gate as seven jobs" \
+  "$full_gate_jobs" "$(jobs_for Cargo.lock)"
+expect_jobs "unknown path falls back to the full gate's jobs" \
+  "$full_gate_jobs" "$(jobs_for scripts/postgres/with-test-postgres.sh)"
+expect_jobs "nightly runs the full gate's jobs" "$full_gate_jobs" \
+  "$(cd "$SCRIPT_DIR/../../.." && GITHUB_OUTPUT=/dev/stdout python3 .github/scripts/select-ci.py --gate \
+    | cut -d= -f2- | describe_jobs)"
+
+# No real change selects TypeScript lanes without the identity journey, so the
+# planner is called directly: the lanes still run alone in the RunsOn job.
+typescript_only="$(cd "$SCRIPT_DIR/.." && python3 -c '
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("select_ci", "select-ci.py")
+select_ci = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(select_ci)
+print(json.dumps(select_ci.plan_jobs([("gate:typescript", "typescript", ["ts:test:unit"])])))
+' | describe_jobs)"
+expect_jobs "TypeScript-only selection runs as the RunsOn job" \
+  "typescript: ts:test:unit (cache journeys-typescript, saves cache, on RunsOn)" \
+  "$typescript_only"
+
 
 zero_outputs="$(mktemp)"
 GITHUB_OUTPUT="$zero_outputs" bash "$DETECT" "$(printf '%040d' 0)" "$(git rev-parse HEAD)" > /dev/null
@@ -237,11 +300,31 @@ job() {
 # on Linux and macOS, and the full gate also selects them.
 ci_job="$(job lints-test.yml ci)"
 if grep -q 'fromJSON(needs.changes.outputs.ci_jobs)' <<< "$ci_job" \
-  && grep -q 'for lane in $CI_LANES' <<< "$ci_job" \
+  && grep -q "for lane in \$CI_LANES" <<< "$ci_job" \
   && grep -q 'WYRD_TEST_PACKAGES' <<< "$ci_job"; then
   ok "ci runs each selected job's lanes in parallel"
 else
   fail "ci must run the ci_jobs matrix and each job's lanes"
+fi
+# Only the planned RunsOn job takes a paid runner; every job starts after
+# selection, with no warm-up job, and the required check aggregates them.
+for workflow in lints-test.yml:ci nightly.yml:gate; do
+  block="$(job "${workflow%%:*}" "${workflow#*:}")"
+  if grep -q "runs-on: \${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=16/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}" <<< "$block" \
+    && grep -q 'if: matrix.job.runs_on' <<< "$block" \
+    && grep -q "for lane in \$CI_LANES" <<< "$block"; then
+    ok "$workflow runs only the planned RunsOn job on RunsOn, lane by lane"
+  else
+    fail "$workflow must run only the planned RunsOn job on RunsOn, lane by lane"
+  fi
+done
+ci_complete="$(job lints-test.yml ci-complete)"
+if ! grep -q '^  deps:' "$WORKFLOWS/lints-test.yml" "$WORKFLOWS/nightly.yml" \
+  && ! grep -q 'needs\.deps' <<< "$ci_complete" \
+  && grep -q 'needs: \[changes, matrix-plan, ci, rust-client, typescript, python, docs, ui, image\]' <<< "$ci_complete"; then
+  ok "no warm-up job; ci complete aggregates every job"
+else
+  fail "ci complete must aggregate every job and no warm-up job may remain"
 fi
 for sdk_job in rust-client typescript python; do
   block="$(job lints-test.yml "$sdk_job")"
@@ -256,13 +339,11 @@ if grep -q '"macos-15"' <<< "$(job lints-test.yml matrix-plan)"; then
 else
   fail "SDK platform matrix must include macOS"
 fi
-for workflow in lints-test.yml; do
-  if ! grep -q '\${{ *secrets\.' "$WORKFLOWS/$workflow"; then
-    ok "$workflow uses no secrets"
-  else
-    fail "$workflow must not reach secrets from pull-request code"
-  fi
-done
+if ! grep -q "\\\${{ *secrets\\." "$WORKFLOWS/lints-test.yml"; then
+  ok "lints-test.yml uses no secrets"
+else
+  fail "lints-test.yml must not reach secrets from pull-request code"
+fi
 if grep -q '^  push:' "$WORKFLOWS/storage-integration-cloud.yml" \
   && ! grep -q 'pull_request' "$WORKFLOWS/storage-integration-cloud.yml"; then
   ok "real-cloud storage stays push-to-main only"

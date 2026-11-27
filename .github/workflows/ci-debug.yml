@@ -1,0 +1,107 @@
+# Temporary CI memory diagnosis: rustc's default lld (shared setup no longer
+# forces BFD) on RunsOn 8 CPU / 32 GiB. Runs the failing workspace test build under the
+# ci:diagnose-build recorder, confirms the test binaries were linked by lld,
+# then runs gate:rust:families in the same workspace under the same recorder.
+# Delete with the recorder once normal CI is restored.
+name: ci-debug
+
+on:
+  push:
+    branches: [ci-debug]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-debug
+  cancel-in-progress: true
+
+env:
+  MISE_LOCKED: "true"
+  DIAG_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  lld:
+    name: lld build and family lanes
+    runs-on: runs-on=${{ github.run_id }}/runner=8cpu-linux-x64/ram=32/volume=100gb/extras=s3-cache
+    timeout-minutes: 150
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v7
+
+      - id: setup
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+          cache-key: test-lld
+
+      - name: Record build configuration
+        run: |
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          echo "RUSTFLAGS=${RUSTFLAGS-<unset>}"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER-<unset>}"
+          echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS-<unset>} cpus=$(nproc)"
+          free -m
+          swapon --show
+
+      - name: Build the workspace tests under the recorder
+        env:
+          DIAG_OUT_DIR: ${{ github.workspace }}/.dev/ci-memory-diagnosis/runs/build
+        run: mise run ci:diagnose-build
+
+      - name: Confirm lld linked the test binaries
+        run: |
+          total=0
+          missing=0
+          while IFS= read -r bin; do
+            total=$((total + 1))
+            if ! readelf -p .comment "$bin" | grep -q 'LLD'; then
+              echo "not linked by lld: $bin"
+              missing=$((missing + 1))
+            fi
+            case "$bin" in */wyrd_server-*) echo "$bin"; readelf -p .comment "$bin" ;; esac
+          done < <(find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.so')
+          echo "linked=$total not_lld=$missing"
+          [ "$total" -gt 0 ] && [ "$missing" -eq 0 ]
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          # The family lanes never run uv, so there may be nothing to cache.
+          ignore-nothing-to-cache: true
+          python-version: "3.13"
+
+      - name: Install Rust components
+        run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
+
+      - name: Install system tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Run the family lanes under the recorder
+        env:
+          RUST_LOG: info,vala_bifrost_redux::oracle=debug,wyrd_server::http::router=debug
+          DIAG_OUT_DIR: ${{ github.workspace }}/.dev/ci-memory-diagnosis/runs/families
+        run: mise run ci:diagnose-build -- mise run gate:rust:families
+
+      - name: Collect kernel diagnostics
+        if: always()
+        run: |
+          mkdir -p .dev/ci-memory-diagnosis
+          { sudo dmesg -T 2>&1 || true; } > .dev/ci-memory-diagnosis/dmesg.txt
+          grep -iE 'out of memory|oom-kill|killed process' .dev/ci-memory-diagnosis/dmesg.txt || echo "no kernel OOM lines"
+          free -m
+          swapon --show
+
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-memory-diagnosis
+          path: .dev/ci-memory-diagnosis/
+          include-hidden-files: true
+          if-no-files-found: warn

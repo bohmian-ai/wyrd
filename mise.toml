@@ -166,6 +166,8 @@ run = [
   # --tests puts the dev-only workspace-hack in the graph, so these binaries
   # share the test builds' third-party artifacts instead of rebuilding them.
   "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
+  # The Failures guide's Rust program runs inside a timed window, so it is built here.
+  "cargo build --locked -p wyrd-rust-examples --bin failed_verification_dispatches -p workspace-hack -p wyrd-testing",
   # `wyrd init` launches the installed production UI build.
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile",
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build",
@@ -689,7 +691,17 @@ depends = ["check", "test:rust-sdk:journey", "test:local-dev:journey"]
 hide = true
 description = "The wyrd-ai unit tests and every story journey except the identity and installed-CLI ones, on one Postgres lifecycle"
 depends = ["build:server"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc '
+set -e
+mise run db:migrate:all:inner
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  mkdir -p .dev/ci-logs
+  exec > .dev/ci-logs/rust-sdk-journeys.log 2>&1
+fi
+cargo nextest run --locked -p wyrd-ai -P journey --run-ignored=all \
+  -E "not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)"'
+"""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
@@ -993,6 +1005,11 @@ run = """
 bash .github/scripts/tests/test-detect-changes.sh
 bash .github/scripts/tests/test-verify-required-jobs.sh
 """
+
+[tasks."ci:diagnose-build"]
+hide = true
+description = "Temporary: record memory of every process in the failing workspace test build"
+run = "bash scripts/ci/diagnose-build.sh"
 
 [tasks."check:tenant-isolation"]
 hide = true
@@ -1577,8 +1594,8 @@ run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-
 [tasks."gate"]
 description = """Full repository aggregate for nightly, release, mixed, global, and unclassified changes: every lane,
 each exactly once. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at
-the first failed lane. CI runs each `gate:*` shard as its own parallel job, read from this list, so a lane belongs to
-exactly one shard. The only tests outside gate are the scheduled production-geometry qualifications
+the first failed lane. CI runs each `gate:*` shard as its own parallel job, read from this list, except
+gate:typescript and gate:rust:journeys, which share one RunsOn job; a lane belongs to exactly one shard. The only tests outside gate are the scheduled production-geometry qualifications
 (performance.yml), the live-credential lanes (storage-integration-cloud.yml, the *:smoke:live tasks), and the official
 image journeys (test:server:startup), which build a Linux image and so run only on Linux, in CI's image job."""
 depends = [

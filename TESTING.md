@@ -200,7 +200,7 @@ release packages; releases build every package.
 `mise run check:ci-selection` pins every route.
 
 The selected `gate:typescript` and `gate:rust:journeys` lanes run in that
-order in one job on a RunsOn 8 CPU / 32 GiB x86_64 runner; every other job,
+order in one job on a RunsOn 8 CPU / 16 GiB x86_64 runner; every other job,
 including the image and SDK platform jobs, runs on GitHub-hosted runners. A
 complete gate is therefore seven parallel `ci` jobs, and nightly runs the same
 seven plus the isolated Postgres checks. Every job starts after selection with

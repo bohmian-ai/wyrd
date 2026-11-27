@@ -612,3 +612,51 @@ Local verification (macOS, scratch target, `CARGO_INCREMENTAL=0`,
   `ruff check`, `docs:check:commands` and `git diff --check` all passed.
 - Not run: the whole `test:local-dev:journey` lane, the `[python]` and
   `[typescript]` parameters, and any cloud run.
+
+
+#### Gateway refresh synchronization and smaller RunsOn runner
+
+Run 45908689141 at `bac00de1e` passed the combined RunsOn TypeScript and
+Rust journey job in 61m10s. Reported peak used RAM was 9,319.87 MB; disk
+usage reached 86.95% of the 100 GB volume. The job cost estimate was $0.2062.
+The only failing gate was GitHub-hosted `gate:rust:families`:
+`components::gateway::pg_invocation_tests::usage_cache_bounds_staleness_restarts_and_policy_changes`
+received `GatewayLimitExceeded` where it expected the raised concurrency
+limit to admit a second call. The earlier corrected tests passed.
+
+Source diagnosis, independently reviewed before editing: `configure` makes
+separate deployment, fallback and governance writes. The test waited for any
+snapshot replacement, so an intermediate snapshot could satisfy that wait
+while retaining the old concurrency limit of 1. The failing CI snapshot was
+not logged; that exact interleaving is inferred. The insufficient readiness
+condition is visible in the source. The test now waits for the served snapshot
+to contain concurrency 2 before making the original invocation and assertion.
+The existing reload helper accepts the readiness predicate; its two credential
+test callers retain their pointer-replacement condition. No production path,
+notification behavior, admission rule, request retry or timeout changed.
+
+With maintainer approval, reduce the single combined RunsOn job to 16 GiB,
+retaining 8 CPUs and 100 GB disk. Update both normal workflow expressions,
+the selection assertion and current topology documentation. Historical 32 GiB
+diagnostic configuration and evidence are unchanged. This is a sizing trial;
+the next cloud run must verify capacity and cost on the smaller instance.
+
+
+Local verification (macOS, scratch target, `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, `CARGO_BUILD_JOBS=2`):
+- `cargo nextest run --locked -p wyrd-server --lib --no-run`: passed.
+- Through `scripts/postgres/with-test-postgres.sh`, exact nextest selection
+  `test(=components::gateway::pg_invocation_tests::usage_cache_bounds_staleness_restarts_and_policy_changes)`
+  with `--stress-count 5 --no-fail-fast`: 5/5 passed, 1.8–2.1 s each.
+- Through the same wrapper, exact selection
+  `test(=components::gateway::pg_invocation_tests::gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotation)`:
+  passed in 1.85 s, covering both other helper calls.
+- `mise run check:ci-selection`: 70 + 7 passed.
+- `mise exec -- cargo fmt --all --check`, actionlint/shellcheck on both
+  changed workflows and `git diff --check`: passed.
+- Build emitted a macOS linker warning about large compact unwind metadata;
+  compilation and both test commands exited 0.
+
+Next: push this revision for normal PR CI. Full Linux families and the 16 GiB
+RunsOn configuration remain pending cloud verification. Nightly stays disabled
+while normal CI is being verified.

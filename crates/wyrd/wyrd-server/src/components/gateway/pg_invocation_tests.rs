@@ -534,23 +534,23 @@ fn served(state: &AppState, tenant: DataTenantId) -> Arc<wyrd_gateway::GatewayTe
         .expect("tenant snapshot served")
 }
 
-/// Waits until `state`'s background reload replaces `before` as the
-/// snapshot it serves `tenant`, as after a change another writer notified.
+/// Waits until `state`'s background reload serves a snapshot for `tenant`
+/// satisfying `ready`, as after a change another writer notified.
 ///
 /// # Panics
 ///
-/// Panics when no reload installs within ten seconds.
+/// Panics when no matching snapshot installs within ten seconds.
 async fn reloaded(
     state: &AppState,
     tenant: DataTenantId,
-    before: &Arc<wyrd_gateway::GatewayTenantSnapshot>,
+    ready: impl Fn(&Arc<wyrd_gateway::GatewayTenantSnapshot>) -> bool,
 ) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while state
             .gateway
             .snapshots()
             .cached(tenant)
-            .is_none_or(|snapshot| Arc::ptr_eq(&snapshot, before))
+            .is_none_or(|snapshot| !ready(&snapshot))
         {
             tokio::task::yield_now().await;
         }
@@ -904,7 +904,10 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     let foreign = managed_envelope(&fixture, second).await;
     let snapshot = served(&rewrapped, first);
     replace_managed_envelope(&fixture, first, &foreign).await;
-    reloaded(&rewrapped, first, &snapshot).await;
+    reloaded(&rewrapped, first, |current| {
+        !Arc::ptr_eq(current, &snapshot)
+    })
+    .await;
     assert_refused(&rewrapped, first, "another tenant's envelope opened").await;
     let unconfigured = managed_replica(&fixture, None, dispatch.clone()).await;
     warm(&unconfigured, [first, second]).await;
@@ -933,7 +936,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         )
         .await
         .expect("revoke");
-    reloaded(&rewrapped, second, &served).await;
+    reloaded(&rewrapped, second, |current| !Arc::ptr_eq(current, &served)).await;
     assert_refused(&rewrapped, second, "a revoked credential resolved").await;
     assert_eq!(
         dispatch.seen().len(),
@@ -1336,9 +1339,12 @@ async fn usage_cache_bounds_staleness_restarts_and_policy_changes() {
         "{over:?}"
     );
 
-    let before = served(&restarted, tenant);
     configure(&a, tenant, concurrency(2), json!([]), "allow_unpriced").await;
-    reloaded(&restarted, tenant, &before).await;
+    reloaded(&restarted, tenant, |snapshot| {
+        snapshot.governance.limits.len() == 1
+            && snapshot.governance.limits[0].concurrent_calls == NonZeroU64::new(2)
+    })
+    .await;
     dispatch.push(Step::Return(completed(10, 5)));
     GatewayInvocation::new(&restarted)
         .invoke(&caller, call())

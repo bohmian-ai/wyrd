@@ -85,7 +85,7 @@ jobs:
     name: ci (${{ matrix.job.name }})
     needs: changes
     if: needs.changes.outputs.ci_jobs != '[]'
-    runs-on: ${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=32/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
+    runs-on: ${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=16/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false

@@ -50,7 +50,7 @@ arm64 lld selection in scripts/build.sh. Do not uninstall binutils.
 Accepted topology (maintainer, 2026-11-26): the two GitHub lost-communication
 workloads are `ci (gate:rust:journeys)` and `ci (gate:typescript)`, both Linux
 x64 and neither an image job. Lost communication alone is not proven OOM. They
-are co-located as ONE RunsOn job (8cpu-linux-x64/ram=32/volume=100gb/s3-cache):
+are co-located as ONE RunsOn job (8cpu-linux-x64/ram=16/volume=100gb/s3-cache):
 selected TypeScript lanes first, then selected journey lanes, in one checkout
 and target directory, with one `journeys-typescript` cache. A full gate is
 seven concurrent `ci` jobs: six GitHub-hosted shards plus that RunsOn job.

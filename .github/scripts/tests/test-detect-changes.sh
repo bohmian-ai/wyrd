@@ -310,7 +310,7 @@ fi
 # selection, with no warm-up job, and the required check aggregates them.
 for workflow in lints-test.yml:ci nightly.yml:gate; do
   block="$(job "${workflow%%:*}" "${workflow#*:}")"
-  if grep -q "runs-on: \${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=32/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}" <<< "$block" \
+  if grep -q "runs-on: \${{ matrix.job.runs_on && format('runs-on={0}/runner=8cpu-linux-x64/ram=16/volume=100gb/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}" <<< "$block" \
     && grep -q 'if: matrix.job.runs_on' <<< "$block" \
     && grep -q "for lane in \$CI_LANES" <<< "$block"; then
     ok "$workflow runs only the planned RunsOn job on RunsOn, lane by lane"

@@ -691,7 +691,17 @@ depends = ["check", "test:rust-sdk:journey", "test:local-dev:journey"]
 hide = true
 description = "The wyrd-ai unit tests and every story journey except the identity and installed-CLI ones, on one Postgres lifecycle"
 depends = ["build:server"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc '
+set -e
+mise run db:migrate:all:inner
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  mkdir -p .dev/ci-logs
+  exec > .dev/ci-logs/rust-sdk-journeys.log 2>&1
+fi
+cargo nextest run --locked -p wyrd-ai -P journey --run-ignored=all \
+  -E "not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)"'
+"""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit

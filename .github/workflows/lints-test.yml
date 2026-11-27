@@ -135,6 +135,19 @@ jobs:
             echo "| \`$lane\` | $((SECONDS - started))s |" >> "$GITHUB_STEP_SUMMARY"
           done
 
+      - name: Print Rust SDK journey log
+        if: always() && hashFiles('.dev/ci-logs/rust-sdk-journeys.log') != ''
+        run: cat .dev/ci-logs/rust-sdk-journeys.log
+
+      - name: Upload Rust SDK journey log
+        if: always() && hashFiles('.dev/ci-logs/rust-sdk-journeys.log') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-sdk-journey-log
+          path: .dev/ci-logs/rust-sdk-journeys.log
+          include-hidden-files: true
+          retention-days: 7
+
   rust-client:
     name: rust client (${{ matrix.os }})
     needs: [changes, matrix-plan]

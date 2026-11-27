@@ -660,3 +660,60 @@ Local verification (macOS, scratch target, `CARGO_INCREMENTAL=0`,
 Next: push this revision for normal PR CI. Full Linux families and the 16 GiB
 RunsOn configuration remain pending cloud verification. Nightly stays disabled
 while normal CI is being verified.
+
+
+#### Test readiness and failure-output remediation after run 46007930354
+
+Run 46007930354 passed families (including the gateway refresh correction).
+The 16 GiB RunsOn job completed normally: reported peak used RAM 8,385.96 MB,
+disk 71.47%, estimated cost $0.0995. TypeScript passed. Rust SDK journeys
+reported timeline and repetition failures; the GitHub Bifrost job reported a
+memory-refusal test receiving a query timeout instead of resource exhaustion.
+
+Independent read-only diagnosis by `ci_failure_diagnostician`, followed by a
+source audit, established these test precondition/workload gaps:
+- Gateway answers precede background capture completion; `act_and_read` only
+  flushed rows already staged. It now waits up to ten seconds for gateway
+  tasks to finish before the existing flush/read and unchanged assertions.
+- DataFusion folds constant `REPEAT('x', 100000000)` during planning. CI spent
+  approximately 28.5 of its 30 seconds before graph registration. The fixture
+  now repeats the row's two-digit id, retaining 100 MB execution-time sort
+  keys. Both query forms must still refuse with the typed resource code.
+  Dependency allocations during planning are outside the cooperative query
+  pool's declared boundary (`architecture/bifrost-design.md:1325,1495`).
+- The repetition test observed a provider request without proving the expected
+  recovery state persisted. It now uses existing `Desk::accepted` to wait for
+  the draft's iteration-0/attempt-1 publication and unsettled iteration-1/
+  attempt-1 invocation before takeover. Its exact publication, overlap and
+  outcome assertions remain. Unaccepted progress may be lost on interruption
+  (`architecture/wyrd-design.md:2278`). This repairs a test precondition; it
+  does not establish the cause of the original repetition failure.
+
+The repetition panic was lost when nextest 0.9.143 failed writing its captured
+output and exited 110. Individual job logs confirm the mid-line interruption;
+the underlying I/O cause is not retained. On GitHub Actions the existing SDK
+journey task now directs nextest itself to a regular log file, preserving its
+exit status. Both normal workflows always print/upload an existing log with
+seven-day retention. Local task output, profiles, test selection, production
+code, timeouts, runner shape and cache behavior are unchanged.
+
+TDD: not applicable to this approved test/CI remediation; the maintainer waived
+TDD for this CI investigation. No original CI interleaving was manufactured.
+
+
+Local verification used `mise exec -- bash scripts/postgres/with-test-postgres.sh --`
+with the existing scratch `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, `CARGO_BUILD_JOBS=2` and tracing on:
+- `cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=action_timeline::service_action_timeline_is_one_connected_tree) | test(=action_timeline::service_action_timeline_survives_a_quiet_operator_policy) | test(=verifier_orchestration::repeat_stops_or_exhausts_without_overlapping)' --stress-count 5 --no-fail-fast`:
+  all three tests passed in every iteration (15 executions, 53.98 s total).
+- `cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=capacity::memory_refusal_preserves_oracle_health_and_next_query)'`:
+  passed in 4.31 s; assertions cover both query forms, release, health and
+  the subsequent query. Builds emitted the same macOS compact-unwind warning.
+- A temporary shell self-check ran the parsed SDK task body with a command
+  returning 7: on GitHub Actions it retained stdout and stderr in the file
+  and returned 7; outside CI it printed both streams and returned 7.
+- `mise run check:ci-selection` (70 + 7), `mise exec -- cargo fmt --all --check`,
+  actionlint/shellcheck for both workflows, shellcheck for the extracted task
+  body and `git diff --check`: passed.
+- Not run: full suites or another cloud run. GitHub artifact upload remains
+  cloud-unverified. Commit requested; no push requested for this remediation.

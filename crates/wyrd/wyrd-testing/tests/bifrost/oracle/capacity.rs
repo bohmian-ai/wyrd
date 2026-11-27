@@ -1341,8 +1341,10 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     }
 
     let refused = client(server, "memory-refusal-reader").await?;
+    // Two-digit ids keep 100 MB keys in execution rather than a folded plan literal.
+    let repeats = REFUSAL_SORT_KEY_BYTES / 2;
     let wide = format!(
-        "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
+        "SELECT REPEAT(CAST(id AS VARCHAR), {repeats}) AS wide_key \
          FROM bifrost.bifrost.{table} WHERE id > {REFUSAL_WIDE_ROWS_AFTER} ORDER BY wide_key"
     );
     // Analysis executes the same governed sort, so it is refused the same way
